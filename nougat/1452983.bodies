@@ -1,0 +1,521 @@
+class BackupRestoreController
+!!!31957303.java!!!	getWidgetParticipants(in userId : int) : String
+            if (DEBUG) {
+                Slog.i(TAG, "Getting widget participants for user: " + userId);
+            }
+
+            HashSet<String> packages = new HashSet<>();
+            synchronized (mLock) {
+                final int N = mWidgets.size();
+                for (int i = 0; i < N; i++) {
+                    Widget widget = mWidgets.get(i);
+
+                    // Skip cross-user widgets.
+                    if (!isProviderAndHostInUser(widget, userId)) {
+                        continue;
+                    }
+
+                    packages.add(widget.host.id.packageName);
+                    Provider provider = widget.provider;
+                    if (provider != null) {
+                        packages.add(provider.id.componentName.getPackageName());
+                    }
+                }
+            }
+            return new ArrayList<>(packages);
+!!!31957431.java!!!	getWidgetState(inout backedupPackage : String, in userId : int) : byte
+            if (DEBUG) {
+                Slog.i(TAG, "Getting widget state for user: " + userId);
+            }
+
+            ByteArrayOutputStream stream = new ByteArrayOutputStream();
+            synchronized (mLock) {
+                // Preflight: if this app neither hosts nor provides any live widgets
+                // we have no work to do.
+                if (!packageNeedsWidgetBackupLocked(backedupPackage, userId)) {
+                    return null;
+                }
+
+                try {
+                    XmlSerializer out = new FastXmlSerializer();
+                    out.setOutput(stream, StandardCharsets.UTF_8.name());
+                    out.startDocument(null, true);
+                    out.startTag(null, "ws");      // widget state
+                    out.attribute(null, "version", String.valueOf(WIDGET_STATE_VERSION));
+                    out.attribute(null, "pkg", backedupPackage);
+
+                    // Remember all the providers that are currently hosted or published
+                    // by this package: that is, all of the entities related to this app
+                    // which will need to be told about id remapping.
+                    int index = 0;
+                    int N = mProviders.size();
+                    for (int i = 0; i < N; i++) {
+                        Provider provider = mProviders.get(i);
+
+                        if (!provider.widgets.isEmpty()
+                                && (provider.isInPackageForUser(backedupPackage, userId)
+                                || provider.hostedByPackageForUser(backedupPackage, userId))) {
+                            provider.tag = index;
+                            serializeProvider(out, provider);
+                            index++;
+                        }
+                    }
+
+                    N = mHosts.size();
+                    index = 0;
+                    for (int i = 0; i < N; i++) {
+                        Host host = mHosts.get(i);
+
+                        if (!host.widgets.isEmpty()
+                                && (host.isInPackageForUser(backedupPackage, userId)
+                                || host.hostsPackageForUser(backedupPackage, userId))) {
+                            host.tag = index;
+                            serializeHost(out, host);
+                            index++;
+                        }
+                    }
+
+                    // All widget instances involving this package,
+                    // either as host or as provider
+                    N = mWidgets.size();
+                    for (int i = 0; i < N; i++) {
+                        Widget widget = mWidgets.get(i);
+
+                        Provider provider = widget.provider;
+                        if (widget.host.isInPackageForUser(backedupPackage, userId)
+                                || (provider != null
+                                &&  provider.isInPackageForUser(backedupPackage, userId))) {
+                            serializeAppWidget(out, widget);
+                        }
+                    }
+
+                    out.endTag(null, "ws");
+                    out.endDocument();
+                } catch (IOException e) {
+                    Slog.w(TAG, "Unable to save widget state for " + backedupPackage);
+                    return null;
+                }
+            }
+
+            return stream.toByteArray();
+!!!31957559.java!!!	restoreStarting(in userId : int) : void
+            if (DEBUG) {
+                Slog.i(TAG, "Restore starting for user: " + userId);
+            }
+
+            synchronized (mLock) {
+                // We're starting a new "system" restore operation, so any widget restore
+                // state that we see from here on is intended to replace the current
+                // widget configuration of any/all of the affected apps.
+                mPrunedApps.clear();
+                mUpdatesByProvider.clear();
+                mUpdatesByHost.clear();
+            }
+!!!31957687.java!!!	restoreWidgetState(inout packageName : String, inout restoredState : byte, in userId : int) : void
+            if (DEBUG) {
+                Slog.i(TAG, "Restoring widget state for user:" + userId
+                        + " package: " + packageName);
+            }
+
+            ByteArrayInputStream stream = new ByteArrayInputStream(restoredState);
+            try {
+                // Providers mentioned in the widget dataset by ordinal
+                ArrayList<Provider> restoredProviders = new ArrayList<>();
+
+                // Hosts mentioned in the widget dataset by ordinal
+                ArrayList<Host> restoredHosts = new ArrayList<>();
+
+                XmlPullParser parser = Xml.newPullParser();
+                parser.setInput(stream, StandardCharsets.UTF_8.name());
+
+                synchronized (mLock) {
+                    int type;
+                    do {
+                        type = parser.next();
+                        if (type == XmlPullParser.START_TAG) {
+                            final String tag = parser.getName();
+                            if ("ws".equals(tag)) {
+                                String version = parser.getAttributeValue(null, "version");
+
+                                final int versionNumber = Integer.parseInt(version);
+                                if (versionNumber > WIDGET_STATE_VERSION) {
+                                    Slog.w(TAG, "Unable to process state version " + version);
+                                    return;
+                                }
+
+                                // TODO: fix up w.r.t. canonical vs current package names
+                                String pkg = parser.getAttributeValue(null, "pkg");
+                                if (!packageName.equals(pkg)) {
+                                    Slog.w(TAG, "Package mismatch in ws");
+                                    return;
+                                }
+                            } else if ("p".equals(tag)) {
+                                String pkg = parser.getAttributeValue(null, "pkg");
+                                String cl = parser.getAttributeValue(null, "cl");
+
+                                // hostedProviders index will match 'p' attribute in widget's
+                                // entry in the xml file being restored
+                                // If there's no live entry for this provider, add an inactive one
+                                // so that widget IDs referring to them can be properly allocated
+
+                                // Backup and resotre only for the parent profile.
+                                ComponentName componentName = new ComponentName(pkg, cl);
+
+                                Provider p = findProviderLocked(componentName, userId);
+                                if (p == null) {
+                                    p = new Provider();
+                                    p.id = new ProviderId(UNKNOWN_UID, componentName);
+                                    p.info = new AppWidgetProviderInfo();
+                                    p.info.provider = componentName;
+                                    p.zombie = true;
+                                    mProviders.add(p);
+                                }
+                                if (DEBUG) {
+                                    Slog.i(TAG, "   provider " + p.id);
+                                }
+                                restoredProviders.add(p);
+                            } else if ("h".equals(tag)) {
+                                // The host app may not yet exist on the device.  If it's here we
+                                // just use the existing Host entry, otherwise we create a
+                                // placeholder whose uid will be fixed up at PACKAGE_ADDED time.
+                                String pkg = parser.getAttributeValue(null, "pkg");
+
+                                final int uid = getUidForPackage(pkg, userId);
+                                final int hostId = Integer.parseInt(
+                                        parser.getAttributeValue(null, "id"), 16);
+
+                                HostId id = new HostId(uid, hostId, pkg);
+                                Host h = lookupOrAddHostLocked(id);
+                                restoredHosts.add(h);
+
+                                if (DEBUG) {
+                                    Slog.i(TAG, "   host[" + restoredHosts.size()
+                                            + "]: {" + h.id + "}");
+                                }
+                            } else if ("g".equals(tag)) {
+                                int restoredId = Integer.parseInt(
+                                        parser.getAttributeValue(null, "id"), 16);
+                                int hostIndex = Integer.parseInt(
+                                        parser.getAttributeValue(null, "h"), 16);
+                                Host host = restoredHosts.get(hostIndex);
+                                Provider p = null;
+                                String prov = parser.getAttributeValue(null, "p");
+                                if (prov != null) {
+                                    // could have been null if the app had allocated an id
+                                    // but not yet established a binding under that id
+                                    int which = Integer.parseInt(prov, 16);
+                                    p = restoredProviders.get(which);
+                                }
+
+                                // We'll be restoring widget state for both the host and
+                                // provider sides of this widget ID, so make sure we are
+                                // beginning from a clean slate on both fronts.
+                                pruneWidgetStateLocked(host.id.packageName, userId);
+                                if (p != null) {
+                                    pruneWidgetStateLocked(p.id.componentName.getPackageName(),
+                                            userId);
+                                }
+
+                                // Have we heard about this ancestral widget instance before?
+                                Widget id = findRestoredWidgetLocked(restoredId, host, p);
+                                if (id == null) {
+                                    id = new Widget();
+                                    id.appWidgetId = incrementAndGetAppWidgetIdLocked(userId);
+                                    id.restoredId = restoredId;
+                                    id.options = parseWidgetIdOptions(parser);
+                                    id.host = host;
+                                    id.host.widgets.add(id);
+                                    id.provider = p;
+                                    if (id.provider != null) {
+                                        id.provider.widgets.add(id);
+                                    }
+                                    if (DEBUG) {
+                                        Slog.i(TAG, "New restored id " + restoredId
+                                                + " now " + id);
+                                    }
+                                    addWidgetLocked(id);
+                                }
+                                if (id.provider.info != null) {
+                                    stashProviderRestoreUpdateLocked(id.provider,
+                                            restoredId, id.appWidgetId);
+                                } else {
+                                    Slog.w(TAG, "Missing provider for restored widget " + id);
+                                }
+                                stashHostRestoreUpdateLocked(id.host, restoredId, id.appWidgetId);
+
+                                if (DEBUG) {
+                                    Slog.i(TAG, "   instance: " + restoredId
+                                            + " -> " + id.appWidgetId
+                                            + " :: p=" + id.provider);
+                                }
+                            }
+                        }
+                    } while (type != XmlPullParser.END_DOCUMENT);
+
+                    // We've updated our own bookkeeping.  We'll need to notify the hosts and
+                    // providers about the changes, but we can't do that yet because the restore
+                    // target is not necessarily fully live at this moment.  Set aside the
+                    // information for now; the backup manager will call us once more at the
+                    // end of the process when all of the targets are in a known state, and we
+                    // will update at that point.
+                }
+            } catch (XmlPullParserException | IOException e) {
+                Slog.w(TAG, "Unable to restore widget state for " + packageName);
+            } finally {
+                saveGroupStateAsync(userId);
+            }
+!!!31957815.java!!!	restoreFinished(in userId : int) : void
+            if (DEBUG) {
+                Slog.i(TAG, "restoreFinished for " + userId);
+            }
+
+            final UserHandle userHandle = new UserHandle(userId);
+            synchronized (mLock) {
+                // Build the providers' broadcasts and send them off
+                Set<Map.Entry<Provider, ArrayList<RestoreUpdateRecord>>> providerEntries
+                        = mUpdatesByProvider.entrySet();
+                for (Map.Entry<Provider, ArrayList<RestoreUpdateRecord>> e : providerEntries) {
+                    // For each provider there's a list of affected IDs
+                    Provider provider = e.getKey();
+                    ArrayList<RestoreUpdateRecord> updates = e.getValue();
+                    final int pending = countPendingUpdates(updates);
+                    if (DEBUG) {
+                        Slog.i(TAG, "Provider " + provider + " pending: " + pending);
+                    }
+                    if (pending > 0) {
+                        int[] oldIds = new int[pending];
+                        int[] newIds = new int[pending];
+                        final int N = updates.size();
+                        int nextPending = 0;
+                        for (int i = 0; i < N; i++) {
+                            RestoreUpdateRecord r = updates.get(i);
+                            if (!r.notified) {
+                                r.notified = true;
+                                oldIds[nextPending] = r.oldId;
+                                newIds[nextPending] = r.newId;
+                                nextPending++;
+                                if (DEBUG) {
+                                    Slog.i(TAG, "   " + r.oldId + " => " + r.newId);
+                                }
+                            }
+                        }
+                        sendWidgetRestoreBroadcastLocked(
+                                AppWidgetManager.ACTION_APPWIDGET_RESTORED,
+                                provider, null, oldIds, newIds, userHandle);
+                    }
+                }
+
+                // same thing per host
+                Set<Map.Entry<Host, ArrayList<RestoreUpdateRecord>>> hostEntries
+                        = mUpdatesByHost.entrySet();
+                for (Map.Entry<Host, ArrayList<RestoreUpdateRecord>> e : hostEntries) {
+                    Host host = e.getKey();
+                    if (host.id.uid != UNKNOWN_UID) {
+                        ArrayList<RestoreUpdateRecord> updates = e.getValue();
+                        final int pending = countPendingUpdates(updates);
+                        if (DEBUG) {
+                            Slog.i(TAG, "Host " + host + " pending: " + pending);
+                        }
+                        if (pending > 0) {
+                            int[] oldIds = new int[pending];
+                            int[] newIds = new int[pending];
+                            final int N = updates.size();
+                            int nextPending = 0;
+                            for (int i = 0; i < N; i++) {
+                                RestoreUpdateRecord r = updates.get(i);
+                                if (!r.notified) {
+                                    r.notified = true;
+                                    oldIds[nextPending] = r.oldId;
+                                    newIds[nextPending] = r.newId;
+                                    nextPending++;
+                                    if (DEBUG) {
+                                        Slog.i(TAG, "   " + r.oldId + " => " + r.newId);
+                                    }
+                                }
+                            }
+                            sendWidgetRestoreBroadcastLocked(
+                                    AppWidgetManager.ACTION_APPWIDGET_HOST_RESTORED,
+                                    null, host, oldIds, newIds, userHandle);
+                        }
+                    }
+                }
+            }
+!!!31957943.java!!!	findProviderLocked(inout componentName : ComponentName, in userId : int) : AppWidgetServiceImpl::Provider
+            final int providerCount = mProviders.size();
+            for (int i = 0; i < providerCount; i++) {
+                Provider provider = mProviders.get(i);
+                if (provider.getUserId() == userId
+                        && provider.id.componentName.equals(componentName)) {
+                    return provider;
+                }
+            }
+            return null;
+!!!31958071.java!!!	findRestoredWidgetLocked(in restoredId : int, inout host : AppWidgetServiceImpl::Host, inout p : AppWidgetServiceImpl::Provider) : AppWidgetServiceImpl::Widget
+            if (DEBUG) {
+                Slog.i(TAG, "Find restored widget: id=" + restoredId
+                        + " host=" + host + " provider=" + p);
+            }
+
+            if (p == null || host == null) {
+                return null;
+            }
+
+            final int N = mWidgets.size();
+            for (int i = 0; i < N; i++) {
+                Widget widget = mWidgets.get(i);
+                if (widget.restoredId == restoredId
+                        && widget.host.id.equals(host.id)
+                        && widget.provider.id.equals(p.id)) {
+                    if (DEBUG) {
+                        Slog.i(TAG, "   Found at " + i + " : " + widget);
+                    }
+                    return widget;
+                }
+            }
+            return null;
+!!!31958199.java!!!	packageNeedsWidgetBackupLocked(inout packageName : String, in userId : int) : boolean
+            int N = mWidgets.size();
+            for (int i = 0; i < N; i++) {
+                Widget widget = mWidgets.get(i);
+
+                // Skip cross-user widgets.
+                if (!isProviderAndHostInUser(widget, userId)) {
+                    continue;
+                }
+
+                if (widget.host.isInPackageForUser(packageName, userId)) {
+                    // this package is hosting widgets, so it knows widget IDs.
+                    return true;
+                }
+
+                Provider provider = widget.provider;
+                if (provider != null && provider.isInPackageForUser(packageName, userId)) {
+                    // someone is hosting this app's widgets, so it knows widget IDs.
+                    return true;
+                }
+            }
+            return false;
+!!!31958327.java!!!	stashProviderRestoreUpdateLocked(inout provider : AppWidgetServiceImpl::Provider, in oldId : int, in newId : int) : void
+            ArrayList<RestoreUpdateRecord> r = mUpdatesByProvider.get(provider);
+            if (r == null) {
+                r = new ArrayList<>();
+                mUpdatesByProvider.put(provider, r);
+            } else {
+                // don't duplicate
+                if (alreadyStashed(r, oldId, newId)) {
+                    if (DEBUG) {
+                        Slog.i(TAG, "ID remap " + oldId + " -> " + newId
+                                + " already stashed for " + provider);
+                    }
+                    return;
+                }
+            }
+            r.add(new RestoreUpdateRecord(oldId, newId));
+!!!31958455.java!!!	alreadyStashed(inout stash : ArrayList<RestoreUpdateRecord>, in oldId : int, in newId : int) : boolean
+            final int N = stash.size();
+            for (int i = 0; i < N; i++) {
+                RestoreUpdateRecord r = stash.get(i);
+                if (r.oldId == oldId && r.newId == newId) {
+                    return true;
+                }
+            }
+            return false;
+!!!31958583.java!!!	stashHostRestoreUpdateLocked(inout host : AppWidgetServiceImpl::Host, in oldId : int, in newId : int) : void
+            ArrayList<RestoreUpdateRecord> r = mUpdatesByHost.get(host);
+            if (r == null) {
+                r = new ArrayList<>();
+                mUpdatesByHost.put(host, r);
+            } else {
+                if (alreadyStashed(r, oldId, newId)) {
+                    if (DEBUG) {
+                        Slog.i(TAG, "ID remap " + oldId + " -> " + newId
+                                + " already stashed for " + host);
+                    }
+                    return;
+                }
+            }
+            r.add(new RestoreUpdateRecord(oldId, newId));
+!!!31958711.java!!!	sendWidgetRestoreBroadcastLocked(inout action : String, inout provider : AppWidgetServiceImpl::Provider, inout host : AppWidgetServiceImpl::Host, inout oldIds : int, inout newIds : int, inout userHandle : UserHandle) : void
+            Intent intent = new Intent(action);
+            intent.putExtra(AppWidgetManager.EXTRA_APPWIDGET_OLD_IDS, oldIds);
+            intent.putExtra(AppWidgetManager.EXTRA_APPWIDGET_IDS, newIds);
+            if (provider != null) {
+                intent.setComponent(provider.info.provider);
+                sendBroadcastAsUser(intent, userHandle);
+            }
+            if (host != null) {
+                intent.setComponent(null);
+                intent.setPackage(host.id.packageName);
+                intent.putExtra(AppWidgetManager.EXTRA_HOST_ID, host.id.hostId);
+                sendBroadcastAsUser(intent, userHandle);
+            }
+!!!31958839.java!!!	pruneWidgetStateLocked(inout pkg : String, in userId : int) : void
+            if (!mPrunedApps.contains(pkg)) {
+                if (DEBUG) {
+                    Slog.i(TAG, "pruning widget state for restoring package " + pkg);
+                }
+                for (int i = mWidgets.size() - 1; i >= 0; i--) {
+                    Widget widget = mWidgets.get(i);
+
+                    Host host = widget.host;
+                    Provider provider = widget.provider;
+
+                    if (host.hostsPackageForUser(pkg, userId)
+                            || (provider != null && provider.isInPackageForUser(pkg, userId))) {
+                        // 'pkg' is either the host or the provider for this instances,
+                        // so we tear it down in anticipation of it (possibly) being
+                        // reconstructed due to the restore
+                        host.widgets.remove(widget);
+                        provider.widgets.remove(widget);
+                        unbindAppWidgetRemoteViewsServicesLocked(widget);
+                        removeWidgetLocked(widget);
+                    }
+                }
+                mPrunedApps.add(pkg);
+            } else {
+                if (DEBUG) {
+                    Slog.i(TAG, "already pruned " + pkg + ", continuing normally");
+                }
+            }
+!!!31958967.java!!!	isProviderAndHostInUser(inout widget : AppWidgetServiceImpl::Widget, in userId : int) : boolean
+            // Backup only widgets hosted or provided by the owner profile.
+            return widget.host.getUserId() == userId && (widget.provider == null
+                    || widget.provider.getUserId() == userId);
+!!!31959095.java!!!	parseWidgetIdOptions(inout parser : XmlPullParser) : Bundle
+            Bundle options = new Bundle();
+            String minWidthString = parser.getAttributeValue(null, "min_width");
+            if (minWidthString != null) {
+                options.putInt(AppWidgetManager.OPTION_APPWIDGET_MIN_WIDTH,
+                        Integer.parseInt(minWidthString, 16));
+            }
+            String minHeightString = parser.getAttributeValue(null, "min_height");
+            if (minHeightString != null) {
+                options.putInt(AppWidgetManager.OPTION_APPWIDGET_MIN_HEIGHT,
+                        Integer.parseInt(minHeightString, 16));
+            }
+            String maxWidthString = parser.getAttributeValue(null, "max_width");
+            if (maxWidthString != null) {
+                options.putInt(AppWidgetManager.OPTION_APPWIDGET_MAX_WIDTH,
+                        Integer.parseInt(maxWidthString, 16));
+            }
+            String maxHeightString = parser.getAttributeValue(null, "max_height");
+            if (maxHeightString != null) {
+                options.putInt(AppWidgetManager.OPTION_APPWIDGET_MAX_HEIGHT,
+                        Integer.parseInt(maxHeightString, 16));
+            }
+            String categoryString = parser.getAttributeValue(null, "host_category");
+            if (categoryString != null) {
+                options.putInt(AppWidgetManager.OPTION_APPWIDGET_HOST_CATEGORY,
+                        Integer.parseInt(categoryString, 16));
+            }
+            return options;
+!!!31959223.java!!!	countPendingUpdates(inout updates : ArrayList<RestoreUpdateRecord>) : int
+            int pending = 0;
+            final int N = updates.size();
+            for (int i = 0; i < N; i++) {
+                RestoreUpdateRecord r = updates.get(i);
+                if (!r.notified) {
+                    pending++;
+                }
+            }
+            return pending;

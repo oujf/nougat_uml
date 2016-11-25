@@ -1,0 +1,181 @@
+class TimeController
+!!!42320951.java!!!	get(inout jms : JobSchedulerService) : TimeController
+        if (mSingleton == null) {
+            mSingleton = new TimeController(jms, jms.getContext(), jms.getLock());
+        }
+        return mSingleton;
+!!!42321079.java!!!	TimeController(inout stateChangedListener : StateChangedListener, inout context : Context, inout lock : Object)
+        super(stateChangedListener, context, lock);
+
+        mNextJobExpiredElapsedMillis = Long.MAX_VALUE;
+        mNextDelayExpiredElapsedMillis = Long.MAX_VALUE;
+!!!42321207.java!!!	maybeStartTrackingJobLocked(inout job : JobStatus, inout lastJob : JobStatus) : void
+        if (job.hasTimingDelayConstraint() || job.hasDeadlineConstraint()) {
+            maybeStopTrackingJobLocked(job, null, false);
+            boolean isInsert = false;
+            ListIterator<JobStatus> it = mTrackedJobs.listIterator(mTrackedJobs.size());
+            while (it.hasPrevious()) {
+                JobStatus ts = it.previous();
+                if (ts.getLatestRunTimeElapsed() < job.getLatestRunTimeElapsed()) {
+                    // Insert
+                    isInsert = true;
+                    break;
+                }
+            }
+            if (isInsert) {
+                it.next();
+            }
+            it.add(job);
+            maybeUpdateAlarmsLocked(
+                    job.hasTimingDelayConstraint() ? job.getEarliestRunTime() : Long.MAX_VALUE,
+                    job.hasDeadlineConstraint() ? job.getLatestRunTimeElapsed() : Long.MAX_VALUE,
+                    job.getSourceUid());
+        }
+!!!42321335.java!!!	maybeStopTrackingJobLocked(inout job : JobStatus, inout incomingJob : JobStatus, inout forUpdate : boolean) : void
+        if (mTrackedJobs.remove(job)) {
+            checkExpiredDelaysAndResetAlarm();
+            checkExpiredDeadlinesAndResetAlarm();
+        }
+!!!42321463.java!!!	canStopTrackingJobLocked(inout job : JobStatus) : boolean
+        return (!job.hasTimingDelayConstraint() ||
+                (job.satisfiedConstraints&JobStatus.CONSTRAINT_TIMING_DELAY) != 0) &&
+                (!job.hasDeadlineConstraint() ||
+                        (job.satisfiedConstraints&JobStatus.CONSTRAINT_DEADLINE) != 0);
+!!!42321591.java!!!	ensureAlarmServiceLocked() : void
+        if (mAlarmService == null) {
+            mAlarmService = (AlarmManager) mContext.getSystemService(Context.ALARM_SERVICE);
+        }
+!!!42321719.java!!!	checkExpiredDeadlinesAndResetAlarm() : void
+        synchronized (mLock) {
+            long nextExpiryTime = Long.MAX_VALUE;
+            int nextExpiryUid = 0;
+            final long nowElapsedMillis = SystemClock.elapsedRealtime();
+
+            Iterator<JobStatus> it = mTrackedJobs.iterator();
+            while (it.hasNext()) {
+                JobStatus job = it.next();
+                if (!job.hasDeadlineConstraint()) {
+                    continue;
+                }
+                final long jobDeadline = job.getLatestRunTimeElapsed();
+
+                if (jobDeadline <= nowElapsedMillis) {
+                    if (job.hasTimingDelayConstraint()) {
+                        job.setTimingDelayConstraintSatisfied(true);
+                    }
+                    job.setDeadlineConstraintSatisfied(true);
+                    mStateChangedListener.onRunJobNow(job);
+                    it.remove();
+                } else {  // Sorted by expiry time, so take the next one and stop.
+                    nextExpiryTime = jobDeadline;
+                    nextExpiryUid = job.getSourceUid();
+                    break;
+                }
+            }
+            setDeadlineExpiredAlarmLocked(nextExpiryTime, nextExpiryUid);
+        }
+!!!42321847.java!!!	checkExpiredDelaysAndResetAlarm() : void
+        synchronized (mLock) {
+            final long nowElapsedMillis = SystemClock.elapsedRealtime();
+            long nextDelayTime = Long.MAX_VALUE;
+            int nextDelayUid = 0;
+            boolean ready = false;
+            Iterator<JobStatus> it = mTrackedJobs.iterator();
+            while (it.hasNext()) {
+                final JobStatus job = it.next();
+                if (!job.hasTimingDelayConstraint()) {
+                    continue;
+                }
+                final long jobDelayTime = job.getEarliestRunTime();
+                if (jobDelayTime <= nowElapsedMillis) {
+                    job.setTimingDelayConstraintSatisfied(true);
+                    if (canStopTrackingJobLocked(job)) {
+                        it.remove();
+                    }
+                    if (job.isReady()) {
+                        ready = true;
+                    }
+                } else if (!job.isConstraintSatisfied(JobStatus.CONSTRAINT_TIMING_DELAY)) {
+                    // If this job still doesn't have its delay constraint satisfied,
+                    // then see if it is the next upcoming delay time for the alarm.
+                    if (nextDelayTime > jobDelayTime) {
+                        nextDelayTime = jobDelayTime;
+                        nextDelayUid = job.getSourceUid();
+                    }
+                }
+            }
+            if (ready) {
+                mStateChangedListener.onControllerStateChanged();
+            }
+            setDelayExpiredAlarmLocked(nextDelayTime, nextDelayUid);
+        }
+!!!42321975.java!!!	maybeUpdateAlarmsLocked(in delayExpiredElapsed : long, in deadlineExpiredElapsed : long, in uid : int) : void
+        if (delayExpiredElapsed < mNextDelayExpiredElapsedMillis) {
+            setDelayExpiredAlarmLocked(delayExpiredElapsed, uid);
+        }
+        if (deadlineExpiredElapsed < mNextJobExpiredElapsedMillis) {
+            setDeadlineExpiredAlarmLocked(deadlineExpiredElapsed, uid);
+        }
+!!!42322103.java!!!	setDelayExpiredAlarmLocked(in alarmTimeElapsedMillis : long, in uid : int) : void
+        alarmTimeElapsedMillis = maybeAdjustAlarmTime(alarmTimeElapsedMillis);
+        mNextDelayExpiredElapsedMillis = alarmTimeElapsedMillis;
+        updateAlarmWithListenerLocked(DELAY_TAG, mNextDelayExpiredListener,
+                mNextDelayExpiredElapsedMillis, uid);
+!!!42322231.java!!!	setDeadlineExpiredAlarmLocked(in alarmTimeElapsedMillis : long, in uid : int) : void
+        alarmTimeElapsedMillis = maybeAdjustAlarmTime(alarmTimeElapsedMillis);
+        mNextJobExpiredElapsedMillis = alarmTimeElapsedMillis;
+        updateAlarmWithListenerLocked(DEADLINE_TAG, mDeadlineExpiredListener,
+                mNextJobExpiredElapsedMillis, uid);
+!!!42322359.java!!!	maybeAdjustAlarmTime(in proposedAlarmTimeElapsedMillis : long) : long
+        final long earliestWakeupTimeElapsed = SystemClock.elapsedRealtime();
+        if (proposedAlarmTimeElapsedMillis < earliestWakeupTimeElapsed) {
+            return earliestWakeupTimeElapsed;
+        }
+        return proposedAlarmTimeElapsedMillis;
+!!!42322487.java!!!	updateAlarmWithListenerLocked(inout tag : String, inout listener : AlarmManager::OnAlarmListener, in alarmTimeElapsed : long, in uid : int) : void
+        ensureAlarmServiceLocked();
+        if (alarmTimeElapsed == Long.MAX_VALUE) {
+            mAlarmService.cancel(listener);
+        } else {
+            if (DEBUG) {
+                Slog.d(TAG, "Setting " + tag + " for: " + alarmTimeElapsed);
+            }
+            mAlarmService.set(AlarmManager.ELAPSED_REALTIME_WAKEUP, alarmTimeElapsed,
+                    AlarmManager.WINDOW_HEURISTIC, 0, tag, listener, null, new WorkSource(uid));
+        }
+!!!42322615.java!!!	dumpControllerStateLocked(inout pw : PrintWriter, in filterUid : int) : void
+        final long nowElapsed = SystemClock.elapsedRealtime();
+        pw.print("Alarms: now=");
+        pw.print(SystemClock.elapsedRealtime());
+        pw.println();
+        pw.print("Next delay alarm in ");
+        TimeUtils.formatDuration(mNextDelayExpiredElapsedMillis, nowElapsed, pw);
+        pw.println();
+        pw.print("Next deadline alarm in ");
+        TimeUtils.formatDuration(mNextJobExpiredElapsedMillis, nowElapsed, pw);
+        pw.println();
+        pw.print("Tracking ");
+        pw.print(mTrackedJobs.size());
+        pw.println(":");
+        for (JobStatus ts : mTrackedJobs) {
+            if (!ts.shouldDump(filterUid)) {
+                continue;
+            }
+            pw.print("  #");
+            ts.printUniqueId(pw);
+            pw.print(" from ");
+            UserHandle.formatUid(pw, ts.getSourceUid());
+            pw.print(": Delay=");
+            if (ts.hasTimingDelayConstraint()) {
+                TimeUtils.formatDuration(ts.getEarliestRunTime(), nowElapsed, pw);
+            } else {
+                pw.print("N/A");
+            }
+            pw.print(", Deadline=");
+            if (ts.hasDeadlineConstraint()) {
+                TimeUtils.formatDuration(ts.getLatestRunTimeElapsed(), nowElapsed, pw);
+            } else {
+                pw.print("N/A");
+            }
+            pw.println();
+        }

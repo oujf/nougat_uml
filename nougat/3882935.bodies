@@ -1,0 +1,239 @@
+class IntentFirewall
+!!!41720631.java!!!	IntentFirewall(inout ams : IntentFirewall::AMSInterface, inout handler : Handler)
+        mAms = ams;
+        mHandler = new FirewallHandler(handler.getLooper());
+        File rulesDir = getRulesDir();
+        rulesDir.mkdirs();
+
+        readRulesDir(rulesDir);
+
+        mObserver = new RuleObserver(rulesDir);
+        mObserver.startWatching();
+!!!41720759.java!!!	checkStartActivity(inout intent : Intent, in callerUid : int, in callerPid : int, inout resolvedType : String, inout resolvedApp : ApplicationInfo) : boolean
+        return checkIntent(mActivityResolver, intent.getComponent(), TYPE_ACTIVITY, intent,
+                callerUid, callerPid, resolvedType, resolvedApp.uid);
+!!!41720887.java!!!	checkService(inout resolvedService : ComponentName, inout intent : Intent, in callerUid : int, in callerPid : int, inout resolvedType : String, inout resolvedApp : ApplicationInfo) : boolean
+        return checkIntent(mServiceResolver, resolvedService, TYPE_SERVICE, intent, callerUid,
+                callerPid, resolvedType, resolvedApp.uid);
+!!!41721015.java!!!	checkBroadcast(inout intent : Intent, in callerUid : int, in callerPid : int, inout resolvedType : String, in receivingUid : int) : boolean
+        return checkIntent(mBroadcastResolver, intent.getComponent(), TYPE_BROADCAST, intent,
+                callerUid, callerPid, resolvedType, receivingUid);
+!!!41721143.java!!!	checkIntent(inout resolver : IntentFirewall::FirewallIntentResolver, inout resolvedComponent : ComponentName, in intentType : int, inout intent : Intent, in callerUid : int, in callerPid : int, inout resolvedType : String, in receivingUid : int) : boolean
+        boolean log = false;
+        boolean block = false;
+
+        // For the first pass, find all the rules that have at least one intent-filter or
+        // component-filter that matches this intent
+        List<Rule> candidateRules;
+        candidateRules = resolver.queryIntent(intent, resolvedType, false, 0);
+        if (candidateRules == null) {
+            candidateRules = new ArrayList<Rule>();
+        }
+        resolver.queryByComponent(resolvedComponent, candidateRules);
+
+        // For the second pass, try to match the potentially more specific conditions in each
+        // rule against the intent
+        for (int i=0; i<candidateRules.size(); i++) {
+            Rule rule = candidateRules.get(i);
+            if (rule.matches(this, resolvedComponent, intent, callerUid, callerPid, resolvedType,
+                    receivingUid)) {
+                block |= rule.getBlock();
+                log |= rule.getLog();
+
+                // if we've already determined that we should both block and log, there's no need
+                // to continue trying rules
+                if (block && log) {
+                    break;
+                }
+            }
+        }
+
+        if (log) {
+            logIntent(intentType, intent, callerUid, resolvedType);
+        }
+
+        return !block;
+!!!41721271.java!!!	logIntent(in intentType : int, inout intent : Intent, in callerUid : int, inout resolvedType : String) : void
+        // The component shouldn't be null, but let's double check just to be safe
+        ComponentName cn = intent.getComponent();
+        String shortComponent = null;
+        if (cn != null) {
+            shortComponent = cn.flattenToShortString();
+        }
+
+        String callerPackages = null;
+        int callerPackageCount = 0;
+        IPackageManager pm = AppGlobals.getPackageManager();
+        if (pm != null) {
+            try {
+                String[] callerPackagesArray = pm.getPackagesForUid(callerUid);
+                if (callerPackagesArray != null) {
+                    callerPackageCount = callerPackagesArray.length;
+                    callerPackages = joinPackages(callerPackagesArray);
+                }
+            } catch (RemoteException ex) {
+                Slog.e(TAG, "Remote exception while retrieving packages", ex);
+            }
+        }
+
+        EventLogTags.writeIfwIntentMatched(intentType, shortComponent, callerUid,
+                callerPackageCount, callerPackages, intent.getAction(), resolvedType,
+                intent.getDataString(), intent.getFlags());
+!!!41721399.java!!!	joinPackages(inout packages : String) : String
+        boolean first = true;
+        StringBuilder sb = new StringBuilder();
+        for (int i=0; i<packages.length; i++) {
+            String pkg = packages[i];
+
+            // + 1 length for the comma. This logic technically isn't correct for the first entry,
+            // but it's not critical.
+            if (sb.length() + pkg.length() + 1 < LOG_PACKAGES_MAX_LENGTH) {
+                if (!first) {
+                    sb.append(',');
+                } else {
+                    first = false;
+                }
+                sb.append(pkg);
+            } else if (sb.length() >= LOG_PACKAGES_SUFFICIENT_LENGTH) {
+                return sb.toString();
+            }
+        }
+        if (sb.length() == 0 && packages.length > 0) {
+            String pkg = packages[0];
+            // truncating from the end - the last part of the package name is more likely to be
+            // interesting/unique
+            return pkg.substring(pkg.length() - LOG_PACKAGES_MAX_LENGTH + 1) + '-';
+        }
+        return null;
+!!!41721527.java!!!	getRulesDir() : File
+        return RULES_DIR;
+!!!41721655.java!!!	readRulesDir(inout rulesDir : File) : void
+        FirewallIntentResolver[] resolvers = new FirewallIntentResolver[3];
+        for (int i=0; i<resolvers.length; i++) {
+            resolvers[i] = new FirewallIntentResolver();
+        }
+
+        File[] files = rulesDir.listFiles();
+        if (files != null) {
+            for (int i=0; i<files.length; i++) {
+                File file = files[i];
+
+                if (file.getName().endsWith(".xml")) {
+                    readRules(file, resolvers);
+                }
+            }
+        }
+
+        Slog.i(TAG, "Read new rules (A:" + resolvers[TYPE_ACTIVITY].filterSet().size() +
+                " B:" + resolvers[TYPE_BROADCAST].filterSet().size() +
+                " S:" + resolvers[TYPE_SERVICE].filterSet().size() + ")");
+
+        synchronized (mAms.getAMSLock()) {
+            mActivityResolver = resolvers[TYPE_ACTIVITY];
+            mBroadcastResolver = resolvers[TYPE_BROADCAST];
+            mServiceResolver = resolvers[TYPE_SERVICE];
+        }
+!!!41721783.java!!!	readRules(inout rulesFile : File, inout resolvers : IntentFirewall::FirewallIntentResolver) : void
+        // some temporary lists to hold the rules while we parse the xml file, so that we can
+        // add the rules all at once, after we know there weren't any major structural problems
+        // with the xml file
+        List<List<Rule>> rulesByType = new ArrayList<List<Rule>>(3);
+        for (int i=0; i<3; i++) {
+            rulesByType.add(new ArrayList<Rule>());
+        }
+
+        FileInputStream fis;
+        try {
+            fis = new FileInputStream(rulesFile);
+        } catch (FileNotFoundException ex) {
+            // Nope, no rules. Nothing else to do!
+            return;
+        }
+
+        try {
+            XmlPullParser parser = Xml.newPullParser();
+
+            parser.setInput(fis, null);
+
+            XmlUtils.beginDocument(parser, TAG_RULES);
+
+            int outerDepth = parser.getDepth();
+            while (XmlUtils.nextElementWithin(parser, outerDepth)) {
+                int ruleType = -1;
+
+                String tagName = parser.getName();
+                if (tagName.equals(TAG_ACTIVITY)) {
+                    ruleType = TYPE_ACTIVITY;
+                } else if (tagName.equals(TAG_BROADCAST)) {
+                    ruleType = TYPE_BROADCAST;
+                } else if (tagName.equals(TAG_SERVICE)) {
+                    ruleType = TYPE_SERVICE;
+                }
+
+                if (ruleType != -1) {
+                    Rule rule = new Rule();
+
+                    List<Rule> rules = rulesByType.get(ruleType);
+
+                    // if we get an error while parsing a particular rule, we'll just ignore
+                    // that rule and continue on with the next rule
+                    try {
+                        rule.readFromXml(parser);
+                    } catch (XmlPullParserException ex) {
+                        Slog.e(TAG, "Error reading an intent firewall rule from " + rulesFile, ex);
+                        continue;
+                    }
+
+                    rules.add(rule);
+                }
+            }
+        } catch (XmlPullParserException ex) {
+            // if there was an error outside of a specific rule, then there are probably
+            // structural problems with the xml file, and we should completely ignore it
+            Slog.e(TAG, "Error reading intent firewall rules from " + rulesFile, ex);
+            return;
+        } catch (IOException ex) {
+            Slog.e(TAG, "Error reading intent firewall rules from " + rulesFile, ex);
+            return;
+        } finally {
+            try {
+                fis.close();
+            } catch (IOException ex) {
+                Slog.e(TAG, "Error while closing " + rulesFile, ex);
+            }
+        }
+
+        for (int ruleType=0; ruleType<rulesByType.size(); ruleType++) {
+            List<Rule> rules = rulesByType.get(ruleType);
+            FirewallIntentResolver resolver = resolvers[ruleType];
+
+            for (int ruleIndex=0; ruleIndex<rules.size(); ruleIndex++) {
+                Rule rule = rules.get(ruleIndex);
+                for (int i=0; i<rule.getIntentFilterCount(); i++) {
+                    resolver.addFilter(rule.getIntentFilter(i));
+                }
+                for (int i=0; i<rule.getComponentFilterCount(); i++) {
+                    resolver.addComponentFilter(rule.getComponentFilter(i), rule);
+                }
+            }
+        }
+!!!41721911.java!!!	parseFilter(inout parser : XmlPullParser) : Filter
+        String elementName = parser.getName();
+
+        FilterFactory factory = factoryMap.get(elementName);
+
+        if (factory == null) {
+            throw new XmlPullParserException("Unknown element in filter list: " + elementName);
+        }
+        return factory.newFilter(parser);
+!!!41725367.java!!!	checkComponentPermission(inout permission : String, in pid : int, in uid : int, in owningUid : int, inout exported : boolean) : boolean
+        return mAms.checkComponentPermission(permission, pid, uid, owningUid, exported) ==
+                PackageManager.PERMISSION_GRANTED;
+!!!41725495.java!!!	signaturesMatch(in uid1 : int, in uid2 : int) : boolean
+        try {
+            IPackageManager pm = AppGlobals.getPackageManager();
+            return pm.checkUidSignatures(uid1, uid2) == PackageManager.SIGNATURE_MATCH;
+        } catch (RemoteException ex) {
+            Slog.e(TAG, "Remote exception while checking signatures", ex);
+            return false;
+        }

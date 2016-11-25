@@ -1,0 +1,136 @@
+class KeyEventDispatcher
+!!!41256887.java!!!	KeyEventDispatcher(inout handlerToSendKeyEventsToInputFilter : Handler, in messageTypeForSendKeyEvent : int, inout lock : Object, inout powerManager : PowerManager)
+        if (InputEventConsistencyVerifier.isInstrumentationEnabled()) {
+            mSentEventsVerifier = new InputEventConsistencyVerifier(
+                    this, 0, KeyEventDispatcher.class.getSimpleName());
+        } else {
+            mSentEventsVerifier = null;
+        }
+        mHandlerToSendKeyEventsToInputFilter = handlerToSendKeyEventsToInputFilter;
+        mMessageTypeForSendKeyEvent = messageTypeForSendKeyEvent;
+        mKeyEventTimeoutHandler =
+                new Handler(mHandlerToSendKeyEventsToInputFilter.getLooper(), new Callback());
+        mLock = lock;
+        mPowerManager = powerManager;
+!!!41257015.java!!!	notifyKeyEventLocked(inout event : KeyEvent, in policyFlags : int, inout boundServices : List<Service>) : boolean
+        PendingKeyEvent pendingKeyEvent = null;
+        KeyEvent localClone = KeyEvent.obtain(event);
+        for (int i = 0; i < boundServices.size(); i++) {
+            Service service = boundServices.get(i);
+            // Key events are handled only by services that declared
+            // this capability and requested to filter key events.
+            if (!service.mRequestFilterKeyEvents) {
+                continue;
+            }
+            int filterKeyEventBit = service.mAccessibilityServiceInfo.getCapabilities()
+                    & AccessibilityServiceInfo.CAPABILITY_CAN_REQUEST_FILTER_KEY_EVENTS;
+            if (filterKeyEventBit == 0) {
+                continue;
+            }
+
+            try {
+                // The event will be cloned in the IPC call, so it doesn't need to be here.
+                service.mServiceInterface.onKeyEvent(localClone, localClone.getSequenceNumber());
+            } catch (RemoteException re) {
+                continue;
+            }
+
+            if (pendingKeyEvent == null) {
+                pendingKeyEvent = obtainPendingEventLocked(localClone, policyFlags);
+            }
+            ArrayList<PendingKeyEvent> pendingEventList = mPendingEventsMap.get(service);
+            if (pendingEventList == null) {
+                pendingEventList = new ArrayList<>();
+                mPendingEventsMap.put(service, pendingEventList);
+            }
+            pendingEventList.add(pendingKeyEvent);
+            pendingKeyEvent.referenceCount++;
+        }
+
+        if (pendingKeyEvent == null) {
+            localClone.recycle();
+            return false;
+        }
+
+        Message message = mKeyEventTimeoutHandler.obtainMessage(
+                MSG_ON_KEY_EVENT_TIMEOUT, pendingKeyEvent);
+        mKeyEventTimeoutHandler.sendMessageDelayed(message, ON_KEY_EVENT_TIMEOUT_MILLIS);
+        return true;
+!!!41257143.java!!!	setOnKeyEventResult(inout service : AccessibilityManagerService::Service, inout handled : boolean, in sequence : int) : void
+        synchronized (mLock) {
+            PendingKeyEvent pendingEvent =
+                    removeEventFromListLocked(mPendingEventsMap.get(service), sequence);
+            if (pendingEvent != null) {
+                if (handled && !pendingEvent.handled) {
+                    pendingEvent.handled = handled;
+                    final long identity = Binder.clearCallingIdentity();
+                    try {
+                        mPowerManager.userActivity(pendingEvent.event.getEventTime(),
+                                PowerManager.USER_ACTIVITY_EVENT_ACCESSIBILITY, 0);
+                    } finally {
+                        Binder.restoreCallingIdentity(identity);
+                    }
+                }
+                removeReferenceToPendingEventLocked(pendingEvent);
+            }
+        }
+!!!41257271.java!!!	flush(inout service : AccessibilityManagerService::Service) : void
+        synchronized (mLock) {
+            List<PendingKeyEvent> pendingEvents = mPendingEventsMap.get(service);
+            if (pendingEvents != null) {
+                for (int i = 0; i < pendingEvents.size(); i++) {
+                    PendingKeyEvent pendingEvent = pendingEvents.get(i);
+                    removeReferenceToPendingEventLocked(pendingEvent);
+                }
+                mPendingEventsMap.remove(service);
+            }
+        }
+!!!41257399.java!!!	obtainPendingEventLocked(inout event : KeyEvent, in policyFlags : int) : KeyEventDispatcher::PendingKeyEvent
+        PendingKeyEvent pendingEvent = mPendingEventPool.acquire();
+        if (pendingEvent == null) {
+            pendingEvent = new PendingKeyEvent();
+        }
+        pendingEvent.event = event;
+        pendingEvent.policyFlags = policyFlags;
+        pendingEvent.referenceCount = 0;
+        pendingEvent.handled = false;
+        return pendingEvent;
+!!!41257527.java!!!	removeEventFromListLocked(inout listOfEvents : List<PendingKeyEvent>, in sequence : int) : KeyEventDispatcher::PendingKeyEvent
+        /* In normal operation, the event should be first */
+        for (int i = 0; i < listOfEvents.size(); i++) {
+            PendingKeyEvent pendingKeyEvent = listOfEvents.get(i);
+            if (pendingKeyEvent.event.getSequenceNumber() == sequence) {
+                    /*
+                     * Removing the first element of the ArrayList can be slow if there are a lot
+                     * of events backed up, but for a handful of events it's better than incurring
+                     * the fixed overhead of LinkedList. An ArrayList optimized for removing the
+                     * first element (by treating the underlying array as a circular buffer) would
+                     * be ideal.
+                     */
+                listOfEvents.remove(pendingKeyEvent);
+                return pendingKeyEvent;
+            }
+        }
+        return null;
+!!!41257655.java!!!	removeReferenceToPendingEventLocked(inout pendingEvent : KeyEventDispatcher::PendingKeyEvent) : boolean
+        if (--pendingEvent.referenceCount > 0) {
+            return false;
+        }
+        mKeyEventTimeoutHandler.removeMessages(MSG_ON_KEY_EVENT_TIMEOUT, pendingEvent);
+        if (!pendingEvent.handled) {
+                /* Pass event to input filter */
+            if (DEBUG) {
+                Slog.i(LOG_TAG, "Injecting event: " + pendingEvent.event);
+            }
+            if (mSentEventsVerifier != null) {
+                mSentEventsVerifier.onKeyEvent(pendingEvent.event, 0);
+            }
+            int policyFlags = pendingEvent.policyFlags | WindowManagerPolicy.FLAG_PASS_TO_USER;
+            mHandlerToSendKeyEventsToInputFilter
+                    .obtainMessage(mMessageTypeForSendKeyEvent, policyFlags, 0, pendingEvent.event)
+                    .sendToTarget();
+        } else {
+            pendingEvent.event.recycle();
+        }
+        mPendingEventPool.release(pendingEvent);
+        return true;

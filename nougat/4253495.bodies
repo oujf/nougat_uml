@@ -1,0 +1,560 @@
+class NetworkControllerImpl
+!!!45221687.java!!!	NetworkControllerImpl(inout context : Context, inout bgLooper : Looper)
+        this(context, (ConnectivityManager) context.getSystemService(Context.CONNECTIVITY_SERVICE),
+                (TelephonyManager) context.getSystemService(Context.TELEPHONY_SERVICE),
+                (WifiManager) context.getSystemService(Context.WIFI_SERVICE),
+                SubscriptionManager.from(context), Config.readConfig(context), bgLooper,
+                new CallbackHandler(),
+                new AccessPointControllerImpl(context, bgLooper),
+                new DataUsageController(context),
+                new SubscriptionDefaults());
+        mReceiverHandler.post(mRegisterListeners);
+!!!45221815.java!!!	NetworkControllerImpl(inout context : Context, inout connectivityManager : ConnectivityManager, inout telephonyManager : TelephonyManager, inout wifiManager : WifiManager, inout subManager : SubscriptionManager, inout config : NetworkControllerImpl::Config, inout bgLooper : Looper, inout callbackHandler : CallbackHandler, inout accessPointController : AccessPointControllerImpl, inout dataUsageController : DataUsageController, inout defaultsHandler : NetworkControllerImpl::SubscriptionDefaults)
+        mContext = context;
+        mConfig = config;
+        mReceiverHandler = new Handler(bgLooper);
+        mCallbackHandler = callbackHandler;
+        mDataSaverController = new DataSaverController(context);
+
+        mSubscriptionManager = subManager;
+        mSubDefaults = defaultsHandler;
+        mConnectivityManager = connectivityManager;
+        mHasMobileDataFeature =
+                mConnectivityManager.isNetworkSupported(ConnectivityManager.TYPE_MOBILE);
+
+        // telephony
+        mPhone = telephonyManager;
+
+        // wifi
+        mWifiManager = wifiManager;
+
+        mLocale = mContext.getResources().getConfiguration().locale;
+        mAccessPoints = accessPointController;
+        mDataUsageController = dataUsageController;
+        mDataUsageController.setNetworkController(this);
+        // TODO: Find a way to move this into DataUsageController.
+        mDataUsageController.setCallback(new DataUsageController.Callback() {
+            @Override
+            public void onMobileDataEnabled(boolean enabled) {
+                mCallbackHandler.setMobileDataEnabled(enabled);
+            }
+        });
+        mWifiSignalController = new WifiSignalController(mContext, mHasMobileDataFeature,
+                mCallbackHandler, this);
+
+        mEthernetSignalController = new EthernetSignalController(mContext, mCallbackHandler, this);
+
+        // AIRPLANE_MODE_CHANGED is sent at boot; we've probably already missed it
+        updateAirplaneMode(true /* force callback */);
+!!!45221943.java!!!	getDataSaverController() : DataSaverController
+        return mDataSaverController;
+!!!45222071.java!!!	registerListeners() : void
+        for (MobileSignalController mobileSignalController : mMobileSignalControllers.values()) {
+            mobileSignalController.registerListener();
+        }
+        if (mSubscriptionListener == null) {
+            mSubscriptionListener = new SubListener();
+        }
+        mSubscriptionManager.addOnSubscriptionsChangedListener(mSubscriptionListener);
+
+        // broadcasts
+        IntentFilter filter = new IntentFilter();
+        filter.addAction(WifiManager.RSSI_CHANGED_ACTION);
+        filter.addAction(WifiManager.WIFI_STATE_CHANGED_ACTION);
+        filter.addAction(WifiManager.NETWORK_STATE_CHANGED_ACTION);
+        filter.addAction(TelephonyIntents.ACTION_SIM_STATE_CHANGED);
+        filter.addAction(TelephonyIntents.ACTION_DEFAULT_DATA_SUBSCRIPTION_CHANGED);
+        filter.addAction(TelephonyIntents.ACTION_DEFAULT_VOICE_SUBSCRIPTION_CHANGED);
+        filter.addAction(TelephonyIntents.ACTION_SERVICE_STATE_CHANGED);
+        filter.addAction(TelephonyIntents.SPN_STRINGS_UPDATED_ACTION);
+        filter.addAction(ConnectivityManager.CONNECTIVITY_ACTION);
+        filter.addAction(ConnectivityManager.INET_CONDITION_ACTION);
+        filter.addAction(Intent.ACTION_AIRPLANE_MODE_CHANGED);
+        mContext.registerReceiver(this, filter, null, mReceiverHandler);
+        mListening = true;
+
+        updateMobileControllers();
+!!!45222199.java!!!	unregisterListeners() : void
+        mListening = false;
+        for (MobileSignalController mobileSignalController : mMobileSignalControllers.values()) {
+            mobileSignalController.unregisterListener();
+        }
+        mSubscriptionManager.removeOnSubscriptionsChangedListener(mSubscriptionListener);
+        mContext.unregisterReceiver(this);
+!!!45222327.java!!!	getConnectedWifiLevel() : int
+        return mWifiSignalController.getState().level;
+!!!45222455.java!!!	getAccessPointController() : NetworkController::AccessPointController
+        return mAccessPoints;
+!!!45222583.java!!!	getMobileDataController() : DataUsageController
+        return mDataUsageController;
+!!!45222711.java!!!	addEmergencyListener(inout listener : NetworkController::EmergencyListener) : void
+        mCallbackHandler.setListening(listener, true);
+        mCallbackHandler.setEmergencyCallsOnly(isEmergencyOnly());
+!!!45222839.java!!!	removeEmergencyListener(inout listener : NetworkController::EmergencyListener) : void
+        mCallbackHandler.setListening(listener, false);
+!!!45222967.java!!!	hasMobileDataFeature() : boolean
+        return mHasMobileDataFeature;
+!!!45223095.java!!!	hasVoiceCallingFeature() : boolean
+        return mPhone.getPhoneType() != TelephonyManager.PHONE_TYPE_NONE;
+!!!45223223.java!!!	getDataController() : MobileSignalController
+        int dataSubId = mSubDefaults.getDefaultDataSubId();
+        if (!SubscriptionManager.isValidSubscriptionId(dataSubId)) {
+            if (DEBUG) Log.e(TAG, "No data sim selected");
+            return mDefaultSignalController;
+        }
+        if (mMobileSignalControllers.containsKey(dataSubId)) {
+            return mMobileSignalControllers.get(dataSubId);
+        }
+        if (DEBUG) Log.e(TAG, "Cannot find controller for data sub: " + dataSubId);
+        return mDefaultSignalController;
+!!!45223351.java!!!	getMobileDataNetworkName() : String
+        MobileSignalController controller = getDataController();
+        return controller != null ? controller.getState().networkNameData : "";
+!!!45223479.java!!!	isEmergencyOnly() : boolean
+        if (mMobileSignalControllers.size() == 0) {
+            // When there are no active subscriptions, determine emengency state from last
+            // broadcast.
+            mEmergencySource = EMERGENCY_NO_CONTROLLERS;
+            return mLastServiceState != null && mLastServiceState.isEmergencyOnly();
+        }
+        int voiceSubId = mSubDefaults.getDefaultVoiceSubId();
+        if (!SubscriptionManager.isValidSubscriptionId(voiceSubId)) {
+            for (MobileSignalController mobileSignalController :
+                                            mMobileSignalControllers.values()) {
+                if (!mobileSignalController.getState().isEmergency) {
+                    mEmergencySource = EMERGENCY_FIRST_CONTROLLER
+                            + mobileSignalController.mSubscriptionInfo.getSubscriptionId();
+                    if (DEBUG) Log.d(TAG, "Found emergency " + mobileSignalController.mTag);
+                    return false;
+                }
+            }
+        }
+        if (mMobileSignalControllers.containsKey(voiceSubId)) {
+            mEmergencySource = EMERGENCY_VOICE_CONTROLLER + voiceSubId;
+            if (DEBUG) Log.d(TAG, "Getting emergency from " + voiceSubId);
+            return mMobileSignalControllers.get(voiceSubId).getState().isEmergency;
+        }
+        if (DEBUG) Log.e(TAG, "Cannot find controller for voice sub: " + voiceSubId);
+        mEmergencySource = EMERGENCY_NO_SUB + voiceSubId;
+        // Something is wrong, better assume we can't make calls...
+        return true;
+!!!45223607.java!!!	recalculateEmergency() : void
+        mIsEmergency = isEmergencyOnly();
+        mCallbackHandler.setEmergencyCallsOnly(mIsEmergency);
+!!!45223735.java!!!	addSignalCallback(inout cb : NetworkController::SignalCallback) : void
+        cb.setSubs(mCurrentSubscriptions);
+        cb.setIsAirplaneMode(new IconState(mAirplaneMode,
+                TelephonyIcons.FLIGHT_MODE_ICON, R.string.accessibility_airplane_mode, mContext));
+        cb.setNoSims(mHasNoSims);
+        mWifiSignalController.notifyListeners(cb);
+        mEthernetSignalController.notifyListeners(cb);
+        for (MobileSignalController mobileSignalController : mMobileSignalControllers.values()) {
+            mobileSignalController.notifyListeners(cb);
+        }
+        mCallbackHandler.setListening(cb, true);
+!!!45223863.java!!!	removeSignalCallback(inout cb : NetworkController::SignalCallback) : void
+        mCallbackHandler.setListening(cb, false);
+!!!45223991.java!!!	setWifiEnabled(in enabled : boolean) : void
+        new AsyncTask<Void, Void, Void>() {
+            @Override
+            protected Void doInBackground(Void... args) {
+                // Disable tethering if enabling Wifi
+                final int wifiApState = mWifiManager.getWifiApState();
+                if (enabled && ((wifiApState == WifiManager.WIFI_AP_STATE_ENABLING) ||
+                        (wifiApState == WifiManager.WIFI_AP_STATE_ENABLED))) {
+                    mWifiManager.setWifiApEnabled(null, false);
+                }
+
+                mWifiManager.setWifiEnabled(enabled);
+                return null;
+            }
+        }.execute();
+!!!45224119.java!!!	onUserSwitched(in newUserId : int) : void
+        mCurrentUserId = newUserId;
+        mAccessPoints.onUserSwitched(newUserId);
+        updateConnectivity();
+!!!45224247.java!!!	onReceive(inout context : Context, inout intent : Intent) : void
+        if (CHATTY) {
+            Log.d(TAG, "onReceive: intent=" + intent);
+        }
+        final String action = intent.getAction();
+        if (action.equals(ConnectivityManager.CONNECTIVITY_ACTION) ||
+                action.equals(ConnectivityManager.INET_CONDITION_ACTION)) {
+            updateConnectivity();
+        } else if (action.equals(Intent.ACTION_AIRPLANE_MODE_CHANGED)) {
+            refreshLocale();
+            updateAirplaneMode(false);
+        } else if (action.equals(TelephonyIntents.ACTION_DEFAULT_VOICE_SUBSCRIPTION_CHANGED)) {
+            // We are using different subs now, we might be able to make calls.
+            recalculateEmergency();
+        } else if (action.equals(TelephonyIntents.ACTION_DEFAULT_DATA_SUBSCRIPTION_CHANGED)) {
+            // Notify every MobileSignalController so they can know whether they are the
+            // data sim or not.
+            for (MobileSignalController controller : mMobileSignalControllers.values()) {
+                controller.handleBroadcast(intent);
+            }
+        } else if (action.equals(TelephonyIntents.ACTION_SIM_STATE_CHANGED)) {
+            // Might have different subscriptions now.
+            updateMobileControllers();
+        } else if (action.equals(TelephonyIntents.ACTION_SERVICE_STATE_CHANGED)) {
+            mLastServiceState = ServiceState.newFromBundle(intent.getExtras());
+            if (mMobileSignalControllers.size() == 0) {
+                // If none of the subscriptions are active, we might need to recalculate
+                // emergency state.
+                recalculateEmergency();
+            }
+        } else {
+            int subId = intent.getIntExtra(PhoneConstants.SUBSCRIPTION_KEY,
+                    SubscriptionManager.INVALID_SUBSCRIPTION_ID);
+            if (SubscriptionManager.isValidSubscriptionId(subId)) {
+                if (mMobileSignalControllers.containsKey(subId)) {
+                    mMobileSignalControllers.get(subId).handleBroadcast(intent);
+                } else {
+                    // Can't find this subscription...  We must be out of date.
+                    updateMobileControllers();
+                }
+            } else {
+                // No sub id, must be for the wifi.
+                mWifiSignalController.handleBroadcast(intent);
+            }
+        }
+!!!45224375.java!!!	onConfigurationChanged() : void
+        mConfig = Config.readConfig(mContext);
+        mReceiverHandler.post(new Runnable() {
+            @Override
+            public void run() {
+                handleConfigurationChanged();
+            }
+        });
+!!!45224503.java!!!	handleConfigurationChanged() : void
+        for (MobileSignalController mobileSignalController : mMobileSignalControllers.values()) {
+            mobileSignalController.setConfiguration(mConfig);
+        }
+        refreshLocale();
+!!!45224631.java!!!	updateMobileControllers() : void
+        if (!mListening) {
+            return;
+        }
+        doUpdateMobileControllers();
+!!!45224759.java!!!	doUpdateMobileControllers() : void
+        List<SubscriptionInfo> subscriptions = mSubscriptionManager.getActiveSubscriptionInfoList();
+        if (subscriptions == null) {
+            subscriptions = Collections.emptyList();
+        }
+        // If there have been no relevant changes to any of the subscriptions, we can leave as is.
+        if (hasCorrectMobileControllers(subscriptions)) {
+            // Even if the controllers are correct, make sure we have the right no sims state.
+            // Such as on boot, don't need any controllers, because there are no sims,
+            // but we still need to update the no sim state.
+            updateNoSims();
+            return;
+        }
+        setCurrentSubscriptions(subscriptions);
+        updateNoSims();
+        recalculateEmergency();
+!!!45224887.java!!!	updateNoSims() : void
+        boolean hasNoSims = mHasMobileDataFeature && mMobileSignalControllers.size() == 0;
+        if (hasNoSims != mHasNoSims) {
+            mHasNoSims = hasNoSims;
+            mCallbackHandler.setNoSims(mHasNoSims);
+        }
+!!!45225015.java!!!	setCurrentSubscriptions(inout subscriptions : List<SubscriptionInfo>) : void
+        Collections.sort(subscriptions, new Comparator<SubscriptionInfo>() {
+            @Override
+            public int compare(SubscriptionInfo lhs, SubscriptionInfo rhs) {
+                return lhs.getSimSlotIndex() == rhs.getSimSlotIndex()
+                        ? lhs.getSubscriptionId() - rhs.getSubscriptionId()
+                        : lhs.getSimSlotIndex() - rhs.getSimSlotIndex();
+            }
+        });
+        mCurrentSubscriptions = subscriptions;
+
+        HashMap<Integer, MobileSignalController> cachedControllers =
+                new HashMap<Integer, MobileSignalController>(mMobileSignalControllers);
+        mMobileSignalControllers.clear();
+        final int num = subscriptions.size();
+        for (int i = 0; i < num; i++) {
+            int subId = subscriptions.get(i).getSubscriptionId();
+            // If we have a copy of this controller already reuse it, otherwise make a new one.
+            if (cachedControllers.containsKey(subId)) {
+                mMobileSignalControllers.put(subId, cachedControllers.remove(subId));
+            } else {
+                MobileSignalController controller = new MobileSignalController(mContext, mConfig,
+                        mHasMobileDataFeature, mPhone, mCallbackHandler,
+                        this, subscriptions.get(i), mSubDefaults, mReceiverHandler.getLooper());
+                controller.setUserSetupComplete(mUserSetup);
+                mMobileSignalControllers.put(subId, controller);
+                if (subscriptions.get(i).getSimSlotIndex() == 0) {
+                    mDefaultSignalController = controller;
+                }
+                if (mListening) {
+                    controller.registerListener();
+                }
+            }
+        }
+        if (mListening) {
+            for (Integer key : cachedControllers.keySet()) {
+                if (cachedControllers.get(key) == mDefaultSignalController) {
+                    mDefaultSignalController = null;
+                }
+                cachedControllers.get(key).unregisterListener();
+            }
+        }
+        mCallbackHandler.setSubs(subscriptions);
+        notifyAllListeners();
+
+        // There may be new MobileSignalControllers around, make sure they get the current
+        // inet condition and airplane mode.
+        pushConnectivityToSignals();
+        updateAirplaneMode(true /* force */);
+!!!45225143.java!!!	setUserSetupComplete(in userSetup : boolean) : void
+        mReceiverHandler.post(new Runnable() {
+            @Override
+            public void run() {
+                handleSetUserSetupComplete(userSetup);
+            }
+        });
+!!!45225271.java!!!	handleSetUserSetupComplete(inout userSetup : boolean) : void
+        mUserSetup = userSetup;
+        for (MobileSignalController controller : mMobileSignalControllers.values()) {
+            controller.setUserSetupComplete(mUserSetup);
+        }
+!!!45225399.java!!!	hasCorrectMobileControllers(inout allSubscriptions : List<SubscriptionInfo>) : boolean
+        if (allSubscriptions.size() != mMobileSignalControllers.size()) {
+            return false;
+        }
+        for (SubscriptionInfo info : allSubscriptions) {
+            if (!mMobileSignalControllers.containsKey(info.getSubscriptionId())) {
+                return false;
+            }
+        }
+        return true;
+!!!45225527.java!!!	updateAirplaneMode(inout force : boolean) : void
+        boolean airplaneMode = (Settings.Global.getInt(mContext.getContentResolver(),
+                Settings.Global.AIRPLANE_MODE_ON, 0) == 1);
+        if (airplaneMode != mAirplaneMode || force) {
+            mAirplaneMode = airplaneMode;
+            for (MobileSignalController mobileSignalController : mMobileSignalControllers.values()) {
+                mobileSignalController.setAirplaneMode(mAirplaneMode);
+            }
+            notifyListeners();
+        }
+!!!45225655.java!!!	refreshLocale() : void
+        Locale current = mContext.getResources().getConfiguration().locale;
+        if (!current.equals(mLocale)) {
+            mLocale = current;
+            notifyAllListeners();
+        }
+!!!45225783.java!!!	notifyAllListeners() : void
+        notifyListeners();
+        for (MobileSignalController mobileSignalController : mMobileSignalControllers.values()) {
+            mobileSignalController.notifyListeners();
+        }
+        mWifiSignalController.notifyListeners();
+        mEthernetSignalController.notifyListeners();
+!!!45225911.java!!!	notifyListeners() : void
+        mCallbackHandler.setIsAirplaneMode(new IconState(mAirplaneMode,
+                TelephonyIcons.FLIGHT_MODE_ICON, R.string.accessibility_airplane_mode, mContext));
+        mCallbackHandler.setNoSims(mHasNoSims);
+!!!45226039.java!!!	updateConnectivity() : void
+        mConnectedTransports.clear();
+        mValidatedTransports.clear();
+        for (NetworkCapabilities nc :
+                mConnectivityManager.getDefaultNetworkCapabilitiesForUser(mCurrentUserId)) {
+            for (int transportType : nc.getTransportTypes()) {
+                mConnectedTransports.set(transportType);
+                if (nc.hasCapability(NET_CAPABILITY_VALIDATED)) {
+                    mValidatedTransports.set(transportType);
+                }
+            }
+        }
+
+        if (CHATTY) {
+            Log.d(TAG, "updateConnectivity: mConnectedTransports=" + mConnectedTransports);
+            Log.d(TAG, "updateConnectivity: mValidatedTransports=" + mValidatedTransports);
+        }
+
+        mInetCondition = !mValidatedTransports.isEmpty();
+
+        pushConnectivityToSignals();
+!!!45226167.java!!!	pushConnectivityToSignals() : void
+        // We want to update all the icons, all at once, for any condition change
+        for (MobileSignalController mobileSignalController : mMobileSignalControllers.values()) {
+            mobileSignalController.updateConnectivity(mConnectedTransports, mValidatedTransports);
+        }
+        mWifiSignalController.updateConnectivity(mConnectedTransports, mValidatedTransports);
+        mEthernetSignalController.updateConnectivity(mConnectedTransports, mValidatedTransports);
+!!!45226295.java!!!	dump(inout fd : FileDescriptor, inout pw : PrintWriter, inout args : String) : void
+        pw.println("NetworkController state:");
+
+        pw.println("  - telephony ------");
+        pw.print("  hasVoiceCallingFeature()=");
+        pw.println(hasVoiceCallingFeature());
+
+        pw.println("  - connectivity ------");
+        pw.print("  mConnectedTransports=");
+        pw.println(mConnectedTransports);
+        pw.print("  mValidatedTransports=");
+        pw.println(mValidatedTransports);
+        pw.print("  mInetCondition=");
+        pw.println(mInetCondition);
+        pw.print("  mAirplaneMode=");
+        pw.println(mAirplaneMode);
+        pw.print("  mLocale=");
+        pw.println(mLocale);
+        pw.print("  mLastServiceState=");
+        pw.println(mLastServiceState);
+        pw.print("  mIsEmergency=");
+        pw.println(mIsEmergency);
+        pw.print("  mEmergencySource=");
+        pw.println(emergencyToString(mEmergencySource));
+
+        for (MobileSignalController mobileSignalController : mMobileSignalControllers.values()) {
+            mobileSignalController.dump(pw);
+        }
+        mWifiSignalController.dump(pw);
+
+        mEthernetSignalController.dump(pw);
+
+        mAccessPoints.dump(pw);
+!!!45226423.java!!!	emergencyToString(in emergencySource : int) : String
+        if (emergencySource > EMERGENCY_NO_SUB) {
+            return "NO_SUB(" + (emergencySource - EMERGENCY_NO_SUB) + ")";
+        } else if (emergencySource > EMERGENCY_VOICE_CONTROLLER) {
+            return "VOICE_CONTROLLER(" + (emergencySource - EMERGENCY_VOICE_CONTROLLER) + ")";
+        } else if (emergencySource > EMERGENCY_FIRST_CONTROLLER) {
+            return "FIRST_CONTROLLER(" + (emergencySource - EMERGENCY_FIRST_CONTROLLER) + ")";
+        } else if (emergencySource == EMERGENCY_NO_CONTROLLERS) {
+            return "NO_CONTROLLERS";
+        }
+        return "UNKNOWN_SOURCE";
+!!!45226551.java!!!	dispatchDemoCommand(inout command : String, inout args : Bundle) : void
+        if (!mDemoMode && command.equals(COMMAND_ENTER)) {
+            if (DEBUG) Log.d(TAG, "Entering demo mode");
+            unregisterListeners();
+            mDemoMode = true;
+            mDemoInetCondition = mInetCondition;
+            mDemoWifiState = mWifiSignalController.getState();
+        } else if (mDemoMode && command.equals(COMMAND_EXIT)) {
+            if (DEBUG) Log.d(TAG, "Exiting demo mode");
+            mDemoMode = false;
+            // Update what MobileSignalControllers, because they may change
+            // to set the number of sim slots.
+            updateMobileControllers();
+            for (MobileSignalController controller : mMobileSignalControllers.values()) {
+                controller.resetLastState();
+            }
+            mWifiSignalController.resetLastState();
+            mReceiverHandler.post(mRegisterListeners);
+            notifyAllListeners();
+        } else if (mDemoMode && command.equals(COMMAND_NETWORK)) {
+            String airplane = args.getString("airplane");
+            if (airplane != null) {
+                boolean show = airplane.equals("show");
+                mCallbackHandler.setIsAirplaneMode(new IconState(show,
+                        TelephonyIcons.FLIGHT_MODE_ICON, R.string.accessibility_airplane_mode,
+                        mContext));
+            }
+            String fully = args.getString("fully");
+            if (fully != null) {
+                mDemoInetCondition = Boolean.parseBoolean(fully);
+                BitSet connected = new BitSet();
+
+                if (mDemoInetCondition) {
+                    connected.set(mWifiSignalController.mTransportType);
+                }
+                mWifiSignalController.updateConnectivity(connected, connected);
+                for (MobileSignalController controller : mMobileSignalControllers.values()) {
+                    if (mDemoInetCondition) {
+                        connected.set(controller.mTransportType);
+                    }
+                    controller.updateConnectivity(connected, connected);
+                }
+            }
+            String wifi = args.getString("wifi");
+            if (wifi != null) {
+                boolean show = wifi.equals("show");
+                String level = args.getString("level");
+                if (level != null) {
+                    mDemoWifiState.level = level.equals("null") ? -1
+                            : Math.min(Integer.parseInt(level), WifiIcons.WIFI_LEVEL_COUNT - 1);
+                    mDemoWifiState.connected = mDemoWifiState.level >= 0;
+                }
+                mDemoWifiState.enabled = show;
+                mWifiSignalController.notifyListeners();
+            }
+            String sims = args.getString("sims");
+            if (sims != null) {
+                int num = MathUtils.constrain(Integer.parseInt(sims), 1, 8);
+                List<SubscriptionInfo> subs = new ArrayList<>();
+                if (num != mMobileSignalControllers.size()) {
+                    mMobileSignalControllers.clear();
+                    int start = mSubscriptionManager.getActiveSubscriptionInfoCountMax();
+                    for (int i = start /* get out of normal index range */; i < start + num; i++) {
+                        subs.add(addSignalController(i, i));
+                    }
+                    mCallbackHandler.setSubs(subs);
+                }
+            }
+            String nosim = args.getString("nosim");
+            if (nosim != null) {
+                mHasNoSims = nosim.equals("show");
+                mCallbackHandler.setNoSims(mHasNoSims);
+            }
+            String mobile = args.getString("mobile");
+            if (mobile != null) {
+                boolean show = mobile.equals("show");
+                String datatype = args.getString("datatype");
+                String slotString = args.getString("slot");
+                int slot = TextUtils.isEmpty(slotString) ? 0 : Integer.parseInt(slotString);
+                slot = MathUtils.constrain(slot, 0, 8);
+                // Ensure we have enough sim slots
+                List<SubscriptionInfo> subs = new ArrayList<>();
+                while (mMobileSignalControllers.size() <= slot) {
+                    int nextSlot = mMobileSignalControllers.size();
+                    subs.add(addSignalController(nextSlot, nextSlot));
+                }
+                if (!subs.isEmpty()) {
+                    mCallbackHandler.setSubs(subs);
+                }
+                // Hack to index linearly for easy use.
+                MobileSignalController controller = mMobileSignalControllers
+                        .values().toArray(new MobileSignalController[0])[slot];
+                controller.getState().dataSim = datatype != null;
+                if (datatype != null) {
+                    controller.getState().iconGroup =
+                            datatype.equals("1x") ? TelephonyIcons.ONE_X :
+                            datatype.equals("3g") ? TelephonyIcons.THREE_G :
+                            datatype.equals("4g") ? TelephonyIcons.FOUR_G :
+                            datatype.equals("e") ? TelephonyIcons.E :
+                            datatype.equals("g") ? TelephonyIcons.G :
+                            datatype.equals("h") ? TelephonyIcons.H :
+                            datatype.equals("lte") ? TelephonyIcons.LTE :
+                            datatype.equals("roam") ? TelephonyIcons.ROAMING :
+                            TelephonyIcons.UNKNOWN;
+                }
+                int[][] icons = TelephonyIcons.TELEPHONY_SIGNAL_STRENGTH;
+                String level = args.getString("level");
+                if (level != null) {
+                    controller.getState().level = level.equals("null") ? -1
+                            : Math.min(Integer.parseInt(level), icons[0].length - 1);
+                    controller.getState().connected = controller.getState().level >= 0;
+                }
+                controller.getState().enabled = show;
+                controller.notifyListeners();
+            }
+            String carrierNetworkChange = args.getString("carriernetworkchange");
+            if (carrierNetworkChange != null) {
+                boolean show = carrierNetworkChange.equals("show");
+                for (MobileSignalController controller : mMobileSignalControllers.values()) {
+                    controller.setCarrierNetworkChangeMode(show);
+                }
+            }
+        }
+!!!45226679.java!!!	addSignalController(in id : int, in simSlotIndex : int) : SubscriptionInfo
+        SubscriptionInfo info = new SubscriptionInfo(id, "", simSlotIndex, "", "", 0, 0, "", 0,
+                null, 0, 0, "", SubscriptionManager.SIM_PROVISIONED);
+        mMobileSignalControllers.put(id, new MobileSignalController(mContext,
+                mConfig, mHasMobileDataFeature, mPhone, mCallbackHandler, this, info,
+                mSubDefaults, mReceiverHandler.getLooper()));
+        return info;

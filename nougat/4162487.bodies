@@ -1,0 +1,149 @@
+class StorageMeasurement
+!!!44252087.java!!!	StorageMeasurement(inout context : Context, inout volume : VolumeInfo, inout sharedVolume : VolumeInfo)
+        mContext = context.getApplicationContext();
+
+        mVolume = volume;
+        mSharedVolume = sharedVolume;
+
+        // Start the thread that will measure the disk usage.
+        final HandlerThread handlerThread = new HandlerThread("MemoryMeasurement");
+        handlerThread.start();
+
+        mMainHandler = new MainHandler();
+        mMeasurementHandler = new MeasurementHandler(handlerThread.getLooper());
+!!!44252215.java!!!	setReceiver(inout receiver : StorageMeasurement::MeasurementReceiver) : void
+        if (mReceiver == null || mReceiver.get() == null) {
+            mReceiver = new WeakReference<MeasurementReceiver>(receiver);
+        }
+!!!44252343.java!!!	forceMeasure() : void
+        invalidate();
+        measure();
+!!!44252471.java!!!	measure() : void
+        if (!mMeasurementHandler.hasMessages(MeasurementHandler.MSG_MEASURE)) {
+            mMeasurementHandler.sendEmptyMessage(MeasurementHandler.MSG_MEASURE);
+        }
+!!!44252599.java!!!	onDestroy() : void
+        mReceiver = null;
+        mMeasurementHandler.removeMessages(MeasurementHandler.MSG_MEASURE);
+        mMeasurementHandler.sendEmptyMessage(MeasurementHandler.MSG_DISCONNECT);
+!!!44252727.java!!!	invalidate() : void
+        mMeasurementHandler.sendEmptyMessage(MeasurementHandler.MSG_INVALIDATE);
+!!!44253623.java!!!	measureExactStorage(inout imcs : IMediaContainerService) : void
+        final UserManager userManager = mContext.getSystemService(UserManager.class);
+        final PackageManager packageManager = mContext.getPackageManager();
+
+        final List<UserInfo> users = userManager.getUsers();
+        final List<UserInfo> currentProfiles = userManager.getEnabledProfiles(
+                ActivityManager.getCurrentUser());
+
+        final MeasurementDetails details = new MeasurementDetails();
+        final Message finished = mMeasurementHandler.obtainMessage(MeasurementHandler.MSG_COMPLETED,
+                details);
+
+        if (mVolume == null || !mVolume.isMountedReadable()) {
+            finished.sendToTarget();
+            return;
+        }
+
+        if (mSharedVolume != null && mSharedVolume.isMountedReadable()) {
+            for (UserInfo currentUserInfo : currentProfiles) {
+                final int userId = currentUserInfo.id;
+                final File basePath = mSharedVolume.getPathForUser(userId);
+                HashMap<String, Long> mediaMap = new HashMap<>(sMeasureMediaTypes.size());
+                details.mediaSize.put(userId, mediaMap);
+
+                // Measure media types for emulated storage, or for primary physical
+                // external volume
+                for (String type : sMeasureMediaTypes) {
+                    final File path = new File(basePath, type);
+                    final long size = getDirectorySize(imcs, path);
+                    mediaMap.put(type, size);
+                }
+
+                // Measure misc files not counted under media
+                addValue(details.miscSize, userId, measureMisc(imcs, basePath));
+            }
+
+            if (mSharedVolume.getType() == VolumeInfo.TYPE_EMULATED) {
+                // Measure total emulated storage of all users; internal apps data
+                // will be spliced in later
+                for (UserInfo user : users) {
+                    final File userPath = mSharedVolume.getPathForUser(user.id);
+                    final long size = getDirectorySize(imcs, userPath);
+                    addValue(details.usersSize, user.id, size);
+                }
+            }
+        }
+
+        final File file = mVolume.getPath();
+        if (file != null) {
+            details.totalSize = file.getTotalSpace();
+            details.availSize = file.getFreeSpace();
+        }
+
+        // Measure all apps hosted on this volume for all users
+        if (mVolume.getType() == VolumeInfo.TYPE_PRIVATE) {
+            final List<ApplicationInfo> apps = packageManager.getInstalledApplications(
+                    PackageManager.GET_UNINSTALLED_PACKAGES
+                    | PackageManager.GET_DISABLED_COMPONENTS);
+
+            final List<ApplicationInfo> volumeApps = new ArrayList<>();
+            for (ApplicationInfo app : apps) {
+                if (Objects.equals(app.volumeUuid, mVolume.getFsUuid())) {
+                    volumeApps.add(app);
+                }
+            }
+
+            final int count = users.size() * volumeApps.size();
+            if (count == 0) {
+                finished.sendToTarget();
+                return;
+            }
+
+            final StatsObserver observer = new StatsObserver(true, details,
+                    ActivityManager.getCurrentUser(), currentProfiles, finished, count);
+            for (UserInfo user : users) {
+                for (ApplicationInfo app : volumeApps) {
+                    packageManager.getPackageSizeInfoAsUser(app.packageName, user.id, observer);
+                }
+            }
+
+        } else {
+            finished.sendToTarget();
+            return;
+        }
+!!!44253751.java!!!	getDirectorySize(inout imcs : IMediaContainerService, inout path : File) : long
+        try {
+            final long size = imcs.calculateDirectorySize(path.toString());
+            Log.d(TAG, "getDirectorySize(" + path + ") returned " + size);
+            return size;
+        } catch (Exception e) {
+            Log.w(TAG, "Could not read memory from default container service for " + path, e);
+            return 0;
+        }
+!!!44253879.java!!!	measureMisc(inout imcs : IMediaContainerService, inout dir : File) : long
+        final File[] files = dir.listFiles();
+        if (ArrayUtils.isEmpty(files)) return 0;
+
+        // Get sizes of all top level nodes except the ones already computed
+        long miscSize = 0;
+        for (File file : files) {
+            final String name = file.getName();
+            if (sMeasureMediaTypes.contains(name)) {
+                continue;
+            }
+
+            if (file.isFile()) {
+                miscSize += file.length();
+            } else if (file.isDirectory()) {
+                miscSize += getDirectorySize(imcs, file);
+            }
+        }
+        return miscSize;
+!!!44254007.java!!!	addValue(inout array : SparseLongArray, in key : int, in value : long) : void
+        array.put(key, array.get(key) + value);
+!!!44254135.java!!!	addValueIfKeyExists(inout array : SparseLongArray, in key : int, in value : long) : void
+        final int index = array.indexOfKey(key);
+        if (index >= 0) {
+            array.put(key, array.valueAt(index) + value);
+        }

@@ -1,0 +1,117 @@
+class GpuVideoTrackDecoder
+!!!34871095.java!!!	GpuVideoTrackDecoder(in trackIndex : int, inout format : MediaFormat, inout listener : TrackDecoder::Listener)
+        super(trackIndex, format, listener);
+
+        // Create a surface texture to be used by the video track decoder.
+        mTextureSource = TextureSource.newExternalTexture();
+        mSurfaceTexture = new SurfaceTexture(mTextureSource.getTextureId());
+        mSurfaceTexture.detachFromGLContext();
+        mSurfaceTexture.setOnFrameAvailableListener(new OnFrameAvailableListener() {
+            @Override
+            public void onFrameAvailable(SurfaceTexture surfaceTexture) {
+                markFrameAvailable();
+            }
+        });
+
+        mOutputWidth = format.getInteger(MediaFormat.KEY_WIDTH);
+        mOutputHeight = format.getInteger(MediaFormat.KEY_HEIGHT);
+
+        mTransformMatrix = new float[16];
+!!!34871223.java!!!	initMediaCodec(inout format : MediaFormat) : MediaCodec
+        MediaCodec mediaCodec;
+        try {
+            mediaCodec = MediaCodec.createDecoderByType(
+                    format.getString(MediaFormat.KEY_MIME));
+        } catch (IOException e) {
+            throw new RuntimeException(
+                    "failed to create decoder for "
+                    + format.getString(MediaFormat.KEY_MIME), e);
+        }
+        Surface surface = new Surface(mSurfaceTexture);
+        mediaCodec.configure(format, surface, null, 0);
+        surface.release();
+        return mediaCodec;
+!!!34871351.java!!!	onDataAvailable(inout codec : MediaCodec, inout buffers : ByteBuffer, in bufferIndex : int, inout info : MediaCodec::BufferInfo) : boolean
+        boolean textureAvailable = waitForFrameGrab();
+
+        mCurrentPresentationTimeUs = info.presentationTimeUs;
+
+        // Only render the next frame if we weren't interrupted.
+        codec.releaseOutputBuffer(bufferIndex, textureAvailable);
+
+        if (textureAvailable) {
+            if (updateTexture()) {
+                notifyListener();
+            }
+        }
+
+        return false;
+!!!34871479.java!!!	updateTexture() : boolean
+        // Wait for the frame we just released to appear in the texture.
+        synchronized (mFrameMonitor) {
+            try {
+                while (!mFrameAvailable) {
+                    mFrameMonitor.wait();
+                }
+                mSurfaceTexture.attachToGLContext(mTextureSource.getTextureId());
+                mSurfaceTexture.updateTexImage();
+                mSurfaceTexture.detachFromGLContext();
+                return true;
+            } catch (InterruptedException e) {
+                return false;
+            }
+        }
+!!!34871607.java!!!	copyFrameDataTo(inout outputVideoFrame : FrameImage2D, in rotation : int) : void
+        TextureSource targetTexture = TextureSource.newExternalTexture();
+        mSurfaceTexture.attachToGLContext(targetTexture.getTextureId());
+        mSurfaceTexture.getTransformMatrix(mTransformMatrix);
+
+        ImageShader imageShader = getImageShader();
+        imageShader.setSourceTransform(mTransformMatrix);
+
+        int outputWidth = mOutputWidth;
+        int outputHeight = mOutputHeight;
+        if (rotation != 0) {
+            float[] targetCoords = getRotationCoords(rotation);
+            imageShader.setTargetCoords(targetCoords);
+            if (needSwapDimension(rotation)) {
+                outputWidth = mOutputHeight;
+                outputHeight = mOutputWidth;
+            }
+        }
+        outputVideoFrame.resize(new int[] { outputWidth, outputHeight });
+        imageShader.process(
+                targetTexture,
+                outputVideoFrame.lockRenderTarget(),
+                outputWidth,
+                outputHeight);
+        outputVideoFrame.setTimestamp(mCurrentPresentationTimeUs * 1000);
+        outputVideoFrame.unlock();
+        targetTexture.release();
+
+        mSurfaceTexture.detachFromGLContext();
+!!!34871735.java!!!	release() : void
+        super.release();
+        synchronized (mFrameMonitor) {
+            mTextureSource.release();
+            mSurfaceTexture.release();
+        }
+!!!34871863.java!!!	getImageShader() : ImageShader
+        if (mImageShader == null) {
+            mImageShader = new ImageShader(COPY_FRAGMENT_SHADER);
+            mImageShader.setTargetRect(0f, 1f, 1f, -1f);
+        }
+        return mImageShader;
+!!!34871991.java!!!	getRotationCoords(in rotation : int) : float
+         switch(rotation) {
+             case MediaDecoder.ROTATE_90_RIGHT:
+                 return new float[] { 0f, 0f, 0f, 1f, 1f, 0f, 1f, 1f };
+             case MediaDecoder.ROTATE_180:
+                 return new float[] { 1f, 0f, 0f, 0f, 1f, 1f, 0f, 1f };
+             case MediaDecoder.ROTATE_90_LEFT:
+                 return new float[] { 1f, 1f, 1f, 0f, 0f, 1f, 0f, 0f };
+             case MediaDecoder.ROTATE_NONE:
+                 return new float[] { 0f, 1f, 1f, 1f, 0f, 0f, 1f, 0f };
+             default:
+                 throw new IllegalArgumentException("Unsupported rotation angle.");
+         }

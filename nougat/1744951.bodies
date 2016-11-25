@@ -1,0 +1,149 @@
+class CpuVideoTrackDecoder
+!!!34869815.java!!!	CpuVideoTrackDecoder(in trackIndex : int, inout format : MediaFormat, inout listener : TrackDecoder::Listener)
+        super(trackIndex, format, listener);
+
+        mWidth = format.getInteger(MediaFormat.KEY_WIDTH);
+        mHeight = format.getInteger(MediaFormat.KEY_HEIGHT);
+!!!34869943.java!!!	initMediaCodec(inout format : MediaFormat) : MediaCodec
+        // Find a codec for our video that can output to one of our supported color-spaces
+        MediaCodec mediaCodec = findDecoderCodec(format, new int[] {
+                CodecCapabilities.COLOR_Format32bitARGB8888,
+                CodecCapabilities.COLOR_FormatYUV420Planar});
+        if (mediaCodec == null) {
+            throw new RuntimeException(
+                    "Could not find a suitable decoder for format: " + format + "!");
+        }
+        mediaCodec.configure(format, null, null, 0);
+        return mediaCodec;
+!!!34870071.java!!!	onDataAvailable(inout codec : MediaCodec, inout buffers : ByteBuffer, in bufferIndex : int, inout info : MediaCodec::BufferInfo) : boolean
+
+        mCurrentPresentationTimeUs = info.presentationTimeUs;
+        mDecodedBuffer = buffers[bufferIndex];
+
+        if (mColorFormat == -1) {
+            mColorFormat = codec.getOutputFormat().getInteger(MediaFormat.KEY_COLOR_FORMAT);
+        }
+
+        markFrameAvailable();
+        notifyListener();
+
+        // Wait for the grab before we release this buffer.
+        waitForFrameGrab();
+
+        codec.releaseOutputBuffer(bufferIndex, false);
+
+        return false;
+!!!34870199.java!!!	copyFrameDataTo(inout outputVideoFrame : FrameImage2D, in rotation : int) : void
+        // Calculate output dimensions
+        int outputWidth = mWidth;
+        int outputHeight = mHeight;
+        if (needSwapDimension(rotation)) {
+            outputWidth = mHeight;
+            outputHeight = mWidth;
+        }
+
+        // Create output frame
+        outputVideoFrame.resize(new int[] {outputWidth, outputHeight});
+        outputVideoFrame.setTimestamp(mCurrentPresentationTimeUs * 1000);
+        ByteBuffer outBytes = outputVideoFrame.lockBytes(Frame.MODE_WRITE);
+
+        // Set data
+        if (rotation == MediaDecoder.ROTATE_NONE) {
+            convertImage(mDecodedBuffer, outBytes, mColorFormat, mWidth, mHeight);
+        } else {
+            if (mUnrotatedBytes == null) {
+                mUnrotatedBytes = ByteBuffer.allocateDirect(mWidth * mHeight * 4);
+            }
+            // TODO: This could be optimized by including the rotation in the color conversion.
+            convertImage(mDecodedBuffer, mUnrotatedBytes, mColorFormat, mWidth, mHeight);
+            copyRotate(mUnrotatedBytes, outBytes, rotation);
+        }
+        outputVideoFrame.unlock();
+!!!34870327.java!!!	copyRotate(inout input : ByteBuffer, inout output : ByteBuffer, in rotation : int) : void
+        int offset;
+        int pixStride;
+        int rowStride;
+        switch (rotation) {
+            case MediaDecoder.ROTATE_NONE:
+                offset = 0;
+                pixStride = 1;
+                rowStride = mWidth;
+                break;
+            case MediaDecoder.ROTATE_90_LEFT:
+                offset = (mWidth - 1) * mHeight;
+                pixStride = -mHeight;
+                rowStride = 1;
+                break;
+            case MediaDecoder.ROTATE_90_RIGHT:
+                offset = mHeight - 1;
+                pixStride = mHeight;
+                rowStride = -1;
+                break;
+            case MediaDecoder.ROTATE_180:
+                offset = mWidth * mHeight - 1;
+                pixStride = -1;
+                rowStride = -mWidth;
+                break;
+            default:
+                throw new IllegalArgumentException("Unsupported rotation " + rotation + "!");
+        }
+        PixelUtils.copyPixels(input, output, mWidth, mHeight, offset, pixStride, rowStride);
+!!!34870455.java!!!	findDecoderCodec(inout format : MediaFormat, inout requiredColorFormats : int) : MediaCodec
+        TreeMap<Integer, String> candidateCodecs = new TreeMap<Integer, String>();
+        SparseIntArray colorPriorities = intArrayToPriorityMap(requiredColorFormats);
+        for (int i = 0; i < MediaCodecList.getCodecCount(); ++i) {
+            // Get next codec
+            MediaCodecInfo info = MediaCodecList.getCodecInfoAt(i);
+
+            // Check that this is a decoder
+            if (info.isEncoder()) {
+                continue;
+            }
+
+            // Check if this codec can decode the video in question
+            String requiredType = format.getString(MediaFormat.KEY_MIME);
+            String[] supportedTypes = info.getSupportedTypes();
+            Set<String> typeSet = new HashSet<String>(Arrays.asList(supportedTypes));
+
+            // Check if it can decode to one of the required color formats
+            if (typeSet.contains(requiredType)) {
+                CodecCapabilities capabilities = info.getCapabilitiesForType(requiredType);
+                for (int supportedColorFormat : capabilities.colorFormats) {
+                    if (colorPriorities.indexOfKey(supportedColorFormat) >= 0) {
+                        int priority = colorPriorities.get(supportedColorFormat);
+                        candidateCodecs.put(priority, info.getName());
+                    }
+                }
+            }
+        }
+
+        // Pick the best codec (with the highest color priority)
+        if (candidateCodecs.isEmpty()) {
+            return null;
+        } else {
+            String bestCodec = candidateCodecs.firstEntry().getValue();
+            try {
+                return MediaCodec.createByCodecName(bestCodec);
+            } catch (IOException e) {
+                throw new RuntimeException(
+                        "failed to create codec for "
+                        + bestCodec, e);
+            }
+        }
+!!!34870583.java!!!	intArrayToPriorityMap(inout values : int) : SparseIntArray
+        SparseIntArray result = new SparseIntArray();
+        for (int priority = 0; priority < values.length; ++priority) {
+            result.append(values[priority], priority);
+        }
+        return result;
+!!!34870711.java!!!	convertImage(inout input : ByteBuffer, inout output : ByteBuffer, in colorFormat : int, in width : int, in height : int) : void
+        switch (colorFormat) {
+            case CodecCapabilities.COLOR_Format32bitARGB8888:
+                ColorSpace.convertArgb8888ToRgba8888(input, output, width, height);
+                break;
+            case CodecCapabilities.COLOR_FormatYUV420Planar:
+                ColorSpace.convertYuv420pToRgba8888(input, output, width, height);
+                break;
+            default:
+                throw new RuntimeException("Unsupported color format: " + colorFormat + "!");
+        }

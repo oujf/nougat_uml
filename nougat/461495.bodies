@@ -1,0 +1,336 @@
+class SystemSensorManager
+!!!3057079.java!!!	SystemSensorManager(inout context : Context, inout mainLooper : Looper)
+        synchronized(sLock) {
+            if (!sNativeClassInited) {
+                sNativeClassInited = true;
+                nativeClassInit();
+            }
+        }
+
+        mMainLooper = mainLooper;
+        mTargetSdkLevel = context.getApplicationInfo().targetSdkVersion;
+        mContext = context;
+        mNativeInstance = nativeCreate(context.getOpPackageName());
+
+        // initialize the sensor list
+        for (int index = 0;;++index) {
+            Sensor sensor = new Sensor();
+            if (!nativeGetSensorAtIndex(mNativeInstance, sensor, index)) break;
+            mFullSensorsList.add(sensor);
+            mHandleToSensor.put(sensor.getHandle(), sensor);
+        }
+!!!3057207.java!!!	getFullSensorList() : Sensor
+        return mFullSensorsList;
+!!!3057335.java!!!	getFullDynamicSensorList() : Sensor
+        // only set up broadcast receiver if the application tries to find dynamic sensors or
+        // explicitly register a DynamicSensorCallback
+        setupDynamicSensorBroadcastReceiver();
+        updateDynamicSensorList();
+        return mFullDynamicSensorsList;
+!!!3057463.java!!!	registerListenerImpl(inout listener : SensorEventListener, inout sensor : Sensor, in delayUs : int, inout handler : Handler, in maxBatchReportLatencyUs : int, in reservedFlags : int) : boolean
+        if (listener == null || sensor == null) {
+            Log.e(TAG, "sensor or listener is null");
+            return false;
+        }
+        // Trigger Sensors should use the requestTriggerSensor call.
+        if (sensor.getReportingMode() == Sensor.REPORTING_MODE_ONE_SHOT) {
+            Log.e(TAG, "Trigger Sensors should use the requestTriggerSensor.");
+            return false;
+        }
+        if (maxBatchReportLatencyUs < 0 || delayUs < 0) {
+            Log.e(TAG, "maxBatchReportLatencyUs and delayUs should be non-negative");
+            return false;
+        }
+
+        // Invariants to preserve:
+        // - one Looper per SensorEventListener
+        // - one Looper per SensorEventQueue
+        // We map SensorEventListener to a SensorEventQueue, which holds the looper
+        synchronized (mSensorListeners) {
+            SensorEventQueue queue = mSensorListeners.get(listener);
+            if (queue == null) {
+                Looper looper = (handler != null) ? handler.getLooper() : mMainLooper;
+                final String fullClassName = listener.getClass().getEnclosingClass() != null ?
+                    listener.getClass().getEnclosingClass().getName() :
+                    listener.getClass().getName();
+                queue = new SensorEventQueue(listener, looper, this, fullClassName);
+                if (!queue.addSensor(sensor, delayUs, maxBatchReportLatencyUs)) {
+                    queue.dispose();
+                    return false;
+                }
+                mSensorListeners.put(listener, queue);
+                return true;
+            } else {
+                return queue.addSensor(sensor, delayUs, maxBatchReportLatencyUs);
+            }
+        }
+!!!3057591.java!!!	unregisterListenerImpl(inout listener : SensorEventListener, inout sensor : Sensor) : void
+        // Trigger Sensors should use the cancelTriggerSensor call.
+        if (sensor != null && sensor.getReportingMode() == Sensor.REPORTING_MODE_ONE_SHOT) {
+            return;
+        }
+
+        synchronized (mSensorListeners) {
+            SensorEventQueue queue = mSensorListeners.get(listener);
+            if (queue != null) {
+                boolean result;
+                if (sensor == null) {
+                    result = queue.removeAllSensors();
+                } else {
+                    result = queue.removeSensor(sensor, true);
+                }
+                if (result && !queue.hasSensors()) {
+                    mSensorListeners.remove(listener);
+                    queue.dispose();
+                }
+            }
+        }
+!!!3057719.java!!!	requestTriggerSensorImpl(inout listener : TriggerEventListener, inout sensor : Sensor) : boolean
+        if (sensor == null) throw new IllegalArgumentException("sensor cannot be null");
+
+        if (listener == null) throw new IllegalArgumentException("listener cannot be null");
+
+        if (sensor.getReportingMode() != Sensor.REPORTING_MODE_ONE_SHOT) return false;
+
+        synchronized (mTriggerListeners) {
+            TriggerEventQueue queue = mTriggerListeners.get(listener);
+            if (queue == null) {
+                final String fullClassName = listener.getClass().getEnclosingClass() != null ?
+                    listener.getClass().getEnclosingClass().getName() :
+                    listener.getClass().getName();
+                queue = new TriggerEventQueue(listener, mMainLooper, this, fullClassName);
+                if (!queue.addSensor(sensor, 0, 0)) {
+                    queue.dispose();
+                    return false;
+                }
+                mTriggerListeners.put(listener, queue);
+                return true;
+            } else {
+                return queue.addSensor(sensor, 0, 0);
+            }
+        }
+!!!3057847.java!!!	cancelTriggerSensorImpl(inout listener : TriggerEventListener, inout sensor : Sensor, inout disable : boolean) : boolean
+        if (sensor != null && sensor.getReportingMode() != Sensor.REPORTING_MODE_ONE_SHOT) {
+            return false;
+        }
+        synchronized (mTriggerListeners) {
+            TriggerEventQueue queue = mTriggerListeners.get(listener);
+            if (queue != null) {
+                boolean result;
+                if (sensor == null) {
+                    result = queue.removeAllSensors();
+                } else {
+                    result = queue.removeSensor(sensor, disable);
+                }
+                if (result && !queue.hasSensors()) {
+                    mTriggerListeners.remove(listener);
+                    queue.dispose();
+                }
+                return result;
+            }
+            return false;
+        }
+!!!3057975.java!!!	flushImpl(inout listener : SensorEventListener) : boolean
+        if (listener == null) throw new IllegalArgumentException("listener cannot be null");
+
+        synchronized (mSensorListeners) {
+            SensorEventQueue queue = mSensorListeners.get(listener);
+            if (queue == null) {
+                return false;
+            } else {
+                return (queue.flush() == 0);
+            }
+        }
+!!!3058103.java!!!	initDataInjectionImpl(inout enable : boolean) : boolean
+        synchronized (sLock) {
+            if (enable) {
+                boolean isDataInjectionModeEnabled = nativeIsDataInjectionEnabled(mNativeInstance);
+                // The HAL does not support injection OR SensorService hasn't been set in DI mode.
+                if (!isDataInjectionModeEnabled) {
+                    Log.e(TAG, "Data Injection mode not enabled");
+                    return false;
+                }
+                // Initialize a client for data_injection.
+                if (sInjectEventQueue == null) {
+                    sInjectEventQueue = new InjectEventQueue(mMainLooper, this,
+                            mContext.getPackageName());
+                }
+            } else {
+                // If data injection is being disabled clean up the native resources.
+                if (sInjectEventQueue != null) {
+                    sInjectEventQueue.dispose();
+                    sInjectEventQueue = null;
+                }
+            }
+            return true;
+        }
+!!!3058231.java!!!	injectSensorDataImpl(inout sensor : Sensor, inout values : float, in accuracy : int, in timestamp : long) : boolean
+        synchronized (sLock) {
+            if (sInjectEventQueue == null) {
+                Log.e(TAG, "Data injection mode not activated before calling injectSensorData");
+                return false;
+            }
+            int ret = sInjectEventQueue.injectSensorData(sensor.getHandle(), values, accuracy,
+                                                         timestamp);
+            // If there are any errors in data injection clean up the native resources.
+            if (ret != 0) {
+                sInjectEventQueue.dispose();
+                sInjectEventQueue = null;
+            }
+            return ret == 0;
+        }
+!!!3058359.java!!!	cleanupSensorConnection(inout sensor : Sensor) : void
+        mHandleToSensor.remove(sensor.getHandle());
+
+        if (sensor.getReportingMode() == Sensor.REPORTING_MODE_ONE_SHOT) {
+            synchronized(mTriggerListeners) {
+                for (TriggerEventListener l: mTriggerListeners.keySet()) {
+                    if (DEBUG_DYNAMIC_SENSOR){
+                        Log.i(TAG, "removed trigger listener" + l.toString() +
+                                   " due to sensor disconnection");
+                    }
+                    cancelTriggerSensorImpl(l, sensor, true);
+                }
+            }
+        } else {
+            synchronized(mSensorListeners) {
+                for (SensorEventListener l: mSensorListeners.keySet()) {
+                    if (DEBUG_DYNAMIC_SENSOR){
+                        Log.i(TAG, "removed event listener" + l.toString() +
+                                   " due to sensor disconnection");
+                    }
+                    unregisterListenerImpl(l, sensor);
+                }
+            }
+        }
+!!!3058487.java!!!	updateDynamicSensorList() : void
+        synchronized(mFullDynamicSensorsList) {
+            if (mDynamicSensorListDirty) {
+                List<Sensor> list = new ArrayList<>();
+                nativeGetDynamicSensors(mNativeInstance, list);
+
+                final List<Sensor> updatedList = new ArrayList<>();
+                final List<Sensor> addedList = new ArrayList<>();
+                final List<Sensor> removedList = new ArrayList<>();
+
+                boolean changed = diffSortedSensorList(
+                        mFullDynamicSensorsList, list, updatedList, addedList, removedList);
+
+                if (changed) {
+                    if (DEBUG_DYNAMIC_SENSOR) {
+                        Log.i(TAG, "DYNS dynamic sensor list cached should be updated");
+                    }
+                    mFullDynamicSensorsList = updatedList;
+
+                    for (Sensor s: addedList) {
+                        mHandleToSensor.put(s.getHandle(), s);
+                    }
+
+                    Handler mainHandler = new Handler(mContext.getMainLooper());
+
+                    for (Map.Entry<DynamicSensorCallback, Handler> entry :
+                            mDynamicSensorCallbacks.entrySet()) {
+                        final DynamicSensorCallback callback = entry.getKey();
+                        Handler handler =
+                                entry.getValue() == null ? mainHandler : entry.getValue();
+
+                        handler.post(new Runnable() {
+                            @Override
+                            public void run() {
+                                for (Sensor s: addedList) {
+                                    callback.onDynamicSensorConnected(s);
+                                }
+                                for (Sensor s: removedList) {
+                                    callback.onDynamicSensorDisconnected(s);
+                                }
+                            }
+                        });
+                    }
+
+                    for (Sensor s: removedList) {
+                        cleanupSensorConnection(s);
+                    }
+                }
+
+                mDynamicSensorListDirty = false;
+            }
+        }
+!!!3058615.java!!!	setupDynamicSensorBroadcastReceiver() : void
+        if (mDynamicSensorBroadcastReceiver == null) {
+            mDynamicSensorBroadcastReceiver = new BroadcastReceiver() {
+                @Override
+                public void onReceive(Context context, Intent intent) {
+                    if (intent.getAction() == Intent.ACTION_DYNAMIC_SENSOR_CHANGED) {
+                        if (DEBUG_DYNAMIC_SENSOR) {
+                            Log.i(TAG, "DYNS received DYNAMIC_SENSOR_CHANED broadcast");
+                        }
+                        // Dynamic sensors probably changed
+                        mDynamicSensorListDirty = true;
+                        updateDynamicSensorList();
+                    }
+                }
+            };
+
+            IntentFilter filter = new IntentFilter("dynamic_sensor_change");
+            filter.addAction(Intent.ACTION_DYNAMIC_SENSOR_CHANGED);
+            mContext.registerReceiver(mDynamicSensorBroadcastReceiver, filter);
+        }
+!!!3058743.java!!!	teardownDynamicSensorBroadcastReceiver() : void
+        mDynamicSensorCallbacks.clear();
+        mContext.unregisterReceiver(mDynamicSensorBroadcastReceiver);
+        mDynamicSensorBroadcastReceiver = null;
+!!!3058871.java!!!	registerDynamicSensorCallbackImpl(inout callback : SensorManager::DynamicSensorCallback, inout handler : Handler) : void
+        if (DEBUG_DYNAMIC_SENSOR) {
+            Log.i(TAG, "DYNS Register dynamic sensor callback");
+        }
+
+        if (callback == null) {
+            throw new IllegalArgumentException("callback cannot be null");
+        }
+        if (mDynamicSensorCallbacks.containsKey(callback)) {
+            // has been already registered, ignore
+            return;
+        }
+
+        setupDynamicSensorBroadcastReceiver();
+        mDynamicSensorCallbacks.put(callback, handler);
+!!!3058999.java!!!	unregisterDynamicSensorCallbackImpl(inout callback : SensorManager::DynamicSensorCallback) : void
+        if (DEBUG_DYNAMIC_SENSOR) {
+            Log.i(TAG, "Removing dynamic sensor listerner");
+        }
+        mDynamicSensorCallbacks.remove(callback);
+!!!3059127.java!!!	diffSortedSensorList(inout oldList : List<Sensor>, inout newList : List<Sensor>, inout updated : List<Sensor>, inout added : List<Sensor>, inout removed : List<Sensor>) : boolean
+
+        boolean changed = false;
+
+        int i = 0, j = 0;
+        while (true) {
+            if (j < oldList.size() && ( i >= newList.size() ||
+                    newList.get(i).getHandle() > oldList.get(j).getHandle()) ) {
+                changed = true;
+                if (removed != null) {
+                    removed.add(oldList.get(j));
+                }
+                ++j;
+            } else if (i < newList.size() && ( j >= oldList.size() ||
+                    newList.get(i).getHandle() < oldList.get(j).getHandle())) {
+                changed = true;
+                if (added != null) {
+                    added.add(newList.get(i));
+                }
+                if (updated != null) {
+                    updated.add(newList.get(i));
+                }
+                ++i;
+            } else if (i < newList.size() && j < oldList.size() &&
+                    newList.get(i).getHandle() == oldList.get(j).getHandle()) {
+                if (updated != null) {
+                    updated.add(oldList.get(j));
+                }
+                ++i;
+                ++j;
+            } else {
+                break;
+            }
+        }
+        return changed;

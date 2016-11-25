@@ -1,0 +1,290 @@
+class ResourceBundle
+!!!35991991.java!!!	ResourceBundle(inout appPackage : String)
+        mAppPackage = appPackage;
+!!!35992119.java!!!	addLayoutBundle(inout bundle : ResourceBundle::LayoutFileBundle) : void
+        if (bundle.mFileName == null) {
+            L.e("File bundle must have a name. %s does not have one.", bundle);
+            return;
+        }
+        if (!mLayoutBundles.containsKey(bundle.mFileName)) {
+            mLayoutBundles.put(bundle.mFileName, new ArrayList<LayoutFileBundle>());
+        }
+        final List<LayoutFileBundle> bundles = mLayoutBundles.get(bundle.mFileName);
+        for (LayoutFileBundle existing : bundles) {
+            if (existing.equals(bundle)) {
+                L.d("skipping layout bundle %s because it already exists.", bundle);
+                return;
+            }
+        }
+        L.d("adding bundle %s", bundle);
+        bundles.add(bundle);
+!!!35992247.java!!!	getLayoutBundles() : String
+        return mLayoutBundles;
+!!!35992375.java!!!	getAppPackage() : String
+        return mAppPackage;
+!!!35992503.java!!!	validateMultiResLayouts() : void
+        for (List<LayoutFileBundle> layoutFileBundles : mLayoutBundles.values()) {
+            for (LayoutFileBundle layoutFileBundle : layoutFileBundles) {
+                List<BindingTargetBundle> unboundIncludes = new ArrayList<BindingTargetBundle>();
+                for (BindingTargetBundle target : layoutFileBundle.getBindingTargetBundles()) {
+                    if (target.isBinder()) {
+                        List<LayoutFileBundle> boundTo =
+                                mLayoutBundles.get(target.getIncludedLayout());
+                        if (boundTo == null || boundTo.isEmpty()) {
+                            L.d("There is no binding for %s, reverting to plain layout",
+                                    target.getIncludedLayout());
+                            if (target.getId() == null) {
+                                unboundIncludes.add(target);
+                            } else {
+                                target.setIncludedLayout(null);
+                                target.setInterfaceType("android.view.View");
+                                target.mViewName = "android.view.View";
+                            }
+                        } else {
+                            String binding = boundTo.get(0).getFullBindingClass();
+                            target.setInterfaceType(binding);
+                        }
+                    }
+                }
+                layoutFileBundle.getBindingTargetBundles().removeAll(unboundIncludes);
+            }
+        }
+
+        for (Map.Entry<String, List<LayoutFileBundle>> bundles : mLayoutBundles.entrySet()) {
+            if (bundles.getValue().size() < 2) {
+                continue;
+            }
+
+            // validate all ids are in correct view types
+            // and all variables have the same name
+            for (LayoutFileBundle bundle : bundles.getValue()) {
+                bundle.mHasVariations = true;
+            }
+            String bindingClass = validateAndGetSharedClassName(bundles.getValue());
+            Map<String, NameTypeLocation> variableTypes = validateAndMergeNameTypeLocations(
+                    bundles.getValue(), ErrorMessages.MULTI_CONFIG_VARIABLE_TYPE_MISMATCH,
+                    new ValidateAndFilterCallback() {
+                        @Override
+                        public List<? extends NameTypeLocation> get(LayoutFileBundle bundle) {
+                            return bundle.mVariables;
+                        }
+                    });
+
+            Map<String, NameTypeLocation> importTypes = validateAndMergeNameTypeLocations(
+                    bundles.getValue(), ErrorMessages.MULTI_CONFIG_IMPORT_TYPE_MISMATCH,
+                    new ValidateAndFilterCallback() {
+                        @Override
+                        public List<NameTypeLocation> get(LayoutFileBundle bundle) {
+                            return bundle.mImports;
+                        }
+                    });
+
+            for (LayoutFileBundle bundle : bundles.getValue()) {
+                // now add missing ones to each to ensure they can be referenced
+                L.d("checking for missing variables in %s / %s", bundle.mFileName,
+                        bundle.mConfigName);
+                for (Map.Entry<String, NameTypeLocation> variable : variableTypes.entrySet()) {
+                    if (!NameTypeLocation.contains(bundle.mVariables, variable.getKey())) {
+                        NameTypeLocation orig = variable.getValue();
+                        bundle.addVariable(orig.name, orig.type, orig.location, false);
+                        L.d("adding missing variable %s to %s / %s", variable.getKey(),
+                                bundle.mFileName, bundle.mConfigName);
+                    }
+                }
+                for (Map.Entry<String, NameTypeLocation> userImport : importTypes.entrySet()) {
+                    if (!NameTypeLocation.contains(bundle.mImports, userImport.getKey())) {
+                        bundle.mImports.add(userImport.getValue());
+                        L.d("adding missing import %s to %s / %s", userImport.getKey(),
+                                bundle.mFileName, bundle.mConfigName);
+                    }
+                }
+            }
+
+            Set<String> includeBindingIds = new HashSet<String>();
+            Set<String> viewBindingIds = new HashSet<String>();
+            Map<String, String> viewTypes = new HashMap<String, String>();
+            Map<String, String> includes = new HashMap<String, String>();
+            L.d("validating ids for %s", bundles.getKey());
+            Set<String> conflictingIds = new HashSet<String>();
+            for (LayoutFileBundle bundle : bundles.getValue()) {
+                try {
+                    Scope.enter(bundle);
+                    for (BindingTargetBundle target : bundle.mBindingTargetBundles) {
+                        try {
+                            Scope.enter(target);
+                            L.d("checking %s %s %s", target.getId(), target.getFullClassName(),
+                                    target.isBinder());
+                            if (target.mId != null) {
+                                if (target.isBinder()) {
+                                    if (viewBindingIds.contains(target.mId)) {
+                                        L.d("%s is conflicting", target.mId);
+                                        conflictingIds.add(target.mId);
+                                        continue;
+                                    }
+                                    includeBindingIds.add(target.mId);
+                                } else {
+                                    if (includeBindingIds.contains(target.mId)) {
+                                        L.d("%s is conflicting", target.mId);
+                                        conflictingIds.add(target.mId);
+                                        continue;
+                                    }
+                                    viewBindingIds.add(target.mId);
+                                }
+                                String existingType = viewTypes.get(target.mId);
+                                if (existingType == null) {
+                                    L.d("assigning %s as %s", target.getId(),
+                                            target.getFullClassName());
+                                            viewTypes.put(target.mId, target.getFullClassName());
+                                    if (target.isBinder()) {
+                                        includes.put(target.mId, target.getIncludedLayout());
+                                    }
+                                } else if (!existingType.equals(target.getFullClassName())) {
+                                    if (target.isBinder()) {
+                                        L.d("overriding %s as base binder", target.getId());
+                                        viewTypes.put(target.mId,
+                                                "android.databinding.ViewDataBinding");
+                                        includes.put(target.mId, target.getIncludedLayout());
+                                    } else {
+                                        L.d("overriding %s as base view", target.getId());
+                                        viewTypes.put(target.mId, "android.view.View");
+                                    }
+                                }
+                            }
+                        } catch (ScopedException ex) {
+                            Scope.defer(ex);
+                        } finally {
+                            Scope.exit();
+                        }
+                    }
+                } finally {
+                    Scope.exit();
+                }
+            }
+
+            if (!conflictingIds.isEmpty()) {
+                for (LayoutFileBundle bundle : bundles.getValue()) {
+                    for (BindingTargetBundle target : bundle.mBindingTargetBundles) {
+                        if (conflictingIds.contains(target.mId)) {
+                            Scope.registerError(String.format(
+                                            ErrorMessages.MULTI_CONFIG_ID_USED_AS_IMPORT,
+                                            target.mId), bundle, target);
+                        }
+                    }
+                }
+            }
+
+            for (LayoutFileBundle bundle : bundles.getValue()) {
+                try {
+                    Scope.enter(bundle);
+                    for (Map.Entry<String, String> viewType : viewTypes.entrySet()) {
+                        BindingTargetBundle target = bundle.getBindingTargetById(viewType.getKey());
+                        if (target == null) {
+                            String include = includes.get(viewType.getKey());
+                            if (include == null) {
+                                bundle.createBindingTarget(viewType.getKey(), viewType.getValue(),
+                                        false, null, null, null);
+                            } else {
+                                BindingTargetBundle bindingTargetBundle = bundle
+                                        .createBindingTarget(
+                                                viewType.getKey(), null, false, null, null, null);
+                                bindingTargetBundle
+                                        .setIncludedLayout(includes.get(viewType.getKey()));
+                                bindingTargetBundle.setInterfaceType(viewType.getValue());
+                            }
+                        } else {
+                            L.d("setting interface type on %s (%s) as %s", target.mId,
+                                    target.getFullClassName(), viewType.getValue());
+                            target.setInterfaceType(viewType.getValue());
+                        }
+                    }
+                } catch (ScopedException ex) {
+                    Scope.defer(ex);
+                } finally {
+                    Scope.exit();
+                }
+            }
+        }
+        // assign class names to each
+        for (Map.Entry<String, List<LayoutFileBundle>> entry : mLayoutBundles.entrySet()) {
+            for (LayoutFileBundle bundle : entry.getValue()) {
+                final String configName;
+                if (bundle.hasVariations()) {
+                    // append configuration specifiers.
+                    final String parentFileName = bundle.mDirectory;
+                    L.d("parent file for %s is %s", bundle.getFileName(), parentFileName);
+                    if ("layout".equals(parentFileName)) {
+                        configName = "";
+                    } else {
+                        configName = ParserHelper.toClassName(parentFileName.substring("layout-".length()));
+                    }
+                } else {
+                    configName = "";
+                }
+                bundle.mConfigName = configName;
+            }
+        }
+!!!35992631.java!!!	validateAndMergeNameTypeLocations(inout bundles : List<LayoutFileBundle>, inout errorMessage : String, inout callback : ResourceBundle::ValidateAndFilterCallback) : String
+        Map<String, NameTypeLocation> result = new HashMap<String, NameTypeLocation>();
+        Set<String> mismatched = new HashSet<String>();
+        for (LayoutFileBundle bundle : bundles) {
+            for (NameTypeLocation item : callback.get(bundle)) {
+                NameTypeLocation existing = result.get(item.name);
+                if (existing != null && !existing.type.equals(item.type)) {
+                    mismatched.add(item.name);
+                    continue;
+                }
+                result.put(item.name, item);
+            }
+        }
+        if (mismatched.isEmpty()) {
+            return result;
+        }
+        // create exceptions. We could get more clever and find the outlier but for now, listing
+        // each file w/ locations seems enough
+        for (String mismatch : mismatched) {
+            for (LayoutFileBundle bundle : bundles) {
+                NameTypeLocation found = null;
+                for (NameTypeLocation item : callback.get(bundle)) {
+                    if (mismatch.equals(item.name)) {
+                        found = item;
+                        break;
+                    }
+                }
+                if (found == null) {
+                    // variable is not defined in this layout, continue
+                    continue;
+                }
+                Scope.registerError(String.format(
+                                errorMessage, found.name, found.type,
+                                bundle.mDirectory + "/" + bundle.getFileName()), bundle,
+                        found.location.createScope());
+            }
+        }
+        return result;
+!!!35992759.java!!!	validateAndGetSharedClassName(inout bundles : List<LayoutFileBundle>) : String
+        String sharedClassName = null;
+        boolean hasMismatch = false;
+        for (LayoutFileBundle bundle : bundles) {
+            bundle.mHasVariations = true;
+            String fullBindingClass = bundle.getFullBindingClass();
+            if (sharedClassName == null) {
+                sharedClassName = fullBindingClass;
+            } else if (!sharedClassName.equals(fullBindingClass)) {
+                hasMismatch = true;
+                break;
+            }
+        }
+        if (!hasMismatch) {
+            return sharedClassName;
+        }
+        // generate proper exceptions for each
+        for (LayoutFileBundle bundle : bundles) {
+            Scope.registerError(String.format(ErrorMessages.MULTI_CONFIG_LAYOUT_CLASS_NAME_MISMATCH,
+                    bundle.getFullBindingClass(), bundle.mDirectory + "/" + bundle.getFileName()),
+                    bundle, bundle.getClassNameLocationProvider());
+        }
+        return sharedClassName;
+!!!35992887.java!!!	addRemovedFile(inout file : File) : void
+        mRemovedFiles.add(file);
+!!!35993015.java!!!	getRemovedFiles() : List<File>
+        return mRemovedFiles;

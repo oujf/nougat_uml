@@ -1,0 +1,371 @@
+class BackgroundScanScheduler
+!!!37076919.java!!!	getMaxBuckets() : int
+        return mMaxBuckets;
+!!!37077047.java!!!	setMaxBuckets(in maxBuckets : int) : void
+        mMaxBuckets = maxBuckets;
+!!!37077175.java!!!	getMaxChannelsPerBucket() : int
+        return mMaxChannelsPerBucket;
+!!!37077303.java!!!	setMaxChannelsPerBucket(in maxChannels : int) : void
+        mMaxChannelsPerBucket = maxChannels;
+!!!37077431.java!!!	getMaxBatch() : int
+        return mMaxBatch;
+!!!37077559.java!!!	setMaxBatch(in maxBatch : int) : void
+        mMaxBatch = maxBatch;
+!!!37077687.java!!!	getMaxApPerScan() : int
+        return mMaxApPerScan;
+!!!37077815.java!!!	setMaxApPerScan(in maxApPerScan : int) : void
+        mMaxApPerScan = maxApPerScan;
+!!!37077943.java!!!	BackgroundScanScheduler(inout channelHelper : ChannelHelper)
+        mChannelHelper = channelHelper;
+        createSchedule(new ArrayList<Bucket>(), getMaxChannelsPerBucket());
+!!!37078071.java!!!	updateSchedule(inout requests : Collection<ScanSettings>) : void
+        // create initial schedule
+        mBuckets.clearAll();
+        for (ScanSettings request : requests) {
+            addScanToBuckets(request);
+        }
+
+        compactBuckets(getMaxBuckets());
+
+        List<Bucket> bucketList = optimizeBuckets();
+
+        List<Bucket> fixedBucketList =
+                fixBuckets(bucketList, getMaxBuckets(), getMaxChannelsPerBucket());
+
+        createSchedule(fixedBucketList, getMaxChannelsPerBucket());
+!!!37078199.java!!!	getSchedule() : WifiNative::ScanSettings
+        return mSchedule;
+!!!37078327.java!!!	shouldReportFullScanResultForSettings(inout result : ScanResult, in bucketsScanned : int, inout settings : WifiScanner::ScanSettings) : boolean
+        return ScanScheduleUtil.shouldReportFullScanResultForSettings(mChannelHelper,
+                result, bucketsScanned, settings, getScheduledBucket(settings));
+!!!37078455.java!!!	filterResultsForSettings(inout scanDatas : WifiScanner::ScanData, inout settings : WifiScanner::ScanSettings) : WifiScanner::ScanData
+        return ScanScheduleUtil.filterResultsForSettings(mChannelHelper, scanDatas, settings,
+                getScheduledBucket(settings));
+!!!37078583.java!!!	getScheduledBucket(inout settings : WifiScanner::ScanSettings) : int
+        Bucket maxScheduledBucket = mSettingsToScheduledBucket.get(settings);
+        if (maxScheduledBucket != null) {
+            return maxScheduledBucket.bucketId;
+        } else {
+            Slog.wtf(TAG, "No bucket found for settings");
+            return -1;
+        }
+!!!37078711.java!!!	createSchedule(inout bucketList : List<Bucket>, in maxChannelsPerBucket : int) : void
+        WifiNative.ScanSettings schedule = new WifiNative.ScanSettings();
+        schedule.num_buckets = bucketList.size();
+        schedule.buckets = new WifiNative.BucketSettings[bucketList.size()];
+
+        schedule.max_ap_per_scan = 0;
+        schedule.report_threshold_num_scans = getMaxBatch();
+        HashSet<Integer> hiddenNetworkIdSet = new HashSet<>();
+
+        // set all buckets in schedule
+        int bucketId = 0;
+        for (Bucket bucket : bucketList) {
+            schedule.buckets[bucketId] =
+                    bucket.createBucketSettings(bucketId, maxChannelsPerBucket);
+            for (ScanSettings settings : bucket.getSettingsList()) {
+                // set APs per scan
+                if (settings.numBssidsPerScan > schedule.max_ap_per_scan) {
+                    schedule.max_ap_per_scan = settings.numBssidsPerScan;
+                }
+                // set batching
+                if (settings.maxScansToCache != 0
+                        && settings.maxScansToCache < schedule.report_threshold_num_scans) {
+                    schedule.report_threshold_num_scans = settings.maxScansToCache;
+                }
+                // note hidden networks
+                if (settings.hiddenNetworkIds != null) {
+                    for (int j = 0; j < settings.hiddenNetworkIds.length; j++) {
+                        hiddenNetworkIdSet.add(settings.hiddenNetworkIds[j]);
+                    }
+                }
+            }
+            bucketId++;
+        }
+
+        schedule.report_threshold_percent = DEFAULT_REPORT_THRESHOLD_PERCENTAGE;
+
+        if (schedule.max_ap_per_scan == 0 || schedule.max_ap_per_scan > getMaxApPerScan()) {
+            schedule.max_ap_per_scan = getMaxApPerScan();
+        }
+        if (hiddenNetworkIdSet.size() > 0) {
+            schedule.hiddenNetworkIds = new int[hiddenNetworkIdSet.size()];
+            int numHiddenNetworks = 0;
+            for (Integer hiddenNetworkId : hiddenNetworkIdSet) {
+                schedule.hiddenNetworkIds[numHiddenNetworks++] = hiddenNetworkId;
+            }
+        }
+
+        // update base period as gcd of periods
+        if (schedule.num_buckets > 0) {
+            int gcd = schedule.buckets[0].period_ms;
+            for (int b = 1; b < schedule.num_buckets; b++) {
+                gcd = Rational.gcd(schedule.buckets[b].period_ms, gcd);
+            }
+
+            if (gcd < PERIOD_MIN_GCD_MS) {
+                Slog.wtf(TAG, "found gcd less than min gcd");
+                gcd = PERIOD_MIN_GCD_MS;
+            }
+
+            schedule.base_period_ms = gcd;
+        } else {
+            schedule.base_period_ms = DEFAULT_PERIOD_MS;
+        }
+
+        mSchedule = schedule;
+!!!37078839.java!!!	addScanToBuckets(inout settings : WifiScanner::ScanSettings) : void
+        int bucketIndex;
+
+        if (settings.maxPeriodInMs != 0 && settings.maxPeriodInMs != settings.periodInMs) {
+            // exponential back off scan has a dedicated bucket
+            bucketIndex = EXPONENTIAL_BACK_OFF_BUCKET_IDX;
+        } else {
+            bucketIndex = findBestRegularBucketIndex(settings.periodInMs, NUM_OF_REGULAR_BUCKETS);
+        }
+
+        mBuckets.getOrCreate(bucketIndex).addSettings(settings);
+!!!37078967.java!!!	findBestRegularBucketIndex(in requestedPeriod : int, in maxNumBuckets : int) : int
+        maxNumBuckets = Math.min(maxNumBuckets, NUM_OF_REGULAR_BUCKETS);
+        int index = -1;
+        int minDiff = Integer.MAX_VALUE;
+        for (int i = 0; i < maxNumBuckets; ++i) {
+            int diff = Math.abs(PREDEFINED_BUCKET_PERIODS[i] - requestedPeriod);
+            if (diff < minDiff) {
+                minDiff = diff;
+                index = i;
+            }
+        }
+        if (index == -1) {
+            Slog.wtf(TAG, "Could not find best bucket for period " + requestedPeriod + " in "
+                     + maxNumBuckets + " buckets");
+        }
+        return index;
+!!!37079095.java!!!	compactBuckets(in maxBuckets : int) : void
+        int maxRegularBuckets = maxBuckets;
+
+        // reserve one bucket for exponential back off scan if there is
+        // such request(s)
+        if (mBuckets.isActive(EXPONENTIAL_BACK_OFF_BUCKET_IDX)) {
+            maxRegularBuckets--;
+        }
+        for (int i = NUM_OF_REGULAR_BUCKETS - 1;
+                i >= 0 && mBuckets.getActiveRegularBucketCount() > maxRegularBuckets; --i) {
+            if (mBuckets.isActive(i)) {
+                for (ScanSettings scanRequest : mBuckets.get(i).getSettingsList()) {
+                    int newBucketIndex = findBestRegularBucketIndex(scanRequest.periodInMs, i);
+                    mBuckets.getOrCreate(newBucketIndex).addSettings(scanRequest);
+                }
+                mBuckets.clear(i);
+            }
+        }
+!!!37079223.java!!!	cloneScanSettings(inout originalSettings : WifiScanner::ScanSettings) : WifiScanner::ScanSettings
+        ScanSettings settings = new ScanSettings();
+        settings.band = originalSettings.band;
+        settings.channels = originalSettings.channels;
+        settings.hiddenNetworkIds = originalSettings.hiddenNetworkIds;
+        settings.periodInMs = originalSettings.periodInMs;
+        settings.reportEvents = originalSettings.reportEvents;
+        settings.numBssidsPerScan = originalSettings.numBssidsPerScan;
+        settings.maxScansToCache = originalSettings.maxScansToCache;
+        settings.maxPeriodInMs = originalSettings.maxPeriodInMs;
+        settings.stepCount = originalSettings.stepCount;
+        settings.isPnoScan = originalSettings.isPnoScan;
+        return settings;
+!!!37079351.java!!!	createCurrentBucketSplitSettings(inout originalSettings : WifiScanner::ScanSettings, inout currentBucketChannels : Set<Integer>) : WifiScanner::ScanSettings
+        ScanSettings currentBucketSettings = cloneScanSettings(originalSettings);
+        // Let's create a new settings for the current bucket with the same flags, but the missing
+        // channels from the other bucket
+        currentBucketSettings.band = WifiScanner.WIFI_BAND_UNSPECIFIED;
+        currentBucketSettings.channels = new WifiScanner.ChannelSpec[currentBucketChannels.size()];
+        int chanIdx = 0;
+        for (Integer channel : currentBucketChannels) {
+            currentBucketSettings.channels[chanIdx++] = new WifiScanner.ChannelSpec(channel);
+        }
+        return currentBucketSettings;
+!!!37079479.java!!!	createTargetBucketSplitSettings(inout originalSettings : WifiScanner::ScanSettings, inout targetBucketChannels : Set<Integer>) : WifiScanner::ScanSettings
+        ScanSettings targetBucketSettings = cloneScanSettings(originalSettings);
+        // The new settings for the other bucket will have the channels that already in the that
+        // bucket. We'll need to do some migration of the |reportEvents| flags.
+        targetBucketSettings.band = WifiScanner.WIFI_BAND_UNSPECIFIED;
+        targetBucketSettings.channels = new WifiScanner.ChannelSpec[targetBucketChannels.size()];
+        int chanIdx = 0;
+        for (Integer channel : targetBucketChannels) {
+            targetBucketSettings.channels[chanIdx++] = new WifiScanner.ChannelSpec(channel);
+        }
+        targetBucketSettings.reportEvents =
+                originalSettings.reportEvents
+                        & (WifiScanner.REPORT_EVENT_NO_BATCH
+                                | WifiScanner.REPORT_EVENT_FULL_SCAN_RESULT);
+        return targetBucketSettings;
+!!!37079607.java!!!	createSplitSettings(inout originalSettings : WifiScanner::ScanSettings, inout targetBucketChannelCol : ChannelHelper::ChannelCollection) : Pair
+        Set<Integer> currentBucketChannels =
+                targetBucketChannelCol.getMissingChannelsFromSettings(originalSettings);
+        Set<Integer> targetBucketChannels =
+                targetBucketChannelCol.getContainingChannelsFromSettings(originalSettings);
+        // Two Copy of the original settings
+        ScanSettings currentBucketSettings =
+                createCurrentBucketSplitSettings(originalSettings, currentBucketChannels);
+        ScanSettings targetBucketSettings =
+                createTargetBucketSplitSettings(originalSettings, targetBucketChannels);
+        return Pair.create(currentBucketSettings, targetBucketSettings);
+!!!37079735.java!!!	mergeSettingsToLowerBuckets(inout originalSettings : WifiScanner::ScanSettings, inout currentBucket : BackgroundScanScheduler::Bucket, inout iterTargetBuckets : ListIterator<Bucket>) : Pair
+        ScanSettings remainingSplitSettings = null;
+        boolean wasMerged = false;
+        Bucket maxScheduledBucket = currentBucket;
+
+        while (iterTargetBuckets.hasPrevious()) {
+            Bucket targetBucket = iterTargetBuckets.previous();
+            ChannelCollection targetBucketChannelCol = targetBucket.getChannelCollection();
+            if (targetBucketChannelCol.containsSettings(originalSettings)) {
+                targetBucket.addSettings(originalSettings);
+                // Update the max scheduled bucket for this setting
+                maxScheduledBucket = targetBucket;
+                wasMerged = true;
+            } else if (targetBucketChannelCol.partiallyContainsSettings(originalSettings)) {
+                Pair<ScanSettings, ScanSettings> splitSettings;
+                if (remainingSplitSettings == null) {
+                    splitSettings = createSplitSettings(originalSettings, targetBucketChannelCol);
+                } else {
+                    splitSettings =
+                            createSplitSettings(remainingSplitSettings, targetBucketChannelCol);
+                }
+                targetBucket.addSettings(splitSettings.second);
+                // Update the |remainingSplitSettings| to keep track of the remaining scan settings.
+                // The original settings could be split across multiple buckets.
+                remainingSplitSettings = splitSettings.first;
+                wasMerged = true;
+            }
+        }
+        // Update the settings to scheduled bucket mapping. This is needed for event
+        // reporting lookup
+        mSettingsToScheduledBucket.put(originalSettings, maxScheduledBucket);
+
+        return Pair.create(wasMerged, remainingSplitSettings);
+!!!37079863.java!!!	optimizeBuckets() : BackgroundScanScheduler::Bucket
+        mSettingsToScheduledBucket.clear();
+        List<Bucket> sortedBuckets = mBuckets.getSortedActiveRegularBucketList();
+        ListIterator<Bucket> iterBuckets = sortedBuckets.listIterator();
+        // This is needed to keep track of split settings that need to be added back to the same
+        // bucket at the end of iterating thru all the settings. This has to be a separate temp list
+        // to prevent concurrent modification exceptions during iterations.
+        List<ScanSettings> currentBucketSplitSettingsList = new ArrayList<>();
+
+        // We need to go thru each setting starting from the lowest time period bucket and check
+        // if they're already contained in a lower time period bucket. If yes, delete the setting
+        // from the current bucket and move it to the other bucket. If the settings are only
+        // partially contained, split the settings into two and move the partial bucket back
+        // to the same bucket. Finally, if all the settings have been moved out, remove the current
+        // bucket altogether.
+        while (iterBuckets.hasNext()) {
+            Bucket currentBucket = iterBuckets.next();
+            Iterator<ScanSettings> iterSettings = currentBucket.getSettingsList().iterator();
+
+            currentBucketSplitSettingsList.clear();
+
+            while (iterSettings.hasNext()) {
+                ScanSettings currentSettings = iterSettings.next();
+                ListIterator<Bucket> iterTargetBuckets =
+                        sortedBuckets.listIterator(iterBuckets.previousIndex());
+
+                Pair<Boolean, ScanSettings> mergeResult =
+                        mergeSettingsToLowerBuckets(
+                                currentSettings, currentBucket, iterTargetBuckets);
+
+                boolean wasMerged = mergeResult.first.booleanValue();
+                if (wasMerged) {
+                    // Remove the original settings from the current bucket.
+                    iterSettings.remove();
+                    ScanSettings remainingSplitSettings = mergeResult.second;
+                    if (remainingSplitSettings != null) {
+                        // Add back the remaining split settings to the current bucket.
+                        currentBucketSplitSettingsList.add(remainingSplitSettings);
+                    }
+                }
+            }
+
+            for (ScanSettings splitSettings: currentBucketSplitSettingsList) {
+                currentBucket.addSettings(splitSettings);
+            }
+            if (currentBucket.getSettingsList().isEmpty()) {
+                iterBuckets.remove();
+            } else {
+                // Update the channel collection to account for the removed settings
+                currentBucket.updateChannelCollection();
+            }
+        }
+
+        // Update the settings to scheduled bucket map for all exponential scans.
+        if (mBuckets.isActive(EXPONENTIAL_BACK_OFF_BUCKET_IDX)) {
+            Bucket exponentialBucket = mBuckets.get(EXPONENTIAL_BACK_OFF_BUCKET_IDX);
+            for (ScanSettings settings : exponentialBucket.getSettingsList()) {
+                mSettingsToScheduledBucket.put(settings, exponentialBucket);
+            }
+            sortedBuckets.add(exponentialBucket);
+        }
+
+        return sortedBuckets;
+!!!37079991.java!!!	partitionChannelSet(inout originalChannelSet : Set<Integer>, in maxChannelsPerBucket : int) : List<Set<Integer>>
+        ArrayList<Set<Integer>> channelSetList = new ArrayList();
+        ArraySet<Integer> channelSet = new ArraySet<>();
+        Iterator<Integer> iterChannels = originalChannelSet.iterator();
+
+        while (iterChannels.hasNext()) {
+            channelSet.add(iterChannels.next());
+            if (channelSet.size() == maxChannelsPerBucket) {
+                channelSetList.add(channelSet);
+                channelSet = new ArraySet<>();
+            }
+        }
+        // Add the last partial set if any
+        if (!channelSet.isEmpty()) {
+            channelSetList.add(channelSet);
+        }
+        return channelSetList;
+!!!37080119.java!!!	createSplitBuckets(inout originalBucket : BackgroundScanScheduler::Bucket, inout channelSets : List<Set<Integer>>) : BackgroundScanScheduler::Bucket
+        List<Bucket> splitBucketList = new ArrayList<>();
+        int channelSetIdx = 0;
+
+        for (Set<Integer> channelSet : channelSets) {
+            Bucket splitBucket;
+            if (channelSetIdx == 0) {
+                // Need to keep the original bucket to keep track of the settings to scheduled
+                // bucket mapping.
+                splitBucket = originalBucket;
+            } else {
+                splitBucket = new Bucket(originalBucket);
+            }
+            ChannelCollection splitBucketChannelCollection = splitBucket.getChannelCollection();
+            splitBucketChannelCollection.clear();
+            for (Integer channel : channelSet) {
+                splitBucketChannelCollection.addChannel(channel);
+            }
+            channelSetIdx++;
+            splitBucketList.add(splitBucket);
+        }
+        return splitBucketList;
+!!!37080247.java!!!	fixBuckets(inout originalBucketList : List<Bucket>, in maxBuckets : int, in maxChannelsPerBucket : int) : BackgroundScanScheduler::Bucket
+        List<Bucket> fixedBucketList = new ArrayList<>();
+        int totalNumBuckets = originalBucketList.size();
+
+        for (Bucket originalBucket : originalBucketList) {
+            ChannelCollection channelCollection = originalBucket.getChannelCollection();
+            Set<Integer> channelSet = channelCollection.getChannelSet();
+            if (channelSet.size() > maxChannelsPerBucket) {
+                List<Set<Integer>> channelSetList =
+                        partitionChannelSet(channelSet, maxChannelsPerBucket);
+                int newTotalNumBuckets = totalNumBuckets + channelSetList.size() - 1;
+                if (newTotalNumBuckets <= maxBuckets) {
+                    List<Bucket> splitBuckets = createSplitBuckets(originalBucket, channelSetList);
+                    for (Bucket bucket : splitBuckets) {
+                        fixedBucketList.add(bucket);
+                    }
+                    totalNumBuckets = newTotalNumBuckets;
+                } else {
+                    fixedBucketList.add(originalBucket);
+                }
+            } else {
+                fixedBucketList.add(originalBucket);
+            }
+        }
+        return fixedBucketList;

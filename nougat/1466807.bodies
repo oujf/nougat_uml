@@ -1,0 +1,203 @@
+class AssetAtlasService
+!!!32037303.java!!!	AssetAtlasService(inout context : Context)
+        mContext = context;
+        mVersionName = queryVersionName(context);
+
+        Collection<Bitmap> bitmaps = new HashSet<Bitmap>(300);
+        int totalPixelCount = 0;
+
+        // We only care about drawables that hold bitmaps
+        final Resources resources = context.getResources();
+        final LongSparseArray<Drawable.ConstantState> drawables = resources.getPreloadedDrawables();
+
+        final int count = drawables.size();
+        for (int i = 0; i < count; i++) {
+            try {
+                totalPixelCount += drawables.valueAt(i).addAtlasableBitmaps(bitmaps);
+            } catch (Throwable t) {
+                Log.e("AssetAtlas", "Failed to fetch preloaded drawable state", t);
+                throw t;
+            }
+        }
+
+        ArrayList<Bitmap> sortedBitmaps = new ArrayList<Bitmap>(bitmaps);
+        // Our algorithms perform better when the bitmaps are first sorted
+        // The comparator will sort the bitmap by width first, then by height
+        Collections.sort(sortedBitmaps, new Comparator<Bitmap>() {
+            @Override
+            public int compare(Bitmap b1, Bitmap b2) {
+                if (b1.getWidth() == b2.getWidth()) {
+                    return b2.getHeight() - b1.getHeight();
+                }
+                return b2.getWidth() - b1.getWidth();
+            }
+        });
+
+        // Kick off the packing work on a worker thread
+        new Thread(new Renderer(sortedBitmaps, totalPixelCount)).start();
+!!!32037431.java!!!	queryVersionName(inout context : Context) : String
+        try {
+            String packageName = context.getPackageName();
+            PackageInfo info = context.getPackageManager().getPackageInfo(packageName,
+                    PackageManager.MATCH_DEBUG_TRIAGED_MISSING);
+            return info.versionName;
+        } catch (PackageManager.NameNotFoundException e) {
+            Log.w(LOG_TAG, "Could not get package info", e);
+        }
+        return null;
+!!!32038327.java!!!	isCompatible(in ppid : int) : boolean
+        return ppid == android.os.Process.myPpid();
+!!!32038455.java!!!	getBuffer() : GraphicBuffer
+        return mAtlasReady.get() ? mBuffer : null;
+!!!32038583.java!!!	getMap() : long
+        return mAtlasReady.get() ? mAtlasMap : null;
+!!!32038711.java!!!	computeBestConfiguration(inout bitmaps : ArrayList<Bitmap>, in pixelCount : int) : AssetAtlasService::Configuration
+        if (DEBUG_ATLAS) Log.d(LOG_TAG, "Computing best atlas configuration...");
+
+        long begin = System.nanoTime();
+        List<WorkerResult> results = Collections.synchronizedList(new ArrayList<WorkerResult>());
+
+        // Don't bother with an extra thread if there's only one processor
+        int cpuCount = Runtime.getRuntime().availableProcessors();
+        if (cpuCount == 1) {
+            new ComputeWorker(MIN_SIZE, MAX_SIZE, STEP, bitmaps, pixelCount, results, null).run();
+        } else {
+            int start = MIN_SIZE + (cpuCount - 1) * STEP;
+            int end = MAX_SIZE;
+            int step = STEP * cpuCount;
+
+            final CountDownLatch signal = new CountDownLatch(cpuCount);
+
+            for (int i = 0; i < cpuCount; i++, start -= STEP, end -= STEP) {
+                ComputeWorker worker = new ComputeWorker(start, end, step,
+                        bitmaps, pixelCount, results, signal);
+                new Thread(worker, "Atlas Worker #" + (i + 1)).start();
+            }
+
+            boolean isAllWorkerFinished;
+            try {
+                isAllWorkerFinished = signal.await(10, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Log.w(LOG_TAG, "Could not complete configuration computation");
+                return null;
+            }
+
+            if (!isAllWorkerFinished) {
+                // We have to abort here, otherwise the async updates on "results" would crash the
+                // sort later.
+                Log.w(LOG_TAG, "Could not complete configuration computation before timeout.");
+                return null;
+            }
+        }
+
+        // Maximize the number of packed bitmaps, minimize the texture size
+        Collections.sort(results, new Comparator<WorkerResult>() {
+            @Override
+            public int compare(WorkerResult r1, WorkerResult r2) {
+                int delta = r2.count - r1.count;
+                if (delta != 0) return delta;
+                return r1.width * r1.height - r2.width * r2.height;
+            }
+        });
+
+        if (DEBUG_ATLAS) {
+            float delay = (System.nanoTime() - begin) / 1000.0f / 1000.0f / 1000.0f;
+            Log.d(LOG_TAG, String.format("Found best atlas configuration (out of %d) in %.2fs",
+                    results.size(), delay));
+        }
+
+        WorkerResult result = results.get(0);
+        return new Configuration(result.type, result.width, result.height, result.count);
+!!!32038839.java!!!	getDataFile() : File
+        File systemDirectory = new File(Environment.getDataDirectory(), "system");
+        return new File(systemDirectory, "framework_atlas.config");
+!!!32038967.java!!!	deleteDataFile() : void
+        Log.w(LOG_TAG, "Current configuration inconsistent with assets list");
+        if (!getDataFile().delete()) {
+            Log.w(LOG_TAG, "Could not delete the current configuration");
+        }
+!!!32039095.java!!!	getFrameworkResourcesFile() : File
+        return new File(mContext.getApplicationInfo().sourceDir);
+!!!32039223.java!!!	chooseConfiguration(inout bitmaps : ArrayList<Bitmap>, in pixelCount : int, inout versionName : String) : AssetAtlasService::Configuration
+        Configuration config = null;
+
+        final File dataFile = getDataFile();
+        if (dataFile.exists()) {
+            config = readConfiguration(dataFile, versionName);
+        }
+
+        if (config == null) {
+            config = computeBestConfiguration(bitmaps, pixelCount);
+            if (config != null) writeConfiguration(config, dataFile, versionName);
+        }
+
+        return config;
+!!!32039351.java!!!	writeConfiguration(inout config : AssetAtlasService::Configuration, inout file : File, inout versionName : String) : void
+        BufferedWriter writer = null;
+        try {
+            writer = new BufferedWriter(new OutputStreamWriter(new FileOutputStream(file)));
+            writer.write(getBuildIdentifier(versionName));
+            writer.newLine();
+            writer.write(config.type.toString());
+            writer.newLine();
+            writer.write(String.valueOf(config.width));
+            writer.newLine();
+            writer.write(String.valueOf(config.height));
+            writer.newLine();
+            writer.write(String.valueOf(config.count));
+            writer.newLine();
+            writer.write(String.valueOf(config.flags));
+            writer.newLine();
+        } catch (FileNotFoundException e) {
+            Log.w(LOG_TAG, "Could not write " + file, e);
+        } catch (IOException e) {
+            Log.w(LOG_TAG, "Could not write " + file, e);
+        } finally {
+            if (writer != null) {
+                try {
+                    writer.close();
+                } catch (IOException e) {
+                    // Ignore
+                }
+            }
+        }
+!!!32039479.java!!!	readConfiguration(inout file : File, inout versionName : String) : AssetAtlasService::Configuration
+        BufferedReader reader = null;
+        Configuration config = null;
+        try {
+            reader = new BufferedReader(new InputStreamReader(new FileInputStream(file)));
+
+            if (checkBuildIdentifier(reader, versionName)) {
+                Atlas.Type type = Atlas.Type.valueOf(reader.readLine());
+                int width = readInt(reader, MIN_SIZE, MAX_SIZE);
+                int height = readInt(reader, MIN_SIZE, MAX_SIZE);
+                int count = readInt(reader, 0, Integer.MAX_VALUE);
+                int flags = readInt(reader, Integer.MIN_VALUE, Integer.MAX_VALUE);
+
+                config = new Configuration(type, width, height, count, flags);
+            }
+        } catch (IllegalArgumentException e) {
+            Log.w(LOG_TAG, "Invalid parameter value in " + file, e);
+        } catch (FileNotFoundException e) {
+            Log.w(LOG_TAG, "Could not read " + file, e);
+        } catch (IOException e) {
+            Log.w(LOG_TAG, "Could not read " + file, e);
+        } finally {
+            if (reader != null) {
+                try {
+                    reader.close();
+                } catch (IOException e) {
+                    // Ignore
+                }
+            }
+        }
+        return config;
+!!!32039607.java!!!	readInt(inout reader : BufferedReader, in min : int, in max : int) : int
+        return Math.max(min, Math.min(max, Integer.parseInt(reader.readLine())));
+!!!32039735.java!!!	checkBuildIdentifier(inout reader : BufferedReader, inout versionName : String) : boolean
+        String deviceBuildId = getBuildIdentifier(versionName);
+        String buildId = reader.readLine();
+        return deviceBuildId.equals(buildId);
+!!!32039863.java!!!	getBuildIdentifier(inout versionName : String) : String
+        return SystemProperties.get("ro.build.fingerprint", "") + '/' + versionName + '/' +
+                String.valueOf(getFrameworkResourcesFile().length());

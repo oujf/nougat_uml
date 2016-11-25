@@ -1,0 +1,215 @@
+class ImageWriter
+!!!28395831.java!!!	newInstance(inout surface : Surface, in maxImages : int) : ImageWriter
+        return new ImageWriter(surface, maxImages);
+!!!28395959.java!!!	ImageWriter(inout surface : Surface, in maxImages : int)
+        if (surface == null || maxImages < 1) {
+            throw new IllegalArgumentException("Illegal input argument: surface " + surface
+                    + ", maxImages: " + maxImages);
+        }
+
+        mMaxImages = maxImages;
+        // Note that the underlying BufferQueue is working in synchronous mode
+        // to avoid dropping any buffers.
+        mNativeContext = nativeInit(new WeakReference<ImageWriter>(this), surface, maxImages);
+
+        // Estimate the native buffer allocation size and register it so it gets accounted for
+        // during GC. Note that this doesn't include the buffers required by the buffer queue
+        // itself and the buffers requested by the producer.
+        // Only include memory for 1 buffer, since actually accounting for the memory used is
+        // complex, and 1 buffer is enough for the VM to treat the ImageWriter as being of some
+        // size.
+        Size surfSize = SurfaceUtils.getSurfaceSize(surface);
+        int format = SurfaceUtils.getSurfaceFormat(surface);
+        mEstimatedNativeAllocBytes =
+                ImageUtils.getEstimatedNativeAllocBytes(surfSize.getWidth(),surfSize.getHeight(),
+                        format, /*buffer count*/ 1);
+        VMRuntime.getRuntime().registerNativeAllocation(mEstimatedNativeAllocBytes);
+!!!28396087.java!!!	getMaxImages() : int
+        return mMaxImages;
+!!!28396215.java!!!	dequeueInputImage() : Image
+        if (mWriterFormat == ImageFormat.PRIVATE) {
+            throw new IllegalStateException(
+                    "PRIVATE format ImageWriter doesn't support this operation since the images are"
+                            + " inaccessible to the application!");
+        }
+
+        if (mDequeuedImages.size() >= mMaxImages) {
+            throw new IllegalStateException("Already dequeued max number of Images " + mMaxImages);
+        }
+        WriterSurfaceImage newImage = new WriterSurfaceImage(this);
+        nativeDequeueInputImage(mNativeContext, newImage);
+        mDequeuedImages.add(newImage);
+        newImage.mIsImageValid = true;
+        return newImage;
+!!!28396343.java!!!	queueInputImage(inout image : Image) : void
+        if (image == null) {
+            throw new IllegalArgumentException("image shouldn't be null");
+        }
+        boolean ownedByMe = isImageOwnedByMe(image);
+        if (ownedByMe && !(((WriterSurfaceImage) image).mIsImageValid)) {
+            throw new IllegalStateException("Image from ImageWriter is invalid");
+        }
+
+        // For images from other components, need to detach first, then attach.
+        if (!ownedByMe) {
+            if (!(image.getOwner() instanceof ImageReader)) {
+                throw new IllegalArgumentException("Only images from ImageReader can be queued to"
+                        + " ImageWriter, other image source is not supported yet!");
+            }
+
+            ImageReader prevOwner = (ImageReader) image.getOwner();
+            // Only do the image attach for PRIVATE format images for now. Do the image
+            // copy for other formats. TODO: use attach for other formats to
+            // improve the performance, and fall back to copy when attach/detach
+            // fails. Right now, detach is guaranteed to fail as the buffer is
+            // locked when ImageReader#acquireNextImage is called. See bug 19962027.
+            if (image.getFormat() == ImageFormat.PRIVATE) {
+                prevOwner.detachImage(image);
+                attachAndQueueInputImage(image);
+                // This clears the native reference held by the original owner.
+                // When this Image is detached later by this ImageWriter, the
+                // native memory won't be leaked.
+                image.close();
+                return;
+            } else {
+                Image inputImage = dequeueInputImage();
+                inputImage.setTimestamp(image.getTimestamp());
+                inputImage.setCropRect(image.getCropRect());
+                ImageUtils.imageCopy(image, inputImage);
+                image.close();
+                image = inputImage;
+                ownedByMe = true;
+            }
+        }
+
+        Rect crop = image.getCropRect();
+        nativeQueueInputImage(mNativeContext, image, image.getTimestamp(), crop.left, crop.top,
+                crop.right, crop.bottom);
+
+        /**
+         * Only remove and cleanup the Images that are owned by this
+         * ImageWriter. Images detached from other owners are only temporarily
+         * owned by this ImageWriter and will be detached immediately after they
+         * are released by downstream consumers, so there is no need to keep
+         * track of them in mDequeuedImages.
+         */
+        if (ownedByMe) {
+            mDequeuedImages.remove(image);
+            // Do not call close here, as close is essentially cancel image.
+            WriterSurfaceImage wi = (WriterSurfaceImage) image;
+            wi.clearSurfacePlanes();
+            wi.mIsImageValid = false;
+        }
+!!!28396471.java!!!	getFormat() : int
+        return mWriterFormat;
+!!!28396727.java!!!	setOnImageReleasedListener(inout listener : ImageWriter::OnImageReleasedListener, inout handler : Handler) : void
+        synchronized (mListenerLock) {
+            if (listener != null) {
+                Looper looper = handler != null ? handler.getLooper() : Looper.myLooper();
+                if (looper == null) {
+                    throw new IllegalArgumentException(
+                            "handler is null but the current thread is not a looper");
+                }
+                if (mListenerHandler == null || mListenerHandler.getLooper() != looper) {
+                    mListenerHandler = new ListenerHandler(looper);
+                }
+                mListener = listener;
+            } else {
+                mListener = null;
+                mListenerHandler = null;
+            }
+        }
+!!!28396855.java!!!	close() : void
+        setOnImageReleasedListener(null, null);
+        for (Image image : mDequeuedImages) {
+            image.close();
+        }
+        mDequeuedImages.clear();
+        nativeClose(mNativeContext);
+        mNativeContext = 0;
+
+        if (mEstimatedNativeAllocBytes > 0) {
+            VMRuntime.getRuntime().registerNativeFree(mEstimatedNativeAllocBytes);
+            mEstimatedNativeAllocBytes = 0;
+        }
+!!!28396983.java!!!	finalize() : void
+        try {
+            close();
+        } finally {
+            super.finalize();
+        }
+!!!28397111.java!!!	attachAndQueueInputImage(inout image : Image) : void
+        if (image == null) {
+            throw new IllegalArgumentException("image shouldn't be null");
+        }
+        if (isImageOwnedByMe(image)) {
+            throw new IllegalArgumentException(
+                    "Can not attach an image that is owned ImageWriter already");
+        }
+        /**
+         * Throw ISE if the image is not attachable, which means that it is
+         * either owned by other entity now, or completely non-attachable (some
+         * stand-alone images are not backed by native gralloc buffer, thus not
+         * attachable).
+         */
+        if (!image.isAttachable()) {
+            throw new IllegalStateException("Image was not detached from last owner, or image "
+                    + " is not detachable");
+        }
+
+        // TODO: what if attach failed, throw RTE or detach a slot then attach?
+        // need do some cleanup to make sure no orphaned
+        // buffer caused leak.
+        Rect crop = image.getCropRect();
+        nativeAttachAndQueueImage(mNativeContext, image.getNativeContext(), image.getFormat(),
+                image.getTimestamp(), crop.left, crop.top, crop.right, crop.bottom);
+!!!28397495.java!!!	postEventFromNative(inout selfRef : Object) : void
+        @SuppressWarnings("unchecked")
+        WeakReference<ImageWriter> weakSelf = (WeakReference<ImageWriter>) selfRef;
+        final ImageWriter iw = weakSelf.get();
+        if (iw == null) {
+            return;
+        }
+
+        final Handler handler;
+        synchronized (iw.mListenerLock) {
+            handler = iw.mListenerHandler;
+        }
+        if (handler != null) {
+            handler.sendEmptyMessage(0);
+        }
+!!!28397623.java!!!	abortImage(inout image : Image) : void
+        if (image == null) {
+            throw new IllegalArgumentException("image shouldn't be null");
+        }
+
+        if (!mDequeuedImages.contains(image)) {
+            throw new IllegalStateException("It is illegal to abort some image that is not"
+                    + " dequeued yet");
+        }
+
+        WriterSurfaceImage wi = (WriterSurfaceImage) image;
+        if (!wi.mIsImageValid) {
+            return;
+        }
+
+        /**
+         * We only need abort Images that are owned and dequeued by ImageWriter.
+         * For attached Images, no need to abort, as there are only two cases:
+         * attached + queued successfully, and attach failed. Neither of the
+         * cases need abort.
+         */
+        cancelImage(mNativeContext, image);
+        mDequeuedImages.remove(image);
+        wi.clearSurfacePlanes();
+        wi.mIsImageValid = false;
+!!!28397751.java!!!	isImageOwnedByMe(inout image : Image) : boolean
+        if (!(image instanceof WriterSurfaceImage)) {
+            return false;
+        }
+        WriterSurfaceImage wi = (WriterSurfaceImage) image;
+        if (wi.getOwner() != this) {
+            return false;
+        }
+
+        return true;

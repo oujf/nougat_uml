@@ -1,0 +1,125 @@
+class OSUSocketFactory
+!!!44023607.java!!!	buildCertSet() : Set<X509Certificate>
+        try {
+            CertificateFactory certFactory = CertificateFactory.getInstance("X.509");
+            Set<X509Certificate> set = new HashSet<>();
+            for (String b64 : WFACerts) {
+                ByteArrayInputStream bis = new ByteArrayInputStream(
+                        Base64.decode(b64, Base64.DEFAULT));
+                X509Certificate cert = (X509Certificate) certFactory.generateCertificate(bis);
+                set.add(cert);
+            }
+            return set;
+        } catch (CertificateException ce) {
+            Log.e(OSUManager.TAG, "Cannot build CA cert set");
+            return null;
+        }
+!!!44023735.java!!!	getSocketFactory(inout ks : KeyStore, inout homeSP : HomeSP, in flowType : int, inout network : Network, inout url : URL, inout km : KeyManager, inout enforceSecurity : boolean) : OSUSocketFactory
+
+        if (enforceSecurity && !url.getProtocol().equalsIgnoreCase(SecureHTTP)) {
+            throw new IOException("Protocol '" + url.getProtocol() + "' is not secure");
+        }
+        return new OSUSocketFactory(ks, homeSP, flowType, network, url, km);
+!!!44023863.java!!!	OSUSocketFactory(inout ks : KeyStore, inout homeSP : HomeSP, in flowType : int, inout network : Network, inout url : URL, inout km : KeyManager)
+        mNetwork = network;
+        mKeyManager = km;
+        mTrustManager = new WFATrustManager(ks, homeSP, flowType);
+        int port;
+        switch (url.getProtocol()) {
+            case UnsecureHTTP:
+                mSocketFactory = new DefaultSocketFactory();
+                port = url.getPort() > 0 ? url.getPort() : 80;
+                break;
+            case SecureHTTP:
+                SSLContext tlsContext = SSLContext.getInstance("TLSv1");
+                tlsContext.init(km != null ? new KeyManager[]{km} : null,
+                        new TrustManager[]{mTrustManager}, null);
+                mSocketFactory = tlsContext.getSocketFactory();
+                port = url.getPort() > 0 ? url.getPort() : 443;
+                break;
+            default:
+                throw new IOException("Bad URL: " + url);
+        }
+        if (OSUManager.R2_MOCK && url.getHost().endsWith(".wi-fi.org")) {
+            // !!! Warning: Ruckus hack!
+            mRemotes = new ArrayList<>(1);
+            mRemotes.add(new InetSocketAddress(InetAddress.getByName("10.123.107.107"), port));
+        } else {
+            InetAddress[] remotes = mNetwork.getAllByName(url.getHost());
+            android.util.Log.d(OSUManager.TAG, "'" + url.getHost() + "' resolves to " +
+                    Arrays.toString(remotes));
+            if (remotes == null || remotes.length == 0) {
+                throw new IOException("Failed to look up host from " + url);
+            }
+            mRemotes = new ArrayList<>(remotes.length);
+            for (InetAddress remote : remotes) {
+                mRemotes.add(new InetSocketAddress(remote, port));
+            }
+        }
+        Collections.shuffle(mRemotes);
+!!!44023991.java!!!	reloadKeys(inout certs : Map<OSUCertType, List<X509Certificate>>, inout key : PrivateKey) : void
+        if (mKeyManager instanceof ClientKeyManager) {
+            ((ClientKeyManager) mKeyManager).reloadKeys(certs, key);
+        }
+!!!44024119.java!!!	createSocket() : Socket
+        Socket socket = mSocketFactory.createSocket();
+        mNetwork.bindSocket(socket);
+
+        long bail = System.currentTimeMillis() + ConnectionTimeout;
+        boolean success = false;
+
+        while (System.currentTimeMillis() < bail) {
+            for (InetSocketAddress remote : mRemotes) {
+                try {
+                    socket.connect(remote);
+                    Log.d(OSUManager.TAG, "Connection " + socket.getLocalSocketAddress() +
+                            " to " + socket.getRemoteSocketAddress());
+                    success = true;
+                    break;
+                } catch (IOException ioe) {
+                    Log.d(OSUManager.TAG, "Failed to connect to " + remote + ": " + ioe);
+                    socket = mSocketFactory.createSocket();
+                    mNetwork.bindSocket(socket);
+                }
+            }
+            if (success) {
+                break;
+            }
+            Utils.delay(ReconnectWait);
+        }
+        if (!success) {
+            throw new IOException("No available network");
+        }
+        return socket;
+!!!44024247.java!!!	getOSUCertificate(inout url : URL) : X509Certificate
+        String fqdn = url.getHost();
+        for (X509Certificate certificate : mTrustManager.getTrustChain()) {
+            for (List<?> name : certificate.getSubjectAlternativeNames()) {
+                if (name.size() >= SPVerifier.DNSName &&
+                        name.get(0).getClass() == Integer.class &&
+                        name.get(1).toString().equals(fqdn)) {
+                    return certificate;
+                }
+            }
+        }
+        return null;
+!!!44025783.java!!!	getCert(inout keyStore : KeyStore, inout alias : String) : X509Certificate
+        Certificate cert = keyStore.getCertificate(alias);
+        if (cert != null && cert instanceof X509Certificate) {
+            return (X509Certificate) cert;
+        }
+        return null;
+!!!44025911.java!!!	getRootCerts(inout keyStore : KeyStore) : Set<X509Certificate>
+        Set<X509Certificate> certSet = new HashSet<>();
+        int index = 0;
+        for (int n = 0; n < 1000; n++) {
+            Certificate cert = keyStore.getCertificate(
+                    String.format("%s%d", OSUManager.CERT_WFA_ALIAS, index));
+            if (cert == null) {
+                break;
+            } else if (cert instanceof X509Certificate) {
+                certSet.add((X509Certificate) cert);
+            }
+            index++;
+        }
+        return certSet;

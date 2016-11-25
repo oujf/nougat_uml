@@ -1,0 +1,312 @@
+class HdmiCecController
+!!!32819383.java!!!	HdmiCecController(inout service : HdmiControlService)
+        mService = service;
+!!!32819511.java!!!	create(inout service : HdmiControlService) : HdmiCecController
+        HdmiCecController controller = new HdmiCecController(service);
+        long nativePtr = nativeInit(controller, service.getServiceLooper().getQueue());
+        if (nativePtr == 0L) {
+            controller = null;
+            return null;
+        }
+
+        controller.init(nativePtr);
+        return controller;
+!!!32819639.java!!!	init(in nativePtr : long) : void
+        mIoHandler = new Handler(mService.getIoLooper());
+        mControlHandler = new Handler(mService.getServiceLooper());
+        mNativePtr = nativePtr;
+!!!32819767.java!!!	addLocalDevice(in deviceType : int, inout device : HdmiCecLocalDevice) : void
+        assertRunOnServiceThread();
+        mLocalDevices.put(deviceType, device);
+!!!32819895.java!!!	allocateLogicalAddress(in deviceType : int, in preferredAddress : int, in callback : HdmiCecController::AllocateAddressCallback) : void
+        assertRunOnServiceThread();
+
+        runOnIoThread(new Runnable() {
+            @Override
+            public void run() {
+                handleAllocateLogicalAddress(deviceType, preferredAddress, callback);
+            }
+        });
+!!!32820023.java!!!	handleAllocateLogicalAddress(in deviceType : int, in preferredAddress : int, in callback : HdmiCecController::AllocateAddressCallback) : void
+        assertRunOnIoThread();
+        int startAddress = preferredAddress;
+        // If preferred address is "unregistered", start address will be the smallest
+        // address matched with the given device type.
+        if (preferredAddress == Constants.ADDR_UNREGISTERED) {
+            for (int i = 0; i < NUM_LOGICAL_ADDRESS; ++i) {
+                if (deviceType == HdmiUtils.getTypeFromAddress(i)) {
+                    startAddress = i;
+                    break;
+                }
+            }
+        }
+
+        int logicalAddress = Constants.ADDR_UNREGISTERED;
+        // Iterates all possible addresses which has the same device type.
+        for (int i = 0; i < NUM_LOGICAL_ADDRESS; ++i) {
+            int curAddress = (startAddress + i) % NUM_LOGICAL_ADDRESS;
+            if (curAddress != Constants.ADDR_UNREGISTERED
+                    && deviceType == HdmiUtils.getTypeFromAddress(curAddress)) {
+                int failedPollingCount = 0;
+                for (int j = 0; j < HdmiConfig.ADDRESS_ALLOCATION_RETRY; ++j) {
+                    if (!sendPollMessage(curAddress, curAddress, 1)) {
+                        failedPollingCount++;
+                    }
+                }
+
+                // Pick logical address if failed ratio is more than a half of all retries.
+                if (failedPollingCount * 2 >  HdmiConfig.ADDRESS_ALLOCATION_RETRY) {
+                    logicalAddress = curAddress;
+                    break;
+                }
+            }
+        }
+
+        final int assignedAddress = logicalAddress;
+        HdmiLogger.debug("New logical address for device [%d]: [preferred:%d, assigned:%d]",
+                        deviceType, preferredAddress, assignedAddress);
+        if (callback != null) {
+            runOnServiceThread(new Runnable() {
+                @Override
+                public void run() {
+                    callback.onAllocated(deviceType, assignedAddress);
+                }
+            });
+        }
+!!!32820151.java!!!	buildBody(in opcode : int, inout params : byte) : byte
+        byte[] body = new byte[params.length + 1];
+        body[0] = (byte) opcode;
+        System.arraycopy(params, 0, body, 1, params.length);
+        return body;
+!!!32820279.java!!!	getPortInfos() : HdmiPortInfo
+        return nativeGetPortInfos(mNativePtr);
+!!!32820407.java!!!	getLocalDevice(in deviceType : int) : HdmiCecLocalDevice
+        return mLocalDevices.get(deviceType);
+!!!32820535.java!!!	addLogicalAddress(in newLogicalAddress : int) : int
+        assertRunOnServiceThread();
+        if (HdmiUtils.isValidAddress(newLogicalAddress)) {
+            return nativeAddLogicalAddress(mNativePtr, newLogicalAddress);
+        } else {
+            return -1;
+        }
+!!!32820663.java!!!	clearLogicalAddress() : void
+        assertRunOnServiceThread();
+        for (int i = 0; i < mLocalDevices.size(); ++i) {
+            mLocalDevices.valueAt(i).clearAddress();
+        }
+        nativeClearLogicalAddress(mNativePtr);
+!!!32820791.java!!!	clearLocalDevices() : void
+        assertRunOnServiceThread();
+        mLocalDevices.clear();
+!!!32820919.java!!!	getPhysicalAddress() : int
+        assertRunOnServiceThread();
+        return nativeGetPhysicalAddress(mNativePtr);
+!!!32821047.java!!!	getVersion() : int
+        assertRunOnServiceThread();
+        return nativeGetVersion(mNativePtr);
+!!!32821175.java!!!	getVendorId() : int
+        assertRunOnServiceThread();
+        return nativeGetVendorId(mNativePtr);
+!!!32821303.java!!!	setOption(in flag : int, in value : int) : void
+        assertRunOnServiceThread();
+        HdmiLogger.debug("setOption: [flag:%d, value:%d]", flag, value);
+        nativeSetOption(mNativePtr, flag, value);
+!!!32821431.java!!!	setAudioReturnChannel(in port : int, inout enabled : boolean) : void
+        assertRunOnServiceThread();
+        nativeSetAudioReturnChannel(mNativePtr, port, enabled);
+!!!32821559.java!!!	isConnected(in port : int) : boolean
+        assertRunOnServiceThread();
+        return nativeIsConnected(mNativePtr, port);
+!!!32821687.java!!!	pollDevices(inout callback : HdmiControlService::DevicePollingCallback, in sourceAddress : int, in pickStrategy : int, in retryCount : int) : void
+        assertRunOnServiceThread();
+
+        // Extract polling candidates. No need to poll against local devices.
+        List<Integer> pollingCandidates = pickPollCandidates(pickStrategy);
+        ArrayList<Integer> allocated = new ArrayList<>();
+        runDevicePolling(sourceAddress, pollingCandidates, retryCount, callback, allocated);
+!!!32821815.java!!!	getLocalDeviceList() : HdmiCecLocalDevice
+        assertRunOnServiceThread();
+        return HdmiUtils.sparseArrayToList(mLocalDevices);
+!!!32821943.java!!!	pickPollCandidates(in pickStrategy : int) : List<Integer>
+        int strategy = pickStrategy & Constants.POLL_STRATEGY_MASK;
+        Predicate<Integer> pickPredicate = null;
+        switch (strategy) {
+            case Constants.POLL_STRATEGY_SYSTEM_AUDIO:
+                pickPredicate = mSystemAudioAddressPredicate;
+                break;
+            case Constants.POLL_STRATEGY_REMOTES_DEVICES:
+            default:  // The default is POLL_STRATEGY_REMOTES_DEVICES.
+                pickPredicate = mRemoteDeviceAddressPredicate;
+                break;
+        }
+
+        int iterationStrategy = pickStrategy & Constants.POLL_ITERATION_STRATEGY_MASK;
+        LinkedList<Integer> pollingCandidates = new LinkedList<>();
+        switch (iterationStrategy) {
+            case Constants.POLL_ITERATION_IN_ORDER:
+                for (int i = Constants.ADDR_TV; i <= Constants.ADDR_SPECIFIC_USE; ++i) {
+                    if (pickPredicate.apply(i)) {
+                        pollingCandidates.add(i);
+                    }
+                }
+                break;
+            case Constants.POLL_ITERATION_REVERSE_ORDER:
+            default:  // The default is reverse order.
+                for (int i = Constants.ADDR_SPECIFIC_USE; i >= Constants.ADDR_TV; --i) {
+                    if (pickPredicate.apply(i)) {
+                        pollingCandidates.add(i);
+                    }
+                }
+                break;
+        }
+        return pollingCandidates;
+!!!32822071.java!!!	isAllocatedLocalDeviceAddress(in address : int) : boolean
+        assertRunOnServiceThread();
+        for (int i = 0; i < mLocalDevices.size(); ++i) {
+            if (mLocalDevices.valueAt(i).isAddressOf(address)) {
+                return true;
+            }
+        }
+        return false;
+!!!32822199.java!!!	runDevicePolling(in sourceAddress : int, in candidates : List<Integer>, in retryCount : int, in callback : HdmiControlService::DevicePollingCallback, in allocated : List<Integer>) : void
+        assertRunOnServiceThread();
+        if (candidates.isEmpty()) {
+            if (callback != null) {
+                HdmiLogger.debug("[P]:AllocatedAddress=%s", allocated.toString());
+                callback.onPollingFinished(allocated);
+            }
+            return;
+        }
+
+        final Integer candidate = candidates.remove(0);
+        // Proceed polling action for the next address once polling action for the
+        // previous address is done.
+        runOnIoThread(new Runnable() {
+            @Override
+            public void run() {
+                if (sendPollMessage(sourceAddress, candidate, retryCount)) {
+                    allocated.add(candidate);
+                }
+                runOnServiceThread(new Runnable() {
+                    @Override
+                    public void run() {
+                        runDevicePolling(sourceAddress, candidates, retryCount, callback,
+                                allocated);
+                    }
+                });
+            }
+        });
+!!!32822327.java!!!	sendPollMessage(in sourceAddress : int, in destinationAddress : int, in retryCount : int) : boolean
+        assertRunOnIoThread();
+        for (int i = 0; i < retryCount; ++i) {
+            // <Polling Message> is a message which has empty body.
+            // If sending <Polling Message> failed (NAK), it becomes
+            // new logical address for the device because no device uses
+            // it as logical address of the device.
+            if (nativeSendCecCommand(mNativePtr, sourceAddress, destinationAddress, EMPTY_BODY)
+                    == Constants.SEND_RESULT_SUCCESS) {
+                return true;
+            }
+        }
+        return false;
+!!!32822455.java!!!	assertRunOnIoThread() : void
+        if (Looper.myLooper() != mIoHandler.getLooper()) {
+            throw new IllegalStateException("Should run on io thread.");
+        }
+!!!32822583.java!!!	assertRunOnServiceThread() : void
+        if (Looper.myLooper() != mControlHandler.getLooper()) {
+            throw new IllegalStateException("Should run on service thread.");
+        }
+!!!32822711.java!!!	runOnIoThread(inout runnable : Runnable) : void
+        mIoHandler.post(runnable);
+!!!32822839.java!!!	runOnServiceThread(inout runnable : Runnable) : void
+        mControlHandler.post(runnable);
+!!!32822967.java!!!	flush(in runnable : Runnable) : void
+        assertRunOnServiceThread();
+        runOnIoThread(new Runnable() {
+            @Override
+            public void run() {
+                // This ensures the runnable for cleanup is performed after all the pending
+                // commands are processed by IO thread.
+                runOnServiceThread(runnable);
+            }
+        });
+!!!32823095.java!!!	isAcceptableAddress(in address : int) : boolean
+        // Can access command targeting devices available in local device or broadcast command.
+        if (address == Constants.ADDR_BROADCAST) {
+            return true;
+        }
+        return isAllocatedLocalDeviceAddress(address);
+!!!32823223.java!!!	onReceiveCommand(inout message : HdmiCecMessage) : void
+        assertRunOnServiceThread();
+        if (isAcceptableAddress(message.getDestination()) && mService.handleCecCommand(message)) {
+            return;
+        }
+        // Not handled message, so we will reply it with <Feature Abort>.
+        maySendFeatureAbortCommand(message, Constants.ABORT_UNRECOGNIZED_OPCODE);
+!!!32823351.java!!!	maySendFeatureAbortCommand(inout message : HdmiCecMessage, in reason : int) : void
+        assertRunOnServiceThread();
+        // Swap the source and the destination.
+        int src = message.getDestination();
+        int dest = message.getSource();
+        if (src == Constants.ADDR_BROADCAST || dest == Constants.ADDR_UNREGISTERED) {
+            // Don't reply <Feature Abort> from the unregistered devices or for the broadcasted
+            // messages. See CEC 12.2 Protocol General Rules for detail.
+            return;
+        }
+        int originalOpcode = message.getOpcode();
+        if (originalOpcode == Constants.MESSAGE_FEATURE_ABORT) {
+            return;
+        }
+        sendCommand(
+                HdmiCecMessageBuilder.buildFeatureAbortCommand(src, dest, originalOpcode, reason));
+!!!32823479.java!!!	sendCommand(inout cecMessage : HdmiCecMessage) : void
+        assertRunOnServiceThread();
+        sendCommand(cecMessage, null);
+!!!32823607.java!!!	sendCommand(in cecMessage : HdmiCecMessage, in callback : HdmiControlService::SendMessageCallback) : void
+        assertRunOnServiceThread();
+        runOnIoThread(new Runnable() {
+            @Override
+            public void run() {
+                HdmiLogger.debug("[S]:" + cecMessage);
+                byte[] body = buildBody(cecMessage.getOpcode(), cecMessage.getParams());
+                int i = 0;
+                int errorCode = Constants.SEND_RESULT_SUCCESS;
+                do {
+                    errorCode = nativeSendCecCommand(mNativePtr, cecMessage.getSource(),
+                            cecMessage.getDestination(), body);
+                    if (errorCode == Constants.SEND_RESULT_SUCCESS) {
+                        break;
+                    }
+                } while (i++ < HdmiConfig.RETRANSMISSION_COUNT);
+
+                final int finalError = errorCode;
+                if (finalError != Constants.SEND_RESULT_SUCCESS) {
+                    Slog.w(TAG, "Failed to send " + cecMessage);
+                }
+                if (callback != null) {
+                    runOnServiceThread(new Runnable() {
+                        @Override
+                        public void run() {
+                            callback.onSendCompleted(finalError);
+                        }
+                    });
+                }
+            }
+        });
+!!!32823735.java!!!	handleIncomingCecCommand(in srcAddress : int, in dstAddress : int, inout body : byte) : void
+        assertRunOnServiceThread();
+        HdmiCecMessage command = HdmiCecMessageBuilder.of(srcAddress, dstAddress, body);
+        HdmiLogger.debug("[R]:" + command);
+        onReceiveCommand(command);
+!!!32823863.java!!!	handleHotplug(in port : int, inout connected : boolean) : void
+        assertRunOnServiceThread();
+        HdmiLogger.debug("Hotplug event:[port:%d, connected:%b]", port, connected);
+        mService.onHotplug(port, connected);
+!!!32823991.java!!!	dump(in pw : IndentingPrintWriter) : void
+        for (int i = 0; i < mLocalDevices.size(); ++i) {
+            pw.println("HdmiCecLocalDevice #" + i + ":");
+            pw.increaseIndent();
+            mLocalDevices.valueAt(i).dump(pw);
+            pw.decreaseIndent();
+        }

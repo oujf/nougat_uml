@@ -1,0 +1,132 @@
+class AudioStreamOut
+!!!40874551.cpp!!!	hwDev() : audio_hw_device_t
+    return audioHwDev->hwDevice();
+!!!40874807.cpp!!!	open(in handle : audio_io_handle_t, in devices : audio_devices_t, inout config : audio_config, in address : char) : status_t
+    audio_stream_out_t *outStream;
+
+    audio_output_flags_t customFlags = (config->format == AUDIO_FORMAT_IEC61937)
+                ? (audio_output_flags_t)(flags | AUDIO_OUTPUT_FLAG_IEC958_NONAUDIO)
+                : flags;
+
+    int status = hwDev()->open_output_stream(
+            hwDev(),
+            handle,
+            devices,
+            customFlags,
+            config,
+            &outStream,
+            address);
+    ALOGV("AudioStreamOut::open(), HAL returned "
+            " stream %p, sampleRate %d, Format %#x, "
+            "channelMask %#x, status %d",
+            outStream,
+            config->sample_rate,
+            config->format,
+            config->channel_mask,
+            status);
+
+    // Some HALs may not recognize AUDIO_FORMAT_IEC61937. But if we declare
+    // it as PCM then it will probably work.
+    if (status != NO_ERROR && config->format == AUDIO_FORMAT_IEC61937) {
+        struct audio_config customConfig = *config;
+        customConfig.format = AUDIO_FORMAT_PCM_16_BIT;
+
+        status = hwDev()->open_output_stream(
+                hwDev(),
+                handle,
+                devices,
+                customFlags,
+                &customConfig,
+                &outStream,
+                address);
+        ALOGV("AudioStreamOut::open(), treat IEC61937 as PCM, status = %d", status);
+    }
+
+    if (status == NO_ERROR) {
+        stream = outStream;
+        mHalFormatHasProportionalFrames = audio_has_proportional_frames(config->format);
+        mHalFrameSize = audio_stream_out_frame_size(stream);
+    }
+
+    return status;
+!!!40875063.cpp!!!	getRenderPosition(inout frames : uint32_t) : status_t
+    uint64_t position64 = 0;
+    status_t status = getRenderPosition(&position64);
+    if (status == NO_ERROR) {
+        *frames = (uint32_t)position64;
+    }
+    return status;
+!!!40875191.cpp!!!	getRenderPosition(inout frames : uint64_t) : status_t
+    if (stream == NULL) {
+        return NO_INIT;
+    }
+
+    uint32_t halPosition = 0;
+    status_t status = stream->get_render_position(stream, &halPosition);
+    if (status != NO_ERROR) {
+        return status;
+    }
+
+    // Maintain a 64-bit render position using the 32-bit result from the HAL.
+    // This delta calculation relies on the arithmetic overflow behavior
+    // of integers. For example (100 - 0xFFFFFFF0) = 116.
+    uint32_t truncatedPosition = (uint32_t)mRenderPosition;
+    int32_t deltaHalPosition = (int32_t)(halPosition - truncatedPosition);
+    if (deltaHalPosition > 0) {
+        mRenderPosition += deltaHalPosition;
+    }
+    // Scale from HAL sample rate to application rate.
+    *frames = mRenderPosition / mRateMultiplier;
+
+    return status;
+!!!40875319.cpp!!!	getPresentationPosition(inout frames : uint64_t, inout timestamp : timespec) : status_t
+    if (stream == NULL) {
+        return NO_INIT;
+    }
+
+    uint64_t halPosition = 0;
+    status_t status = stream->get_presentation_position(stream, &halPosition, timestamp);
+    if (status != NO_ERROR) {
+        return status;
+    }
+
+    // Adjust for standby using HAL rate frames.
+    // Only apply this correction if the HAL is getting PCM frames.
+    if (mHalFormatHasProportionalFrames) {
+        uint64_t adjustedPosition = (halPosition <= mFramesWrittenAtStandby) ?
+                0 : (halPosition - mFramesWrittenAtStandby);
+        // Scale from HAL sample rate to application rate.
+        *frames = adjustedPosition / mRateMultiplier;
+    } else {
+        // For offloaded MP3 and other compressed formats.
+        *frames = halPosition;
+    }
+
+    return status;
+!!!40875447.cpp!!!	write(in buffer : void, in numBytes : size_t) : ssize_t
+    ALOG_ASSERT(stream != NULL);
+    ssize_t bytesWritten = stream->write(stream, buffer, numBytes);
+    if (bytesWritten > 0 && mHalFrameSize > 0) {
+        mFramesWritten += bytesWritten / mHalFrameSize;
+    }
+    return bytesWritten;
+!!!40875703.cpp!!!	getFormat() : audio_format_t
+    return stream->common.get_format(&stream->common);
+!!!40875831.cpp!!!	getSampleRate() : uint32_t
+    return stream->common.get_sample_rate(&stream->common);
+!!!40875959.cpp!!!	getChannelMask() : audio_channel_mask_t
+    return stream->common.get_channels(&stream->common);
+!!!40876087.cpp!!!	flush() : status_t
+    ALOG_ASSERT(stream != NULL);
+    mRenderPosition = 0;
+    mFramesWritten = 0;
+    mFramesWrittenAtStandby = 0;
+    if (stream->flush != NULL) {
+        return stream->flush(stream);
+    }
+    return NO_ERROR;
+!!!40876215.cpp!!!	standby() : status_t
+    ALOG_ASSERT(stream != NULL);
+    mRenderPosition = 0;
+    mFramesWrittenAtStandby = mFramesWritten;
+    return stream->common.standby(&stream->common);

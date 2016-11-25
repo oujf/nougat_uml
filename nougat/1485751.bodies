@@ -1,0 +1,329 @@
+class NativeDaemonConnector
+!!!32200759.java!!!	NativeDaemonConnector(inout callbacks : INativeDaemonConnectorCallbacks, inout socket : String, in responseQueueSize : int, inout logTag : String, in maxLogSize : int, inout wl : PowerManager::WakeLock)
+        this(callbacks, socket, responseQueueSize, logTag, maxLogSize, wl,
+                FgThread.get().getLooper());
+!!!32200887.java!!!	NativeDaemonConnector(inout callbacks : INativeDaemonConnectorCallbacks, inout socket : String, in responseQueueSize : int, inout logTag : String, in maxLogSize : int, inout wl : PowerManager::WakeLock, inout looper : Looper)
+        mCallbacks = callbacks;
+        mSocket = socket;
+        mResponseQueue = new ResponseQueue(responseQueueSize);
+        mWakeLock = wl;
+        if (mWakeLock != null) {
+            mWakeLock.setReferenceCounted(true);
+        }
+        mLooper = looper;
+        mSequenceNumber = new AtomicInteger(0);
+        TAG = logTag != null ? logTag : "NativeDaemonConnector";
+        mLocalLog = new LocalLog(maxLogSize);
+!!!32201015.java!!!	setDebug(inout debug : boolean) : void
+        mDebug = debug;
+!!!32201143.java!!!	uptimeMillisInt() : int
+        return (int) SystemClock.uptimeMillis() & Integer.MAX_VALUE;
+!!!32201271.java!!!	setWarnIfHeld(inout warnIfHeld : Object) : void
+        Preconditions.checkState(mWarnIfHeld == null);
+        mWarnIfHeld = Preconditions.checkNotNull(warnIfHeld);
+!!!32201399.java!!!	run() : void
+        mCallbackHandler = new Handler(mLooper, this);
+
+        while (true) {
+            try {
+                listenToSocket();
+            } catch (Exception e) {
+                loge("Error in NativeDaemonConnector: " + e);
+                SystemClock.sleep(5000);
+            }
+        }
+!!!32201527.java!!!	handleMessage(inout msg : Message) : boolean
+        final String event = (String) msg.obj;
+        final int start = uptimeMillisInt();
+        final int sent = msg.arg1;
+        try {
+            if (!mCallbacks.onEvent(msg.what, event, NativeDaemonEvent.unescapeArgs(event))) {
+                log(String.format("Unhandled event '%s'", event));
+            }
+        } catch (Exception e) {
+            loge("Error handling '" + event + "': " + e);
+        } finally {
+            if (mCallbacks.onCheckHoldWakeLock(msg.what) && mWakeLock != null) {
+                mWakeLock.release();
+            }
+            final int end = uptimeMillisInt();
+            if (start > sent && start - sent > WARN_EXECUTE_DELAY_MS) {
+                loge(String.format("NDC event {%s} processed too late: %dms", event, start - sent));
+            }
+            if (end > start && end - start > WARN_EXECUTE_DELAY_MS) {
+                loge(String.format("NDC event {%s} took too long: %dms", event, end - start));
+            }
+        }
+        return true;
+!!!32201655.java!!!	determineSocketAddress() : LocalSocketAddress
+        // If we're testing, set up a socket in a namespace that's accessible to test code.
+        // In order to ensure that unprivileged apps aren't able to impersonate native daemons on
+        // production devices, even if said native daemons ill-advisedly pick a socket name that
+        // starts with __test__, only allow this on debug builds.
+        if (mSocket.startsWith("__test__") && Build.IS_DEBUGGABLE) {
+            return new LocalSocketAddress(mSocket);
+        } else {
+            return new LocalSocketAddress(mSocket, LocalSocketAddress.Namespace.RESERVED);
+        }
+!!!32201783.java!!!	listenToSocket() : void
+        LocalSocket socket = null;
+
+        try {
+            socket = new LocalSocket();
+            LocalSocketAddress address = determineSocketAddress();
+
+            socket.connect(address);
+
+            InputStream inputStream = socket.getInputStream();
+            synchronized (mDaemonLock) {
+                mOutputStream = socket.getOutputStream();
+            }
+
+            mCallbacks.onDaemonConnected();
+
+            FileDescriptor[] fdList = null;
+            byte[] buffer = new byte[BUFFER_SIZE];
+            int start = 0;
+
+            while (true) {
+                int count = inputStream.read(buffer, start, BUFFER_SIZE - start);
+                if (count < 0) {
+                    loge("got " + count + " reading with start = " + start);
+                    break;
+                }
+                fdList = socket.getAncillaryFileDescriptors();
+
+                // Add our starting point to the count and reset the start.
+                count += start;
+                start = 0;
+
+                for (int i = 0; i < count; i++) {
+                    if (buffer[i] == 0) {
+                        // Note - do not log this raw message since it may contain
+                        // sensitive data
+                        final String rawEvent = new String(
+                                buffer, start, i - start, StandardCharsets.UTF_8);
+
+                        boolean releaseWl = false;
+                        try {
+                            final NativeDaemonEvent event =
+                                    NativeDaemonEvent.parseRawEvent(rawEvent, fdList);
+
+                            log("RCV <- {" + event + "}");
+
+                            if (event.isClassUnsolicited()) {
+                                // TODO: migrate to sending NativeDaemonEvent instances
+                                if (mCallbacks.onCheckHoldWakeLock(event.getCode())
+                                        && mWakeLock != null) {
+                                    mWakeLock.acquire();
+                                    releaseWl = true;
+                                }
+                                Message msg = mCallbackHandler.obtainMessage(
+                                        event.getCode(), uptimeMillisInt(), 0, event.getRawEvent());
+                                if (mCallbackHandler.sendMessage(msg)) {
+                                    releaseWl = false;
+                                }
+                            } else {
+                                mResponseQueue.add(event.getCmdNumber(), event);
+                            }
+                        } catch (IllegalArgumentException e) {
+                            log("Problem parsing message " + e);
+                        } finally {
+                            if (releaseWl) {
+                                mWakeLock.release();
+                            }
+                        }
+
+                        start = i + 1;
+                    }
+                }
+
+                if (start == 0) {
+                    log("RCV incomplete");
+                }
+
+                // We should end at the amount we read. If not, compact then
+                // buffer and read again.
+                if (start != count) {
+                    final int remaining = BUFFER_SIZE - start;
+                    System.arraycopy(buffer, start, buffer, 0, remaining);
+                    start = remaining;
+                } else {
+                    start = 0;
+                }
+            }
+        } catch (IOException ex) {
+            loge("Communications error: " + ex);
+            throw ex;
+        } finally {
+            synchronized (mDaemonLock) {
+                if (mOutputStream != null) {
+                    try {
+                        loge("closing stream for " + mSocket);
+                        mOutputStream.close();
+                    } catch (IOException e) {
+                        loge("Failed closing output stream: " + e);
+                    }
+                    mOutputStream = null;
+                }
+            }
+
+            try {
+                if (socket != null) {
+                    socket.close();
+                }
+            } catch (IOException ex) {
+                loge("Failed closing socket: " + ex);
+            }
+        }
+!!!32202167.java!!!	makeCommand(inout rawBuilder : StringBuilder, inout logBuilder : StringBuilder, in sequenceNumber : int, inout cmd : String, inout  : Object...args) : void
+        if (cmd.indexOf('\0') >= 0) {
+            throw new IllegalArgumentException("Unexpected command: " + cmd);
+        }
+        if (cmd.indexOf(' ') >= 0) {
+            throw new IllegalArgumentException("Arguments must be separate from command");
+        }
+
+        rawBuilder.append(sequenceNumber).append(' ').append(cmd);
+        logBuilder.append(sequenceNumber).append(' ').append(cmd);
+        for (Object arg : args) {
+            final String argString = String.valueOf(arg);
+            if (argString.indexOf('\0') >= 0) {
+                throw new IllegalArgumentException("Unexpected argument: " + arg);
+            }
+
+            rawBuilder.append(' ');
+            logBuilder.append(' ');
+
+            appendEscaped(rawBuilder, argString);
+            if (arg instanceof SensitiveArg) {
+                logBuilder.append("[scrubbed]");
+            } else {
+                appendEscaped(logBuilder, argString);
+            }
+        }
+
+        rawBuilder.append('\0');
+!!!32202295.java!!!	waitForCallbacks() : void
+        if (Thread.currentThread() == mLooper.getThread()) {
+            throw new IllegalStateException("Must not call this method on callback thread");
+        }
+
+        final CountDownLatch latch = new CountDownLatch(1);
+        mCallbackHandler.post(new Runnable() {
+            @Override
+            public void run() {
+                latch.countDown();
+            }
+        });
+        try {
+            latch.await();
+        } catch (InterruptedException e) {
+            Slog.wtf(TAG, "Interrupted while waiting for unsolicited response handling", e);
+        }
+!!!32202423.java!!!	execute(inout cmd : NativeDaemonConnector::Command) : NativeDaemonEvent
+        return execute(cmd.mCmd, cmd.mArguments.toArray());
+!!!32202551.java!!!	execute(inout cmd : String, inout  : Object...args) : NativeDaemonEvent
+        return execute(DEFAULT_TIMEOUT, cmd, args);
+!!!32202679.java!!!	execute(in timeoutMs : long, inout cmd : String, inout  : Object...args) : NativeDaemonEvent
+        final NativeDaemonEvent[] events = executeForList(timeoutMs, cmd, args);
+        if (events.length != 1) {
+            throw new NativeDaemonConnectorException(
+                    "Expected exactly one response, but received " + events.length);
+        }
+        return events[0];
+!!!32202807.java!!!	executeForList(inout cmd : NativeDaemonConnector::Command) : NativeDaemonEvent
+        return executeForList(cmd.mCmd, cmd.mArguments.toArray());
+!!!32202935.java!!!	executeForList(inout cmd : String, inout  : Object...args) : NativeDaemonEvent
+        return executeForList(DEFAULT_TIMEOUT, cmd, args);
+!!!32203063.java!!!	executeForList(in timeoutMs : long, inout cmd : String, inout  : Object...args) : NativeDaemonEvent
+        if (mWarnIfHeld != null && Thread.holdsLock(mWarnIfHeld)) {
+            Slog.wtf(TAG, "Calling thread " + Thread.currentThread().getName() + " is holding 0x"
+                    + Integer.toHexString(System.identityHashCode(mWarnIfHeld)), new Throwable());
+        }
+
+        final long startTime = SystemClock.elapsedRealtime();
+
+        final ArrayList<NativeDaemonEvent> events = Lists.newArrayList();
+
+        final StringBuilder rawBuilder = new StringBuilder();
+        final StringBuilder logBuilder = new StringBuilder();
+        final int sequenceNumber = mSequenceNumber.incrementAndGet();
+
+        makeCommand(rawBuilder, logBuilder, sequenceNumber, cmd, args);
+
+        final String rawCmd = rawBuilder.toString();
+        final String logCmd = logBuilder.toString();
+
+        log("SND -> {" + logCmd + "}");
+
+        synchronized (mDaemonLock) {
+            if (mOutputStream == null) {
+                throw new NativeDaemonConnectorException("missing output stream");
+            } else {
+                try {
+                    mOutputStream.write(rawCmd.getBytes(StandardCharsets.UTF_8));
+                } catch (IOException e) {
+                    throw new NativeDaemonConnectorException("problem sending command", e);
+                }
+            }
+        }
+
+        NativeDaemonEvent event = null;
+        do {
+            event = mResponseQueue.remove(sequenceNumber, timeoutMs, logCmd);
+            if (event == null) {
+                loge("timed-out waiting for response to " + logCmd);
+                throw new NativeDaemonTimeoutException(logCmd, event);
+            }
+            if (VDBG) log("RMV <- {" + event + "}");
+            events.add(event);
+        } while (event.isClassContinue());
+
+        final long endTime = SystemClock.elapsedRealtime();
+        if (endTime - startTime > WARN_EXECUTE_DELAY_MS) {
+            loge("NDC Command {" + logCmd + "} took too long (" + (endTime - startTime) + "ms)");
+        }
+
+        if (event.isClassClientError()) {
+            throw new NativeDaemonArgumentException(logCmd, event);
+        }
+        if (event.isClassServerError()) {
+            throw new NativeDaemonFailureException(logCmd, event);
+        }
+
+        return events.toArray(new NativeDaemonEvent[events.size()]);
+!!!32203191.java!!!	appendEscaped(inout builder : StringBuilder, inout arg : String) : void
+        final boolean hasSpaces = arg.indexOf(' ') >= 0;
+        if (hasSpaces) {
+            builder.append('"');
+        }
+
+        final int length = arg.length();
+        for (int i = 0; i < length; i++) {
+            final char c = arg.charAt(i);
+
+            if (c == '"') {
+                builder.append("\\\"");
+            } else if (c == '\\') {
+                builder.append("\\\\");
+            } else {
+                builder.append(c);
+            }
+        }
+
+        if (hasSpaces) {
+            builder.append('"');
+        }
+!!!32204727.java!!!	monitor() : void
+        synchronized (mDaemonLock) { }
+!!!32204855.java!!!	dump(inout fd : FileDescriptor, inout pw : PrintWriter, inout args : String) : void
+        mLocalLog.dump(fd, pw, args);
+        pw.println();
+        mResponseQueue.dump(fd, pw, args);
+!!!32204983.java!!!	log(inout logstring : String) : void
+        if (mDebug) Slog.d(TAG, logstring);
+        mLocalLog.log(logstring);
+!!!32205111.java!!!	loge(inout logstring : String) : void
+        Slog.e(TAG, logstring);
+        mLocalLog.log(logstring);

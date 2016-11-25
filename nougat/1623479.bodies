@@ -1,0 +1,119 @@
+class WallpaperObserver
+!!!33645495.java!!!	WallpaperObserver(inout wallpaper : WallpaperManagerService::WallpaperData)
+            super(getWallpaperDir(wallpaper.userId).getAbsolutePath(),
+                    CLOSE_WRITE | MOVED_TO | DELETE | DELETE_SELF);
+            mUserId = wallpaper.userId;
+            mWallpaperDir = getWallpaperDir(wallpaper.userId);
+            mWallpaper = wallpaper;
+            mWallpaperFile = new File(mWallpaperDir, WALLPAPER);
+            mWallpaperLockFile = new File(mWallpaperDir, WALLPAPER_LOCK_ORIG);
+            mWallpaperInfoFile = new File(mWallpaperDir, WALLPAPER_INFO);
+!!!33645623.java!!!	dataForEvent(inout sysChanged : boolean, inout lockChanged : boolean) : WallpaperManagerService::WallpaperData
+            WallpaperData wallpaper = null;
+            synchronized (mLock) {
+                if (lockChanged) {
+                    wallpaper = mLockWallpaperMap.get(mUserId);
+                }
+                if (wallpaper == null) {
+                    // no lock-specific wallpaper exists, or sys case, handled together
+                    wallpaper = mWallpaperMap.get(mUserId);
+                }
+            }
+            return (wallpaper != null) ? wallpaper : mWallpaper;
+!!!33645751.java!!!	onEvent(in event : int, inout path : String) : void
+            if (path == null) {
+                return;
+            }
+            final boolean moved = (event == MOVED_TO);
+            final boolean written = (event == CLOSE_WRITE || moved);
+            final File changedFile = new File(mWallpaperDir, path);
+
+            // System and system+lock changes happen on the system wallpaper input file;
+            // lock-only changes happen on the dedicated lock wallpaper input file
+            final boolean sysWallpaperChanged = (mWallpaperFile.equals(changedFile));
+            final boolean lockWallpaperChanged = (mWallpaperLockFile.equals(changedFile));
+            WallpaperData wallpaper = dataForEvent(sysWallpaperChanged, lockWallpaperChanged);
+
+            if (DEBUG) {
+                Slog.v(TAG, "Wallpaper file change: evt=" + event
+                        + " path=" + path
+                        + " sys=" + sysWallpaperChanged
+                        + " lock=" + lockWallpaperChanged
+                        + " imagePending=" + wallpaper.imageWallpaperPending
+                        + " whichPending=0x" + Integer.toHexString(wallpaper.whichPending)
+                        + " written=" + written);
+            }
+
+            if (moved && lockWallpaperChanged) {
+                // We just migrated sys -> lock to preserve imagery for an impending
+                // new system-only wallpaper.  Tell keyguard about it and make sure it
+                // has the right SELinux label.
+                if (DEBUG) {
+                    Slog.i(TAG, "Sys -> lock MOVED_TO");
+                }
+                SELinux.restorecon(changedFile);
+                notifyLockWallpaperChanged();
+                return;
+            }
+
+            synchronized (mLock) {
+                if (sysWallpaperChanged || lockWallpaperChanged) {
+                    notifyCallbacksLocked(wallpaper);
+                    if (wallpaper.wallpaperComponent == null
+                            || event != CLOSE_WRITE // includes the MOVED_TO case
+                            || wallpaper.imageWallpaperPending) {
+                        if (written) {
+                            // The image source has finished writing the source image,
+                            // so we now produce the crop rect (in the background), and
+                            // only publish the new displayable (sub)image as a result
+                            // of that work.
+                            if (DEBUG) {
+                                Slog.v(TAG, "Wallpaper written; generating crop");
+                            }
+                            if (moved) {
+                                // This is a restore, so generate the crop using any just-restored new
+                                // crop guidelines, making sure to preserve our local dimension hints.
+                                // We also make sure to reapply the correct SELinux label.
+                                if (DEBUG) {
+                                    Slog.v(TAG, "moved-to, therefore restore; reloading metadata");
+                                }
+                                SELinux.restorecon(changedFile);
+                                loadSettingsLocked(wallpaper.userId, true);
+                            }
+                            generateCrop(wallpaper);
+                            if (DEBUG) {
+                                Slog.v(TAG, "Crop done; invoking completion callback");
+                            }
+                            wallpaper.imageWallpaperPending = false;
+                            if (wallpaper.setComplete != null) {
+                                try {
+                                    wallpaper.setComplete.onWallpaperChanged();
+                                } catch (RemoteException e) {
+                                    // if this fails we don't really care; the setting app may just
+                                    // have crashed and that sort of thing is a fact of life.
+                                }
+                            }
+                            if (sysWallpaperChanged) {
+                                // If this was the system wallpaper, rebind...
+                                bindWallpaperComponentLocked(mImageWallpaper, true,
+                                        false, wallpaper, null);
+                            }
+                            if (lockWallpaperChanged
+                                    || (wallpaper.whichPending & FLAG_LOCK) != 0) {
+                                if (DEBUG) {
+                                    Slog.i(TAG, "Lock-relevant wallpaper changed");
+                                }
+                                // either a lock-only wallpaper commit or a system+lock event.
+                                // if it's system-plus-lock we need to wipe the lock bookkeeping;
+                                // we're falling back to displaying the system wallpaper there.
+                                if (!lockWallpaperChanged) {
+                                    mLockWallpaperMap.remove(wallpaper.userId);
+                                }
+                                // and in any case, tell keyguard about it
+                                notifyLockWallpaperChanged();
+                            }
+                            saveSettingsLocked(wallpaper.userId);
+                        }
+                    }
+                }
+            }

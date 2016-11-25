@@ -1,0 +1,684 @@
+class UsageStatsService
+!!!34204471.java!!!	UsageStatsService(inout context : Context)
+        super(context);
+!!!34204599.java!!!	onStart() : void
+        mAppOps = (AppOpsManager) getContext().getSystemService(Context.APP_OPS_SERVICE);
+        mUserManager = (UserManager) getContext().getSystemService(Context.USER_SERVICE);
+        mPackageManager = getContext().getPackageManager();
+        mHandler = new H(BackgroundThread.get().getLooper());
+
+        File systemDataDir = new File(Environment.getDataDirectory(), "system");
+        mUsageStatsDir = new File(systemDataDir, "usagestats");
+        mUsageStatsDir.mkdirs();
+        if (!mUsageStatsDir.exists()) {
+            throw new IllegalStateException("Usage stats directory does not exist: "
+                    + mUsageStatsDir.getAbsolutePath());
+        }
+
+        IntentFilter filter = new IntentFilter(Intent.ACTION_USER_REMOVED);
+        filter.addAction(Intent.ACTION_USER_STARTED);
+        getContext().registerReceiverAsUser(new UserActionsReceiver(), UserHandle.ALL, filter,
+                null, mHandler);
+
+        IntentFilter packageFilter = new IntentFilter();
+        packageFilter.addAction(Intent.ACTION_PACKAGE_ADDED);
+        packageFilter.addAction(Intent.ACTION_PACKAGE_CHANGED);
+        packageFilter.addAction(Intent.ACTION_PACKAGE_REMOVED);
+        packageFilter.addDataScheme("package");
+
+        getContext().registerReceiverAsUser(new PackageReceiver(), UserHandle.ALL, packageFilter,
+                null, mHandler);
+
+        mAppIdleEnabled = getContext().getResources().getBoolean(
+                com.android.internal.R.bool.config_enableAutoPowerModes);
+        if (mAppIdleEnabled) {
+            IntentFilter deviceStates = new IntentFilter(BatteryManager.ACTION_CHARGING);
+            deviceStates.addAction(BatteryManager.ACTION_DISCHARGING);
+            deviceStates.addAction(PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED);
+            getContext().registerReceiver(new DeviceStateReceiver(), deviceStates);
+        }
+
+        synchronized (mLock) {
+            cleanUpRemovedUsersLocked();
+            mAppIdleHistory = new AppIdleHistory(SystemClock.elapsedRealtime());
+        }
+
+        mRealTimeSnapshot = SystemClock.elapsedRealtime();
+        mSystemTimeSnapshot = System.currentTimeMillis();
+
+        publishLocalService(UsageStatsManagerInternal.class, new LocalService());
+        publishBinderService(Context.USAGE_STATS_SERVICE, new BinderService());
+!!!34204727.java!!!	onBootPhase(in phase : int) : void
+        if (phase == PHASE_SYSTEM_SERVICES_READY) {
+            // Observe changes to the threshold
+            SettingsObserver settingsObserver = new SettingsObserver(mHandler);
+            settingsObserver.registerObserver();
+            settingsObserver.updateSettings();
+
+            mAppWidgetManager = getContext().getSystemService(AppWidgetManager.class);
+            mDeviceIdleController = IDeviceIdleController.Stub.asInterface(
+                    ServiceManager.getService(Context.DEVICE_IDLE_CONTROLLER));
+            mBatteryStats = IBatteryStats.Stub.asInterface(
+                    ServiceManager.getService(BatteryStats.SERVICE_NAME));
+            mDisplayManager = (DisplayManager) getContext().getSystemService(
+                    Context.DISPLAY_SERVICE);
+            mPowerManager = getContext().getSystemService(PowerManager.class);
+
+            mDisplayManager.registerDisplayListener(mDisplayListener, mHandler);
+            synchronized (mLock) {
+                mAppIdleHistory.updateDisplayLocked(isDisplayOn(), SystemClock.elapsedRealtime());
+            }
+
+            if (mPendingOneTimeCheckIdleStates) {
+                postOneTimeCheckIdleStates();
+            }
+
+            mSystemServicesReady = true;
+        } else if (phase == PHASE_BOOT_COMPLETED) {
+            setAppIdleParoled(getContext().getSystemService(BatteryManager.class).isCharging());
+        }
+!!!34204855.java!!!	isDisplayOn() : boolean
+        return mDisplayManager
+                .getDisplay(Display.DEFAULT_DISPLAY).getState() == Display.STATE_ON;
+!!!34205367.java!!!	onStatsUpdated() : void
+        mHandler.sendEmptyMessageDelayed(MSG_FLUSH_TO_DISK, FLUSH_INTERVAL);
+!!!34205495.java!!!	onStatsReloaded() : void
+        postOneTimeCheckIdleStates();
+!!!34205623.java!!!	onNewUpdate(in userId : int) : void
+        initializeDefaultsForSystemApps(userId);
+!!!34205751.java!!!	initializeDefaultsForSystemApps(in userId : int) : void
+        Slog.d(TAG, "Initializing defaults for system apps on user " + userId);
+        final long elapsedRealtime = SystemClock.elapsedRealtime();
+        List<PackageInfo> packages = mPackageManager.getInstalledPackagesAsUser(
+                PackageManager.MATCH_DISABLED_COMPONENTS,
+                userId);
+        final int packageCount = packages.size();
+        for (int i = 0; i < packageCount; i++) {
+            final PackageInfo pi = packages.get(i);
+            String packageName = pi.packageName;
+            if (pi.applicationInfo != null && pi.applicationInfo.isSystemApp()) {
+                mAppIdleHistory.reportUsageLocked(packageName, userId, elapsedRealtime);
+            }
+        }
+!!!34205879.java!!!	clearAppIdleForPackage(inout packageName : String, in userId : int) : void
+        synchronized (mLock) {
+            mAppIdleHistory.clearUsageLocked(packageName, userId);
+        }
+!!!34206007.java!!!	cleanUpRemovedUsersLocked() : void
+        final List<UserInfo> users = mUserManager.getUsers(true);
+        if (users == null || users.size() == 0) {
+            throw new IllegalStateException("There can't be no users");
+        }
+
+        ArraySet<String> toDelete = new ArraySet<>();
+        String[] fileNames = mUsageStatsDir.list();
+        if (fileNames == null) {
+            // No users to delete.
+            return;
+        }
+
+        toDelete.addAll(Arrays.asList(fileNames));
+
+        final int userCount = users.size();
+        for (int i = 0; i < userCount; i++) {
+            final UserInfo userInfo = users.get(i);
+            toDelete.remove(Integer.toString(userInfo.id));
+        }
+
+        final int deleteCount = toDelete.size();
+        for (int i = 0; i < deleteCount; i++) {
+            deleteRecursively(new File(mUsageStatsDir, toDelete.valueAt(i)));
+        }
+!!!34206135.java!!!	setAppIdleParoled(inout paroled : boolean) : void
+        synchronized (mLock) {
+            if (mAppIdleParoled != paroled) {
+                mAppIdleParoled = paroled;
+                if (DEBUG) Slog.d(TAG, "Changing paroled to " + mAppIdleParoled);
+                if (paroled) {
+                    postParoleEndTimeout();
+                } else {
+                    mLastAppIdleParoledTime = checkAndGetTimeLocked();
+                    postNextParoleTimeout();
+                }
+                postParoleStateChanged();
+            }
+        }
+!!!34206263.java!!!	postNextParoleTimeout() : void
+        if (DEBUG) Slog.d(TAG, "Posting MSG_CHECK_PAROLE_TIMEOUT");
+        mHandler.removeMessages(MSG_CHECK_PAROLE_TIMEOUT);
+        // Compute when the next parole needs to happen. We check more frequently than necessary
+        // since the message handler delays are based on elapsedRealTime and not wallclock time.
+        // The comparison is done in wallclock time.
+        long timeLeft = (mLastAppIdleParoledTime + mAppIdleParoleIntervalMillis)
+                - checkAndGetTimeLocked();
+        if (timeLeft < 0) {
+            timeLeft = 0;
+        }
+        mHandler.sendEmptyMessageDelayed(MSG_CHECK_PAROLE_TIMEOUT, timeLeft);
+!!!34206391.java!!!	postParoleEndTimeout() : void
+        if (DEBUG) Slog.d(TAG, "Posting MSG_PAROLE_END_TIMEOUT");
+        mHandler.removeMessages(MSG_PAROLE_END_TIMEOUT);
+        mHandler.sendEmptyMessageDelayed(MSG_PAROLE_END_TIMEOUT, mAppIdleParoleDurationMillis);
+!!!34206519.java!!!	postParoleStateChanged() : void
+        if (DEBUG) Slog.d(TAG, "Posting MSG_PAROLE_STATE_CHANGED");
+        mHandler.removeMessages(MSG_PAROLE_STATE_CHANGED);
+        mHandler.sendEmptyMessage(MSG_PAROLE_STATE_CHANGED);
+!!!34206647.java!!!	postCheckIdleStates(in userId : int) : void
+        mHandler.sendMessage(mHandler.obtainMessage(MSG_CHECK_IDLE_STATES, userId, 0));
+!!!34206775.java!!!	postOneTimeCheckIdleStates() : void
+        if (mDeviceIdleController == null) {
+            // Not booted yet; wait for it!
+            mPendingOneTimeCheckIdleStates = true;
+        } else {
+            mHandler.sendEmptyMessage(MSG_ONE_TIME_CHECK_IDLE_STATES);
+            mPendingOneTimeCheckIdleStates = false;
+        }
+!!!34206903.java!!!	checkIdleStates(in checkUserId : int) : boolean
+        if (!mAppIdleEnabled) {
+            return false;
+        }
+
+        final int[] runningUserIds;
+        try {
+            runningUserIds = ActivityManagerNative.getDefault().getRunningUserIds();
+            if (checkUserId != UserHandle.USER_ALL
+                    && !ArrayUtils.contains(runningUserIds, checkUserId)) {
+                return false;
+            }
+        } catch (RemoteException re) {
+            throw re.rethrowFromSystemServer();
+        }
+
+        final long elapsedRealtime = SystemClock.elapsedRealtime();
+        for (int i = 0; i < runningUserIds.length; i++) {
+            final int userId = runningUserIds[i];
+            if (checkUserId != UserHandle.USER_ALL && checkUserId != userId) {
+                continue;
+            }
+            if (DEBUG) {
+                Slog.d(TAG, "Checking idle state for user " + userId);
+            }
+            List<PackageInfo> packages = mPackageManager.getInstalledPackagesAsUser(
+                    PackageManager.MATCH_DISABLED_COMPONENTS,
+                    userId);
+            final int packageCount = packages.size();
+            for (int p = 0; p < packageCount; p++) {
+                final PackageInfo pi = packages.get(p);
+                final String packageName = pi.packageName;
+                final boolean isIdle = isAppIdleFiltered(packageName,
+                        UserHandle.getAppId(pi.applicationInfo.uid),
+                        userId, elapsedRealtime);
+                mHandler.sendMessage(mHandler.obtainMessage(MSG_INFORM_LISTENERS,
+                        userId, isIdle ? 1 : 0, packageName));
+                if (isIdle) {
+                    synchronized (mLock) {
+                        mAppIdleHistory.setIdle(packageName, userId, elapsedRealtime);
+                    }
+                }
+            }
+        }
+        if (DEBUG) {
+            Slog.d(TAG, "checkIdleStates took "
+                    + (SystemClock.elapsedRealtime() - elapsedRealtime));
+        }
+        return true;
+!!!34207031.java!!!	checkParoleTimeout() : void
+        synchronized (mLock) {
+            if (!mAppIdleParoled) {
+                final long timeSinceLastParole = checkAndGetTimeLocked() - mLastAppIdleParoledTime;
+                if (timeSinceLastParole > mAppIdleParoleIntervalMillis) {
+                    if (DEBUG) Slog.d(TAG, "Crossed default parole interval");
+                    setAppIdleParoled(true);
+                } else {
+                    if (DEBUG) Slog.d(TAG, "Not long enough to go to parole");
+                    postNextParoleTimeout();
+                }
+            }
+        }
+!!!34207159.java!!!	notifyBatteryStats(inout packageName : String, in userId : int, inout idle : boolean) : void
+        try {
+            final int uid = mPackageManager.getPackageUidAsUser(packageName,
+                    PackageManager.MATCH_UNINSTALLED_PACKAGES, userId);
+            if (idle) {
+                mBatteryStats.noteEvent(BatteryStats.HistoryItem.EVENT_PACKAGE_INACTIVE,
+                        packageName, uid);
+            } else {
+                mBatteryStats.noteEvent(BatteryStats.HistoryItem.EVENT_PACKAGE_ACTIVE,
+                        packageName, uid);
+            }
+        } catch (NameNotFoundException | RemoteException e) {
+        }
+!!!34207287.java!!!	onDeviceIdleModeChanged() : void
+        final boolean deviceIdle = mPowerManager.isDeviceIdleMode();
+        if (DEBUG) Slog.i(TAG, "DeviceIdleMode changed to " + deviceIdle);
+        synchronized (mLock) {
+            final long timeSinceLastParole = checkAndGetTimeLocked() - mLastAppIdleParoledTime;
+            if (!deviceIdle
+                    && timeSinceLastParole >= mAppIdleParoleIntervalMillis) {
+                if (DEBUG) Slog.i(TAG, "Bringing idle apps out of inactive state due to deviceIdleMode=false");
+                setAppIdleParoled(true);
+            } else if (deviceIdle) {
+                if (DEBUG) Slog.i(TAG, "Device idle, back to prison");
+                setAppIdleParoled(false);
+            }
+        }
+!!!34207415.java!!!	deleteRecursively(inout f : File) : void
+        File[] files = f.listFiles();
+        if (files != null) {
+            for (File subFile : files) {
+                deleteRecursively(subFile);
+            }
+        }
+
+        if (!f.delete()) {
+            Slog.e(TAG, "Failed to delete " + f);
+        }
+!!!34207543.java!!!	getUserDataAndInitializeIfNeededLocked(in userId : int, in currentTimeMillis : long) : UserUsageStatsService
+        UserUsageStatsService service = mUserState.get(userId);
+        if (service == null) {
+            service = new UserUsageStatsService(getContext(), userId,
+                    new File(mUsageStatsDir, Integer.toString(userId)), this);
+            service.init(currentTimeMillis);
+            mUserState.put(userId, service);
+        }
+        return service;
+!!!34207671.java!!!	checkAndGetTimeLocked() : long
+        final long actualSystemTime = System.currentTimeMillis();
+        final long actualRealtime = SystemClock.elapsedRealtime();
+        final long expectedSystemTime = (actualRealtime - mRealTimeSnapshot) + mSystemTimeSnapshot;
+        final long diffSystemTime = actualSystemTime - expectedSystemTime;
+        if (Math.abs(diffSystemTime) > TIME_CHANGE_THRESHOLD_MILLIS) {
+            // The time has changed.
+            Slog.i(TAG, "Time changed in UsageStats by " + (diffSystemTime / 1000) + " seconds");
+            final int userCount = mUserState.size();
+            for (int i = 0; i < userCount; i++) {
+                final UserUsageStatsService service = mUserState.valueAt(i);
+                service.onTimeChanged(expectedSystemTime, actualSystemTime);
+            }
+            mRealTimeSnapshot = actualRealtime;
+            mSystemTimeSnapshot = actualSystemTime;
+        }
+        return actualSystemTime;
+!!!34207799.java!!!	convertToSystemTimeLocked(inout event : UsageEvents::Event) : void
+        event.mTimeStamp = Math.max(0, event.mTimeStamp - mRealTimeSnapshot) + mSystemTimeSnapshot;
+!!!34207927.java!!!	shutdown() : void
+        synchronized (mLock) {
+            mHandler.removeMessages(MSG_REPORT_EVENT);
+            flushToDiskLocked();
+        }
+!!!34208055.java!!!	reportEvent(inout event : UsageEvents::Event, in userId : int) : void
+        synchronized (mLock) {
+            final long timeNow = checkAndGetTimeLocked();
+            final long elapsedRealtime = SystemClock.elapsedRealtime();
+            convertToSystemTimeLocked(event);
+
+            final UserUsageStatsService service =
+                    getUserDataAndInitializeIfNeededLocked(userId, timeNow);
+            // TODO: Ideally this should call isAppIdleFiltered() to avoid calling back
+            // about apps that are on some kind of whitelist anyway.
+            final boolean previouslyIdle = mAppIdleHistory.isIdleLocked(
+                    event.mPackage, userId, elapsedRealtime);
+            service.reportEvent(event);
+            // Inform listeners if necessary
+            if ((event.mEventType == Event.MOVE_TO_FOREGROUND
+                    || event.mEventType == Event.MOVE_TO_BACKGROUND
+                    || event.mEventType == Event.SYSTEM_INTERACTION
+                    || event.mEventType == Event.USER_INTERACTION)) {
+                mAppIdleHistory.reportUsageLocked(event.mPackage, userId, elapsedRealtime);
+                if (previouslyIdle) {
+                    mHandler.sendMessage(mHandler.obtainMessage(MSG_INFORM_LISTENERS, userId,
+                            /* idle = */ 0, event.mPackage));
+                    notifyBatteryStats(event.mPackage, userId, false);
+                }
+            }
+        }
+!!!34208183.java!!!	reportContentProviderUsage(inout authority : String, inout providerPkgName : String, in userId : int) : void
+        // Get sync adapters for the authority
+        String[] packages = ContentResolver.getSyncAdapterPackagesForAuthorityAsUser(
+                authority, userId);
+        for (String packageName: packages) {
+            // Only force the sync adapters to active if the provider is not in the same package and
+            // the sync adapter is a system package.
+            try {
+                PackageInfo pi = mPackageManager.getPackageInfoAsUser(
+                        packageName, PackageManager.MATCH_SYSTEM_ONLY, userId);
+                if (pi == null || pi.applicationInfo == null) {
+                    continue;
+                }
+                if (!packageName.equals(providerPkgName)) {
+                    forceIdleState(packageName, userId, false);
+                }
+            } catch (NameNotFoundException e) {
+                // Shouldn't happen
+            }
+        }
+!!!34208311.java!!!	forceIdleState(inout packageName : String, in userId : int, inout idle : boolean) : void
+        final int appId = getAppId(packageName);
+        if (appId < 0) return;
+        synchronized (mLock) {
+            final long elapsedRealtime = SystemClock.elapsedRealtime();
+
+            final boolean previouslyIdle = isAppIdleFiltered(packageName, appId,
+                    userId, elapsedRealtime);
+            mAppIdleHistory.setIdleLocked(packageName, userId, idle, elapsedRealtime);
+            final boolean stillIdle = isAppIdleFiltered(packageName, appId,
+                    userId, elapsedRealtime);
+            // Inform listeners if necessary
+            if (previouslyIdle != stillIdle) {
+                mHandler.sendMessage(mHandler.obtainMessage(MSG_INFORM_LISTENERS, userId,
+                        /* idle = */ stillIdle ? 1 : 0, packageName));
+                if (!stillIdle) {
+                    notifyBatteryStats(packageName, userId, idle);
+                }
+            }
+        }
+!!!34208439.java!!!	flushToDisk() : void
+        synchronized (mLock) {
+            flushToDiskLocked();
+        }
+!!!34208567.java!!!	onUserRemoved(in userId : int) : void
+        synchronized (mLock) {
+            Slog.i(TAG, "Removing user " + userId + " and all data.");
+            mUserState.remove(userId);
+            mAppIdleHistory.onUserRemoved(userId);
+            cleanUpRemovedUsersLocked();
+        }
+!!!34208695.java!!!	queryUsageStats(in userId : int, in bucketType : int, in beginTime : long, in endTime : long) : UsageStats
+        synchronized (mLock) {
+            final long timeNow = checkAndGetTimeLocked();
+            if (!validRange(timeNow, beginTime, endTime)) {
+                return null;
+            }
+
+            final UserUsageStatsService service =
+                    getUserDataAndInitializeIfNeededLocked(userId, timeNow);
+            return service.queryUsageStats(bucketType, beginTime, endTime);
+        }
+!!!34208823.java!!!	queryConfigurationStats(in userId : int, in bucketType : int, in beginTime : long, in endTime : long) : ConfigurationStats
+        synchronized (mLock) {
+            final long timeNow = checkAndGetTimeLocked();
+            if (!validRange(timeNow, beginTime, endTime)) {
+                return null;
+            }
+
+            final UserUsageStatsService service =
+                    getUserDataAndInitializeIfNeededLocked(userId, timeNow);
+            return service.queryConfigurationStats(bucketType, beginTime, endTime);
+        }
+!!!34208951.java!!!	queryEvents(in userId : int, in beginTime : long, in endTime : long) : UsageEvents
+        synchronized (mLock) {
+            final long timeNow = checkAndGetTimeLocked();
+            if (!validRange(timeNow, beginTime, endTime)) {
+                return null;
+            }
+
+            final UserUsageStatsService service =
+                    getUserDataAndInitializeIfNeededLocked(userId, timeNow);
+            return service.queryEvents(beginTime, endTime);
+        }
+!!!34209079.java!!!	isAppIdleUnfiltered(inout packageName : String, in userId : int, in elapsedRealtime : long) : boolean
+        synchronized (mLock) {
+            return mAppIdleHistory.isIdleLocked(packageName, userId, elapsedRealtime);
+        }
+!!!34209207.java!!!	addListener(inout listener : UsageStatsManagerInternal::AppIdleStateChangeListener) : void
+        synchronized (mLock) {
+            if (!mPackageAccessListeners.contains(listener)) {
+                mPackageAccessListeners.add(listener);
+            }
+        }
+!!!34209335.java!!!	removeListener(inout listener : UsageStatsManagerInternal::AppIdleStateChangeListener) : void
+        synchronized (mLock) {
+            mPackageAccessListeners.remove(listener);
+        }
+!!!34209463.java!!!	getAppId(inout packageName : String) : int
+        try {
+            ApplicationInfo ai = mPackageManager.getApplicationInfo(packageName,
+                    PackageManager.MATCH_UNINSTALLED_PACKAGES
+                            | PackageManager.MATCH_DISABLED_COMPONENTS);
+            return ai.uid;
+        } catch (NameNotFoundException re) {
+            return -1;
+        }
+!!!34209591.java!!!	isAppIdleFilteredOrParoled(inout packageName : String, in userId : int, in elapsedRealtime : long) : boolean
+        if (mAppIdleParoled) {
+            return false;
+        }
+        return isAppIdleFiltered(packageName, getAppId(packageName), userId, elapsedRealtime);
+!!!34209719.java!!!	isAppIdleFiltered(inout packageName : String, in appId : int, in userId : int, in elapsedRealtime : long) : boolean
+        if (packageName == null) return false;
+        // If not enabled at all, of course nobody is ever idle.
+        if (!mAppIdleEnabled) {
+            return false;
+        }
+        if (appId < Process.FIRST_APPLICATION_UID) {
+            // System uids never go idle.
+            return false;
+        }
+        if (packageName.equals("android")) {
+            // Nor does the framework (which should be redundant with the above, but for MR1 we will
+            // retain this for safety).
+            return false;
+        }
+        if (mSystemServicesReady) {
+            try {
+                // We allow all whitelisted apps, including those that don't want to be whitelisted
+                // for idle mode, because app idle (aka app standby) is really not as big an issue
+                // for controlling who participates vs. doze mode.
+                if (mDeviceIdleController.isPowerSaveWhitelistExceptIdleApp(packageName)) {
+                    return false;
+                }
+            } catch (RemoteException re) {
+                throw re.rethrowFromSystemServer();
+            }
+
+            if (isActiveDeviceAdmin(packageName, userId)) {
+                return false;
+            }
+
+            if (isActiveNetworkScorer(packageName)) {
+                return false;
+            }
+
+            if (mAppWidgetManager != null
+                    && mAppWidgetManager.isBoundWidgetPackage(packageName, userId)) {
+                return false;
+            }
+        }
+
+        if (!isAppIdleUnfiltered(packageName, userId, elapsedRealtime)) {
+            return false;
+        }
+
+        // Check this last, as it is the most expensive check
+        // TODO: Optimize this by fetching the carrier privileged apps ahead of time
+        if (isCarrierApp(packageName)) {
+            return false;
+        }
+
+        return true;
+!!!34209847.java!!!	getIdleUidsForUser(in userId : int) : int
+        if (!mAppIdleEnabled) {
+            return new int[0];
+        }
+
+        final long elapsedRealtime = SystemClock.elapsedRealtime();
+
+        List<ApplicationInfo> apps;
+        try {
+            ParceledListSlice<ApplicationInfo> slice = AppGlobals.getPackageManager()
+                    .getInstalledApplications(/* flags= */ 0, userId);
+            if (slice == null) {
+                return new int[0];
+            }
+            apps = slice.getList();
+        } catch (RemoteException e) {
+            throw e.rethrowFromSystemServer();
+        }
+
+        // State of each uid.  Key is the uid.  Value lower 16 bits is the number of apps
+        // associated with that uid, upper 16 bits is the number of those apps that is idle.
+        SparseIntArray uidStates = new SparseIntArray();
+
+        // Now resolve all app state.  Iterating over all apps, keeping track of how many
+        // we find for each uid and how many of those are idle.
+        for (int i = apps.size() - 1; i >= 0; i--) {
+            ApplicationInfo ai = apps.get(i);
+
+            // Check whether this app is idle.
+            boolean idle = isAppIdleFiltered(ai.packageName, UserHandle.getAppId(ai.uid),
+                    userId, elapsedRealtime);
+
+            int index = uidStates.indexOfKey(ai.uid);
+            if (index < 0) {
+                uidStates.put(ai.uid, 1 + (idle ? 1<<16 : 0));
+            } else {
+                int value = uidStates.valueAt(index);
+                uidStates.setValueAt(index, value + 1 + (idle ? 1<<16 : 0));
+            }
+        }
+        if (DEBUG) {
+            Slog.d(TAG, "getIdleUids took " + (SystemClock.elapsedRealtime() - elapsedRealtime));
+        }
+        int numIdle = 0;
+        for (int i = uidStates.size() - 1; i >= 0; i--) {
+            int value = uidStates.valueAt(i);
+            if ((value&0x7fff) == (value>>16)) {
+                numIdle++;
+            }
+        }
+
+        int[] res = new int[numIdle];
+        numIdle = 0;
+        for (int i = uidStates.size() - 1; i >= 0; i--) {
+            int value = uidStates.valueAt(i);
+            if ((value&0x7fff) == (value>>16)) {
+                res[numIdle] = uidStates.keyAt(i);
+                numIdle++;
+            }
+        }
+
+        return res;
+!!!34209975.java!!!	setAppIdle(inout packageName : String, inout idle : boolean, in userId : int) : void
+        if (packageName == null) return;
+
+        mHandler.obtainMessage(MSG_FORCE_IDLE_STATE, userId, idle ? 1 : 0, packageName)
+                .sendToTarget();
+!!!34210103.java!!!	isActiveDeviceAdmin(inout packageName : String, in userId : int) : boolean
+        DevicePolicyManager dpm = getContext().getSystemService(DevicePolicyManager.class);
+        if (dpm == null) return false;
+        return dpm.packageHasActiveAdmins(packageName, userId);
+!!!34210231.java!!!	isCarrierApp(inout packageName : String) : boolean
+        synchronized (mLock) {
+            if (!mHaveCarrierPrivilegedApps) {
+                fetchCarrierPrivilegedAppsLocked();
+            }
+            if (mCarrierPrivilegedApps != null) {
+                return mCarrierPrivilegedApps.contains(packageName);
+            }
+            return false;
+        }
+!!!34210359.java!!!	clearCarrierPrivilegedApps() : void
+        if (DEBUG) {
+            Slog.i(TAG, "Clearing carrier privileged apps list");
+        }
+        synchronized (mLock) {
+            mHaveCarrierPrivilegedApps = false;
+            mCarrierPrivilegedApps = null; // Need to be refetched.
+        }
+!!!34210487.java!!!	fetchCarrierPrivilegedAppsLocked() : void
+        TelephonyManager telephonyManager =
+                getContext().getSystemService(TelephonyManager.class);
+        mCarrierPrivilegedApps = telephonyManager.getPackagesWithCarrierPrivileges();
+        mHaveCarrierPrivilegedApps = true;
+        if (DEBUG) {
+            Slog.d(TAG, "apps with carrier privilege " + mCarrierPrivilegedApps);
+        }
+!!!34210615.java!!!	isActiveNetworkScorer(inout packageName : String) : boolean
+        NetworkScoreManager nsm = (NetworkScoreManager) getContext().getSystemService(
+                Context.NETWORK_SCORE_SERVICE);
+        return packageName != null && packageName.equals(nsm.getActiveScorerPackage());
+!!!34210743.java!!!	informListeners(inout packageName : String, in userId : int, inout isIdle : boolean) : void
+        for (AppIdleStateChangeListener listener : mPackageAccessListeners) {
+            listener.onAppIdleStateChanged(packageName, userId, isIdle);
+        }
+!!!34210871.java!!!	informParoleStateChanged() : void
+        for (AppIdleStateChangeListener listener : mPackageAccessListeners) {
+            listener.onParoleStateChanged(mAppIdleParoled);
+        }
+!!!34210999.java!!!	validRange(in currentTime : long, in beginTime : long, in endTime : long) : boolean
+        return beginTime <= currentTime && beginTime < endTime;
+!!!34211127.java!!!	flushToDiskLocked() : void
+        final int userCount = mUserState.size();
+        for (int i = 0; i < userCount; i++) {
+            UserUsageStatsService service = mUserState.valueAt(i);
+            service.persistActiveStats();
+            mAppIdleHistory.writeAppIdleTimesLocked(mUserState.keyAt(i));
+        }
+        // Persist elapsed time periodically, in case screen doesn't get toggled
+        // until the next boot
+        mAppIdleHistory.writeElapsedTimeLocked();
+        mHandler.removeMessages(MSG_FLUSH_TO_DISK);
+!!!34211255.java!!!	dump(inout args : String, inout pw : PrintWriter) : void
+        synchronized (mLock) {
+            IndentingPrintWriter idpw = new IndentingPrintWriter(pw, "  ");
+            ArraySet<String> argSet = new ArraySet<>();
+            argSet.addAll(Arrays.asList(args));
+
+            final int userCount = mUserState.size();
+            for (int i = 0; i < userCount; i++) {
+                idpw.printPair("user", mUserState.keyAt(i));
+                idpw.println();
+                idpw.increaseIndent();
+                if (argSet.contains("--checkin")) {
+                    mUserState.valueAt(i).checkin(idpw);
+                } else {
+                    mUserState.valueAt(i).dump(idpw);
+                    idpw.println();
+                    if (args.length > 0) {
+                        if ("history".equals(args[0])) {
+                            mAppIdleHistory.dumpHistory(idpw, mUserState.keyAt(i));
+                        } else if ("flush".equals(args[0])) {
+                            UsageStatsService.this.flushToDiskLocked();
+                            pw.println("Flushed stats to disk");
+                        }
+                    }
+                }
+                mAppIdleHistory.dump(idpw, mUserState.keyAt(i));
+                idpw.decreaseIndent();
+            }
+
+            pw.println();
+            pw.println("Carrier privileged apps (have=" + mHaveCarrierPrivilegedApps
+                    + "): " + mCarrierPrivilegedApps);
+
+            pw.println();
+            pw.println("Settings:");
+
+            pw.print("  mAppIdleDurationMillis=");
+            TimeUtils.formatDuration(mAppIdleScreenThresholdMillis, pw);
+            pw.println();
+
+            pw.print("  mAppIdleWallclockThresholdMillis=");
+            TimeUtils.formatDuration(mAppIdleWallclockThresholdMillis, pw);
+            pw.println();
+
+            pw.print("  mCheckIdleIntervalMillis=");
+            TimeUtils.formatDuration(mCheckIdleIntervalMillis, pw);
+            pw.println();
+
+            pw.print("  mAppIdleParoleIntervalMillis=");
+            TimeUtils.formatDuration(mAppIdleParoleIntervalMillis, pw);
+            pw.println();
+
+            pw.print("  mAppIdleParoleDurationMillis=");
+            TimeUtils.formatDuration(mAppIdleParoleDurationMillis, pw);
+            pw.println();
+
+            pw.println();
+            pw.print("mAppIdleEnabled="); pw.print(mAppIdleEnabled);
+            pw.print(" mAppIdleParoled="); pw.print(mAppIdleParoled);
+            pw.print(" mScreenOn="); pw.println(mScreenOn);
+            pw.print("mLastAppIdleParoledTime=");
+            TimeUtils.formatDuration(mLastAppIdleParoledTime, pw);
+            pw.println();
+        }

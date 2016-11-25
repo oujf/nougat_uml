@@ -1,0 +1,268 @@
+class ACodec::LoadedState
+!!!40159159.cpp!!!	stateEntered() : void
+    ALOGV("[%s] Now Loaded", mCodec->mComponentName.c_str());
+
+    mCodec->mPortEOS[kPortIndexInput] =
+        mCodec->mPortEOS[kPortIndexOutput] = false;
+
+    mCodec->mInputEOSResult = OK;
+
+    mCodec->mDequeueCounter = 0;
+    mCodec->mMetadataBuffersToSubmit = 0;
+    mCodec->mRepeatFrameDelayUs = -1ll;
+    mCodec->mInputFormat.clear();
+    mCodec->mOutputFormat.clear();
+    mCodec->mBaseOutputFormat.clear();
+
+    if (mCodec->mShutdownInProgress) {
+        bool keepComponentAllocated = mCodec->mKeepComponentAllocated;
+
+        mCodec->mShutdownInProgress = false;
+        mCodec->mKeepComponentAllocated = false;
+
+        onShutdown(keepComponentAllocated);
+    }
+    mCodec->mExplicitShutdown = false;
+
+    mCodec->processDeferredMessages();
+!!!40159287.cpp!!!	onConfigureComponent(in msg : sp<AMessage>) : bool
+    ALOGV("onConfigureComponent");
+
+    CHECK(mCodec->mNode != 0);
+
+    status_t err = OK;
+    AString mime;
+    if (!msg->findString("mime", &mime)) {
+        err = BAD_VALUE;
+    } else {
+        err = mCodec->configureCodec(mime.c_str(), msg);
+    }
+    if (err != OK) {
+        ALOGE("[%s] configureCodec returning error %d",
+              mCodec->mComponentName.c_str(), err);
+
+        mCodec->signalError(OMX_ErrorUndefined, makeNoSideEffectStatus(err));
+        return false;
+    }
+
+    {
+        sp<AMessage> notify = mCodec->mNotify->dup();
+        notify->setInt32("what", CodecBase::kWhatComponentConfigured);
+        notify->setMessage("input-format", mCodec->mInputFormat);
+        notify->setMessage("output-format", mCodec->mOutputFormat);
+        notify->post();
+    }
+
+    return true;
+!!!40159415.cpp!!!	onCreateInputSurface(in msg : sp<AMessage>) : void
+    ALOGV("onCreateInputSurface");
+
+    sp<AMessage> notify = mCodec->mNotify->dup();
+    notify->setInt32("what", CodecBase::kWhatInputSurfaceCreated);
+
+    android_dataspace dataSpace;
+    status_t err =
+        mCodec->setInitialColorAspectsForVideoEncoderSurfaceAndGetDataSpace(&dataSpace);
+    notify->setMessage("input-format", mCodec->mInputFormat);
+    notify->setMessage("output-format", mCodec->mOutputFormat);
+
+    sp<IGraphicBufferProducer> bufferProducer;
+    if (err == OK) {
+        mCodec->mInputMetadataType = kMetadataBufferTypeANWBuffer;
+        err = mCodec->mOMX->createInputSurface(
+                mCodec->mNode, kPortIndexInput, dataSpace, &bufferProducer,
+                &mCodec->mInputMetadataType);
+        // framework uses ANW buffers internally instead of gralloc handles
+        if (mCodec->mInputMetadataType == kMetadataBufferTypeGrallocSource) {
+            mCodec->mInputMetadataType = kMetadataBufferTypeANWBuffer;
+        }
+    }
+
+    if (err == OK) {
+        err = setupInputSurface();
+    }
+
+    if (err == OK) {
+        notify->setObject("input-surface",
+                new BufferProducerWrapper(bufferProducer));
+    } else {
+        // Can't use mCodec->signalError() here -- MediaCodec won't forward
+        // the error through because it's in the "configured" state.  We
+        // send a kWhatInputSurfaceCreated with an error value instead.
+        ALOGE("[%s] onCreateInputSurface returning error %d",
+                mCodec->mComponentName.c_str(), err);
+        notify->setInt32("err", err);
+    }
+    notify->post();
+!!!40159543.cpp!!!	onSetInputSurface(in msg : sp<AMessage>) : void
+    ALOGV("onSetInputSurface");
+
+    sp<AMessage> notify = mCodec->mNotify->dup();
+    notify->setInt32("what", CodecBase::kWhatInputSurfaceAccepted);
+
+    sp<RefBase> obj;
+    CHECK(msg->findObject("input-surface", &obj));
+    sp<PersistentSurface> surface = static_cast<PersistentSurface *>(obj.get());
+
+    android_dataspace dataSpace;
+    status_t err =
+        mCodec->setInitialColorAspectsForVideoEncoderSurfaceAndGetDataSpace(&dataSpace);
+    notify->setMessage("input-format", mCodec->mInputFormat);
+    notify->setMessage("output-format", mCodec->mOutputFormat);
+
+    if (err == OK) {
+        mCodec->mInputMetadataType = kMetadataBufferTypeANWBuffer;
+        err = mCodec->mOMX->setInputSurface(
+                mCodec->mNode, kPortIndexInput, surface->getBufferConsumer(),
+                &mCodec->mInputMetadataType);
+        // framework uses ANW buffers internally instead of gralloc handles
+        if (mCodec->mInputMetadataType == kMetadataBufferTypeGrallocSource) {
+            mCodec->mInputMetadataType = kMetadataBufferTypeANWBuffer;
+        }
+    }
+
+    if (err == OK) {
+        surface->getBufferConsumer()->setDefaultBufferDataSpace(dataSpace);
+        err = setupInputSurface();
+    }
+
+    if (err != OK) {
+        // Can't use mCodec->signalError() here -- MediaCodec won't forward
+        // the error through because it's in the "configured" state.  We
+        // send a kWhatInputSurfaceAccepted with an error value instead.
+        ALOGE("[%s] onSetInputSurface returning error %d",
+                mCodec->mComponentName.c_str(), err);
+        notify->setInt32("err", err);
+    }
+    notify->post();
+!!!40159671.cpp!!!	onStart() : void
+    ALOGV("onStart");
+
+    status_t err = mCodec->mOMX->sendCommand(mCodec->mNode, OMX_CommandStateSet, OMX_StateIdle);
+    if (err != OK) {
+        mCodec->signalError(OMX_ErrorUndefined, makeNoSideEffectStatus(err));
+    } else {
+        mCodec->changeState(mCodec->mLoadedToIdleState);
+    }
+!!!40159799.cpp!!!	onShutdown(in keepComponentAllocated : bool) : void
+    if (!keepComponentAllocated) {
+        (void)mCodec->mOMX->freeNode(mCodec->mNode);
+
+        mCodec->changeState(mCodec->mUninitializedState);
+    }
+
+    if (mCodec->mExplicitShutdown) {
+        sp<AMessage> notify = mCodec->mNotify->dup();
+        notify->setInt32("what", CodecBase::kWhatShutdownCompleted);
+        notify->post();
+        mCodec->mExplicitShutdown = false;
+    }
+!!!40159927.cpp!!!	setupInputSurface() : status_t
+    status_t err = OK;
+
+    if (mCodec->mRepeatFrameDelayUs > 0ll) {
+        err = mCodec->mOMX->setInternalOption(
+                mCodec->mNode,
+                kPortIndexInput,
+                IOMX::INTERNAL_OPTION_REPEAT_PREVIOUS_FRAME_DELAY,
+                &mCodec->mRepeatFrameDelayUs,
+                sizeof(mCodec->mRepeatFrameDelayUs));
+
+        if (err != OK) {
+            ALOGE("[%s] Unable to configure option to repeat previous "
+                  "frames (err %d)",
+                  mCodec->mComponentName.c_str(),
+                  err);
+            return err;
+        }
+    }
+
+    if (mCodec->mMaxPtsGapUs > 0ll) {
+        err = mCodec->mOMX->setInternalOption(
+                mCodec->mNode,
+                kPortIndexInput,
+                IOMX::INTERNAL_OPTION_MAX_TIMESTAMP_GAP,
+                &mCodec->mMaxPtsGapUs,
+                sizeof(mCodec->mMaxPtsGapUs));
+
+        if (err != OK) {
+            ALOGE("[%s] Unable to configure max timestamp gap (err %d)",
+                    mCodec->mComponentName.c_str(),
+                    err);
+            return err;
+        }
+    }
+
+    if (mCodec->mMaxFps > 0) {
+        err = mCodec->mOMX->setInternalOption(
+                mCodec->mNode,
+                kPortIndexInput,
+                IOMX::INTERNAL_OPTION_MAX_FPS,
+                &mCodec->mMaxFps,
+                sizeof(mCodec->mMaxFps));
+
+        if (err != OK) {
+            ALOGE("[%s] Unable to configure max fps (err %d)",
+                    mCodec->mComponentName.c_str(),
+                    err);
+            return err;
+        }
+    }
+
+    if (mCodec->mTimePerCaptureUs > 0ll
+            && mCodec->mTimePerFrameUs > 0ll) {
+        int64_t timeLapse[2];
+        timeLapse[0] = mCodec->mTimePerFrameUs;
+        timeLapse[1] = mCodec->mTimePerCaptureUs;
+        err = mCodec->mOMX->setInternalOption(
+                mCodec->mNode,
+                kPortIndexInput,
+                IOMX::INTERNAL_OPTION_TIME_LAPSE,
+                &timeLapse[0],
+                sizeof(timeLapse));
+
+        if (err != OK) {
+            ALOGE("[%s] Unable to configure time lapse (err %d)",
+                    mCodec->mComponentName.c_str(),
+                    err);
+            return err;
+        }
+    }
+
+    if (mCodec->mCreateInputBuffersSuspended) {
+        bool suspend = true;
+        err = mCodec->mOMX->setInternalOption(
+                mCodec->mNode,
+                kPortIndexInput,
+                IOMX::INTERNAL_OPTION_SUSPEND,
+                &suspend,
+                sizeof(suspend));
+
+        if (err != OK) {
+            ALOGE("[%s] Unable to configure option to suspend (err %d)",
+                  mCodec->mComponentName.c_str(),
+                  err);
+            return err;
+        }
+    }
+
+    uint32_t usageBits;
+    if (mCodec->mOMX->getParameter(
+            mCodec->mNode, (OMX_INDEXTYPE)OMX_IndexParamConsumerUsageBits,
+            &usageBits, sizeof(usageBits)) == OK) {
+        mCodec->mInputFormat->setInt32(
+                "using-sw-read-often", !!(usageBits & GRALLOC_USAGE_SW_READ_OFTEN));
+    }
+
+    sp<ABuffer> colorAspectsBuffer;
+    if (mCodec->mInputFormat->findBuffer("android._color-aspects", &colorAspectsBuffer)) {
+        err = mCodec->mOMX->setInternalOption(
+                mCodec->mNode, kPortIndexInput, IOMX::INTERNAL_OPTION_COLOR_ASPECTS,
+                colorAspectsBuffer->base(), colorAspectsBuffer->capacity());
+        if (err != OK) {
+            ALOGE("[%s] Unable to configure color aspects (err %d)",
+                  mCodec->mComponentName.c_str(), err);
+            return err;
+        }
+    }
+    return OK;

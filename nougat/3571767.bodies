@@ -1,0 +1,296 @@
+class AImageReader
+!!!40098999.cpp!!!	isSupportedFormat(in format : int32_t) : bool
+    switch (format) {
+        case AIMAGE_FORMAT_YUV_420_888:
+        case AIMAGE_FORMAT_JPEG:
+        case AIMAGE_FORMAT_RAW16:
+        case AIMAGE_FORMAT_RAW_PRIVATE:
+        case AIMAGE_FORMAT_RAW10:
+        case AIMAGE_FORMAT_RAW12:
+        case AIMAGE_FORMAT_DEPTH16:
+        case AIMAGE_FORMAT_DEPTH_POINT_CLOUD:
+            return true;
+        default:
+            return false;
+    }
+!!!40099127.cpp!!!	getNumPlanesForFormat(in format : int32_t) : int
+    switch (format) {
+        case AIMAGE_FORMAT_YUV_420_888:
+            return 3;
+        case AIMAGE_FORMAT_JPEG:
+        case AIMAGE_FORMAT_RAW16:
+        case AIMAGE_FORMAT_RAW_PRIVATE:
+        case AIMAGE_FORMAT_RAW10:
+        case AIMAGE_FORMAT_RAW12:
+        case AIMAGE_FORMAT_DEPTH16:
+        case AIMAGE_FORMAT_DEPTH_POINT_CLOUD:
+            return 1;
+        default:
+            return -1;
+    }
+!!!40099383.cpp!!!	~AImageReader()
+    Mutex::Autolock _l(mLock);
+    AImageReader_ImageListener nullListener = {nullptr, nullptr};
+    setImageListenerLocked(&nullListener);
+
+    if (mCbLooper != nullptr) {
+        mCbLooper->unregisterHandler(mHandler->id());
+        mCbLooper->stop();
+    }
+    mCbLooper.clear();
+    mHandler.clear();
+
+    // Close all previously acquired images
+    for (auto it = mAcquiredImages.begin();
+              it != mAcquiredImages.end(); it++) {
+        AImage* image = *it;
+        image->close();
+    }
+
+    // Delete LockedBuffers
+    for (auto it = mBuffers.begin();
+              it != mBuffers.end(); it++) {
+        delete *it;
+    }
+
+    if (mCpuConsumer != nullptr) {
+        mCpuConsumer->abandon();
+        mCpuConsumer->setFrameAvailableListener(nullptr);
+    }
+!!!40099511.cpp!!!	init() : media_status_t
+    PublicFormat publicFormat = static_cast<PublicFormat>(mFormat);
+    mHalFormat = android_view_Surface_mapPublicFormatToHalFormat(publicFormat);
+    mHalDataSpace = android_view_Surface_mapPublicFormatToHalDataspace(publicFormat);
+
+    sp<IGraphicBufferProducer> gbProducer;
+    sp<IGraphicBufferConsumer> gbConsumer;
+    BufferQueue::createBufferQueue(&gbProducer, &gbConsumer);
+
+    sp<CpuConsumer> cpuConsumer;
+    String8 consumerName = String8::format("ImageReader-%dx%df%xm%d-%d-%d",
+            mWidth, mHeight, mFormat, mMaxImages, getpid(),
+            createProcessUniqueId());
+
+    cpuConsumer = new CpuConsumer(gbConsumer, mMaxImages, /*controlledByApp*/true);
+    if (cpuConsumer == nullptr) {
+        ALOGE("Failed to allocate CpuConsumer");
+        return AMEDIA_ERROR_UNKNOWN;
+    }
+
+    mCpuConsumer = cpuConsumer;
+    mCpuConsumer->setName(consumerName);
+    mProducer = gbProducer;
+
+    sp<ConsumerBase> consumer = cpuConsumer;
+    consumer->setFrameAvailableListener(mFrameListener);
+
+    status_t res;
+    res = cpuConsumer->setDefaultBufferSize(mWidth, mHeight);
+    if (res != OK) {
+        ALOGE("Failed to set CpuConsumer buffer size");
+        return AMEDIA_ERROR_UNKNOWN;
+    }
+    res = cpuConsumer->setDefaultBufferFormat(mHalFormat);
+    if (res != OK) {
+        ALOGE("Failed to set CpuConsumer buffer format");
+        return AMEDIA_ERROR_UNKNOWN;
+    }
+    res = cpuConsumer->setDefaultBufferDataSpace(mHalDataSpace);
+    if (res != OK) {
+        ALOGE("Failed to set CpuConsumer buffer dataSpace");
+        return AMEDIA_ERROR_UNKNOWN;
+    }
+
+    mSurface = new Surface(mProducer, /*controlledByApp*/true);
+    if (mSurface == nullptr) {
+        ALOGE("Failed to create surface");
+        return AMEDIA_ERROR_UNKNOWN;
+    }
+    mWindow = static_cast<ANativeWindow*>(mSurface.get());
+
+    for (int i = 0; i < mMaxImages; i++) {
+        CpuConsumer::LockedBuffer* buffer = new CpuConsumer::LockedBuffer;
+        mBuffers.push_back(buffer);
+    }
+
+    mCbLooper = new ALooper;
+    mCbLooper->setName(consumerName.string());
+    res = mCbLooper->start(
+            /*runOnCallingThread*/false,
+            /*canCallJava*/       true,
+            PRIORITY_DEFAULT);
+    if (res != OK) {
+        ALOGE("Failed to start the looper");
+        return AMEDIA_ERROR_UNKNOWN;
+    }
+    mHandler = new CallbackHandler(this);
+    mCbLooper->registerHandler(mHandler);
+
+    return AMEDIA_OK;
+!!!40099639.cpp!!!	setImageListener(inout listener : AImageReader_ImageListener) : media_status_t
+    Mutex::Autolock _l(mLock);
+    return setImageListenerLocked(listener);
+!!!40099767.cpp!!!	acquireNextImage(inout image : AImage) : media_status_t
+    Mutex::Autolock _l(mLock);
+    return acquireCpuConsumerImageLocked(image);
+!!!40099895.cpp!!!	acquireLatestImage(inout image : AImage) : media_status_t
+    if (image == nullptr) {
+        return AMEDIA_ERROR_INVALID_PARAMETER;
+    }
+    Mutex::Autolock _l(mLock);
+    *image = nullptr;
+    AImage* prevImage = nullptr;
+    AImage* nextImage = nullptr;
+    media_status_t ret = acquireCpuConsumerImageLocked(&prevImage);
+    if (prevImage == nullptr) {
+        return ret;
+    }
+    for (;;) {
+        ret = acquireCpuConsumerImageLocked(&nextImage);
+        if (nextImage == nullptr) {
+            *image = prevImage;
+            return AMEDIA_OK;
+        }
+        prevImage->close();
+        prevImage->free();
+        prevImage = nextImage;
+        nextImage = nullptr;
+    }
+!!!40100663.cpp!!!	acquireCpuConsumerImageLocked(inout image : AImage) : media_status_t
+    *image = nullptr;
+    CpuConsumer::LockedBuffer* buffer = getLockedBufferLocked();
+    if (buffer == nullptr) {
+        ALOGW("Unable to acquire a lockedBuffer, very likely client tries to lock more than"
+            " maxImages buffers");
+        return AMEDIA_IMGREADER_MAX_IMAGES_ACQUIRED;
+    }
+
+    status_t res = mCpuConsumer->lockNextBuffer(buffer);
+    if (res != NO_ERROR) {
+        returnLockedBufferLocked(buffer);
+        if (res != BAD_VALUE /*no buffers*/) {
+            if (res == NOT_ENOUGH_DATA) {
+                return AMEDIA_IMGREADER_MAX_IMAGES_ACQUIRED;
+            } else {
+                ALOGE("%s Fail to lockNextBuffer with error: %d ",
+                      __FUNCTION__, res);
+                return AMEDIA_ERROR_UNKNOWN;
+            }
+        }
+        return AMEDIA_IMGREADER_NO_BUFFER_AVAILABLE;
+    }
+
+    if (buffer->flexFormat == HAL_PIXEL_FORMAT_YCrCb_420_SP) {
+        ALOGE("NV21 format is not supported by AImageReader");
+        return AMEDIA_ERROR_UNSUPPORTED;
+    }
+
+    // Check if the left-top corner of the crop rect is origin, we currently assume this point is
+    // zero, will revist this once this assumption turns out problematic.
+    Point lt = buffer->crop.leftTop();
+    if (lt.x != 0 || lt.y != 0) {
+        ALOGE("crop left top corner [%d, %d] need to be at origin", lt.x, lt.y);
+        return AMEDIA_ERROR_UNKNOWN;
+    }
+
+    // Check if the producer buffer configurations match what ImageReader configured.
+    int outputWidth = getBufferWidth(buffer);
+    int outputHeight = getBufferHeight(buffer);
+
+    int readerFmt = mHalFormat;
+    int readerWidth = mWidth;
+    int readerHeight = mHeight;
+
+    if ((buffer->format != HAL_PIXEL_FORMAT_BLOB) && (readerFmt != HAL_PIXEL_FORMAT_BLOB) &&
+            (readerWidth != outputWidth || readerHeight != outputHeight)) {
+        ALOGW("%s: Producer buffer size: %dx%d, doesn't match AImageReader configured size: %dx%d",
+                __FUNCTION__, outputWidth, outputHeight, readerWidth, readerHeight);
+    }
+
+    int bufFmt = buffer->format;
+    if (readerFmt == HAL_PIXEL_FORMAT_YCbCr_420_888) {
+        bufFmt = buffer->flexFormat;
+    }
+
+    if (readerFmt != bufFmt) {
+        if (readerFmt == HAL_PIXEL_FORMAT_YCbCr_420_888 && (bufFmt ==
+                HAL_PIXEL_FORMAT_YCrCb_420_SP || bufFmt == HAL_PIXEL_FORMAT_YV12)) {
+            // Special casing for when producer switches to a format compatible with flexible YUV
+            // (HAL_PIXEL_FORMAT_YCbCr_420_888).
+            mHalFormat = bufFmt;
+            ALOGD("%s: Overriding buffer format YUV_420_888 to %x.", __FUNCTION__, bufFmt);
+        } else {
+            // Return the buffer to the queue.
+            mCpuConsumer->unlockBuffer(*buffer);
+            returnLockedBufferLocked(buffer);
+
+            ALOGE("Producer output buffer format: 0x%x, ImageReader configured format: 0x%x",
+                    buffer->format, readerFmt);
+
+            return AMEDIA_ERROR_UNKNOWN;
+        }
+    }
+
+    if (mHalFormat == HAL_PIXEL_FORMAT_BLOB) {
+        *image = new AImage(this, mFormat, buffer, buffer->timestamp,
+                            readerWidth, readerHeight, mNumPlanes);
+    } else {
+        *image = new AImage(this, mFormat, buffer, buffer->timestamp,
+                            outputWidth, outputHeight, mNumPlanes);
+    }
+    mAcquiredImages.push_back(*image);
+    return AMEDIA_OK;
+!!!40100791.cpp!!!	getLockedBufferLocked() : CpuConsumer::LockedBuffer
+    if (mBuffers.empty()) {
+        return nullptr;
+    }
+    // Return a LockedBuffer pointer and remove it from the list
+    auto it = mBuffers.begin();
+    CpuConsumer::LockedBuffer* buffer = *it;
+    mBuffers.erase(it);
+    return buffer;
+!!!40100919.cpp!!!	returnLockedBufferLocked(inout buffer : CpuConsumer::LockedBuffer) : void
+    mBuffers.push_back(buffer);
+!!!40101047.cpp!!!	releaseImageLocked(inout image : AImage) : void
+    CpuConsumer::LockedBuffer* buffer = image->mBuffer;
+    if (buffer == nullptr) {
+        // This should not happen, but is not fatal
+        ALOGW("AImage %p has no buffer!", image);
+        return;
+    }
+
+    mCpuConsumer->unlockBuffer(*buffer);
+    returnLockedBufferLocked(buffer);
+    image->mBuffer = nullptr;
+
+    bool found = false;
+    // cleanup acquired image list
+    for (auto it = mAcquiredImages.begin();
+              it != mAcquiredImages.end(); it++) {
+        AImage* readerCopy = *it;
+        if (readerCopy == image) {
+            found = true;
+            mAcquiredImages.erase(it);
+            break;
+        }
+    }
+    if (!found) {
+        ALOGE("Error: AImage %p is not generated by AImageReader %p",
+                image, this);
+    }
+!!!40101175.cpp!!!	getBufferWidth(inout buffer : CpuConsumer::LockedBuffer) : int
+    if (buffer == nullptr) return -1;
+
+    if (!buffer->crop.isEmpty()) {
+        return buffer->crop.getWidth();
+    }
+    return buffer->width;
+!!!40101303.cpp!!!	getBufferHeight(inout buffer : CpuConsumer::LockedBuffer) : int
+    if (buffer == nullptr) return -1;
+
+    if (!buffer->crop.isEmpty()) {
+        return buffer->crop.getHeight();
+    }
+    return buffer->height;
+!!!40101431.cpp!!!	setImageListenerLocked(inout listener : AImageReader_ImageListener) : media_status_t
+    return mFrameListener->setImageListener(listener);

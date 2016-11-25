@@ -1,0 +1,152 @@
+class MediaCodecSource::Puller
+!!!40180151.cpp!!!	interruptSource() : void
+    // call source->stop if read has been pending for over a second
+    // We have to call this outside the looper as looper is pending on the read.
+    mSource->stop();
+!!!40180279.cpp!!!	start(in meta : sp<MetaData>, in notify : sp<AMessage>) : status_t
+    ALOGV("puller (%s) start", mIsAudio ? "audio" : "video");
+    mLooper->start(
+            false /* runOnCallingThread */,
+            false /* canCallJava */,
+            PRIORITY_AUDIO);
+    mLooper->registerHandler(this);
+    mNotify = notify;
+
+    sp<AMessage> msg = new AMessage(kWhatStart, this);
+    msg->setObject("meta", meta);
+    return postSynchronouslyAndReturnError(msg);
+!!!40180407.cpp!!!	stop() : void
+    bool interrupt = false;
+    {
+        // mark stopping before actually reaching kWhatStop on the looper, so the pulling will
+        // stop.
+        Mutexed<Queue>::Locked queue(mQueue);
+        queue->mPulling = false;
+        interrupt = queue->mReadPendingSince && (queue->mReadPendingSince < ALooper::GetNowUs() - 1000000);
+        queue->flush(); // flush any unprocessed pulled buffers
+    }
+
+    if (interrupt) {
+        interruptSource();
+    }
+!!!40180535.cpp!!!	stopSource() : void
+    sp<AMessage> msg = new AMessage(kWhatStop, this);
+    (void)postSynchronouslyAndReturnError(msg);
+!!!40180663.cpp!!!	pause() : void
+    Mutexed<Queue>::Locked queue(mQueue);
+    queue->mPaused = true;
+!!!40180791.cpp!!!	resume() : void
+    Mutexed<Queue>::Locked queue(mQueue);
+    queue->mPaused = false;
+!!!40180919.cpp!!!	readBuffer(inout mbuf : MediaBuffer) : bool
+    Mutexed<Queue>::Locked queue(mQueue);
+    return queue->readBuffer(mbuf);
+!!!40181047.cpp!!!	onMessageReceived(in msg : sp<AMessage>) : void
+    switch (msg->what()) {
+        case kWhatStart:
+        {
+            sp<RefBase> obj;
+            CHECK(msg->findObject("meta", &obj));
+
+            {
+                Mutexed<Queue>::Locked queue(mQueue);
+                queue->mPulling = true;
+            }
+
+            status_t err = mSource->start(static_cast<MetaData *>(obj.get()));
+
+            if (err == OK) {
+                schedulePull();
+            }
+
+            sp<AMessage> response = new AMessage;
+            response->setInt32("err", err);
+
+            sp<AReplyToken> replyID;
+            CHECK(msg->senderAwaitsResponse(&replyID));
+            response->postReply(replyID);
+            break;
+        }
+
+        case kWhatStop:
+        {
+            mSource->stop();
+
+            sp<AMessage> response = new AMessage;
+            response->setInt32("err", OK);
+
+            sp<AReplyToken> replyID;
+            CHECK(msg->senderAwaitsResponse(&replyID));
+            response->postReply(replyID);
+            break;
+        }
+
+        case kWhatPull:
+        {
+            Mutexed<Queue>::Locked queue(mQueue);
+            queue->mReadPendingSince = ALooper::GetNowUs();
+            if (!queue->mPulling) {
+                handleEOS();
+                break;
+            }
+
+            queue.unlock();
+            MediaBuffer *mbuf = NULL;
+            status_t err = mSource->read(&mbuf);
+            queue.lock();
+
+            queue->mReadPendingSince = 0;
+            // if we need to discard buffer
+            if (!queue->mPulling || queue->mPaused || err != OK) {
+                if (mbuf != NULL) {
+                    mbuf->release();
+                    mbuf = NULL;
+                }
+                if (queue->mPulling && err == OK) {
+                    msg->post(); // if simply paused, keep pulling source
+                    break;
+                } else if (err == ERROR_END_OF_STREAM) {
+                    ALOGV("stream ended, mbuf %p", mbuf);
+                } else if (err != OK) {
+                    ALOGE("error %d reading stream.", err);
+                }
+            }
+
+            if (mbuf != NULL) {
+                queue->pushBuffer(mbuf);
+            }
+
+            queue.unlock();
+
+            if (mbuf != NULL) {
+                mNotify->post();
+                msg->post();
+            } else {
+                handleEOS();
+            }
+            break;
+        }
+
+        default:
+            TRESPASS();
+    }
+!!!40181687.cpp!!!	postSynchronouslyAndReturnError(in msg : sp<AMessage>) : status_t
+    sp<AMessage> response;
+    status_t err = msg->postAndAwaitResponse(&response);
+
+    if (err != OK) {
+        return err;
+    }
+
+    if (!response->findInt32("err", &err)) {
+        err = OK;
+    }
+
+    return err;
+!!!40181815.cpp!!!	schedulePull() : void
+    (new AMessage(kWhatPull, this))->post();
+!!!40181943.cpp!!!	handleEOS() : void
+    ALOGV("puller (%s) posting EOS", mIsAudio ? "audio" : "video");
+    sp<AMessage> msg = mNotify->dup();
+    msg->setInt32("eos", 1);
+    msg->post();

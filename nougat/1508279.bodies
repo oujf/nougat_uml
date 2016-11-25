@@ -1,0 +1,575 @@
+class MainHandler
+!!!32342839.java!!!	MainHandler(inout looper : Looper)
+            super(looper, null, true);
+!!!32342967.java!!!	handleMessage(inout msg : Message) : void
+            switch (msg.what) {
+            case UPDATE_CONFIGURATION_MSG: {
+                final ContentResolver resolver = mContext.getContentResolver();
+                Settings.System.putConfigurationForUser(resolver, (Configuration) msg.obj,
+                        msg.arg1);
+            } break;
+            case GC_BACKGROUND_PROCESSES_MSG: {
+                synchronized (ActivityManagerService.this) {
+                    performAppGcsIfAppropriateLocked();
+                }
+            } break;
+            case SERVICE_TIMEOUT_MSG: {
+                if (mDidDexOpt) {
+                    mDidDexOpt = false;
+                    Message nmsg = mHandler.obtainMessage(SERVICE_TIMEOUT_MSG);
+                    nmsg.obj = msg.obj;
+                    mHandler.sendMessageDelayed(nmsg, ActiveServices.SERVICE_TIMEOUT);
+                    return;
+                }
+                mServices.serviceTimeout((ProcessRecord)msg.obj);
+            } break;
+            case UPDATE_TIME_ZONE: {
+                synchronized (ActivityManagerService.this) {
+                    for (int i = mLruProcesses.size() - 1 ; i >= 0 ; i--) {
+                        ProcessRecord r = mLruProcesses.get(i);
+                        if (r.thread != null) {
+                            try {
+                                r.thread.updateTimeZone();
+                            } catch (RemoteException ex) {
+                                Slog.w(TAG, "Failed to update time zone for: " + r.info.processName);
+                            }
+                        }
+                    }
+                }
+            } break;
+            case CLEAR_DNS_CACHE_MSG: {
+                synchronized (ActivityManagerService.this) {
+                    for (int i = mLruProcesses.size() - 1 ; i >= 0 ; i--) {
+                        ProcessRecord r = mLruProcesses.get(i);
+                        if (r.thread != null) {
+                            try {
+                                r.thread.clearDnsCache();
+                            } catch (RemoteException ex) {
+                                Slog.w(TAG, "Failed to clear dns cache for: " + r.info.processName);
+                            }
+                        }
+                    }
+                }
+            } break;
+            case UPDATE_HTTP_PROXY_MSG: {
+                ProxyInfo proxy = (ProxyInfo)msg.obj;
+                String host = "";
+                String port = "";
+                String exclList = "";
+                Uri pacFileUrl = Uri.EMPTY;
+                if (proxy != null) {
+                    host = proxy.getHost();
+                    port = Integer.toString(proxy.getPort());
+                    exclList = proxy.getExclusionListAsString();
+                    pacFileUrl = proxy.getPacFileUrl();
+                }
+                synchronized (ActivityManagerService.this) {
+                    for (int i = mLruProcesses.size() - 1 ; i >= 0 ; i--) {
+                        ProcessRecord r = mLruProcesses.get(i);
+                        if (r.thread != null) {
+                            try {
+                                r.thread.setHttpProxy(host, port, exclList, pacFileUrl);
+                            } catch (RemoteException ex) {
+                                Slog.w(TAG, "Failed to update http proxy for: " +
+                                        r.info.processName);
+                            }
+                        }
+                    }
+                }
+            } break;
+            case PROC_START_TIMEOUT_MSG: {
+                if (mDidDexOpt) {
+                    mDidDexOpt = false;
+                    Message nmsg = mHandler.obtainMessage(PROC_START_TIMEOUT_MSG);
+                    nmsg.obj = msg.obj;
+                    mHandler.sendMessageDelayed(nmsg, PROC_START_TIMEOUT);
+                    return;
+                }
+                ProcessRecord app = (ProcessRecord)msg.obj;
+                synchronized (ActivityManagerService.this) {
+                    processStartTimedOutLocked(app);
+                }
+            } break;
+            case CONTENT_PROVIDER_PUBLISH_TIMEOUT_MSG: {
+                ProcessRecord app = (ProcessRecord)msg.obj;
+                synchronized (ActivityManagerService.this) {
+                    processContentProviderPublishTimedOutLocked(app);
+                }
+            } break;
+            case DO_PENDING_ACTIVITY_LAUNCHES_MSG: {
+                synchronized (ActivityManagerService.this) {
+                    mActivityStarter.doPendingActivityLaunchesLocked(true);
+                }
+            } break;
+            case KILL_APPLICATION_MSG: {
+                synchronized (ActivityManagerService.this) {
+                    final int appId = msg.arg1;
+                    final int userId = msg.arg2;
+                    Bundle bundle = (Bundle)msg.obj;
+                    String pkg = bundle.getString("pkg");
+                    String reason = bundle.getString("reason");
+                    forceStopPackageLocked(pkg, appId, false, false, true, false,
+                            false, userId, reason);
+                }
+            } break;
+            case FINALIZE_PENDING_INTENT_MSG: {
+                ((PendingIntentRecord)msg.obj).completeFinalize();
+            } break;
+            case POST_HEAVY_NOTIFICATION_MSG: {
+                INotificationManager inm = NotificationManager.getService();
+                if (inm == null) {
+                    return;
+                }
+
+                ActivityRecord root = (ActivityRecord)msg.obj;
+                ProcessRecord process = root.app;
+                if (process == null) {
+                    return;
+                }
+
+                try {
+                    Context context = mContext.createPackageContext(process.info.packageName, 0);
+                    String text = mContext.getString(R.string.heavy_weight_notification,
+                            context.getApplicationInfo().loadLabel(context.getPackageManager()));
+                    Notification notification = new Notification.Builder(context)
+                            .setSmallIcon(com.android.internal.R.drawable.stat_sys_adb)
+                            .setWhen(0)
+                            .setOngoing(true)
+                            .setTicker(text)
+                            .setColor(mContext.getColor(
+                                    com.android.internal.R.color.system_notification_accent_color))
+                            .setContentTitle(text)
+                            .setContentText(
+                                    mContext.getText(R.string.heavy_weight_notification_detail))
+                            .setContentIntent(PendingIntent.getActivityAsUser(mContext, 0,
+                                    root.intent, PendingIntent.FLAG_CANCEL_CURRENT, null,
+                                    new UserHandle(root.userId)))
+                            .build();
+                    try {
+                        int[] outId = new int[1];
+                        inm.enqueueNotificationWithTag("android", "android", null,
+                                R.string.heavy_weight_notification,
+                                notification, outId, root.userId);
+                    } catch (RuntimeException e) {
+                        Slog.w(ActivityManagerService.TAG,
+                                "Error showing notification for heavy-weight app", e);
+                    } catch (RemoteException e) {
+                    }
+                } catch (NameNotFoundException e) {
+                    Slog.w(TAG, "Unable to create context for heavy notification", e);
+                }
+            } break;
+            case CANCEL_HEAVY_NOTIFICATION_MSG: {
+                INotificationManager inm = NotificationManager.getService();
+                if (inm == null) {
+                    return;
+                }
+                try {
+                    inm.cancelNotificationWithTag("android", null,
+                            R.string.heavy_weight_notification,  msg.arg1);
+                } catch (RuntimeException e) {
+                    Slog.w(ActivityManagerService.TAG,
+                            "Error canceling notification for service", e);
+                } catch (RemoteException e) {
+                }
+            } break;
+            case CHECK_EXCESSIVE_WAKE_LOCKS_MSG: {
+                synchronized (ActivityManagerService.this) {
+                    checkExcessivePowerUsageLocked(true);
+                    removeMessages(CHECK_EXCESSIVE_WAKE_LOCKS_MSG);
+                    Message nmsg = obtainMessage(CHECK_EXCESSIVE_WAKE_LOCKS_MSG);
+                    sendMessageDelayed(nmsg, POWER_CHECK_DELAY);
+                }
+            } break;
+            case REPORT_MEM_USAGE_MSG: {
+                final ArrayList<ProcessMemInfo> memInfos = (ArrayList<ProcessMemInfo>)msg.obj;
+                Thread thread = new Thread() {
+                    @Override public void run() {
+                        reportMemUsage(memInfos);
+                    }
+                };
+                thread.start();
+                break;
+            }
+            case REPORT_USER_SWITCH_MSG: {
+                mUserController.dispatchUserSwitch((UserState) msg.obj, msg.arg1, msg.arg2);
+                break;
+            }
+            case CONTINUE_USER_SWITCH_MSG: {
+                mUserController.continueUserSwitch((UserState) msg.obj, msg.arg1, msg.arg2);
+                break;
+            }
+            case USER_SWITCH_TIMEOUT_MSG: {
+                mUserController.timeoutUserSwitch((UserState) msg.obj, msg.arg1, msg.arg2);
+                break;
+            }
+            case IMMERSIVE_MODE_LOCK_MSG: {
+                final boolean nextState = (msg.arg1 != 0);
+                if (mUpdateLock.isHeld() != nextState) {
+                    if (DEBUG_IMMERSIVE) Slog.d(TAG_IMMERSIVE,
+                            "Applying new update lock state '" + nextState
+                            + "' for " + (ActivityRecord)msg.obj);
+                    if (nextState) {
+                        mUpdateLock.acquire();
+                    } else {
+                        mUpdateLock.release();
+                    }
+                }
+                break;
+            }
+            case PERSIST_URI_GRANTS_MSG: {
+                writeGrantedUriPermissions();
+                break;
+            }
+            case REQUEST_ALL_PSS_MSG: {
+                synchronized (ActivityManagerService.this) {
+                    requestPssAllProcsLocked(SystemClock.uptimeMillis(), true, false);
+                }
+                break;
+            }
+            case START_PROFILES_MSG: {
+                synchronized (ActivityManagerService.this) {
+                    mUserController.startProfilesLocked();
+                }
+                break;
+            }
+            case UPDATE_TIME: {
+                synchronized (ActivityManagerService.this) {
+                    for (int i = mLruProcesses.size() - 1 ; i >= 0 ; i--) {
+                        ProcessRecord r = mLruProcesses.get(i);
+                        if (r.thread != null) {
+                            try {
+                                r.thread.updateTimePrefs(msg.arg1 == 0 ? false : true);
+                            } catch (RemoteException ex) {
+                                Slog.w(TAG, "Failed to update preferences for: " + r.info.processName);
+                            }
+                        }
+                    }
+                }
+                break;
+            }
+            case SYSTEM_USER_START_MSG: {
+                mBatteryStatsService.noteEvent(BatteryStats.HistoryItem.EVENT_USER_RUNNING_START,
+                        Integer.toString(msg.arg1), msg.arg1);
+                mSystemServiceManager.startUser(msg.arg1);
+                break;
+            }
+            case SYSTEM_USER_UNLOCK_MSG: {
+                final int userId = msg.arg1;
+                mSystemServiceManager.unlockUser(userId);
+                synchronized (ActivityManagerService.this) {
+                    mRecentTasks.loadUserRecentsLocked(userId);
+                }
+                if (userId == UserHandle.USER_SYSTEM) {
+                    startPersistentApps(PackageManager.MATCH_DIRECT_BOOT_UNAWARE);
+                }
+                installEncryptionUnawareProviders(userId);
+                mUserController.finishUserUnlocked((UserState) msg.obj);
+                break;
+            }
+            case SYSTEM_USER_CURRENT_MSG: {
+                mBatteryStatsService.noteEvent(
+                        BatteryStats.HistoryItem.EVENT_USER_FOREGROUND_FINISH,
+                        Integer.toString(msg.arg2), msg.arg2);
+                mBatteryStatsService.noteEvent(
+                        BatteryStats.HistoryItem.EVENT_USER_FOREGROUND_START,
+                        Integer.toString(msg.arg1), msg.arg1);
+                mSystemServiceManager.switchUser(msg.arg1);
+                break;
+            }
+            case ENTER_ANIMATION_COMPLETE_MSG: {
+                synchronized (ActivityManagerService.this) {
+                    ActivityRecord r = ActivityRecord.forTokenLocked((IBinder) msg.obj);
+                    if (r != null && r.app != null && r.app.thread != null) {
+                        try {
+                            r.app.thread.scheduleEnterAnimationComplete(r.appToken);
+                        } catch (RemoteException e) {
+                        }
+                    }
+                }
+                break;
+            }
+            case FINISH_BOOTING_MSG: {
+                if (msg.arg1 != 0) {
+                    Trace.traceBegin(Trace.TRACE_TAG_ACTIVITY_MANAGER, "FinishBooting");
+                    finishBooting();
+                    Trace.traceEnd(Trace.TRACE_TAG_ACTIVITY_MANAGER);
+                }
+                if (msg.arg2 != 0) {
+                    enableScreenAfterBoot();
+                }
+                break;
+            }
+            case SEND_LOCALE_TO_MOUNT_DAEMON_MSG: {
+                try {
+                    Locale l = (Locale) msg.obj;
+                    IBinder service = ServiceManager.getService("mount");
+                    IMountService mountService = IMountService.Stub.asInterface(service);
+                    Log.d(TAG, "Storing locale " + l.toLanguageTag() + " for decryption UI");
+                    mountService.setField(StorageManager.SYSTEM_LOCALE_KEY, l.toLanguageTag());
+                } catch (RemoteException e) {
+                    Log.e(TAG, "Error storing locale for decryption UI", e);
+                }
+                break;
+            }
+            case NOTIFY_TASK_STACK_CHANGE_LISTENERS_MSG: {
+                synchronized (ActivityManagerService.this) {
+                    for (int i = mTaskStackListeners.beginBroadcast() - 1; i >= 0; i--) {
+                        try {
+                            // Make a one-way callback to the listener
+                            mTaskStackListeners.getBroadcastItem(i).onTaskStackChanged();
+                        } catch (RemoteException e){
+                            // Handled by the RemoteCallbackList
+                        }
+                    }
+                    mTaskStackListeners.finishBroadcast();
+                }
+                break;
+            }
+            case NOTIFY_ACTIVITY_PINNED_LISTENERS_MSG: {
+                synchronized (ActivityManagerService.this) {
+                    for (int i = mTaskStackListeners.beginBroadcast() - 1; i >= 0; i--) {
+                        try {
+                            // Make a one-way callback to the listener
+                            mTaskStackListeners.getBroadcastItem(i).onActivityPinned();
+                        } catch (RemoteException e){
+                            // Handled by the RemoteCallbackList
+                        }
+                    }
+                    mTaskStackListeners.finishBroadcast();
+                }
+                break;
+            }
+            case NOTIFY_PINNED_ACTIVITY_RESTART_ATTEMPT_LISTENERS_MSG: {
+                synchronized (ActivityManagerService.this) {
+                    for (int i = mTaskStackListeners.beginBroadcast() - 1; i >= 0; i--) {
+                        try {
+                            // Make a one-way callback to the listener
+                            mTaskStackListeners.getBroadcastItem(i).onPinnedActivityRestartAttempt();
+                        } catch (RemoteException e){
+                            // Handled by the RemoteCallbackList
+                        }
+                    }
+                    mTaskStackListeners.finishBroadcast();
+                }
+                break;
+            }
+            case NOTIFY_PINNED_STACK_ANIMATION_ENDED_LISTENERS_MSG: {
+                synchronized (ActivityManagerService.this) {
+                    for (int i = mTaskStackListeners.beginBroadcast() - 1; i >= 0; i--) {
+                        try {
+                            // Make a one-way callback to the listener
+                            mTaskStackListeners.getBroadcastItem(i).onPinnedStackAnimationEnded();
+                        } catch (RemoteException e){
+                            // Handled by the RemoteCallbackList
+                        }
+                    }
+                    mTaskStackListeners.finishBroadcast();
+                }
+                break;
+            }
+            case NOTIFY_FORCED_RESIZABLE_MSG: {
+                synchronized (ActivityManagerService.this) {
+                    for (int i = mTaskStackListeners.beginBroadcast() - 1; i >= 0; i--) {
+                        try {
+                            // Make a one-way callback to the listener
+                            mTaskStackListeners.getBroadcastItem(i).onActivityForcedResizable(
+                                    (String) msg.obj, msg.arg1);
+                        } catch (RemoteException e){
+                            // Handled by the RemoteCallbackList
+                        }
+                    }
+                    mTaskStackListeners.finishBroadcast();
+                }
+                break;
+            }
+                case NOTIFY_ACTIVITY_DISMISSING_DOCKED_STACK_MSG: {
+                    synchronized (ActivityManagerService.this) {
+                        for (int i = mTaskStackListeners.beginBroadcast() - 1; i >= 0; i--) {
+                            try {
+                                // Make a one-way callback to the listener
+                                mTaskStackListeners.getBroadcastItem(i)
+                                        .onActivityDismissingDockedStack();
+                            } catch (RemoteException e){
+                                // Handled by the RemoteCallbackList
+                            }
+                        }
+                        mTaskStackListeners.finishBroadcast();
+                    }
+                    break;
+                }
+            case NOTIFY_CLEARTEXT_NETWORK_MSG: {
+                final int uid = msg.arg1;
+                final byte[] firstPacket = (byte[]) msg.obj;
+
+                synchronized (mPidsSelfLocked) {
+                    for (int i = 0; i < mPidsSelfLocked.size(); i++) {
+                        final ProcessRecord p = mPidsSelfLocked.valueAt(i);
+                        if (p.uid == uid) {
+                            try {
+                                p.thread.notifyCleartextNetwork(firstPacket);
+                            } catch (RemoteException ignored) {
+                            }
+                        }
+                    }
+                }
+                break;
+            }
+            case POST_DUMP_HEAP_NOTIFICATION_MSG: {
+                final String procName;
+                final int uid;
+                final long memLimit;
+                final String reportPackage;
+                synchronized (ActivityManagerService.this) {
+                    procName = mMemWatchDumpProcName;
+                    uid = mMemWatchDumpUid;
+                    Pair<Long, String> val = mMemWatchProcesses.get(procName, uid);
+                    if (val == null) {
+                        val = mMemWatchProcesses.get(procName, 0);
+                    }
+                    if (val != null) {
+                        memLimit = val.first;
+                        reportPackage = val.second;
+                    } else {
+                        memLimit = 0;
+                        reportPackage = null;
+                    }
+                }
+                if (procName == null) {
+                    return;
+                }
+
+                if (DEBUG_PSS) Slog.d(TAG_PSS,
+                        "Showing dump heap notification from " + procName + "/" + uid);
+
+                INotificationManager inm = NotificationManager.getService();
+                if (inm == null) {
+                    return;
+                }
+
+                String text = mContext.getString(R.string.dump_heap_notification, procName);
+
+
+                Intent deleteIntent = new Intent();
+                deleteIntent.setAction(DumpHeapActivity.ACTION_DELETE_DUMPHEAP);
+                Intent intent = new Intent();
+                intent.setClassName("android", DumpHeapActivity.class.getName());
+                intent.putExtra(DumpHeapActivity.KEY_PROCESS, procName);
+                intent.putExtra(DumpHeapActivity.KEY_SIZE, memLimit);
+                if (reportPackage != null) {
+                    intent.putExtra(DumpHeapActivity.KEY_DIRECT_LAUNCH, reportPackage);
+                }
+                int userId = UserHandle.getUserId(uid);
+                Notification notification = new Notification.Builder(mContext)
+                        .setSmallIcon(com.android.internal.R.drawable.stat_sys_adb)
+                        .setWhen(0)
+                        .setOngoing(true)
+                        .setAutoCancel(true)
+                        .setTicker(text)
+                        .setColor(mContext.getColor(
+                                com.android.internal.R.color.system_notification_accent_color))
+                        .setContentTitle(text)
+                        .setContentText(
+                                mContext.getText(R.string.dump_heap_notification_detail))
+                        .setContentIntent(PendingIntent.getActivityAsUser(mContext, 0,
+                                intent, PendingIntent.FLAG_CANCEL_CURRENT, null,
+                                new UserHandle(userId)))
+                        .setDeleteIntent(PendingIntent.getBroadcastAsUser(mContext, 0,
+                                deleteIntent, 0, UserHandle.SYSTEM))
+                        .build();
+
+                try {
+                    int[] outId = new int[1];
+                    inm.enqueueNotificationWithTag("android", "android", null,
+                            R.string.dump_heap_notification,
+                            notification, outId, userId);
+                } catch (RuntimeException e) {
+                    Slog.w(ActivityManagerService.TAG,
+                            "Error showing notification for dump heap", e);
+                } catch (RemoteException e) {
+                }
+            } break;
+            case DELETE_DUMPHEAP_MSG: {
+                revokeUriPermission(ActivityThread.currentActivityThread().getApplicationThread(),
+                        DumpHeapActivity.JAVA_URI,
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION
+                                | Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
+                        UserHandle.myUserId());
+                synchronized (ActivityManagerService.this) {
+                    mMemWatchDumpFile = null;
+                    mMemWatchDumpProcName = null;
+                    mMemWatchDumpPid = -1;
+                    mMemWatchDumpUid = -1;
+                }
+            } break;
+            case FOREGROUND_PROFILE_CHANGED_MSG: {
+                mUserController.dispatchForegroundProfileChanged(msg.arg1);
+            } break;
+            case REPORT_TIME_TRACKER_MSG: {
+                AppTimeTracker tracker = (AppTimeTracker)msg.obj;
+                tracker.deliverResult(mContext);
+            } break;
+            case REPORT_USER_SWITCH_COMPLETE_MSG: {
+                mUserController.dispatchUserSwitchComplete(msg.arg1);
+            } break;
+            case SHUTDOWN_UI_AUTOMATION_CONNECTION_MSG: {
+                IUiAutomationConnection connection = (IUiAutomationConnection) msg.obj;
+                try {
+                    connection.shutdown();
+                } catch (RemoteException e) {
+                    Slog.w(TAG, "Error shutting down UiAutomationConnection");
+                }
+                // Only a UiAutomation can set this flag and now that
+                // it is finished we make sure it is reset to its default.
+                mUserIsMonkey = false;
+            } break;
+            case APP_BOOST_DEACTIVATE_MSG: {
+                synchronized(ActivityManagerService.this) {
+                    if (mIsBoosted) {
+                        if (mBoostStartTime < (SystemClock.uptimeMillis() - APP_BOOST_TIMEOUT)) {
+                            nativeMigrateFromBoost();
+                            mIsBoosted = false;
+                            mBoostStartTime = 0;
+                        } else {
+                            Message newmsg = mHandler.obtainMessage(APP_BOOST_DEACTIVATE_MSG);
+                            mHandler.sendMessageDelayed(newmsg, APP_BOOST_TIMEOUT);
+                        }
+                    }
+                }
+            } break;
+            case IDLE_UIDS_MSG: {
+                idleUids();
+            } break;
+            case LOG_STACK_STATE: {
+                synchronized (ActivityManagerService.this) {
+                    mStackSupervisor.logStackState();
+                }
+            } break;
+            case VR_MODE_CHANGE_MSG: {
+                VrManagerInternal vrService = LocalServices.getService(VrManagerInternal.class);
+                final ActivityRecord r = (ActivityRecord) msg.obj;
+                boolean vrMode;
+                ComponentName requestedPackage;
+                ComponentName callingPackage;
+                int userId;
+                synchronized (ActivityManagerService.this) {
+                    vrMode = r.requestedVrComponent != null;
+                    requestedPackage = r.requestedVrComponent;
+                    userId = r.userId;
+                    callingPackage = r.info.getComponentName();
+                    if (mInVrMode != vrMode) {
+                        mInVrMode = vrMode;
+                        mShowDialogs = shouldShowDialogs(mConfiguration, mInVrMode);
+                    }
+                }
+                vrService.setVrMode(vrMode, requestedPackage, userId, callingPackage);
+            } break;
+            case VR_MODE_APPLY_IF_NEEDED_MSG: {
+                final ActivityRecord r = (ActivityRecord) msg.obj;
+                final boolean needsVrMode = r != null && r.requestedVrComponent != null;
+                if (needsVrMode) {
+                    applyVrMode(msg.arg1 == 1, r.requestedVrComponent, r.userId,
+                            r.info.getComponentName(), false);
+                }
+            } break;
+            }

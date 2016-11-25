@@ -1,0 +1,297 @@
+class DreamManagerService
+!!!42133303.java!!!	DreamManagerService(inout context : Context)
+        super(context);
+        mContext = context;
+        mHandler = new DreamHandler(FgThread.get().getLooper());
+        mController = new DreamController(context, mHandler, mControllerListener);
+
+        mPowerManager = (PowerManager)context.getSystemService(Context.POWER_SERVICE);
+        mPowerManagerInternal = getLocalService(PowerManagerInternal.class);
+        mDozeWakeLock = mPowerManager.newWakeLock(PowerManager.DOZE_WAKE_LOCK, TAG);
+!!!42133431.java!!!	onStart() : void
+        publishBinderService(DreamService.DREAM_SERVICE, new BinderService());
+        publishLocalService(DreamManagerInternal.class, new LocalService());
+!!!42133559.java!!!	onBootPhase(in phase : int) : void
+        if (phase == SystemService.PHASE_THIRD_PARTY_APPS_CAN_START) {
+            if (Build.IS_DEBUGGABLE) {
+                SystemProperties.addChangeCallback(mSystemPropertiesChanged);
+            }
+            mContext.registerReceiver(new BroadcastReceiver() {
+                @Override
+                public void onReceive(Context context, Intent intent) {
+                    synchronized (mLock) {
+                        stopDreamLocked(false /*immediate*/);
+                    }
+                }
+            }, new IntentFilter(Intent.ACTION_USER_SWITCHED), null, mHandler);
+        }
+!!!42133687.java!!!	dumpInternal(inout pw : PrintWriter) : void
+        pw.println("DREAM MANAGER (dumpsys dreams)");
+        pw.println();
+        pw.println("mCurrentDreamToken=" + mCurrentDreamToken);
+        pw.println("mCurrentDreamName=" + mCurrentDreamName);
+        pw.println("mCurrentDreamUserId=" + mCurrentDreamUserId);
+        pw.println("mCurrentDreamIsTest=" + mCurrentDreamIsTest);
+        pw.println("mCurrentDreamCanDoze=" + mCurrentDreamCanDoze);
+        pw.println("mCurrentDreamIsDozing=" + mCurrentDreamIsDozing);
+        pw.println("mCurrentDreamIsWaking=" + mCurrentDreamIsWaking);
+        pw.println("mCurrentDreamDozeScreenState="
+                + Display.stateToString(mCurrentDreamDozeScreenState));
+        pw.println("mCurrentDreamDozeScreenBrightness=" + mCurrentDreamDozeScreenBrightness);
+        pw.println("getDozeComponent()=" + getDozeComponent());
+        pw.println();
+
+        DumpUtils.dumpAsync(mHandler, new DumpUtils.Dump() {
+            @Override
+            public void dump(PrintWriter pw, String prefix) {
+                mController.dump(pw);
+            }
+        }, pw, "", 200);
+!!!42133815.java!!!	isDreamingInternal() : boolean
+        synchronized (mLock) {
+            return mCurrentDreamToken != null && !mCurrentDreamIsTest
+                    && !mCurrentDreamIsWaking;
+        }
+!!!42133943.java!!!	requestDreamInternal() : void
+        // Ask the power manager to nap.  It will eventually call back into
+        // startDream() if/when it is appropriate to start dreaming.
+        // Because napping could cause the screen to turn off immediately if the dream
+        // cannot be started, we keep one eye open and gently poke user activity.
+        long time = SystemClock.uptimeMillis();
+        mPowerManager.userActivity(time, true /*noChangeLights*/);
+        mPowerManager.nap(time);
+!!!42134071.java!!!	requestAwakenInternal() : void
+        // Treat an explicit request to awaken as user activity so that the
+        // device doesn't immediately go to sleep if the timeout expired,
+        // for example when being undocked.
+        long time = SystemClock.uptimeMillis();
+        mPowerManager.userActivity(time, false /*noChangeLights*/);
+        stopDreamInternal(false /*immediate*/);
+!!!42134199.java!!!	finishSelfInternal(inout token : IBinder, inout immediate : boolean) : void
+        if (DEBUG) {
+            Slog.d(TAG, "Dream finished: " + token + ", immediate=" + immediate);
+        }
+
+        // Note that a dream finishing and self-terminating is not
+        // itself considered user activity.  If the dream is ending because
+        // the user interacted with the device then user activity will already
+        // have been poked so the device will stay awake a bit longer.
+        // If the dream is ending on its own for other reasons and no wake
+        // locks are held and the user activity timeout has expired then the
+        // device may simply go to sleep.
+        synchronized (mLock) {
+            if (mCurrentDreamToken == token) {
+                stopDreamLocked(immediate);
+            }
+        }
+!!!42134327.java!!!	testDreamInternal(inout dream : ComponentName, in userId : int) : void
+        synchronized (mLock) {
+            startDreamLocked(dream, true /*isTest*/, false /*canDoze*/, userId);
+        }
+!!!42134455.java!!!	startDreamInternal(inout doze : boolean) : void
+        final int userId = ActivityManager.getCurrentUser();
+        final ComponentName dream = chooseDreamForUser(doze, userId);
+        if (dream != null) {
+            synchronized (mLock) {
+                startDreamLocked(dream, false /*isTest*/, doze, userId);
+            }
+        }
+!!!42134583.java!!!	stopDreamInternal(inout immediate : boolean) : void
+        synchronized (mLock) {
+            stopDreamLocked(immediate);
+        }
+!!!42134711.java!!!	startDozingInternal(inout token : IBinder, in screenState : int, in screenBrightness : int) : void
+        if (DEBUG) {
+            Slog.d(TAG, "Dream requested to start dozing: " + token
+                    + ", screenState=" + screenState
+                    + ", screenBrightness=" + screenBrightness);
+        }
+
+        synchronized (mLock) {
+            if (mCurrentDreamToken == token && mCurrentDreamCanDoze) {
+                mCurrentDreamDozeScreenState = screenState;
+                mCurrentDreamDozeScreenBrightness = screenBrightness;
+                mPowerManagerInternal.setDozeOverrideFromDreamManager(
+                        screenState, screenBrightness);
+                if (!mCurrentDreamIsDozing) {
+                    mCurrentDreamIsDozing = true;
+                    mDozeWakeLock.acquire();
+                }
+            }
+        }
+!!!42134839.java!!!	stopDozingInternal(inout token : IBinder) : void
+        if (DEBUG) {
+            Slog.d(TAG, "Dream requested to stop dozing: " + token);
+        }
+
+        synchronized (mLock) {
+            if (mCurrentDreamToken == token && mCurrentDreamIsDozing) {
+                mCurrentDreamIsDozing = false;
+                mDozeWakeLock.release();
+                mPowerManagerInternal.setDozeOverrideFromDreamManager(
+                        Display.STATE_UNKNOWN, PowerManager.BRIGHTNESS_DEFAULT);
+            }
+        }
+!!!42134967.java!!!	chooseDreamForUser(inout doze : boolean, in userId : int) : ComponentName
+        if (doze) {
+            ComponentName dozeComponent = getDozeComponent(userId);
+            return validateDream(dozeComponent) ? dozeComponent : null;
+        }
+        ComponentName[] dreams = getDreamComponentsForUser(userId);
+        return dreams != null && dreams.length != 0 ? dreams[0] : null;
+!!!42135095.java!!!	validateDream(inout component : ComponentName) : boolean
+        if (component == null) return false;
+        final ServiceInfo serviceInfo = getServiceInfo(component);
+        if (serviceInfo == null) {
+            Slog.w(TAG, "Dream " + component + " does not exist");
+            return false;
+        } else if (serviceInfo.applicationInfo.targetSdkVersion >= Build.VERSION_CODES.LOLLIPOP
+                && !BIND_DREAM_SERVICE.equals(serviceInfo.permission)) {
+            Slog.w(TAG, "Dream " + component
+                    + " is not available because its manifest is missing the " + BIND_DREAM_SERVICE
+                    + " permission on the dream service declaration.");
+            return false;
+        }
+        return true;
+!!!42135223.java!!!	getDreamComponentsForUser(in userId : int) : ComponentName
+        String names = Settings.Secure.getStringForUser(mContext.getContentResolver(),
+                Settings.Secure.SCREENSAVER_COMPONENTS,
+                userId);
+        ComponentName[] components = componentsFromString(names);
+
+        // first, ensure components point to valid services
+        List<ComponentName> validComponents = new ArrayList<ComponentName>();
+        if (components != null) {
+            for (ComponentName component : components) {
+                if (validateDream(component)) {
+                    validComponents.add(component);
+                }
+            }
+        }
+
+        // fallback to the default dream component if necessary
+        if (validComponents.isEmpty()) {
+            ComponentName defaultDream = getDefaultDreamComponentForUser(userId);
+            if (defaultDream != null) {
+                Slog.w(TAG, "Falling back to default dream " + defaultDream);
+                validComponents.add(defaultDream);
+            }
+        }
+        return validComponents.toArray(new ComponentName[validComponents.size()]);
+!!!42135351.java!!!	setDreamComponentsForUser(in userId : int, inout componentNames : ComponentName) : void
+        Settings.Secure.putStringForUser(mContext.getContentResolver(),
+                Settings.Secure.SCREENSAVER_COMPONENTS,
+                componentsToString(componentNames),
+                userId);
+!!!42135479.java!!!	getDefaultDreamComponentForUser(in userId : int) : ComponentName
+        String name = Settings.Secure.getStringForUser(mContext.getContentResolver(),
+                Settings.Secure.SCREENSAVER_DEFAULT_COMPONENT,
+                userId);
+        return name == null ? null : ComponentName.unflattenFromString(name);
+!!!42135607.java!!!	getDozeComponent() : ComponentName
+        return getDozeComponent(ActivityManager.getCurrentUser());
+!!!42135735.java!!!	getDozeComponent(in userId : int) : ComponentName
+        // Read the component from a system property to facilitate debugging.
+        // Note that for production devices, the dream should actually be declared in
+        // a config.xml resource.
+        String name = Build.IS_DEBUGGABLE ? SystemProperties.get("debug.doze.component") : null;
+        if (TextUtils.isEmpty(name)) {
+            // Read the component from a config.xml resource.
+            // The value should be specified in a resource overlay for the product.
+            name = mContext.getResources().getString(
+                    com.android.internal.R.string.config_dozeComponent);
+        }
+        boolean enabled = Settings.Secure.getIntForUser(mContext.getContentResolver(),
+                Settings.Secure.DOZE_ENABLED, 1, userId) != 0;
+        return TextUtils.isEmpty(name) || !enabled ? null : ComponentName.unflattenFromString(name);
+!!!42135863.java!!!	getServiceInfo(inout name : ComponentName) : ServiceInfo
+        try {
+            return name != null ? mContext.getPackageManager().getServiceInfo(name,
+                    PackageManager.MATCH_DEBUG_TRIAGED_MISSING) : null;
+        } catch (NameNotFoundException e) {
+            return null;
+        }
+!!!42135991.java!!!	startDreamLocked(in name : ComponentName, in isTest : boolean, in canDoze : boolean, in userId : int) : void
+        if (Objects.equal(mCurrentDreamName, name)
+                && mCurrentDreamIsTest == isTest
+                && mCurrentDreamCanDoze == canDoze
+                && mCurrentDreamUserId == userId) {
+            return;
+        }
+
+        stopDreamLocked(true /*immediate*/);
+
+        Slog.i(TAG, "Entering dreamland.");
+
+        final Binder newToken = new Binder();
+        mCurrentDreamToken = newToken;
+        mCurrentDreamName = name;
+        mCurrentDreamIsTest = isTest;
+        mCurrentDreamCanDoze = canDoze;
+        mCurrentDreamUserId = userId;
+
+        mHandler.post(new Runnable() {
+            @Override
+            public void run() {
+                mController.startDream(newToken, name, isTest, canDoze, userId);
+            }
+        });
+!!!42136119.java!!!	stopDreamLocked(in immediate : boolean) : void
+        if (mCurrentDreamToken != null) {
+            if (immediate) {
+                Slog.i(TAG, "Leaving dreamland.");
+                cleanupDreamLocked();
+            } else if (mCurrentDreamIsWaking) {
+                return; // already waking
+            } else {
+                Slog.i(TAG, "Gently waking up from dream.");
+                mCurrentDreamIsWaking = true;
+            }
+
+            mHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    mController.stopDream(immediate);
+                }
+            });
+        }
+!!!42136247.java!!!	cleanupDreamLocked() : void
+        mCurrentDreamToken = null;
+        mCurrentDreamName = null;
+        mCurrentDreamIsTest = false;
+        mCurrentDreamCanDoze = false;
+        mCurrentDreamUserId = 0;
+        mCurrentDreamIsWaking = false;
+        if (mCurrentDreamIsDozing) {
+            mCurrentDreamIsDozing = false;
+            mDozeWakeLock.release();
+        }
+        mCurrentDreamDozeScreenState = Display.STATE_UNKNOWN;
+        mCurrentDreamDozeScreenBrightness = PowerManager.BRIGHTNESS_DEFAULT;
+!!!42136375.java!!!	checkPermission(inout permission : String) : void
+        if (mContext.checkCallingOrSelfPermission(permission)
+                != PackageManager.PERMISSION_GRANTED) {
+            throw new SecurityException("Access denied to process: " + Binder.getCallingPid()
+                    + ", must have permission " + permission);
+        }
+!!!42136503.java!!!	componentsToString(inout componentNames : ComponentName) : String
+        StringBuilder names = new StringBuilder();
+        if (componentNames != null) {
+            for (ComponentName componentName : componentNames) {
+                if (names.length() > 0) {
+                    names.append(',');
+                }
+                names.append(componentName.flattenToString());
+            }
+        }
+        return names.toString();
+!!!42136631.java!!!	componentsFromString(inout names : String) : ComponentName
+        if (names == null) {
+            return null;
+        }
+        String[] namesArray = names.split(",");
+        ComponentName[] componentNames = new ComponentName[namesArray.length];
+        for (int i = 0; i < namesArray.length; i++) {
+            componentNames[i] = ComponentName.unflattenFromString(namesArray[i]);
+        }
+        return componentNames;

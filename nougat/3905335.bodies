@@ -1,0 +1,157 @@
+class NetworkDiagnostics
+!!!42002743.java!!!	now() : long
+        return SystemClock.elapsedRealtime();
+!!!42003511.java!!!	NetworkDiagnostics(inout network : Network, inout lp : LinkProperties, in timeoutMs : long)
+        mNetwork = network;
+        mLinkProperties = lp;
+        mInterfaceIndex = getInterfaceIndex(mLinkProperties.getInterfaceName());
+        mTimeoutMs = timeoutMs;
+        mStartTime = now();
+        mDeadlineTime = mStartTime + mTimeoutMs;
+
+        // Hardcode measurements to TEST_DNS4 and TEST_DNS6 in order to test off-link connectivity.
+        // We are free to modify mLinkProperties with impunity because ConnectivityService passes us
+        // a copy and not the original object. It's easier to do it this way because we don't need
+        // to check whether the LinkProperties already contains these DNS servers because
+        // LinkProperties#addDnsServer checks for duplicates.
+        if (mLinkProperties.isReachable(TEST_DNS4)) {
+            mLinkProperties.addDnsServer(TEST_DNS4);
+        }
+        // TODO: we could use mLinkProperties.isReachable(TEST_DNS6) here, because we won't set any
+        // DNS servers for which isReachable() is false, but since this is diagnostic code, be extra
+        // careful.
+        if (mLinkProperties.hasGlobalIPv6Address() || mLinkProperties.hasIPv6DefaultRoute()) {
+            mLinkProperties.addDnsServer(TEST_DNS6);
+        }
+
+        for (RouteInfo route : mLinkProperties.getRoutes()) {
+            if (route.hasGateway()) {
+                InetAddress gateway = route.getGateway();
+                prepareIcmpMeasurement(gateway);
+                if (route.isIPv6Default()) {
+                    prepareExplicitSourceIcmpMeasurements(gateway);
+                }
+            }
+        }
+        for (InetAddress nameserver : mLinkProperties.getDnsServers()) {
+                prepareIcmpMeasurement(nameserver);
+                prepareDnsMeasurement(nameserver);
+        }
+
+        mCountDownLatch = new CountDownLatch(totalMeasurementCount());
+
+        startMeasurements();
+
+        mDescription = "ifaces{" + TextUtils.join(",", mLinkProperties.getAllInterfaceNames()) + "}"
+                + " index{" + mInterfaceIndex + "}"
+                + " network{" + mNetwork + "}"
+                + " nethandle{" + mNetwork.getNetworkHandle() + "}";
+!!!42003639.java!!!	getInterfaceIndex(inout ifname : String) : Integer
+        try {
+            NetworkInterface ni = NetworkInterface.getByName(ifname);
+            return ni.getIndex();
+        } catch (NullPointerException | SocketException e) {
+            return null;
+        }
+!!!42003767.java!!!	prepareIcmpMeasurement(inout target : InetAddress) : void
+        if (!mIcmpChecks.containsKey(target)) {
+            Measurement measurement = new Measurement();
+            measurement.thread = new Thread(new IcmpCheck(target, measurement));
+            mIcmpChecks.put(target, measurement);
+        }
+!!!42003895.java!!!	prepareExplicitSourceIcmpMeasurements(inout target : InetAddress) : void
+        for (LinkAddress l : mLinkProperties.getLinkAddresses()) {
+            InetAddress source = l.getAddress();
+            if (source instanceof Inet6Address && l.isGlobalPreferred()) {
+                Pair<InetAddress, InetAddress> srcTarget = new Pair<>(source, target);
+                if (!mExplicitSourceIcmpChecks.containsKey(srcTarget)) {
+                    Measurement measurement = new Measurement();
+                    measurement.thread = new Thread(new IcmpCheck(source, target, measurement));
+                    mExplicitSourceIcmpChecks.put(srcTarget, measurement);
+                }
+            }
+        }
+!!!42004023.java!!!	prepareDnsMeasurement(inout target : InetAddress) : void
+        if (!mDnsUdpChecks.containsKey(target)) {
+            Measurement measurement = new Measurement();
+            measurement.thread = new Thread(new DnsUdpCheck(target, measurement));
+            mDnsUdpChecks.put(target, measurement);
+        }
+!!!42004151.java!!!	totalMeasurementCount() : int
+        return mIcmpChecks.size() + mExplicitSourceIcmpChecks.size() + mDnsUdpChecks.size();
+!!!42004279.java!!!	startMeasurements() : void
+        for (Measurement measurement : mIcmpChecks.values()) {
+            measurement.thread.start();
+        }
+        for (Measurement measurement : mExplicitSourceIcmpChecks.values()) {
+            measurement.thread.start();
+        }
+        for (Measurement measurement : mDnsUdpChecks.values()) {
+            measurement.thread.start();
+        }
+!!!42004407.java!!!	waitForMeasurements() : void
+        try {
+            mCountDownLatch.await(mDeadlineTime - now(), TimeUnit.MILLISECONDS);
+        } catch (InterruptedException ignored) {}
+!!!42004535.java!!!	getMeasurements() : NetworkDiagnostics::Measurement
+        // TODO: Consider moving waitForMeasurements() in here to minimize the
+        // chance of caller errors.
+
+        ArrayList<Measurement> measurements = new ArrayList(totalMeasurementCount());
+
+        // Sort measurements IPv4 first.
+        for (Map.Entry<InetAddress, Measurement> entry : mIcmpChecks.entrySet()) {
+            if (entry.getKey() instanceof Inet4Address) {
+                measurements.add(entry.getValue());
+            }
+        }
+        for (Map.Entry<Pair<InetAddress, InetAddress>, Measurement> entry :
+                mExplicitSourceIcmpChecks.entrySet()) {
+            if (entry.getKey().first instanceof Inet4Address) {
+                measurements.add(entry.getValue());
+            }
+        }
+        for (Map.Entry<InetAddress, Measurement> entry : mDnsUdpChecks.entrySet()) {
+            if (entry.getKey() instanceof Inet4Address) {
+                measurements.add(entry.getValue());
+            }
+        }
+
+        // IPv6 measurements second.
+        for (Map.Entry<InetAddress, Measurement> entry : mIcmpChecks.entrySet()) {
+            if (entry.getKey() instanceof Inet6Address) {
+                measurements.add(entry.getValue());
+            }
+        }
+        for (Map.Entry<Pair<InetAddress, InetAddress>, Measurement> entry :
+                mExplicitSourceIcmpChecks.entrySet()) {
+            if (entry.getKey().first instanceof Inet6Address) {
+                measurements.add(entry.getValue());
+            }
+        }
+        for (Map.Entry<InetAddress, Measurement> entry : mDnsUdpChecks.entrySet()) {
+            if (entry.getKey() instanceof Inet6Address) {
+                measurements.add(entry.getValue());
+            }
+        }
+
+        return measurements;
+!!!42004663.java!!!	dump(inout pw : IndentingPrintWriter) : void
+        pw.println(TAG + ":" + mDescription);
+        final long unfinished = mCountDownLatch.getCount();
+        if (unfinished > 0) {
+            // This can't happen unless a caller forgets to call waitForMeasurements()
+            // or a measurement isn't implemented to correctly honor the timeout.
+            pw.println("WARNING: countdown wait incomplete: "
+                    + unfinished + " unfinished measurements");
+        }
+
+        pw.increaseIndent();
+
+        String prefix;
+        for (Measurement m : getMeasurements()) {
+            prefix = m.checkSucceeded() ? "." : "F";
+            pw.println(prefix + "  " + m.toString());
+        }
+
+        pw.decreaseIndent();

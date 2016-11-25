@@ -1,0 +1,823 @@
+class BugreportProgressService
+!!!30406455.java!!!	onCreate() : void
+        mContext = getApplicationContext();
+        mMainHandler = new ServiceHandler("BugreportProgressServiceMainThread");
+        mScreenshotHandler = new ScreenshotHandler("BugreportProgressServiceScreenshotThread");
+
+        mScreenshotsDir = new File(getFilesDir(), SCREENSHOT_DIR);
+        if (!mScreenshotsDir.exists()) {
+            Log.i(TAG, "Creating directory " + mScreenshotsDir + " to store temporary screenshots");
+            if (!mScreenshotsDir.mkdir()) {
+                Log.w(TAG, "Could not create directory " + mScreenshotsDir);
+            }
+        }
+!!!30406583.java!!!	onStartCommand(inout intent : Intent, in flags : int, in startId : int) : int
+        Log.v(TAG, "onStartCommand(): " + dumpIntent(intent));
+        if (intent != null) {
+            // Handle it in a separate thread.
+            final Message msg = mMainHandler.obtainMessage();
+            msg.what = MSG_SERVICE_COMMAND;
+            msg.obj = intent;
+            mMainHandler.sendMessage(msg);
+        }
+
+        // If service is killed it cannot be recreated because it would not know which
+        // dumpstate IDs it would have to watch.
+        return START_NOT_STICKY;
+!!!30406711.java!!!	onBind(inout intent : Intent) : IBinder
+        return null;
+!!!30406839.java!!!	onDestroy() : void
+        mMainHandler.getLooper().quit();
+        mScreenshotHandler.getLooper().quit();
+        super.onDestroy();
+!!!30406967.java!!!	dump(inout fd : FileDescriptor, inout writer : PrintWriter, inout args : String) : void
+        final int size = mProcesses.size();
+        if (size == 0) {
+            writer.printf("No monitored processes");
+            return;
+        }
+        writer.printf("Foreground id: %d\n\n", mForegroundId);
+        writer.printf("Monitored dumpstate processes\n");
+        writer.printf("-----------------------------\n");
+        for (int i = 0; i < size; i++) {
+            writer.printf("%s\n", mProcesses.valueAt(i));
+        }
+!!!30407735.java!!!	getInfo(in id : int) : BugreportProgressService::BugreportInfo
+        final BugreportInfo info = mProcesses.get(id);
+        if (info == null) {
+            Log.w(TAG, "Not monitoring process with ID " + id);
+        }
+        return info;
+!!!30407863.java!!!	startProgress(inout name : String, in id : int, in pid : int, in max : int) : boolean
+        if (name == null) {
+            Log.w(TAG, "Missing " + EXTRA_NAME + " on start intent");
+        }
+        if (id == -1) {
+            Log.e(TAG, "Missing " + EXTRA_ID + " on start intent");
+            return false;
+        }
+        if (pid == -1) {
+            Log.e(TAG, "Missing " + EXTRA_PID + " on start intent");
+            return false;
+        }
+        if (max <= 0) {
+            Log.e(TAG, "Invalid value for extra " + EXTRA_MAX + ": " + max);
+            return false;
+        }
+
+        final BugreportInfo info = new BugreportInfo(mContext, id, pid, name, max);
+        if (mProcesses.indexOfKey(id) >= 0) {
+            // BUGREPORT_STARTED intent was already received; ignore it.
+            Log.w(TAG, "ID " + id + " already watched");
+            return true;
+        }
+        mProcesses.put(info.id, info);
+        updateProgress(info);
+        return true;
+!!!30407991.java!!!	updateProgress(inout info : BugreportProgressService::BugreportInfo) : void
+        if (info.max <= 0 || info.progress < 0) {
+            Log.e(TAG, "Invalid progress values for " + info);
+            return;
+        }
+
+        final NumberFormat nf = NumberFormat.getPercentInstance();
+        nf.setMinimumFractionDigits(2);
+        nf.setMaximumFractionDigits(2);
+        final String percentageText = nf.format((double) info.progress / info.max);
+        final Action cancelAction = new Action.Builder(null, mContext.getString(
+                com.android.internal.R.string.cancel), newCancelIntent(mContext, info)).build();
+        final Intent infoIntent = new Intent(mContext, BugreportProgressService.class);
+        infoIntent.setAction(INTENT_BUGREPORT_INFO_LAUNCH);
+        infoIntent.putExtra(EXTRA_ID, info.id);
+        final PendingIntent infoPendingIntent =
+                PendingIntent.getService(mContext, info.id, infoIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT);
+        final Action infoAction = new Action.Builder(null,
+                mContext.getString(R.string.bugreport_info_action),
+                infoPendingIntent).build();
+        final Intent screenshotIntent = new Intent(mContext, BugreportProgressService.class);
+        screenshotIntent.setAction(INTENT_BUGREPORT_SCREENSHOT);
+        screenshotIntent.putExtra(EXTRA_ID, info.id);
+        PendingIntent screenshotPendingIntent = mTakingScreenshot ? null : PendingIntent
+                .getService(mContext, info.id, screenshotIntent,
+                        PendingIntent.FLAG_UPDATE_CURRENT);
+        final Action screenshotAction = new Action.Builder(null,
+                mContext.getString(R.string.bugreport_screenshot_action),
+                screenshotPendingIntent).build();
+
+        final String title = mContext.getString(R.string.bugreport_in_progress_title, info.id);
+
+        final String name =
+                info.name != null ? info.name : mContext.getString(R.string.bugreport_unnamed);
+
+        final Notification notification = newBaseNotification(mContext)
+                .setContentTitle(title)
+                .setTicker(title)
+                .setContentText(name)
+                .setProgress(info.max, info.progress, false)
+                .setOngoing(true)
+                .setContentIntent(infoPendingIntent)
+                .setActions(infoAction, screenshotAction, cancelAction)
+                .build();
+
+        if (info.finished) {
+            Log.w(TAG, "Not sending progress notification because bugreport has finished already ("
+                    + info + ")");
+            return;
+        }
+        if (DEBUG) {
+            Log.d(TAG, "Sending 'Progress' notification for id " + info.id + " (pid " + info.pid
+                    + "): " + percentageText);
+        }
+        sendForegroundabledNotification(info.id, notification);
+!!!30408119.java!!!	sendForegroundabledNotification(in id : int, inout notification : Notification) : void
+        if (mForegroundId >= 0) {
+            if (DEBUG) Log.d(TAG, "Already running as foreground service");
+            NotificationManager.from(mContext).notify(id, notification);
+        } else {
+            mForegroundId = id;
+            Log.d(TAG, "Start running as foreground service on id " + mForegroundId);
+            startForeground(mForegroundId, notification);
+        }
+!!!30408247.java!!!	newCancelIntent(inout context : Context, inout info : BugreportProgressService::BugreportInfo) : PendingIntent
+        final Intent intent = new Intent(INTENT_BUGREPORT_CANCEL);
+        intent.setClass(context, BugreportProgressService.class);
+        intent.putExtra(EXTRA_ID, info.id);
+        return PendingIntent.getService(context, info.id, intent,
+                PendingIntent.FLAG_UPDATE_CURRENT);
+!!!30408375.java!!!	stopProgress(in id : int) : void
+        if (mProcesses.indexOfKey(id) < 0) {
+            Log.w(TAG, "ID not watched: " + id);
+        } else {
+            Log.d(TAG, "Removing ID " + id);
+            mProcesses.remove(id);
+        }
+        // Must stop foreground service first, otherwise notif.cancel() will fail below.
+        stopForegroundWhenDone(id);
+        Log.d(TAG, "stopProgress(" + id + "): cancel notification");
+        NotificationManager.from(mContext).cancel(id);
+        stopSelfWhenDone();
+!!!30408503.java!!!	cancel(in id : int) : void
+        MetricsLogger.action(this, MetricsEvent.ACTION_BUGREPORT_NOTIFICATION_ACTION_CANCEL);
+        Log.v(TAG, "cancel: ID=" + id);
+        final BugreportInfo info = getInfo(id);
+        if (info != null && !info.finished) {
+            Log.i(TAG, "Cancelling bugreport service (ID=" + id + ") on user's request");
+            setSystemProperty(CTL_STOP, BUGREPORT_SERVICE);
+            deleteScreenshots(info);
+        }
+        stopProgress(id);
+!!!30408631.java!!!	pollProgress() : boolean
+        final int total = mProcesses.size();
+        if (total == 0) {
+            Log.d(TAG, "No process to poll progress.");
+        }
+        int activeProcesses = 0;
+        for (int i = 0; i < total; i++) {
+            final BugreportInfo info = mProcesses.valueAt(i);
+            if (info == null) {
+                Log.wtf(TAG, "pollProgress(): null info at index " + i + "(ID = "
+                        + mProcesses.keyAt(i) + ")");
+                continue;
+            }
+
+            final int pid = info.pid;
+            final int id = info.id;
+            if (info.finished) {
+                if (DEBUG) Log.v(TAG, "Skipping finished process " + pid + " (id: " + id + ")");
+                continue;
+            }
+            activeProcesses++;
+            final String progressKey = DUMPSTATE_PREFIX + pid + PROGRESS_SUFFIX;
+            info.realProgress = SystemProperties.getInt(progressKey, 0);
+            if (info.realProgress == 0) {
+                Log.v(TAG, "System property " + progressKey + " is not set yet");
+            }
+            final String maxKey = DUMPSTATE_PREFIX + pid + MAX_SUFFIX;
+            info.realMax = SystemProperties.getInt(maxKey, info.max);
+            if (info.realMax <= 0 ) {
+                Log.w(TAG, "Property " + maxKey + " is not positive: " + info.max);
+                continue;
+            }
+            /*
+             * Checks whether the progress changed in a way that should be displayed to the user:
+             * - info.progress / info.max represents the displayed progress
+             * - info.realProgress / info.realMax represents the real progress
+             * - since the real progress can decrease, the displayed progress is only updated if it
+             *   increases
+             * - the displayed progress is capped at a maximum (like 99%)
+             */
+            final int oldPercentage = (CAPPED_MAX * info.progress) / info.max;
+            int newPercentage = (CAPPED_MAX * info.realProgress) / info.realMax;
+            int max = info.realMax;
+            int progress = info.realProgress;
+
+            if (newPercentage > CAPPED_PROGRESS) {
+                progress = newPercentage = CAPPED_PROGRESS;
+                max = CAPPED_MAX;
+            }
+
+            if (newPercentage > oldPercentage) {
+                if (DEBUG) {
+                    if (progress != info.progress) {
+                        Log.v(TAG, "Updating progress for PID " + pid + "(id: " + id + ") from "
+                                + info.progress + " to " + progress);
+                    }
+                    if (max != info.max) {
+                        Log.v(TAG, "Updating max progress for PID " + pid + "(id: " + id + ") from "
+                                + info.max + " to " + max);
+                    }
+                }
+                info.progress = progress;
+                info.max = max;
+                info.lastUpdate = System.currentTimeMillis();
+                updateProgress(info);
+            } else {
+                long inactiveTime = System.currentTimeMillis() - info.lastUpdate;
+                if (inactiveTime >= INACTIVITY_TIMEOUT) {
+                    Log.w(TAG, "No progress update for PID " + pid + " since "
+                            + info.getFormattedLastUpdate());
+                    stopProgress(info.id);
+                }
+            }
+        }
+        if (DEBUG) Log.v(TAG, "pollProgress() total=" + total + ", actives=" + activeProcesses);
+        return activeProcesses > 0;
+!!!30408759.java!!!	launchBugreportInfoDialog(in id : int) : void
+        MetricsLogger.action(this, MetricsEvent.ACTION_BUGREPORT_NOTIFICATION_ACTION_DETAILS);
+        // Copy values so it doesn't lock mProcesses while UI is being updated
+        final String name, title, description;
+        final BugreportInfo info = getInfo(id);
+        if (info == null) {
+            // Most likely am killed Shell before user tapped the notification. Since system might
+            // be too busy anwyays, it's better to ignore the notification and switch back to the
+            // non-interactive mode (where the bugerport will be shared upon completion).
+            Log.w(TAG, "launchBugreportInfoDialog(): canceling notification because id " + id
+                    + " was not found");
+            // TODO: add test case to make sure notification is canceled.
+            NotificationManager.from(mContext).cancel(id);
+            return;
+        }
+
+        collapseNotificationBar();
+        mInfoDialog.initialize(mContext, info);
+!!!30408887.java!!!	takeScreenshot(in id : int) : void
+        MetricsLogger.action(this, MetricsEvent.ACTION_BUGREPORT_NOTIFICATION_ACTION_SCREENSHOT);
+        if (getInfo(id) == null) {
+            // Most likely am killed Shell before user tapped the notification. Since system might
+            // be too busy anwyays, it's better to ignore the notification and switch back to the
+            // non-interactive mode (where the bugerport will be shared upon completion).
+            Log.w(TAG, "takeScreenshot(): canceling notification because id " + id
+                    + " was not found");
+            // TODO: add test case to make sure notification is canceled.
+            NotificationManager.from(mContext).cancel(id);
+            return;
+        }
+        setTakingScreenshot(true);
+        collapseNotificationBar();
+        final String msg = mContext.getResources()
+                .getQuantityString(com.android.internal.R.plurals.bugreport_countdown,
+                        SCREENSHOT_DELAY_SECONDS, SCREENSHOT_DELAY_SECONDS);
+        Log.i(TAG, msg);
+        // Show a toast just once, otherwise it might be captured in the screenshot.
+        Toast.makeText(mContext, msg, Toast.LENGTH_SHORT).show();
+
+        takeScreenshot(id, SCREENSHOT_DELAY_SECONDS);
+!!!30409015.java!!!	takeScreenshot(in id : int, in delay : int) : void
+        if (delay > 0) {
+            Log.d(TAG, "Taking screenshot for " + id + " in " + delay + " seconds");
+            final Message msg = mMainHandler.obtainMessage();
+            msg.what = MSG_DELAYED_SCREENSHOT;
+            msg.arg1 = id;
+            msg.arg2 = delay - 1;
+            mMainHandler.sendMessageDelayed(msg, DateUtils.SECOND_IN_MILLIS);
+            return;
+        }
+
+        // It's time to take the screenshot: let the proper thread handle it
+        final BugreportInfo info = getInfo(id);
+        if (info == null) {
+            return;
+        }
+        final String screenshotPath =
+                new File(mScreenshotsDir, info.getPathNextScreenshot()).getAbsolutePath();
+
+        Message.obtain(mScreenshotHandler, MSG_SCREENSHOT_REQUEST, id, UNUSED_ARG2, screenshotPath)
+                .sendToTarget();
+!!!30409143.java!!!	setTakingScreenshot(inout flag : boolean) : void
+        synchronized (BugreportProgressService.this) {
+            mTakingScreenshot = flag;
+            for (int i = 0; i < mProcesses.size(); i++) {
+                final BugreportInfo info = mProcesses.valueAt(i);
+                if (info.finished) {
+                    Log.d(TAG, "Not updating progress for " + info.id + " while taking screenshot"
+                            + " because share notification was already sent");
+                    continue;
+                }
+                updateProgress(info);
+            }
+        }
+!!!30409271.java!!!	handleScreenshotRequest(inout requestMsg : Message) : void
+        String screenshotFile = (String) requestMsg.obj;
+        boolean taken = takeScreenshot(mContext, screenshotFile);
+        setTakingScreenshot(false);
+
+        Message.obtain(mMainHandler, MSG_SCREENSHOT_RESPONSE, requestMsg.arg1, taken ? 1 : 0,
+                screenshotFile).sendToTarget();
+!!!30409399.java!!!	handleScreenshotResponse(inout resultMsg : Message) : void
+        final boolean taken = resultMsg.arg2 != 0;
+        final BugreportInfo info = getInfo(resultMsg.arg1);
+        if (info == null) {
+            return;
+        }
+        final File screenshotFile = new File((String) resultMsg.obj);
+
+        final String msg;
+        if (taken) {
+            info.addScreenshot(screenshotFile);
+            if (info.finished) {
+                Log.d(TAG, "Screenshot finished after bugreport; updating share notification");
+                info.renameScreenshots(mScreenshotsDir);
+                sendBugreportNotification(info, mTakingScreenshot);
+            }
+            msg = mContext.getString(R.string.bugreport_screenshot_taken);
+        } else {
+            // TODO: try again using Framework APIs instead of relying on screencap.
+            msg = mContext.getString(R.string.bugreport_screenshot_failed);
+            Toast.makeText(mContext, msg, Toast.LENGTH_SHORT).show();
+        }
+        Log.d(TAG, msg);
+!!!30409527.java!!!	deleteScreenshots(inout info : BugreportProgressService::BugreportInfo) : void
+        for (File file : info.screenshotFiles) {
+            Log.i(TAG, "Deleting screenshot file " + file);
+            file.delete();
+        }
+!!!30409655.java!!!	stopForegroundWhenDone(in id : int) : void
+        if (id != mForegroundId) {
+            Log.d(TAG, "stopForegroundWhenDone(" + id + "): ignoring since foreground id is "
+                    + mForegroundId);
+            return;
+        }
+
+        Log.d(TAG, "detaching foreground from id " + mForegroundId);
+        stopForeground(Service.STOP_FOREGROUND_DETACH);
+        mForegroundId = -1;
+
+        // Might need to restart foreground using a new notification id.
+        final int total = mProcesses.size();
+        if (total > 0) {
+            for (int i = 0; i < total; i++) {
+                final BugreportInfo info = mProcesses.valueAt(i);
+                if (!info.finished) {
+                    updateProgress(info);
+                    break;
+                }
+            }
+        }
+!!!30409783.java!!!	stopSelfWhenDone() : void
+        if (mProcesses.size() > 0) {
+            if (DEBUG) Log.d(TAG, "Staying alive, waiting for IDs " + mProcesses);
+            return;
+        }
+        Log.v(TAG, "No more processes to handle, shutting down");
+        stopSelf();
+!!!30409911.java!!!	onBugreportFinished(in id : int, inout intent : Intent) : void
+        final File bugreportFile = getFileExtra(intent, EXTRA_BUGREPORT);
+        // Since BugreportProvider and BugreportProgressService aren't tightly coupled,
+        // we need to make sure they are explicitly tied to a single unique notification URI
+        // so that the service can alert the provider of changes it has done (ie. new bug
+        // reports)
+        // See { @link Cursor#setNotificationUri } and {@link ContentResolver#notifyChanges }
+        final Uri notificationUri = BugreportStorageProvider.getNotificationUri();
+        mContext.getContentResolver().notifyChange(notificationUri, null, false);
+
+        if (bugreportFile == null) {
+            // Should never happen, dumpstate always set the file.
+            Log.wtf(TAG, "Missing " + EXTRA_BUGREPORT + " on intent " + intent);
+            return;
+        }
+        mInfoDialog.onBugreportFinished(id);
+        BugreportInfo info = getInfo(id);
+        if (info == null) {
+            // Happens when BUGREPORT_FINISHED was received without a BUGREPORT_STARTED first.
+            Log.v(TAG, "Creating info for untracked ID " + id);
+            info = new BugreportInfo(mContext, id);
+            mProcesses.put(id, info);
+        }
+        info.renameScreenshots(mScreenshotsDir);
+        info.bugreportFile = bugreportFile;
+
+        final int max = intent.getIntExtra(EXTRA_MAX, -1);
+        if (max != -1) {
+            MetricsLogger.histogram(this, "dumpstate_duration", max);
+            info.max = max;
+        }
+
+        final File screenshot = getFileExtra(intent, EXTRA_SCREENSHOT);
+        if (screenshot != null) {
+            info.addScreenshot(screenshot);
+        }
+        info.finished = true;
+
+        // Stop running on foreground, otherwise share notification cannot be dismissed.
+        stopForegroundWhenDone(id);
+
+        final Configuration conf = mContext.getResources().getConfiguration();
+        if ((conf.uiMode & Configuration.UI_MODE_TYPE_MASK) != Configuration.UI_MODE_TYPE_WATCH) {
+            triggerLocalNotification(mContext, info);
+        }
+!!!30410039.java!!!	triggerLocalNotification(in context : Context, in info : BugreportProgressService::BugreportInfo) : void
+        if (!info.bugreportFile.exists() || !info.bugreportFile.canRead()) {
+            Log.e(TAG, "Could not read bugreport file " + info.bugreportFile);
+            Toast.makeText(context, R.string.bugreport_unreadable_text, Toast.LENGTH_LONG).show();
+            stopProgress(info.id);
+            return;
+        }
+
+        boolean isPlainText = info.bugreportFile.getName().toLowerCase().endsWith(".txt");
+        if (!isPlainText) {
+            // Already zipped, send it right away.
+            sendBugreportNotification(info, mTakingScreenshot);
+        } else {
+            // Asynchronously zip the file first, then send it.
+            sendZippedBugreportNotification(info, mTakingScreenshot);
+        }
+!!!30410167.java!!!	buildWarningIntent(inout context : Context, inout sendIntent : Intent) : Intent
+        final Intent intent = new Intent(context, BugreportWarningActivity.class);
+        intent.putExtra(Intent.EXTRA_INTENT, sendIntent);
+        return intent;
+!!!30410295.java!!!	buildSendIntent(inout context : Context, inout info : BugreportProgressService::BugreportInfo) : Intent
+        // Files are kept on private storage, so turn into Uris that we can
+        // grant temporary permissions for.
+        final Uri bugreportUri;
+        try {
+            bugreportUri = getUri(context, info.bugreportFile);
+        } catch (IllegalArgumentException e) {
+            // Should not happen on production, but happens when a Shell is sideloaded and
+            // FileProvider cannot find a configured root for it.
+            Log.wtf(TAG, "Could not get URI for " + info.bugreportFile, e);
+            return null;
+        }
+
+        final Intent intent = new Intent(Intent.ACTION_SEND_MULTIPLE);
+        final String mimeType = "application/vnd.android.bugreport";
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        intent.addCategory(Intent.CATEGORY_DEFAULT);
+        intent.setType(mimeType);
+
+        final String subject = !TextUtils.isEmpty(info.title) ?
+                info.title : bugreportUri.getLastPathSegment();
+        intent.putExtra(Intent.EXTRA_SUBJECT, subject);
+
+        // EXTRA_TEXT should be an ArrayList, but some clients are expecting a single String.
+        // So, to avoid an exception on Intent.migrateExtraStreamToClipData(), we need to manually
+        // create the ClipData object with the attachments URIs.
+        final StringBuilder messageBody = new StringBuilder("Build info: ")
+            .append(SystemProperties.get("ro.build.description"))
+            .append("\nSerial number: ")
+            .append(SystemProperties.get("ro.serialno"));
+        if (!TextUtils.isEmpty(info.description)) {
+            messageBody.append("\nDescription: ").append(info.description);
+        }
+        intent.putExtra(Intent.EXTRA_TEXT, messageBody.toString());
+        final ClipData clipData = new ClipData(null, new String[] { mimeType },
+                new ClipData.Item(null, null, null, bugreportUri));
+        final ArrayList<Uri> attachments = Lists.newArrayList(bugreportUri);
+        for (File screenshot : info.screenshotFiles) {
+            final Uri screenshotUri = getUri(context, screenshot);
+            clipData.addItem(new ClipData.Item(null, null, null, screenshotUri));
+            attachments.add(screenshotUri);
+        }
+        intent.setClipData(clipData);
+        intent.putParcelableArrayListExtra(Intent.EXTRA_STREAM, attachments);
+
+        final Account sendToAccount = findSendToAccount(context);
+        if (sendToAccount != null) {
+            intent.putExtra(Intent.EXTRA_EMAIL, new String[] { sendToAccount.name });
+        }
+
+        return intent;
+!!!30410423.java!!!	shareBugreport(in id : int, inout sharedInfo : BugreportProgressService::BugreportInfo) : void
+        MetricsLogger.action(this, MetricsEvent.ACTION_BUGREPORT_NOTIFICATION_ACTION_SHARE);
+        BugreportInfo info = getInfo(id);
+        if (info == null) {
+            // Service was terminated but notification persisted
+            info = sharedInfo;
+            Log.d(TAG, "shareBugreport(): no info for ID " + id + " on managed processes ("
+                    + mProcesses + "), using info from intent instead (" + info + ")");
+        } else {
+            Log.v(TAG, "shareBugReport(): id " + id + " info = " + info);
+        }
+
+        addDetailsToZipFile(info);
+
+        final Intent sendIntent = buildSendIntent(mContext, info);
+        if (sendIntent == null) {
+            Log.w(TAG, "Stopping progres on ID " + id + " because share intent could not be built");
+            stopProgress(id);
+            return;
+        }
+
+        final Intent notifIntent;
+
+        // Send through warning dialog by default
+        if (getWarningState(mContext, STATE_UNKNOWN) != STATE_HIDE) {
+            notifIntent = buildWarningIntent(mContext, sendIntent);
+        } else {
+            notifIntent = sendIntent;
+        }
+        notifIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+
+        // Send the share intent...
+        mContext.startActivity(notifIntent);
+
+        // ... and stop watching this process.
+        stopProgress(id);
+!!!30410551.java!!!	sendBugreportNotification(inout info : BugreportProgressService::BugreportInfo, inout takingScreenshot : boolean) : void
+
+        // Since adding the details can take a while, do it before notifying user.
+        addDetailsToZipFile(info);
+
+        final Intent shareIntent = new Intent(INTENT_BUGREPORT_SHARE);
+        shareIntent.setClass(mContext, BugreportProgressService.class);
+        shareIntent.setAction(INTENT_BUGREPORT_SHARE);
+        shareIntent.putExtra(EXTRA_ID, info.id);
+        shareIntent.putExtra(EXTRA_INFO, info);
+
+        final String title = mContext.getString(R.string.bugreport_finished_title, info.id);
+        final String content = takingScreenshot ?
+                mContext.getString(R.string.bugreport_finished_pending_screenshot_text)
+                : mContext.getString(R.string.bugreport_finished_text);
+        final Notification.Builder builder = newBaseNotification(mContext)
+                .setContentTitle(title)
+                .setTicker(title)
+                .setContentText(content)
+                .setContentIntent(PendingIntent.getService(mContext, info.id, shareIntent,
+                        PendingIntent.FLAG_UPDATE_CURRENT))
+                .setDeleteIntent(newCancelIntent(mContext, info));
+
+        if (!TextUtils.isEmpty(info.name)) {
+            builder.setSubText(info.name);
+        }
+
+        Log.v(TAG, "Sending 'Share' notification for ID " + info.id + ": " + title);
+        NotificationManager.from(mContext).notify(info.id, builder.build());
+!!!30410679.java!!!	sendBugreportBeingUpdatedNotification(inout context : Context, in id : int) : void
+        final String title = context.getString(R.string.bugreport_updating_title);
+        final Notification.Builder builder = newBaseNotification(context)
+                .setContentTitle(title)
+                .setTicker(title)
+                .setContentText(context.getString(R.string.bugreport_updating_wait));
+        Log.v(TAG, "Sending 'Updating zip' notification for ID " + id + ": " + title);
+        sendForegroundabledNotification(id, builder.build());
+!!!30410807.java!!!	newBaseNotification(inout context : Context) : Notification::Builder
+        if (sNotificationBundle.isEmpty()) {
+            // Rename notifcations from "Shell" to "Android System"
+            sNotificationBundle.putString(Notification.EXTRA_SUBSTITUTE_APP_NAME,
+                    context.getString(com.android.internal.R.string.android_system_label));
+        }
+        return new Notification.Builder(context)
+                .addExtras(sNotificationBundle)
+                .setCategory(Notification.CATEGORY_SYSTEM)
+                .setSmallIcon(com.android.internal.R.drawable.stat_sys_adb)
+                .setLocalOnly(true)
+                .setColor(context.getColor(
+                        com.android.internal.R.color.system_notification_accent_color));
+!!!30410935.java!!!	sendZippedBugreportNotification(in info : BugreportProgressService::BugreportInfo, in takingScreenshot : boolean) : void
+        new AsyncTask<Void, Void, Void>() {
+            @Override
+            protected Void doInBackground(Void... params) {
+                zipBugreport(info);
+                sendBugreportNotification(info, takingScreenshot);
+                return null;
+            }
+        }.execute();
+!!!30411063.java!!!	zipBugreport(inout info : BugreportProgressService::BugreportInfo) : void
+        final String bugreportPath = info.bugreportFile.getAbsolutePath();
+        final String zippedPath = bugreportPath.replace(".txt", ".zip");
+        Log.v(TAG, "zipping " + bugreportPath + " as " + zippedPath);
+        final File bugreportZippedFile = new File(zippedPath);
+        try (InputStream is = new FileInputStream(info.bugreportFile);
+                ZipOutputStream zos = new ZipOutputStream(
+                        new BufferedOutputStream(new FileOutputStream(bugreportZippedFile)))) {
+            addEntry(zos, info.bugreportFile.getName(), is);
+            // Delete old file
+            final boolean deleted = info.bugreportFile.delete();
+            if (deleted) {
+                Log.v(TAG, "deleted original bugreport (" + bugreportPath + ")");
+            } else {
+                Log.e(TAG, "could not delete original bugreport (" + bugreportPath + ")");
+            }
+            info.bugreportFile = bugreportZippedFile;
+        } catch (IOException e) {
+            Log.e(TAG, "exception zipping file " + zippedPath, e);
+        }
+!!!30411191.java!!!	addDetailsToZipFile(inout info : BugreportProgressService::BugreportInfo) : void
+        if (info.bugreportFile == null) {
+            // One possible reason is a bug in the Parcelization code.
+            Log.wtf(TAG, "addDetailsToZipFile(): no bugreportFile on " + info);
+            return;
+        }
+        if (TextUtils.isEmpty(info.title) && TextUtils.isEmpty(info.description)) {
+            Log.d(TAG, "Not touching zip file since neither title nor description are set");
+            return;
+        }
+        if (info.addedDetailsToZip || info.addingDetailsToZip) {
+            Log.d(TAG, "Already added details to zip file for " + info);
+            return;
+        }
+        info.addingDetailsToZip = true;
+
+        // It's not possible to add a new entry into an existing file, so we need to create a new
+        // zip, copy all entries, then rename it.
+        sendBugreportBeingUpdatedNotification(mContext, info.id); // ...and that takes time
+
+        final File dir = info.bugreportFile.getParentFile();
+        final File tmpZip = new File(dir, "tmp-" + info.bugreportFile.getName());
+        Log.d(TAG, "Writing temporary zip file (" + tmpZip + ") with title and/or description");
+        try (ZipFile oldZip = new ZipFile(info.bugreportFile);
+                ZipOutputStream zos = new ZipOutputStream(new FileOutputStream(tmpZip))) {
+
+            // First copy contents from original zip.
+            Enumeration<? extends ZipEntry> entries = oldZip.entries();
+            while (entries.hasMoreElements()) {
+                final ZipEntry entry = entries.nextElement();
+                final String entryName = entry.getName();
+                if (!entry.isDirectory()) {
+                    addEntry(zos, entryName, entry.getTime(), oldZip.getInputStream(entry));
+                } else {
+                    Log.w(TAG, "skipping directory entry: " + entryName);
+                }
+            }
+
+            // Then add the user-provided info.
+            addEntry(zos, "title.txt", info.title);
+            addEntry(zos, "description.txt", info.description);
+        } catch (IOException e) {
+            Log.e(TAG, "exception zipping file " + tmpZip, e);
+            Toast.makeText(mContext, R.string.bugreport_add_details_to_zip_failed,
+                    Toast.LENGTH_LONG).show();
+            return;
+        } finally {
+            // Make sure it only tries to add details once, even it fails the first time.
+            info.addedDetailsToZip = true;
+            info.addingDetailsToZip = false;
+            stopForegroundWhenDone(info.id);
+        }
+
+        if (!tmpZip.renameTo(info.bugreportFile)) {
+            Log.e(TAG, "Could not rename " + tmpZip + " to " + info.bugreportFile);
+        }
+!!!30411319.java!!!	addEntry(inout zos : ZipOutputStream, inout entry : String, inout text : String) : void
+        if (DEBUG) Log.v(TAG, "adding entry '" + entry + "': " + text);
+        if (!TextUtils.isEmpty(text)) {
+            addEntry(zos, entry, new ByteArrayInputStream(text.getBytes(StandardCharsets.UTF_8)));
+        }
+!!!30411447.java!!!	addEntry(inout zos : ZipOutputStream, inout entryName : String, inout is : InputStream) : void
+        addEntry(zos, entryName, System.currentTimeMillis(), is);
+!!!30411575.java!!!	addEntry(inout zos : ZipOutputStream, inout entryName : String, in timestamp : long, inout is : InputStream) : void
+        final ZipEntry entry = new ZipEntry(entryName);
+        entry.setTime(timestamp);
+        zos.putNextEntry(entry);
+        final int totalBytes = Streams.copy(is, zos);
+        if (DEBUG) Log.v(TAG, "size of '" + entryName + "' entry: " + totalBytes + " bytes");
+        zos.closeEntry();
+!!!30411703.java!!!	findSendToAccount(inout context : Context) : Account
+        final AccountManager am = (AccountManager) context.getSystemService(
+                Context.ACCOUNT_SERVICE);
+
+        String preferredDomain = SystemProperties.get("sendbug.preferred.domain");
+        if (!preferredDomain.startsWith("@")) {
+            preferredDomain = "@" + preferredDomain;
+        }
+
+        final Account[] accounts;
+        try {
+            accounts = am.getAccounts();
+        } catch (RuntimeException e) {
+            Log.e(TAG, "Could not get accounts for preferred domain " + preferredDomain, e);
+            return null;
+        }
+        if (DEBUG) Log.d(TAG, "Number of accounts: " + accounts.length);
+        Account foundAccount = null;
+        for (Account account : accounts) {
+            if (Patterns.EMAIL_ADDRESS.matcher(account.name).matches()) {
+                if (!preferredDomain.isEmpty()) {
+                    // if we have a preferred domain and it matches, return; otherwise keep
+                    // looking
+                    if (account.name.endsWith(preferredDomain)) {
+                        return account;
+                    } else {
+                        foundAccount = account;
+                    }
+                    // if we don't have a preferred domain, just return since it looks like
+                    // an email address
+                } else {
+                    return account;
+                }
+            }
+        }
+        return foundAccount;
+!!!30411831.java!!!	getUri(inout context : Context, inout file : File) : Uri
+        return file != null ? FileProvider.getUriForFile(context, AUTHORITY, file) : null;
+!!!30411959.java!!!	getFileExtra(inout intent : Intent, inout key : String) : File
+        final String path = intent.getStringExtra(key);
+        if (path != null) {
+            return new File(path);
+        } else {
+            return null;
+        }
+!!!30412087.java!!!	dumpIntent(inout intent : Intent) : String
+        if (intent == null) {
+            return "NO INTENT";
+        }
+        String action = intent.getAction();
+        if (action == null) {
+            // Happens when BugreportReceiver calls startService...
+            action = "no action";
+        }
+        final StringBuilder buffer = new StringBuilder(action).append(" extras: ");
+        addExtra(buffer, intent, EXTRA_ID);
+        addExtra(buffer, intent, EXTRA_PID);
+        addExtra(buffer, intent, EXTRA_MAX);
+        addExtra(buffer, intent, EXTRA_NAME);
+        addExtra(buffer, intent, EXTRA_DESCRIPTION);
+        addExtra(buffer, intent, EXTRA_BUGREPORT);
+        addExtra(buffer, intent, EXTRA_SCREENSHOT);
+        addExtra(buffer, intent, EXTRA_INFO);
+
+        if (intent.hasExtra(EXTRA_ORIGINAL_INTENT)) {
+            buffer.append(SHORT_EXTRA_ORIGINAL_INTENT).append(": ");
+            final Intent originalIntent = intent.getParcelableExtra(EXTRA_ORIGINAL_INTENT);
+            buffer.append(dumpIntent(originalIntent));
+        } else {
+            buffer.append("no ").append(SHORT_EXTRA_ORIGINAL_INTENT);
+        }
+
+        return buffer.toString();
+!!!30412215.java!!!	addExtra(inout buffer : StringBuilder, inout intent : Intent, inout name : String) : void
+        final String shortName = name.substring(name.lastIndexOf('.') + 1);
+        if (intent.hasExtra(name)) {
+            buffer.append(shortName).append('=').append(intent.getExtra(name));
+        } else {
+            buffer.append("no ").append(shortName);
+        }
+        buffer.append(", ");
+!!!30412343.java!!!	setSystemProperty(inout key : String, inout value : String) : boolean
+        try {
+            if (DEBUG) Log.v(TAG, "Setting system property " + key + " to " + value);
+            SystemProperties.set(key, value);
+        } catch (IllegalArgumentException e) {
+            Log.e(TAG, "Could not set property " + key + " to " + value, e);
+            return false;
+        }
+        return true;
+!!!30412471.java!!!	setBugreportNameProperty(in pid : int, inout name : String) : boolean
+        Log.d(TAG, "Updating bugreport name to " + name);
+        final String key = DUMPSTATE_PREFIX + pid + NAME_SUFFIX;
+        return setSystemProperty(key, name);
+!!!30412599.java!!!	updateBugreportInfo(in id : int, inout name : String, inout title : String, inout description : String) : void
+        final BugreportInfo info = getInfo(id);
+        if (info == null) {
+            return;
+        }
+        if (title != null && !title.equals(info.title)) {
+            MetricsLogger.action(this, MetricsEvent.ACTION_BUGREPORT_DETAILS_TITLE_CHANGED);
+        }
+        info.title = title;
+        if (description != null && !description.equals(info.description)) {
+            MetricsLogger.action(this, MetricsEvent.ACTION_BUGREPORT_DETAILS_DESCRIPTION_CHANGED);
+        }
+        info.description = description;
+        if (name != null && !name.equals(info.name)) {
+            MetricsLogger.action(this, MetricsEvent.ACTION_BUGREPORT_DETAILS_NAME_CHANGED);
+            info.name = name;
+            updateProgress(info);
+        }
+!!!30412727.java!!!	collapseNotificationBar() : void
+        sendBroadcast(new Intent(Intent.ACTION_CLOSE_SYSTEM_DIALOGS));
+!!!30412855.java!!!	newLooper(inout name : String) : Looper
+        final HandlerThread thread = new HandlerThread(name, THREAD_PRIORITY_BACKGROUND);
+        thread.start();
+        return thread.getLooper();
+!!!30412983.java!!!	takeScreenshot(inout context : Context, inout screenshotFile : String) : boolean
+        final ProcessBuilder screencap = new ProcessBuilder()
+                .command("/system/bin/screencap", "-p", screenshotFile);
+        Log.d(TAG, "Taking screenshot using " + screencap.command());
+        try {
+            final int exitValue = screencap.start().waitFor();
+            if (exitValue == 0) {
+                ((Vibrator) context.getSystemService(Context.VIBRATOR_SERVICE)).vibrate(150);
+                return true;
+            }
+            Log.e(TAG, "screencap (" + screencap.command() + ") failed: " + exitValue);
+        } catch (IOException e) {
+            Log.e(TAG, "screencap (" + screencap.command() + ") failed", e);
+        } catch (InterruptedException e) {
+            Log.w(TAG, "Thread interrupted while screencap still running");
+            Thread.currentThread().interrupt();
+        }
+        return false;
+!!!30413111.java!!!	isValid(in c : char) : boolean
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+                || c == '_' || c == '-';

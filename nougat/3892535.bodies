@@ -1,0 +1,185 @@
+class ActivityStackSupervisorHandler
+!!!41832119.java!!!	ActivityStackSupervisorHandler(inout looper : Looper)
+            super(looper);
+!!!41832247.java!!!	activityIdleInternal(inout r : ActivityRecord) : void
+            synchronized (mService) {
+                activityIdleInternalLocked(r != null ? r.appToken : null, true, null);
+            }
+!!!41832375.java!!!	handleMessage(inout msg : Message) : void
+            switch (msg.what) {
+                case REPORT_MULTI_WINDOW_MODE_CHANGED_MSG: {
+                    synchronized (mService) {
+                        for (int i = mMultiWindowModeChangedActivities.size() - 1; i >= 0; i--) {
+                            final ActivityRecord r = mMultiWindowModeChangedActivities.remove(i);
+                            r.scheduleMultiWindowModeChanged();
+                        }
+                    }
+                } break;
+                case REPORT_PIP_MODE_CHANGED_MSG: {
+                    synchronized (mService) {
+                        for (int i = mPipModeChangedActivities.size() - 1; i >= 0; i--) {
+                            final ActivityRecord r = mPipModeChangedActivities.remove(i);
+                            r.schedulePictureInPictureModeChanged();
+                        }
+                    }
+                } break;
+                case IDLE_TIMEOUT_MSG: {
+                    if (DEBUG_IDLE) Slog.d(TAG_IDLE,
+                            "handleMessage: IDLE_TIMEOUT_MSG: r=" + msg.obj);
+                    if (mService.mDidDexOpt) {
+                        mService.mDidDexOpt = false;
+                        Message nmsg = mHandler.obtainMessage(IDLE_TIMEOUT_MSG);
+                        nmsg.obj = msg.obj;
+                        mHandler.sendMessageDelayed(nmsg, IDLE_TIMEOUT);
+                        return;
+                    }
+                    // We don't at this point know if the activity is fullscreen,
+                    // so we need to be conservative and assume it isn't.
+                    activityIdleInternal((ActivityRecord)msg.obj);
+                } break;
+                case IDLE_NOW_MSG: {
+                    if (DEBUG_IDLE) Slog.d(TAG_IDLE, "handleMessage: IDLE_NOW_MSG: r=" + msg.obj);
+                    activityIdleInternal((ActivityRecord)msg.obj);
+                } break;
+                case RESUME_TOP_ACTIVITY_MSG: {
+                    synchronized (mService) {
+                        resumeFocusedStackTopActivityLocked();
+                    }
+                } break;
+                case SLEEP_TIMEOUT_MSG: {
+                    synchronized (mService) {
+                        if (mService.isSleepingOrShuttingDownLocked()) {
+                            Slog.w(TAG, "Sleep timeout!  Sleeping now.");
+                            mSleepTimeout = true;
+                            checkReadyForSleepLocked();
+                        }
+                    }
+                } break;
+                case LAUNCH_TIMEOUT_MSG: {
+                    if (mService.mDidDexOpt) {
+                        mService.mDidDexOpt = false;
+                        mHandler.sendEmptyMessageDelayed(LAUNCH_TIMEOUT_MSG, LAUNCH_TIMEOUT);
+                        return;
+                    }
+                    synchronized (mService) {
+                        if (mLaunchingActivity.isHeld()) {
+                            Slog.w(TAG, "Launch timeout has expired, giving up wake lock!");
+                            if (VALIDATE_WAKE_LOCK_CALLER
+                                    && Binder.getCallingUid() != Process.myUid()) {
+                                throw new IllegalStateException("Calling must be system uid");
+                            }
+                            mLaunchingActivity.release();
+                        }
+                    }
+                } break;
+                case HANDLE_DISPLAY_ADDED: {
+                    handleDisplayAdded(msg.arg1);
+                } break;
+                case HANDLE_DISPLAY_CHANGED: {
+                    handleDisplayChanged(msg.arg1);
+                } break;
+                case HANDLE_DISPLAY_REMOVED: {
+                    handleDisplayRemoved(msg.arg1);
+                } break;
+                case CONTAINER_CALLBACK_VISIBILITY: {
+                    final ActivityContainer container = (ActivityContainer) msg.obj;
+                    final IActivityContainerCallback callback = container.mCallback;
+                    if (callback != null) {
+                        try {
+                            callback.setVisible(container.asBinder(), msg.arg1 == 1);
+                        } catch (RemoteException e) {
+                        }
+                    }
+                } break;
+                case LOCK_TASK_START_MSG: {
+                    // When lock task starts, we disable the status bars.
+                    try {
+                        if (mLockTaskNotify == null) {
+                            mLockTaskNotify = new LockTaskNotify(mService.mContext);
+                        }
+                        mLockTaskNotify.show(true);
+                        mLockTaskModeState = msg.arg2;
+                        if (getStatusBarService() != null) {
+                            int flags = 0;
+                            if (mLockTaskModeState == LOCK_TASK_MODE_LOCKED) {
+                                flags = StatusBarManager.DISABLE_MASK
+                                        & (~StatusBarManager.DISABLE_BACK);
+                            } else if (mLockTaskModeState == LOCK_TASK_MODE_PINNED) {
+                                flags = StatusBarManager.DISABLE_MASK
+                                        & (~StatusBarManager.DISABLE_BACK)
+                                        & (~StatusBarManager.DISABLE_HOME)
+                                        & (~StatusBarManager.DISABLE_RECENT);
+                            }
+                            getStatusBarService().disable(flags, mToken,
+                                    mService.mContext.getPackageName());
+                        }
+                        mWindowManager.disableKeyguard(mToken, LOCK_TASK_TAG);
+                        if (getDevicePolicyManager() != null) {
+                            getDevicePolicyManager().notifyLockTaskModeChanged(true,
+                                    (String)msg.obj, msg.arg1);
+                        }
+                    } catch (RemoteException ex) {
+                        throw new RuntimeException(ex);
+                    }
+                } break;
+                case LOCK_TASK_END_MSG: {
+                    // When lock task ends, we enable the status bars.
+                    try {
+                        if (getStatusBarService() != null) {
+                            getStatusBarService().disable(StatusBarManager.DISABLE_NONE, mToken,
+                                    mService.mContext.getPackageName());
+                        }
+                        mWindowManager.reenableKeyguard(mToken);
+                        if (getDevicePolicyManager() != null) {
+                            getDevicePolicyManager().notifyLockTaskModeChanged(false, null,
+                                    msg.arg1);
+                        }
+                        if (mLockTaskNotify == null) {
+                            mLockTaskNotify = new LockTaskNotify(mService.mContext);
+                        }
+                        mLockTaskNotify.show(false);
+                        try {
+                            boolean shouldLockKeyguard = Settings.Secure.getInt(
+                                    mService.mContext.getContentResolver(),
+                                    Settings.Secure.LOCK_TO_APP_EXIT_LOCKED) != 0;
+                            if (mLockTaskModeState == LOCK_TASK_MODE_PINNED && shouldLockKeyguard) {
+                                mWindowManager.lockNow(null);
+                                mWindowManager.dismissKeyguard();
+                                new LockPatternUtils(mService.mContext)
+                                        .requireCredentialEntry(UserHandle.USER_ALL);
+                            }
+                        } catch (SettingNotFoundException e) {
+                            // No setting, don't lock.
+                        }
+                    } catch (RemoteException ex) {
+                        throw new RuntimeException(ex);
+                    } finally {
+                        mLockTaskModeState = LOCK_TASK_MODE_NONE;
+                    }
+                } break;
+                case SHOW_LOCK_TASK_ESCAPE_MESSAGE_MSG: {
+                    if (mLockTaskNotify == null) {
+                        mLockTaskNotify = new LockTaskNotify(mService.mContext);
+                    }
+                    mLockTaskNotify.showToast(LOCK_TASK_MODE_PINNED);
+                } break;
+                case CONTAINER_CALLBACK_TASK_LIST_EMPTY: {
+                    final ActivityContainer container = (ActivityContainer) msg.obj;
+                    final IActivityContainerCallback callback = container.mCallback;
+                    if (callback != null) {
+                        try {
+                            callback.onAllActivitiesComplete(container.asBinder());
+                        } catch (RemoteException e) {
+                        }
+                    }
+                } break;
+                case LAUNCH_TASK_BEHIND_COMPLETE: {
+                    synchronized (mService) {
+                        ActivityRecord r = ActivityRecord.forTokenLocked((IBinder) msg.obj);
+                        if (r != null) {
+                            handleLaunchTaskBehindCompleteLocked(r);
+                        }
+                    }
+                } break;
+
+            }

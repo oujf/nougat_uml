@@ -1,0 +1,328 @@
+class FilesActivity
+!!!29574199.java!!!	FilesActivity()
+        super(R.layout.files_activity, TAG);
+!!!29574327.java!!!	onCreate(inout icicle : Bundle) : void
+        super.onCreate(icicle);
+
+        mClipper = new DocumentClipper(this);
+
+        RootsFragment.show(getFragmentManager(), null);
+
+        final Intent intent = getIntent();
+        final Uri uri = intent.getData();
+
+        if (mState.restored) {
+            if (DEBUG) Log.d(TAG, "Stack already resolved for uri: " + intent.getData());
+        } else if (!mState.stack.isEmpty()) {
+            // If a non-empty stack is present in our state, it was read (presumably)
+            // from EXTRA_STACK intent extra. In this case, we'll skip other means of
+            // loading or restoring the stack (like URI).
+            //
+            // When restoring from a stack, if a URI is present, it should only ever be:
+            // -- a launch URI: Launch URIs support sensible activity management,
+            //    but don't specify a real content target)
+            // -- a fake Uri from notifications. These URIs have no authority (TODO: details).
+            //
+            // Any other URI is *sorta* unexpected...except when browsing an archive
+            // in downloads.
+            if(uri != null
+                    && uri.getAuthority() != null
+                    && !uri.equals(mState.stack.peek())
+                    && !LauncherActivity.isLaunchUri(uri)) {
+                if (DEBUG) Log.w(TAG,
+                        "Launching with non-empty stack. Ignoring unexpected uri: " + uri);
+            } else {
+                if (DEBUG) Log.d(TAG, "Launching with non-empty stack.");
+            }
+            refreshCurrentRootAndDirectory(AnimationView.ANIM_NONE);
+        } else if (Intent.ACTION_VIEW.equals(intent.getAction())) {
+            assert(uri != null);
+            new OpenUriForViewTask(this).executeOnExecutor(
+                    ProviderExecutor.forAuthority(uri.getAuthority()), uri);
+        } else if (DocumentsContract.isRootUri(this, uri)) {
+            if (DEBUG) Log.d(TAG, "Launching with root URI.");
+            // If we've got a specific root to display, restore that root using a dedicated
+            // authority. That way a misbehaving provider won't result in an ANR.
+            loadRoot(uri);
+        } else {
+            if (DEBUG) Log.d(TAG, "All other means skipped. Launching into default directory.");
+            loadRoot(getDefaultRoot());
+        }
+
+        final @DialogType int dialogType = intent.getIntExtra(
+                FileOperationService.EXTRA_DIALOG_TYPE, DIALOG_TYPE_UNKNOWN);
+        // DialogFragment takes care of restoring the dialog on configuration change.
+        // Only show it manually for the first time (icicle is null).
+        if (icicle == null && dialogType != DIALOG_TYPE_UNKNOWN) {
+            final int opType = intent.getIntExtra(
+                    FileOperationService.EXTRA_OPERATION,
+                    FileOperationService.OPERATION_COPY);
+            final ArrayList<DocumentInfo> srcList =
+                    intent.getParcelableArrayListExtra(FileOperationService.EXTRA_SRC_LIST);
+            OperationDialogFragment.show(
+                    getFragmentManager(),
+                    dialogType,
+                    srcList,
+                    mState.stack,
+                    opType);
+        }
+!!!29574455.java!!!	includeState(inout state : State) : void
+        final Intent intent = getIntent();
+
+        state.action = State.ACTION_BROWSE;
+        state.allowMultiple = true;
+
+        // Options specific to the DocumentsActivity.
+        assert(!intent.hasExtra(Intent.EXTRA_LOCAL_ONLY));
+
+        final DocumentStack stack = intent.getParcelableExtra(Shared.EXTRA_STACK);
+        if (stack != null) {
+            state.stack = stack;
+        }
+!!!29574583.java!!!	onPostCreate(inout savedInstanceState : Bundle) : void
+        super.onPostCreate(savedInstanceState);
+        // This check avoids a flicker from "Recents" to "Home".
+        // Only update action bar at this point if there is an active
+        // serach. Why? Because this avoid an early (undesired) load of
+        // the recents root...which is the default root in other activities.
+        // In Files app "Home" is the default, but it is loaded async.
+        // update will be called once Home root is loaded.
+        // Except while searching we need this call to ensure the
+        // search bits get layed out correctly.
+        if (mSearchManager.isSearching()) {
+            mNavigator.update();
+        }
+!!!29574711.java!!!	onResume() : void
+        super.onResume();
+
+        final RootInfo root = getCurrentRoot();
+
+        // If we're browsing a specific root, and that root went away, then we
+        // have no reason to hang around.
+        // TODO: Rather than just disappearing, maybe we should inform
+        // the user what has happened, let them close us. Less surprising.
+        if (mRoots.getRootBlocking(root.authority, root.rootId) == null) {
+            finish();
+        }
+!!!29574839.java!!!	getDrawerTitle() : String
+        Intent intent = getIntent();
+        return (intent != null && intent.hasExtra(Intent.EXTRA_TITLE))
+                ? intent.getStringExtra(Intent.EXTRA_TITLE)
+                : getTitle().toString();
+!!!29574967.java!!!	onPrepareOptionsMenu(inout menu : Menu) : boolean
+        super.onPrepareOptionsMenu(menu);
+
+        final RootInfo root = getCurrentRoot();
+
+        final MenuItem createDir = menu.findItem(R.id.menu_create_dir);
+        final MenuItem pasteFromCb = menu.findItem(R.id.menu_paste_from_clipboard);
+        final MenuItem settings = menu.findItem(R.id.menu_settings);
+        final MenuItem newWindow = menu.findItem(R.id.menu_new_window);
+
+        createDir.setVisible(true);
+        createDir.setEnabled(canCreateDirectory());
+        pasteFromCb.setEnabled(mClipper.hasItemsToPaste());
+        settings.setVisible(root.hasSettings());
+        newWindow.setVisible(Shared.shouldShowFancyFeatures(this));
+
+        Menus.disableHiddenItems(menu, pasteFromCb);
+        // It hides icon if searching in progress
+        mSearchManager.updateMenu();
+        return true;
+!!!29575095.java!!!	onOptionsItemSelected(inout item : MenuItem) : boolean
+        switch (item.getItemId()) {
+            case R.id.menu_create_dir:
+                assert(canCreateDirectory());
+                showCreateDirectoryDialog();
+                break;
+            case R.id.menu_new_window:
+                createNewWindow();
+                break;
+            case R.id.menu_paste_from_clipboard:
+                DirectoryFragment dir = getDirectoryFragment();
+                if (dir != null) {
+                    dir.pasteFromClipboard();
+                }
+                break;
+            default:
+                return super.onOptionsItemSelected(item);
+        }
+        return true;
+!!!29575223.java!!!	createNewWindow() : void
+        Metrics.logUserAction(this, Metrics.USER_ACTION_NEW_WINDOW);
+
+        Intent intent = LauncherActivity.createLaunchIntent(this);
+        intent.putExtra(Shared.EXTRA_STACK, (Parcelable) mState.stack);
+
+        // With new multi-window mode we have to pick how we are launched.
+        // By default we'd be launched in-place above the existing app.
+        // By setting launch-to-side ActivityManager will open us to side.
+        if (isInMultiWindowMode()) {
+            intent.addFlags(Intent.FLAG_ACTIVITY_LAUNCH_ADJACENT);
+        }
+
+        startActivity(intent);
+!!!29575351.java!!!	refreshDirectory(in anim : int) : void
+        final FragmentManager fm = getFragmentManager();
+        final RootInfo root = getCurrentRoot();
+        final DocumentInfo cwd = getCurrentDirectory();
+
+        assert(!mSearchManager.isSearching());
+
+        if (cwd == null) {
+            DirectoryFragment.showRecentsOpen(fm, anim);
+        } else {
+            // Normal boring directory
+            DirectoryFragment.showDirectory(fm, root, cwd, anim);
+        }
+!!!29575479.java!!!	onRootPicked(inout root : RootInfo) : void
+        super.onRootPicked(root);
+        mDrawer.setOpen(false);
+!!!29575607.java!!!	onDocumentsPicked(inout docs : List<DocumentInfo>) : void
+        throw new UnsupportedOperationException();
+!!!29575735.java!!!	onDocumentPicked(inout doc : DocumentInfo, inout model : Model) : void
+        // Anything on downloads goes through the back through downloads manager
+        // (that's the MANAGE_DOCUMENT bit).
+        // This is done for two reasons:
+        // 1) The file in question might be a failed/queued or otherwise have some
+        //    specialized download handling.
+        // 2) For APKs, the download manager will add on some important security stuff
+        //    like origin URL.
+        // All other files not on downloads, event APKs, would get no benefit from this
+        // treatment, thusly the "isDownloads" check.
+
+        // Launch MANAGE_DOCUMENTS only for the root level files, so it's not called for
+        // files in archives. Also, if the activity is already browsing a ZIP from downloads,
+        // then skip MANAGE_DOCUMENTS.
+        final boolean isViewing = Intent.ACTION_VIEW.equals(getIntent().getAction());
+        final boolean isInArchive = mState.stack.size() > 1;
+        if (getCurrentRoot().isDownloads() && !isInArchive && !isViewing) {
+            // First try managing the document; we expect manager to filter
+            // based on authority, so we don't grant.
+            final Intent manage = new Intent(DocumentsContract.ACTION_MANAGE_DOCUMENT);
+            manage.setData(doc.derivedUri);
+
+            try {
+                startActivity(manage);
+                return;
+            } catch (ActivityNotFoundException ex) {
+                // fall back to regular handling below.
+            }
+        }
+
+        if (doc.isContainer()) {
+            openContainerDocument(doc);
+        } else {
+            openDocument(doc, model);
+        }
+!!!29575863.java!!!	openDocument(inout doc : DocumentInfo, inout model : Model) : void
+        Intent intent = new QuickViewIntentBuilder(
+                getPackageManager(), getResources(), doc, model).build();
+
+        if (intent != null) {
+            // TODO: un-work around issue b/24963914. Should be fixed soon.
+            try {
+                startActivity(intent);
+                return;
+            } catch (SecurityException e) {
+                // Carry on to regular view mode.
+                Log.e(TAG, "Caught security error: " + e.getLocalizedMessage());
+            }
+        }
+
+        // Fall back to traditional VIEW action...
+        intent = new Intent(Intent.ACTION_VIEW);
+        intent.setFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        intent.setData(doc.derivedUri);
+
+        if (DEBUG && intent.getClipData() != null) {
+            Log.d(TAG, "Starting intent w/ clip data: " + intent.getClipData());
+        }
+
+        try {
+            startActivity(intent);
+        } catch (ActivityNotFoundException e) {
+            Snackbars.makeSnackbar(
+                    this, R.string.toast_no_application, Snackbar.LENGTH_SHORT).show();
+        }
+!!!29575991.java!!!	onKeyShortcut(in keyCode : int, inout event : KeyEvent) : boolean
+        DirectoryFragment dir;
+        // TODO: All key events should be statically bound using alphabeticShortcut.
+        // But not working.
+        switch (keyCode) {
+            case KeyEvent.KEYCODE_A:
+                dir = getDirectoryFragment();
+                if (dir != null) {
+                    dir.selectAllFiles();
+                }
+                return true;
+            case KeyEvent.KEYCODE_C:
+                dir = getDirectoryFragment();
+                if (dir != null) {
+                    dir.copySelectedToClipboard();
+                }
+                return true;
+            case KeyEvent.KEYCODE_V:
+                dir = getDirectoryFragment();
+                if (dir != null) {
+                    dir.pasteFromClipboard();
+                }
+                return true;
+            default:
+                return super.onKeyShortcut(keyCode, event);
+        }
+!!!29576119.java!!!	onBeforePopDir() : boolean
+        int size = mState.stack.size();
+
+        if (mDrawer.isPresent()
+                && (System.currentTimeMillis() - mDrawerLastFiddled) > DRAWER_NO_FIDDLE_DELAY) {
+            // Close drawer if it is open.
+            if (mDrawer.isOpen()) {
+                mDrawer.setOpen(false);
+                mDrawerLastFiddled = System.currentTimeMillis();
+                return true;
+            }
+
+            // Open the Close drawer if it is closed and we're at the top of a root.
+            if (size <= 1) {
+                mDrawer.setOpen(true);
+                // Remember so we don't just close it again if back is pressed again.
+                mDrawerLastFiddled = System.currentTimeMillis();
+                return true;
+            }
+        }
+
+        return false;
+!!!29576247.java!!!	writeStackToRecentsBlocking() : void
+        final ContentResolver resolver = getContentResolver();
+        final ContentValues values = new ContentValues();
+
+        final byte[] rawStack = DurableUtils.writeToArrayOrNull(mState.stack);
+
+        // Remember location for next app launch
+        final String packageName = getCallingPackageMaybeExtra();
+        values.clear();
+        values.put(ResumeColumns.STACK, rawStack);
+        values.put(ResumeColumns.EXTERNAL, 0);
+        resolver.insert(RecentsProvider.buildResume(packageName), values);
+!!!29576375.java!!!	onTaskFinished(inout  : Uri...uris) : void
+        if (DEBUG) Log.d(TAG, "onFinished() " + Arrays.toString(uris));
+
+        final Intent intent = new Intent();
+        if (uris.length == 1) {
+            intent.setData(uris[0]);
+        } else if (uris.length > 1) {
+            final ClipData clipData = new ClipData(
+                    null, mState.acceptMimes, new ClipData.Item(uris[0]));
+            for (int i = 1; i < uris.length; i++) {
+                clipData.addItem(new ClipData.Item(uris[i]));
+            }
+            intent.setClipData(clipData);
+        }
+
+        intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION
+                | Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
+
+        setResult(Activity.RESULT_OK, intent);
+        finish();

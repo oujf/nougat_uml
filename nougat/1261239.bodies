@@ -1,0 +1,144 @@
+class DocumentTransformer
+!!!30187959.java!!!	DocumentTransformer(inout context : Context, inout printJob : PrintJobInfo, inout fileProvider : MutexFileProvider, inout attributes : PrintAttributes, inout callback : Runnable)
+            mContext = context;
+            mPrintJob = printJob;
+            mFileProvider = fileProvider;
+            mCallback = callback;
+            mPagesToShred = computePagesToShred(mPrintJob);
+            mAttributesToApply = attributes;
+!!!30188087.java!!!	transform() : void
+            // If we have only the pages we want, done.
+            if (mPagesToShred.length <= 0 && mAttributesToApply == null) {
+                mCallback.run();
+                return;
+            }
+
+            // Bind to the manipulation service and the work
+            // will be performed upon connection to the service.
+            Intent intent = new Intent(PdfManipulationService.ACTION_GET_EDITOR);
+            intent.setClass(mContext, PdfManipulationService.class);
+            mContext.bindService(intent, this, Context.BIND_AUTO_CREATE);
+!!!30188215.java!!!	onServiceConnected(inout name : ComponentName, inout service : IBinder) : void
+            final IPdfEditor editor = IPdfEditor.Stub.asInterface(service);
+            new AsyncTask<Void, Void, Void>() {
+                @Override
+                protected Void doInBackground(Void... params) {
+                    // It's OK to access the data members as they are
+                    // final and this code is the last one to touch
+                    // them as shredding is the very last step, so the
+                    // UI is not interactive at this point.
+                    doTransform(editor);
+                    updatePrintJob();
+                    return null;
+                }
+
+                @Override
+                protected void onPostExecute(Void aVoid) {
+                    mContext.unbindService(DocumentTransformer.this);
+                    mCallback.run();
+                }
+            }.executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR);
+!!!30188343.java!!!	onServiceDisconnected(inout name : ComponentName) : void
+            /* do nothing */
+!!!30188471.java!!!	doTransform(inout editor : IPdfEditor) : void
+            File tempFile = null;
+            ParcelFileDescriptor src = null;
+            ParcelFileDescriptor dst = null;
+            InputStream in = null;
+            OutputStream out = null;
+            try {
+                File jobFile = mFileProvider.acquireFile(null);
+                src = ParcelFileDescriptor.open(jobFile, ParcelFileDescriptor.MODE_READ_WRITE);
+
+                // Open the document.
+                editor.openDocument(src);
+
+                // We passed the fd over IPC, close this one.
+                src.close();
+
+                // Drop the pages.
+                editor.removePages(mPagesToShred);
+
+                // Apply print attributes if needed.
+                if (mAttributesToApply != null) {
+                    editor.applyPrintAttributes(mAttributesToApply);
+                }
+
+                // Write the modified PDF to a temp file.
+                tempFile = File.createTempFile(TEMP_FILE_PREFIX, TEMP_FILE_EXTENSION,
+                        mContext.getCacheDir());
+                dst = ParcelFileDescriptor.open(tempFile, ParcelFileDescriptor.MODE_READ_WRITE);
+                editor.write(dst);
+                dst.close();
+
+                // Close the document.
+                editor.closeDocument();
+
+                // Copy the temp file over the print job file.
+                jobFile.delete();
+                in = new FileInputStream(tempFile);
+                out = new FileOutputStream(jobFile);
+                Streams.copy(in, out);
+            } catch (IOException|RemoteException e) {
+                Log.e(LOG_TAG, "Error dropping pages", e);
+            } finally {
+                IoUtils.closeQuietly(src);
+                IoUtils.closeQuietly(dst);
+                IoUtils.closeQuietly(in);
+                IoUtils.closeQuietly(out);
+                if (tempFile != null) {
+                    tempFile.delete();
+                }
+                mFileProvider.releaseFile();
+            }
+!!!30188599.java!!!	updatePrintJob() : void
+            // Update the print job pages.
+            final int newPageCount = PageRangeUtils.getNormalizedPageCount(
+                    mPrintJob.getPages(), 0);
+            mPrintJob.setPages(new PageRange[]{PageRange.ALL_PAGES});
+
+            // Update the print job document info.
+            PrintDocumentInfo oldDocInfo = mPrintJob.getDocumentInfo();
+            PrintDocumentInfo newDocInfo = new PrintDocumentInfo
+                    .Builder(oldDocInfo.getName())
+                    .setContentType(oldDocInfo.getContentType())
+                    .setPageCount(newPageCount)
+                    .build();
+            mPrintJob.setDocumentInfo(newDocInfo);
+!!!30188727.java!!!	computePagesToShred(inout printJob : PrintJobInfo) : PageRange
+            List<PageRange> rangesToShred = new ArrayList<>();
+            PageRange previousRange = null;
+
+            PageRange[] printedPages = printJob.getPages();
+            final int rangeCount = printedPages.length;
+            for (int i = 0; i < rangeCount; i++) {
+                PageRange range = printedPages[i];
+
+                if (previousRange == null) {
+                    final int startPageIdx = 0;
+                    final int endPageIdx = range.getStart() - 1;
+                    if (startPageIdx <= endPageIdx) {
+                        PageRange removedRange = new PageRange(startPageIdx, endPageIdx);
+                        rangesToShred.add(removedRange);
+                    }
+                } else {
+                    final int startPageIdx = previousRange.getEnd() + 1;
+                    final int endPageIdx = range.getStart() - 1;
+                    if (startPageIdx <= endPageIdx) {
+                        PageRange removedRange = new PageRange(startPageIdx, endPageIdx);
+                        rangesToShred.add(removedRange);
+                    }
+                }
+
+                if (i == rangeCount - 1) {
+                    if (range.getEnd() != Integer.MAX_VALUE) {
+                        rangesToShred.add(new PageRange(range.getEnd() + 1, Integer.MAX_VALUE));
+                    }
+                }
+
+                previousRange = range;
+            }
+
+            PageRange[] result = new PageRange[rangesToShred.size()];
+            rangesToShred.toArray(result);
+            return result;

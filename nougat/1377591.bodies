@@ -1,0 +1,136 @@
+class SecurityControllerImpl
+!!!31344183.java!!!	SecurityControllerImpl(inout context : Context)
+        mContext = context;
+        mDevicePolicyManager = (DevicePolicyManager)
+                context.getSystemService(Context.DEVICE_POLICY_SERVICE);
+        mConnectivityManager = (ConnectivityManager)
+                context.getSystemService(Context.CONNECTIVITY_SERVICE);
+        mConnectivityManagerService = IConnectivityManager.Stub.asInterface(
+                ServiceManager.getService(Context.CONNECTIVITY_SERVICE));
+        mUserManager = (UserManager)
+                context.getSystemService(Context.USER_SERVICE);
+
+        // TODO: re-register network callback on user change.
+        mConnectivityManager.registerNetworkCallback(REQUEST, mNetworkCallback);
+        onUserSwitched(ActivityManager.getCurrentUser());
+!!!31344311.java!!!	dump(inout fd : FileDescriptor, inout pw : PrintWriter, inout args : String) : void
+        pw.println("SecurityController state:");
+        pw.print("  mCurrentVpns={");
+        for (int i = 0 ; i < mCurrentVpns.size(); i++) {
+            if (i > 0) {
+                pw.print(", ");
+            }
+            pw.print(mCurrentVpns.keyAt(i));
+            pw.print('=');
+            pw.print(mCurrentVpns.valueAt(i).user);
+        }
+        pw.println("}");
+!!!31344439.java!!!	isDeviceManaged() : boolean
+        return mDevicePolicyManager.isDeviceManaged();
+!!!31344567.java!!!	getDeviceOwnerName() : String
+        return mDevicePolicyManager.getDeviceOwnerNameOnAnyUser();
+!!!31344695.java!!!	hasProfileOwner() : boolean
+        return mDevicePolicyManager.getProfileOwnerAsUser(mCurrentUserId) != null;
+!!!31344823.java!!!	getProfileOwnerName() : String
+        for (int profileId : mUserManager.getProfileIdsWithDisabled(mCurrentUserId)) {
+            String name = mDevicePolicyManager.getProfileOwnerNameAsUser(profileId);
+            if (name != null) {
+                return name;
+            }
+        }
+        return null;
+!!!31344951.java!!!	getPrimaryVpnName() : String
+        VpnConfig cfg = mCurrentVpns.get(mVpnUserId);
+        if (cfg != null) {
+            return getNameForVpnConfig(cfg, new UserHandle(mVpnUserId));
+        } else {
+            return null;
+        }
+!!!31345079.java!!!	getProfileVpnName() : String
+        for (int profileId : mUserManager.getProfileIdsWithDisabled(mVpnUserId)) {
+            if (profileId == mVpnUserId) {
+                continue;
+            }
+            VpnConfig cfg = mCurrentVpns.get(profileId);
+            if (cfg != null) {
+                return getNameForVpnConfig(cfg, UserHandle.of(profileId));
+            }
+        }
+        return null;
+!!!31345207.java!!!	isVpnEnabled() : boolean
+        for (int profileId : mUserManager.getProfileIdsWithDisabled(mVpnUserId)) {
+            if (mCurrentVpns.get(profileId) != null) {
+                return true;
+            }
+        }
+        return false;
+!!!31345335.java!!!	isVpnRestricted() : boolean
+        UserHandle currentUser = new UserHandle(mCurrentUserId);
+        return mUserManager.getUserInfo(mCurrentUserId).isRestricted()
+                || mUserManager.hasUserRestriction(UserManager.DISALLOW_CONFIG_VPN, currentUser);
+!!!31345463.java!!!	removeCallback(inout callback : SecurityController::SecurityControllerCallback) : void
+        synchronized (mCallbacks) {
+            if (callback == null) return;
+            if (DEBUG) Log.d(TAG, "removeCallback " + callback);
+            mCallbacks.remove(callback);
+        }
+!!!31345591.java!!!	addCallback(inout callback : SecurityController::SecurityControllerCallback) : void
+        synchronized (mCallbacks) {
+            if (callback == null || mCallbacks.contains(callback)) return;
+            if (DEBUG) Log.d(TAG, "addCallback " + callback);
+            mCallbacks.add(callback);
+        }
+!!!31345719.java!!!	onUserSwitched(in newUserId : int) : void
+        mCurrentUserId = newUserId;
+        final UserInfo newUserInfo = mUserManager.getUserInfo(newUserId);
+        if (newUserInfo.isRestricted()) {
+            // VPN for a restricted profile is routed through its owner user
+            mVpnUserId = newUserInfo.restrictedProfileParentId;
+        } else {
+            mVpnUserId = mCurrentUserId;
+        }
+        fireCallbacks();
+!!!31345847.java!!!	getNameForVpnConfig(inout cfg : VpnConfig, inout user : UserHandle) : String
+        if (cfg.legacy) {
+            return mContext.getString(R.string.legacy_vpn_name);
+        }
+        // The package name for an active VPN is stored in the 'user' field of its VpnConfig
+        final String vpnPackage = cfg.user;
+        try {
+            Context userContext = mContext.createPackageContextAsUser(mContext.getPackageName(),
+                    0 /* flags */, user);
+            return VpnConfig.getVpnLabel(userContext, vpnPackage).toString();
+        } catch (NameNotFoundException nnfe) {
+            Log.e(TAG, "Package " + vpnPackage + " is not present", nnfe);
+            return null;
+        }
+!!!31345975.java!!!	fireCallbacks() : void
+        synchronized (mCallbacks) {
+            for (SecurityControllerCallback callback : mCallbacks) {
+                callback.onStateChanged();
+            }
+        }
+!!!31346103.java!!!	updateState() : void
+        // Find all users with an active VPN
+        SparseArray<VpnConfig> vpns = new SparseArray<>();
+        try {
+            for (UserInfo user : mUserManager.getUsers()) {
+                VpnConfig cfg = mConnectivityManagerService.getVpnConfig(user.id);
+                if (cfg == null) {
+                    continue;
+                } else if (cfg.legacy) {
+                    // Legacy VPNs should do nothing if the network is disconnected. Third-party
+                    // VPN warnings need to continue as traffic can still go to the app.
+                    LegacyVpnInfo legacyVpn = mConnectivityManagerService.getLegacyVpnInfo(user.id);
+                    if (legacyVpn == null || legacyVpn.state != LegacyVpnInfo.STATE_CONNECTED) {
+                        continue;
+                    }
+                }
+                vpns.put(user.id, cfg);
+            }
+        } catch (RemoteException rme) {
+            // Roll back to previous state
+            Log.e(TAG, "Unable to list active VPNs", rme);
+            return;
+        }
+        mCurrentVpns = vpns;

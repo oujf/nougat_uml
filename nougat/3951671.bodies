@@ -1,0 +1,167 @@
+class CalendarTracker
+!!!42475831.java!!!	CalendarTracker(inout systemContext : Context, inout userContext : Context)
+        mSystemContext = systemContext;
+        mUserContext = userContext;
+!!!42475959.java!!!	setCallback(inout callback : CalendarTracker::Callback) : void
+        if (mCallback == callback) return;
+        mCallback = callback;
+        setRegistered(mCallback != null);
+!!!42476087.java!!!	dump(inout prefix : String, inout pw : PrintWriter) : void
+        pw.print(prefix); pw.print("mCallback="); pw.println(mCallback);
+        pw.print(prefix); pw.print("mRegistered="); pw.println(mRegistered);
+        pw.print(prefix); pw.print("u="); pw.println(mUserContext.getUserId());
+!!!42476215.java!!!	getPrimaryCalendars() : ArraySet
+        final long start = System.currentTimeMillis();
+        final ArraySet<Long> rt = new ArraySet<>();
+        final String primary = "\"primary\"";
+        final String[] projection = { Calendars._ID,
+                "(" + Calendars.ACCOUNT_NAME + "=" + Calendars.OWNER_ACCOUNT + ") AS " + primary };
+        final String selection = primary + " = 1";
+        Cursor cursor = null;
+        try {
+            cursor = mUserContext.getContentResolver().query(Calendars.CONTENT_URI, projection,
+                    selection, null, null);
+            while (cursor != null && cursor.moveToNext()) {
+                rt.add(cursor.getLong(0));
+            }
+        } finally {
+            if (cursor != null) {
+                cursor.close();
+            }
+        }
+        if (DEBUG) Log.d(TAG, "getPrimaryCalendars took " + (System.currentTimeMillis() - start));
+        return rt;
+!!!42476343.java!!!	checkEvent(inout filter : EventInfo, in time : long) : CalendarTracker::CheckEventResult
+        final Uri.Builder uriBuilder = Instances.CONTENT_URI.buildUpon();
+        ContentUris.appendId(uriBuilder, time);
+        ContentUris.appendId(uriBuilder, time + EVENT_CHECK_LOOKAHEAD);
+        final Uri uri = uriBuilder.build();
+        final Cursor cursor = mUserContext.getContentResolver().query(uri, INSTANCE_PROJECTION,
+                null, null, INSTANCE_ORDER_BY);
+        final CheckEventResult result = new CheckEventResult();
+        result.recheckAt = time + EVENT_CHECK_LOOKAHEAD;
+        try {
+            final ArraySet<Long> primaryCalendars = getPrimaryCalendars();
+            while (cursor != null && cursor.moveToNext()) {
+                final long begin = cursor.getLong(0);
+                final long end = cursor.getLong(1);
+                final String title = cursor.getString(2);
+                final boolean calendarVisible = cursor.getInt(3) == 1;
+                final int eventId = cursor.getInt(4);
+                final String name = cursor.getString(5);
+                final String owner = cursor.getString(6);
+                final long calendarId = cursor.getLong(7);
+                final int availability = cursor.getInt(8);
+                final boolean calendarPrimary = primaryCalendars.contains(calendarId);
+                if (DEBUG) Log.d(TAG, String.format(
+                        "%s %s-%s v=%s a=%s eid=%s n=%s o=%s cid=%s p=%s",
+                        title,
+                        new Date(begin), new Date(end), calendarVisible,
+                        availabilityToString(availability), eventId, name, owner, calendarId,
+                        calendarPrimary));
+                final boolean meetsTime = time >= begin && time < end;
+                final boolean meetsCalendar = calendarVisible && calendarPrimary
+                        && (filter.calendar == null || Objects.equals(filter.calendar, owner)
+                        || Objects.equals(filter.calendar, name));
+                final boolean meetsAvailability = availability != Instances.AVAILABILITY_FREE;
+                if (meetsCalendar && meetsAvailability) {
+                    if (DEBUG) Log.d(TAG, "  MEETS CALENDAR & AVAILABILITY");
+                    final boolean meetsAttendee = meetsAttendee(filter, eventId, owner);
+                    if (meetsAttendee) {
+                        if (DEBUG) Log.d(TAG, "    MEETS ATTENDEE");
+                        if (meetsTime) {
+                            if (DEBUG) Log.d(TAG, "      MEETS TIME");
+                            result.inEvent = true;
+                        }
+                        if (begin > time && begin < result.recheckAt) {
+                            result.recheckAt = begin;
+                        } else if (end > time && end < result.recheckAt) {
+                            result.recheckAt = end;
+                        }
+                    }
+                }
+            }
+        } finally {
+            if (cursor != null) {
+                cursor.close();
+            }
+        }
+        return result;
+!!!42476471.java!!!	meetsAttendee(inout filter : EventInfo, in eventId : int, inout email : String) : boolean
+        final long start = System.currentTimeMillis();
+        String selection = ATTENDEE_SELECTION;
+        String[] selectionArgs = { Integer.toString(eventId), email };
+        if (DEBUG_ATTENDEES) {
+            selection = null;
+            selectionArgs = null;
+        }
+        final Cursor cursor = mUserContext.getContentResolver().query(Attendees.CONTENT_URI,
+                ATTENDEE_PROJECTION, selection, selectionArgs, null);
+        try {
+            if (cursor.getCount() == 0) {
+                if (DEBUG) Log.d(TAG, "No attendees found");
+                return true;
+            }
+            boolean rt = false;
+            while (cursor.moveToNext()) {
+                final long rowEventId = cursor.getLong(0);
+                final String rowEmail = cursor.getString(1);
+                final int status = cursor.getInt(2);
+                final boolean meetsReply = meetsReply(filter.reply, status);
+                if (DEBUG) Log.d(TAG, (DEBUG_ATTENDEES ? String.format(
+                        "rowEventId=%s, rowEmail=%s, ", rowEventId, rowEmail) : "") +
+                        String.format("status=%s, meetsReply=%s",
+                        attendeeStatusToString(status), meetsReply));
+                final boolean eventMeets = rowEventId == eventId && Objects.equals(rowEmail, email)
+                        && meetsReply;
+                rt |= eventMeets;
+            }
+            return rt;
+        } finally {
+            cursor.close();
+            if (DEBUG) Log.d(TAG, "meetsAttendee took " + (System.currentTimeMillis() - start));
+        }
+!!!42476599.java!!!	setRegistered(inout registered : boolean) : void
+        if (mRegistered == registered) return;
+        final ContentResolver cr = mSystemContext.getContentResolver();
+        final int userId = mUserContext.getUserId();
+        if (mRegistered) {
+            if (DEBUG) Log.d(TAG, "unregister content observer u=" + userId);
+            cr.unregisterContentObserver(mObserver);
+        }
+        mRegistered = registered;
+        if (DEBUG) Log.d(TAG, "mRegistered = " + registered + " u=" + userId);
+        if (mRegistered) {
+            if (DEBUG) Log.d(TAG, "register content observer u=" + userId);
+            cr.registerContentObserver(Instances.CONTENT_URI, true, mObserver, userId);
+            cr.registerContentObserver(Events.CONTENT_URI, true, mObserver, userId);
+            cr.registerContentObserver(Calendars.CONTENT_URI, true, mObserver, userId);
+        }
+!!!42476727.java!!!	attendeeStatusToString(in status : int) : String
+        switch (status) {
+            case Attendees.ATTENDEE_STATUS_NONE: return "ATTENDEE_STATUS_NONE";
+            case Attendees.ATTENDEE_STATUS_ACCEPTED: return "ATTENDEE_STATUS_ACCEPTED";
+            case Attendees.ATTENDEE_STATUS_DECLINED: return "ATTENDEE_STATUS_DECLINED";
+            case Attendees.ATTENDEE_STATUS_INVITED: return "ATTENDEE_STATUS_INVITED";
+            case Attendees.ATTENDEE_STATUS_TENTATIVE: return "ATTENDEE_STATUS_TENTATIVE";
+            default: return "ATTENDEE_STATUS_UNKNOWN_" + status;
+        }
+!!!42476855.java!!!	availabilityToString(in availability : int) : String
+        switch (availability) {
+            case Instances.AVAILABILITY_BUSY: return "AVAILABILITY_BUSY";
+            case Instances.AVAILABILITY_FREE: return "AVAILABILITY_FREE";
+            case Instances.AVAILABILITY_TENTATIVE: return "AVAILABILITY_TENTATIVE";
+            default: return "AVAILABILITY_UNKNOWN_" + availability;
+        }
+!!!42476983.java!!!	meetsReply(in reply : int, in attendeeStatus : int) : boolean
+        switch (reply) {
+            case EventInfo.REPLY_YES:
+                return attendeeStatus == Attendees.ATTENDEE_STATUS_ACCEPTED;
+            case EventInfo.REPLY_YES_OR_MAYBE:
+                return attendeeStatus == Attendees.ATTENDEE_STATUS_ACCEPTED
+                        || attendeeStatus == Attendees.ATTENDEE_STATUS_TENTATIVE;
+            case EventInfo.REPLY_ANY_EXCEPT_NO:
+                return attendeeStatus != Attendees.ATTENDEE_STATUS_DECLINED;
+            default:
+                return false;
+        }

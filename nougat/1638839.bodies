@@ -1,0 +1,423 @@
+class MidiService
+!!!33920439.java!!!	getClient(inout token : IBinder) : MidiService::Client
+        synchronized (mClients) {
+            Client client = mClients.get(token);
+            if (client == null) {
+                client = new Client(token);
+
+                try {
+                    token.linkToDeath(client, 0);
+                } catch (RemoteException e) {
+                    return null;
+                }
+                mClients.put(token, client);
+            }
+            return client;
+        }
+!!!33923511.java!!!	MidiService(inout context : Context)
+        mContext = context;
+        mPackageManager = context.getPackageManager();
+
+        mBluetoothServiceUid = -1;
+!!!33923639.java!!!	onUnlockUser() : void
+        mPackageMonitor.register(mContext, null, true);
+
+        Intent intent = new Intent(MidiDeviceService.SERVICE_INTERFACE);
+        List<ResolveInfo> resolveInfos = mPackageManager.queryIntentServices(intent,
+                PackageManager.GET_META_DATA);
+        if (resolveInfos != null) {
+            int count = resolveInfos.size();
+            for (int i = 0; i < count; i++) {
+                ServiceInfo serviceInfo = resolveInfos.get(i).serviceInfo;
+                if (serviceInfo != null) {
+                    addPackageDeviceServer(serviceInfo);
+                }
+            }
+        }
+
+        PackageInfo info;
+        try {
+            info = mPackageManager.getPackageInfo(MidiManager.BLUETOOTH_MIDI_SERVICE_PACKAGE, 0);
+        } catch (PackageManager.NameNotFoundException e) {
+            info = null;
+        }
+        if (info != null && info.applicationInfo != null) {
+            mBluetoothServiceUid = info.applicationInfo.uid;
+        } else {
+            mBluetoothServiceUid = -1;
+        }
+!!!33923767.java!!!	registerListener(inout token : IBinder, inout listener : IMidiDeviceListener) : void
+        Client client = getClient(token);
+        if (client == null) return;
+        client.addListener(listener);
+        // Let listener know whether any ports are already busy.
+        updateStickyDeviceStatus(client.mUid, listener);
+!!!33923895.java!!!	unregisterListener(inout token : IBinder, inout listener : IMidiDeviceListener) : void
+        Client client = getClient(token);
+        if (client == null) return;
+        client.removeListener(listener);
+!!!33924023.java!!!	updateStickyDeviceStatus(in uid : int, inout listener : IMidiDeviceListener) : void
+        synchronized (mDevicesByInfo) {
+            for (Device device : mDevicesByInfo.values()) {
+                // ignore private devices that our client cannot access
+                if (device.isUidAllowed(uid)) {
+                    try {
+                        MidiDeviceStatus status = device.getDeviceStatus();
+                        if (status != null) {
+                            listener.onDeviceStatusChanged(status);
+                        }
+                    } catch (RemoteException e) {
+                        Log.e(TAG, "remote exception", e);
+                    }
+                }
+            }
+        }
+!!!33924151.java!!!	getDevices() : MidiDeviceInfo
+        ArrayList<MidiDeviceInfo> deviceInfos = new ArrayList<MidiDeviceInfo>();
+        int uid = Binder.getCallingUid();
+
+        synchronized (mDevicesByInfo) {
+            for (Device device : mDevicesByInfo.values()) {
+                if (device.isUidAllowed(uid)) {
+                    deviceInfos.add(device.getDeviceInfo());
+                }
+            }
+        }
+
+        return deviceInfos.toArray(EMPTY_DEVICE_INFO_ARRAY);
+!!!33924279.java!!!	openDevice(inout token : IBinder, inout deviceInfo : MidiDeviceInfo, inout callback : IMidiDeviceOpenCallback) : void
+        Client client = getClient(token);
+        if (client == null) return;
+
+        Device device;
+        synchronized (mDevicesByInfo) {
+            device = mDevicesByInfo.get(deviceInfo);
+            if (device == null) {
+                throw new IllegalArgumentException("device does not exist: " + deviceInfo);
+            }
+            if (!device.isUidAllowed(Binder.getCallingUid())) {
+                throw new SecurityException("Attempt to open private device with wrong UID");
+            }
+        }
+
+        // clear calling identity so bindService does not fail
+        long identity = Binder.clearCallingIdentity();
+        try {
+            client.addDeviceConnection(device, callback);
+        } finally {
+            Binder.restoreCallingIdentity(identity);
+        }
+!!!33924407.java!!!	openBluetoothDevice(inout token : IBinder, inout bluetoothDevice : BluetoothDevice, inout callback : IMidiDeviceOpenCallback) : void
+        Client client = getClient(token);
+        if (client == null) return;
+
+        // Bluetooth devices are created on demand
+        Device device;
+        synchronized (mDevicesByInfo) {
+            device = mBluetoothDevices.get(bluetoothDevice);
+            if (device == null) {
+                device = new Device(bluetoothDevice);
+                mBluetoothDevices.put(bluetoothDevice, device);
+            }
+        }
+
+        // clear calling identity so bindService does not fail
+        long identity = Binder.clearCallingIdentity();
+        try {
+            client.addDeviceConnection(device, callback);
+        } finally {
+            Binder.restoreCallingIdentity(identity);
+        }
+!!!33924535.java!!!	closeDevice(inout clientToken : IBinder, inout deviceToken : IBinder) : void
+        Client client = getClient(clientToken);
+        if (client == null) return;
+        client.removeDeviceConnection(deviceToken);
+!!!33924663.java!!!	registerDeviceServer(inout server : IMidiDeviceServer, in numInputPorts : int, in numOutputPorts : int, inout inputPortNames : String, inout outputPortNames : String, inout properties : Bundle, in type : int) : MidiDeviceInfo
+        int uid = Binder.getCallingUid();
+        if (type == MidiDeviceInfo.TYPE_USB && uid != Process.SYSTEM_UID) {
+            throw new SecurityException("only system can create USB devices");
+        } else if (type == MidiDeviceInfo.TYPE_BLUETOOTH && uid != mBluetoothServiceUid) {
+            throw new SecurityException("only MidiBluetoothService can create Bluetooth devices");
+        }
+
+        synchronized (mDevicesByInfo) {
+            return addDeviceLocked(type, numInputPorts, numOutputPorts, inputPortNames,
+                    outputPortNames, properties, server, null, false, uid);
+        }
+!!!33924791.java!!!	unregisterDeviceServer(inout server : IMidiDeviceServer) : void
+        synchronized (mDevicesByInfo) {
+            Device device = mDevicesByServer.get(server.asBinder());
+            if (device != null) {
+                device.closeLocked();
+            }
+        }
+!!!33924919.java!!!	getServiceDeviceInfo(inout packageName : String, inout className : String) : MidiDeviceInfo
+        synchronized (mDevicesByInfo) {
+            for (Device device : mDevicesByInfo.values()) {
+                 ServiceInfo serviceInfo = device.getServiceInfo();
+                 if (serviceInfo != null &&
+                        packageName.equals(serviceInfo.packageName) &&
+                        className.equals(serviceInfo.name)) {
+                    return device.getDeviceInfo();
+                }
+            }
+            return null;
+        }
+!!!33925047.java!!!	getDeviceStatus(inout deviceInfo : MidiDeviceInfo) : MidiDeviceStatus
+        Device device = mDevicesByInfo.get(deviceInfo);
+        if (device == null) {
+            throw new IllegalArgumentException("no such device for " + deviceInfo);
+        }
+        return device.getDeviceStatus();
+!!!33925175.java!!!	setDeviceStatus(inout server : IMidiDeviceServer, inout status : MidiDeviceStatus) : void
+        Device device = mDevicesByServer.get(server.asBinder());
+        if (device != null) {
+            if (Binder.getCallingUid() != device.getUid()) {
+                throw new SecurityException("setDeviceStatus() caller UID " + Binder.getCallingUid()
+                        + " does not match device's UID " + device.getUid());
+            }
+            device.setDeviceStatus(status);
+            notifyDeviceStatusChanged(device, status);
+        }
+!!!33925303.java!!!	notifyDeviceStatusChanged(inout device : MidiService::Device, inout status : MidiDeviceStatus) : void
+        synchronized (mClients) {
+            for (Client c : mClients.values()) {
+                c.deviceStatusChanged(device, status);
+            }
+        }
+!!!33925431.java!!!	addDeviceLocked(in type : int, in numInputPorts : int, in numOutputPorts : int, inout inputPortNames : String, inout outputPortNames : String, inout properties : Bundle, inout server : IMidiDeviceServer, inout serviceInfo : ServiceInfo, inout isPrivate : boolean, in uid : int) : MidiDeviceInfo
+
+        int id = mNextDeviceId++;
+        MidiDeviceInfo deviceInfo = new MidiDeviceInfo(type, id, numInputPorts, numOutputPorts,
+                inputPortNames, outputPortNames, properties, isPrivate);
+
+        if (server != null) {
+            try {
+                server.setDeviceInfo(deviceInfo);
+            } catch (RemoteException e) {
+                Log.e(TAG, "RemoteException in setDeviceInfo()");
+                return null;
+            }
+        }
+
+        Device device = null;
+        BluetoothDevice bluetoothDevice = null;
+        if (type == MidiDeviceInfo.TYPE_BLUETOOTH) {
+            bluetoothDevice = (BluetoothDevice)properties.getParcelable(
+                    MidiDeviceInfo.PROPERTY_BLUETOOTH_DEVICE);
+            device = mBluetoothDevices.get(bluetoothDevice);
+            if (device != null) {
+                device.setDeviceInfo(deviceInfo);
+            }
+        }
+        if (device == null) {
+            device = new Device(server, deviceInfo, serviceInfo, uid);
+        }
+        mDevicesByInfo.put(deviceInfo, device);
+        if (bluetoothDevice != null) {
+            mBluetoothDevices.put(bluetoothDevice, device);
+        }
+
+        synchronized (mClients) {
+            for (Client c : mClients.values()) {
+                c.deviceAdded(device);
+            }
+        }
+
+        return deviceInfo;
+!!!33925559.java!!!	removeDeviceLocked(inout device : MidiService::Device) : void
+        IMidiDeviceServer server = device.getDeviceServer();
+        if (server != null) {
+            mDevicesByServer.remove(server.asBinder());
+        }
+        mDevicesByInfo.remove(device.getDeviceInfo());
+
+        synchronized (mClients) {
+            for (Client c : mClients.values()) {
+                c.deviceRemoved(device);
+            }
+        }
+!!!33925687.java!!!	addPackageDeviceServers(inout packageName : String) : void
+        PackageInfo info;
+
+        try {
+            info = mPackageManager.getPackageInfo(packageName,
+                    PackageManager.GET_SERVICES | PackageManager.GET_META_DATA);
+        } catch (PackageManager.NameNotFoundException e) {
+            Log.e(TAG, "handlePackageUpdate could not find package " + packageName, e);
+            return;
+        }
+
+        ServiceInfo[] services = info.services;
+        if (services == null) return;
+        for (int i = 0; i < services.length; i++) {
+            addPackageDeviceServer(services[i]);
+        }
+!!!33925815.java!!!	addPackageDeviceServer(inout serviceInfo : ServiceInfo) : void
+        XmlResourceParser parser = null;
+
+        try {
+            parser = serviceInfo.loadXmlMetaData(mPackageManager,
+                    MidiDeviceService.SERVICE_INTERFACE);
+            if (parser == null) return;
+
+            // ignore virtual device servers that do not require the correct permission
+            if (!android.Manifest.permission.BIND_MIDI_DEVICE_SERVICE.equals(
+                    serviceInfo.permission)) {
+                Log.w(TAG, "Skipping MIDI device service " + serviceInfo.packageName
+                        + ": it does not require the permission "
+                        + android.Manifest.permission.BIND_MIDI_DEVICE_SERVICE);
+                return;
+            }
+
+            Bundle properties = null;
+            int numInputPorts = 0;
+            int numOutputPorts = 0;
+            boolean isPrivate = false;
+            ArrayList<String> inputPortNames = new ArrayList<String>();
+            ArrayList<String> outputPortNames = new ArrayList<String>();
+
+            while (true) {
+                int eventType = parser.next();
+                if (eventType == XmlPullParser.END_DOCUMENT) {
+                    break;
+                } else if (eventType == XmlPullParser.START_TAG) {
+                    String tagName = parser.getName();
+                    if ("device".equals(tagName)) {
+                        if (properties != null) {
+                            Log.w(TAG, "nested <device> elements in metadata for "
+                                + serviceInfo.packageName);
+                            continue;
+                        }
+                        properties = new Bundle();
+                        properties.putParcelable(MidiDeviceInfo.PROPERTY_SERVICE_INFO, serviceInfo);
+                        numInputPorts = 0;
+                        numOutputPorts = 0;
+                        isPrivate = false;
+
+                        int count = parser.getAttributeCount();
+                        for (int i = 0; i < count; i++) {
+                            String name = parser.getAttributeName(i);
+                            String value = parser.getAttributeValue(i);
+                            if ("private".equals(name)) {
+                                isPrivate = "true".equals(value);
+                            } else {
+                                properties.putString(name, value);
+                            }
+                        }
+                    } else if ("input-port".equals(tagName)) {
+                        if (properties == null) {
+                            Log.w(TAG, "<input-port> outside of <device> in metadata for "
+                                + serviceInfo.packageName);
+                            continue;
+                        }
+                        numInputPorts++;
+
+                        String portName = null;
+                        int count = parser.getAttributeCount();
+                        for (int i = 0; i < count; i++) {
+                            String name = parser.getAttributeName(i);
+                            String value = parser.getAttributeValue(i);
+                            if ("name".equals(name)) {
+                                portName = value;
+                                break;
+                            }
+                        }
+                        inputPortNames.add(portName);
+                    } else if ("output-port".equals(tagName)) {
+                        if (properties == null) {
+                            Log.w(TAG, "<output-port> outside of <device> in metadata for "
+                                + serviceInfo.packageName);
+                            continue;
+                        }
+                        numOutputPorts++;
+
+                        String portName = null;
+                        int count = parser.getAttributeCount();
+                        for (int i = 0; i < count; i++) {
+                            String name = parser.getAttributeName(i);
+                            String value = parser.getAttributeValue(i);
+                            if ("name".equals(name)) {
+                                portName = value;
+                                break;
+                            }
+                        }
+                        outputPortNames.add(portName);
+                    }
+                } else if (eventType == XmlPullParser.END_TAG) {
+                    String tagName = parser.getName();
+                    if ("device".equals(tagName)) {
+                        if (properties != null) {
+                            if (numInputPorts == 0 && numOutputPorts == 0) {
+                                Log.w(TAG, "<device> with no ports in metadata for "
+                                    + serviceInfo.packageName);
+                                continue;
+                            }
+
+                            int uid;
+                            try {
+                                ApplicationInfo appInfo = mPackageManager.getApplicationInfo(
+                                        serviceInfo.packageName, 0);
+                                uid = appInfo.uid;
+                            } catch (PackageManager.NameNotFoundException e) {
+                                Log.e(TAG, "could not fetch ApplicationInfo for "
+                                        + serviceInfo.packageName);
+                                continue;
+                            }
+
+                            synchronized (mDevicesByInfo) {
+                                addDeviceLocked(MidiDeviceInfo.TYPE_VIRTUAL,
+                                    numInputPorts, numOutputPorts,
+                                    inputPortNames.toArray(EMPTY_STRING_ARRAY),
+                                    outputPortNames.toArray(EMPTY_STRING_ARRAY),
+                                    properties, null, serviceInfo, isPrivate, uid);
+                            }
+                            // setting properties to null signals that we are no longer
+                            // processing a <device>
+                            properties = null;
+                            inputPortNames.clear();
+                            outputPortNames.clear();
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "Unable to load component info " + serviceInfo.toString(), e);
+        } finally {
+            if (parser != null) parser.close();
+        }
+!!!33925943.java!!!	removePackageDeviceServers(inout packageName : String) : void
+        synchronized (mDevicesByInfo) {
+            Iterator<Device> iterator = mDevicesByInfo.values().iterator();
+            while (iterator.hasNext()) {
+                Device device = iterator.next();
+                if (packageName.equals(device.getPackageName())) {
+                    iterator.remove();
+                    removeDeviceLocked(device);
+                }
+            }
+        }
+!!!33926071.java!!!	dump(inout fd : FileDescriptor, inout writer : PrintWriter, inout args : String) : void
+        mContext.enforceCallingOrSelfPermission(android.Manifest.permission.DUMP, TAG);
+        final IndentingPrintWriter pw = new IndentingPrintWriter(writer, "  ");
+
+        pw.println("MIDI Manager State:");
+        pw.increaseIndent();
+
+        pw.println("Devices:");
+        pw.increaseIndent();
+        synchronized (mDevicesByInfo) {
+            for (Device device : mDevicesByInfo.values()) {
+                pw.println(device.toString());
+            }
+        }
+        pw.decreaseIndent();
+
+        pw.println("Clients:");
+        pw.increaseIndent();
+        synchronized (mClients) {
+            for (Client client : mClients.values()) {
+                pw.println(client.toString());
+            }
+        }
+        pw.decreaseIndent();

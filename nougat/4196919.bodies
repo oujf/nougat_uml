@@ -1,0 +1,261 @@
+class KeyboardUI
+!!!44476343.java!!!	start() : void
+        mContext = super.mContext;
+        HandlerThread thread = new HandlerThread("Keyboard", Process.THREAD_PRIORITY_BACKGROUND);
+        thread.start();
+        mHandler = new KeyboardHandler(thread.getLooper());
+        mHandler.sendEmptyMessage(MSG_INIT);
+!!!44476599.java!!!	dump(inout fd : FileDescriptor, inout pw : PrintWriter, inout args : String) : void
+        pw.println("KeyboardUI:");
+        pw.println("  mEnabled=" + mEnabled);
+        pw.println("  mBootCompleted=" + mEnabled);
+        pw.println("  mBootCompletedTime=" + mBootCompletedTime);
+        pw.println("  mKeyboardName=" + mKeyboardName);
+        pw.println("  mInTabletMode=" + mInTabletMode);
+        pw.println("  mState=" + stateToString(mState));
+!!!44476727.java!!!	onBootCompleted() : void
+        mHandler.sendEmptyMessage(MSG_ON_BOOT_COMPLETED);
+!!!44476855.java!!!	onTabletModeChanged(in whenNanos : long, inout inTabletMode : boolean) : void
+        if (DEBUG) {
+            Slog.d(TAG, "onTabletModeChanged(" + whenNanos + ", " + inTabletMode + ")");
+        }
+
+        if (inTabletMode && mInTabletMode != InputManager.SWITCH_STATE_ON
+                || !inTabletMode && mInTabletMode != InputManager.SWITCH_STATE_OFF) {
+            mInTabletMode = inTabletMode ?
+                    InputManager.SWITCH_STATE_ON : InputManager.SWITCH_STATE_OFF;
+            processKeyboardState();
+        }
+!!!44476983.java!!!	init() : void
+        Context context = mContext;
+        mKeyboardName =
+                context.getString(com.android.internal.R.string.config_packagedKeyboardName);
+        if (TextUtils.isEmpty(mKeyboardName)) {
+            if (DEBUG) {
+                Slog.d(TAG, "No packaged keyboard name given.");
+            }
+            return;
+        }
+
+        LocalBluetoothManager bluetoothManager = LocalBluetoothManager.getInstance(context, null);
+        if (bluetoothManager == null)  {
+            if (DEBUG) {
+                Slog.e(TAG, "Failed to retrieve LocalBluetoothManager instance");
+            }
+            return;
+        }
+        mEnabled = true;
+        mCachedDeviceManager = bluetoothManager.getCachedDeviceManager();
+        mLocalBluetoothAdapter = bluetoothManager.getBluetoothAdapter();
+        mProfileManager = bluetoothManager.getProfileManager();
+        bluetoothManager.getEventManager().registerCallback(new BluetoothCallbackHandler());
+        Utils.setErrorListener(new BluetoothErrorListener());
+
+        InputManager im = context.getSystemService(InputManager.class);
+        im.registerOnTabletModeChangedListener(this, mHandler);
+        mInTabletMode = im.isInTabletMode();
+
+        processKeyboardState();
+        mUIHandler = new KeyboardUIHandler();
+!!!44477111.java!!!	processKeyboardState() : void
+        mHandler.removeMessages(MSG_PROCESS_KEYBOARD_STATE);
+
+        if (!mEnabled) {
+            mState = STATE_NOT_ENABLED;
+            return;
+        }
+
+        if (!mBootCompleted) {
+            mState = STATE_WAITING_FOR_BOOT_COMPLETED;
+            return;
+        }
+
+        if (mInTabletMode != InputManager.SWITCH_STATE_OFF) {
+            if (mState == STATE_WAITING_FOR_DEVICE_DISCOVERY) {
+                stopScanning();
+            } else if (mState == STATE_WAITING_FOR_BLUETOOTH) {
+                mUIHandler.sendEmptyMessage(MSG_DISMISS_BLUETOOTH_DIALOG);
+            }
+            mState = STATE_WAITING_FOR_TABLET_MODE_EXIT;
+            return;
+        }
+
+        final int btState = mLocalBluetoothAdapter.getState();
+        if ((btState == BluetoothAdapter.STATE_TURNING_ON || btState == BluetoothAdapter.STATE_ON)
+                && mState == STATE_WAITING_FOR_BLUETOOTH) {
+            // If we're waiting for bluetooth but it has come on in the meantime, or is coming
+            // on, just dismiss the dialog. This frequently happens during device startup.
+            mUIHandler.sendEmptyMessage(MSG_DISMISS_BLUETOOTH_DIALOG);
+        }
+
+        if (btState == BluetoothAdapter.STATE_TURNING_ON) {
+            mState = STATE_WAITING_FOR_BLUETOOTH;
+            // Wait for bluetooth to fully come on.
+            return;
+        }
+
+        if (btState != BluetoothAdapter.STATE_ON) {
+            mState = STATE_WAITING_FOR_BLUETOOTH;
+            showBluetoothDialog();
+            return;
+        }
+
+        CachedBluetoothDevice device = getPairedKeyboard();
+        if (mState == STATE_WAITING_FOR_TABLET_MODE_EXIT || mState == STATE_WAITING_FOR_BLUETOOTH) {
+            if (device != null) {
+                // If we're just coming out of tablet mode or BT just turned on,
+                // then we want to go ahead and automatically connect to the
+                // keyboard. We want to avoid this in other cases because we might
+                // be spuriously called after the user has manually disconnected
+                // the keyboard, meaning we shouldn't try to automtically connect
+                // it again.
+                mState = STATE_PAIRED;
+                device.connect(false);
+                return;
+            }
+            mCachedDeviceManager.clearNonBondedDevices();
+        }
+
+        device = getDiscoveredKeyboard();
+        if (device != null) {
+            mState = STATE_PAIRING;
+            device.startPairing();
+        } else {
+            mState = STATE_WAITING_FOR_DEVICE_DISCOVERY;
+            startScanning();
+        }
+!!!44477239.java!!!	onBootCompletedInternal() : void
+        mBootCompleted = true;
+        mBootCompletedTime = SystemClock.uptimeMillis();
+        if (mState == STATE_WAITING_FOR_BOOT_COMPLETED) {
+            processKeyboardState();
+        }
+!!!44477367.java!!!	showBluetoothDialog() : void
+        if (isUserSetupComplete()) {
+            long now = SystemClock.uptimeMillis();
+            long earliestDialogTime = mBootCompletedTime + BLUETOOTH_START_DELAY_MILLIS;
+            if (earliestDialogTime < now) {
+                mUIHandler.sendEmptyMessage(MSG_SHOW_BLUETOOTH_DIALOG);
+            } else {
+                mHandler.sendEmptyMessageAtTime(MSG_PROCESS_KEYBOARD_STATE, earliestDialogTime);
+            }
+        } else {
+            // If we're in setup wizard and the keyboard is docked, just automatically enable BT.
+            mLocalBluetoothAdapter.enable();
+        }
+!!!44477495.java!!!	isUserSetupComplete() : boolean
+        ContentResolver resolver = mContext.getContentResolver();
+        return Secure.getIntForUser(
+                resolver, Secure.USER_SETUP_COMPLETE, 0, UserHandle.USER_CURRENT) != 0;
+!!!44477623.java!!!	getPairedKeyboard() : CachedBluetoothDevice
+        Set<BluetoothDevice> devices = mLocalBluetoothAdapter.getBondedDevices();
+        for (BluetoothDevice d : devices) {
+            if (mKeyboardName.equals(d.getName())) {
+                return getCachedBluetoothDevice(d);
+            }
+        }
+        return null;
+!!!44477751.java!!!	getDiscoveredKeyboard() : CachedBluetoothDevice
+        Collection<CachedBluetoothDevice> devices = mCachedDeviceManager.getCachedDevicesCopy();
+        for (CachedBluetoothDevice d : devices) {
+            if (d.getName().equals(mKeyboardName)) {
+                return d;
+            }
+        }
+        return null;
+!!!44477879.java!!!	getCachedBluetoothDevice(inout d : BluetoothDevice) : CachedBluetoothDevice
+        CachedBluetoothDevice cachedDevice = mCachedDeviceManager.findDevice(d);
+        if (cachedDevice == null) {
+            cachedDevice = mCachedDeviceManager.addDevice(
+                    mLocalBluetoothAdapter, mProfileManager, d);
+        }
+        return cachedDevice;
+!!!44478007.java!!!	startScanning() : void
+        BluetoothLeScanner scanner = mLocalBluetoothAdapter.getBluetoothLeScanner();
+        ScanFilter filter = (new ScanFilter.Builder()).setDeviceName(mKeyboardName).build();
+        ScanSettings settings = (new ScanSettings.Builder())
+            .setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
+            .setNumOfMatches(ScanSettings.MATCH_NUM_ONE_ADVERTISEMENT)
+            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+            .setReportDelay(0)
+            .build();
+        mScanCallback = new KeyboardScanCallback();
+        scanner.startScan(Arrays.asList(filter), settings, mScanCallback);
+
+        Message abortMsg = mHandler.obtainMessage(MSG_BLE_ABORT_SCAN, ++mScanAttempt, 0);
+        mHandler.sendMessageDelayed(abortMsg, BLUETOOTH_SCAN_TIMEOUT_MILLIS);
+!!!44478135.java!!!	stopScanning() : void
+        if (mScanCallback != null) {
+            BluetoothLeScanner scanner = mLocalBluetoothAdapter.getBluetoothLeScanner();
+            if (scanner != null) {
+                scanner.stopScan(mScanCallback);
+            }
+            mScanCallback = null;
+        }
+!!!44478263.java!!!	bleAbortScanInternal(in scanAttempt : int) : void
+        if (mState == STATE_WAITING_FOR_DEVICE_DISCOVERY && scanAttempt == mScanAttempt) {
+            if (DEBUG) {
+                Slog.d(TAG, "Bluetooth scan timed out");
+            }
+            stopScanning();
+            // FIXME: should we also try shutting off bluetooth if we enabled
+            // it in the first place?
+            mState = STATE_DEVICE_NOT_FOUND;
+        }
+!!!44478391.java!!!	onDeviceAddedInternal(inout d : CachedBluetoothDevice) : void
+        if (mState == STATE_WAITING_FOR_DEVICE_DISCOVERY && d.getName().equals(mKeyboardName)) {
+            stopScanning();
+            d.startPairing();
+            mState = STATE_PAIRING;
+        }
+!!!44478519.java!!!	onBluetoothStateChangedInternal(in bluetoothState : int) : void
+        if (bluetoothState == BluetoothAdapter.STATE_ON && mState == STATE_WAITING_FOR_BLUETOOTH) {
+            processKeyboardState();
+        }
+!!!44478647.java!!!	onDeviceBondStateChangedInternal(inout d : CachedBluetoothDevice, in bondState : int) : void
+        if (mState == STATE_PAIRING && d.getName().equals(mKeyboardName)) {
+            if (bondState == BluetoothDevice.BOND_BONDED) {
+                // We don't need to manually connect to the device here because it will
+                // automatically try to connect after it has been paired.
+                mState = STATE_PAIRED;
+            } else if (bondState == BluetoothDevice.BOND_NONE) {
+                mState = STATE_PAIRING_FAILED;
+            }
+        }
+!!!44478775.java!!!	onBleScanFailedInternal() : void
+        mScanCallback = null;
+        if (mState == STATE_WAITING_FOR_DEVICE_DISCOVERY) {
+            mState = STATE_DEVICE_NOT_FOUND;
+        }
+!!!44478903.java!!!	onShowErrorInternal(inout context : Context, inout name : String, in messageResId : int) : void
+        if ((mState == STATE_PAIRING || mState == STATE_PAIRING_FAILED)
+                && mKeyboardName.equals(name)) {
+            String message = context.getString(messageResId, name);
+            Toast.makeText(context, message, Toast.LENGTH_SHORT).show();
+        }
+!!!44481207.java!!!	stateToString(in state : int) : String
+        switch (state) {
+            case STATE_NOT_ENABLED:
+                return "STATE_NOT_ENABLED";
+            case STATE_WAITING_FOR_BOOT_COMPLETED:
+                return "STATE_WAITING_FOR_BOOT_COMPLETED";
+            case STATE_WAITING_FOR_TABLET_MODE_EXIT:
+                return "STATE_WAITING_FOR_TABLET_MODE_EXIT";
+            case STATE_WAITING_FOR_DEVICE_DISCOVERY:
+                return "STATE_WAITING_FOR_DEVICE_DISCOVERY";
+            case STATE_WAITING_FOR_BLUETOOTH:
+                return "STATE_WAITING_FOR_BLUETOOTH";
+            case STATE_PAIRING:
+                return "STATE_PAIRING";
+            case STATE_PAIRED:
+                return "STATE_PAIRED";
+            case STATE_PAIRING_FAILED:
+                return "STATE_PAIRING_FAILED";
+            case STATE_USER_CANCELLED:
+                return "STATE_USER_CANCELLED";
+            case STATE_DEVICE_NOT_FOUND:
+                return "STATE_DEVICE_NOT_FOUND";
+            case STATE_UNKNOWN:
+            default:
+                return "STATE_UNKNOWN (" + state + ")";
+        }

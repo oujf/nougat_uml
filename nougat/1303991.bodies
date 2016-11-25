@@ -1,0 +1,648 @@
+class BaseStatusBar
+!!!30953015.java!!!	isDeviceProvisioned() : boolean
+        return mDeviceProvisioned;
+!!!30953143.java!!!	isDeviceInVrMode() : boolean
+        return mVrMode;
+!!!30953271.java!!!	updateCurrentProfilesCache() : void
+        synchronized (mCurrentProfiles) {
+            mCurrentProfiles.clear();
+            if (mUserManager != null) {
+                for (UserInfo user : mUserManager.getProfiles(mCurrentUserId)) {
+                    mCurrentProfiles.put(user.id, user);
+                }
+            }
+        }
+!!!30953399.java!!!	start() : void
+        mWindowManager = (WindowManager)mContext.getSystemService(Context.WINDOW_SERVICE);
+        mWindowManagerService = WindowManagerGlobal.getWindowManagerService();
+        mDisplay = mWindowManager.getDefaultDisplay();
+        mDevicePolicyManager = (DevicePolicyManager)mContext.getSystemService(
+                Context.DEVICE_POLICY_SERVICE);
+
+        mNotificationData = new NotificationData(this);
+
+        mAccessibilityManager = (AccessibilityManager)
+                mContext.getSystemService(Context.ACCESSIBILITY_SERVICE);
+
+        mDreamManager = IDreamManager.Stub.asInterface(
+                ServiceManager.checkService(DreamService.DREAM_SERVICE));
+        mPowerManager = (PowerManager) mContext.getSystemService(Context.POWER_SERVICE);
+
+        mContext.getContentResolver().registerContentObserver(
+                Settings.Global.getUriFor(Settings.Global.DEVICE_PROVISIONED), true,
+                mSettingsObserver);
+        mContext.getContentResolver().registerContentObserver(
+                Settings.Global.getUriFor(Settings.Global.ZEN_MODE), false,
+                mSettingsObserver);
+        mContext.getContentResolver().registerContentObserver(
+                Settings.Secure.getUriFor(Settings.Secure.LOCK_SCREEN_SHOW_NOTIFICATIONS), false,
+                mSettingsObserver,
+                UserHandle.USER_ALL);
+        if (ENABLE_LOCK_SCREEN_ALLOW_REMOTE_INPUT) {
+            mContext.getContentResolver().registerContentObserver(
+                    Settings.Secure.getUriFor(Settings.Secure.LOCK_SCREEN_ALLOW_REMOTE_INPUT),
+                    false,
+                    mSettingsObserver,
+                    UserHandle.USER_ALL);
+        }
+
+        mContext.getContentResolver().registerContentObserver(
+                Settings.Secure.getUriFor(Settings.Secure.LOCK_SCREEN_ALLOW_PRIVATE_NOTIFICATIONS),
+                true,
+                mLockscreenSettingsObserver,
+                UserHandle.USER_ALL);
+
+        mBarService = IStatusBarService.Stub.asInterface(
+                ServiceManager.getService(Context.STATUS_BAR_SERVICE));
+
+        mRecents = getComponent(Recents.class);
+
+        final Configuration currentConfig = mContext.getResources().getConfiguration();
+        mLocale = currentConfig.locale;
+        mLayoutDirection = TextUtils.getLayoutDirectionFromLocale(mLocale);
+        mFontScale = currentConfig.fontScale;
+        mDensity = currentConfig.densityDpi;
+
+        mUserManager = (UserManager) mContext.getSystemService(Context.USER_SERVICE);
+        mKeyguardManager = (KeyguardManager) mContext.getSystemService(Context.KEYGUARD_SERVICE);
+        mLockPatternUtils = new LockPatternUtils(mContext);
+
+        // Connect in to the status bar manager service
+        mCommandQueue = new CommandQueue(this);
+
+        int[] switches = new int[9];
+        ArrayList<IBinder> binders = new ArrayList<IBinder>();
+        ArrayList<String> iconSlots = new ArrayList<>();
+        ArrayList<StatusBarIcon> icons = new ArrayList<>();
+        Rect fullscreenStackBounds = new Rect();
+        Rect dockedStackBounds = new Rect();
+        try {
+            mBarService.registerStatusBar(mCommandQueue, iconSlots, icons, switches, binders,
+                    fullscreenStackBounds, dockedStackBounds);
+        } catch (RemoteException ex) {
+            // If the system process isn't there we're doomed anyway.
+        }
+
+        createAndAddWindows();
+
+        mSettingsObserver.onChange(false); // set up
+        disable(switches[0], switches[6], false /* animate */);
+        setSystemUiVisibility(switches[1], switches[7], switches[8], 0xffffffff,
+                fullscreenStackBounds, dockedStackBounds);
+        topAppWindowChanged(switches[2] != 0);
+        // StatusBarManagerService has a back up of IME token and it's restored here.
+        setImeWindowStatus(binders.get(0), switches[3], switches[4], switches[5] != 0);
+
+        // Set up the initial icon state
+        int N = iconSlots.size();
+        int viewIndex = 0;
+        for (int i=0; i < N; i++) {
+            setIcon(iconSlots.get(i), icons.get(i));
+        }
+
+        // Set up the initial notification state.
+        try {
+            mNotificationListener.registerAsSystemService(mContext,
+                    new ComponentName(mContext.getPackageName(), getClass().getCanonicalName()),
+                    UserHandle.USER_ALL);
+        } catch (RemoteException e) {
+            Log.e(TAG, "Unable to register notification listener", e);
+        }
+
+
+        if (DEBUG) {
+            Log.d(TAG, String.format(
+                    "init: icons=%d disabled=0x%08x lights=0x%08x menu=0x%08x imeButton=0x%08x",
+                   icons.size(),
+                   switches[0],
+                   switches[1],
+                   switches[2],
+                   switches[3]
+                   ));
+        }
+
+        mCurrentUserId = ActivityManager.getCurrentUser();
+        setHeadsUpUser(mCurrentUserId);
+
+        IntentFilter filter = new IntentFilter();
+        filter.addAction(Intent.ACTION_USER_SWITCHED);
+        filter.addAction(Intent.ACTION_USER_ADDED);
+        filter.addAction(Intent.ACTION_USER_PRESENT);
+        mContext.registerReceiver(mBroadcastReceiver, filter);
+
+        IntentFilter internalFilter = new IntentFilter();
+        internalFilter.addAction(WORK_CHALLENGE_UNLOCKED_NOTIFICATION_ACTION);
+        internalFilter.addAction(BANNER_ACTION_CANCEL);
+        internalFilter.addAction(BANNER_ACTION_SETUP);
+        mContext.registerReceiver(mBroadcastReceiver, internalFilter, PERMISSION_SELF, null);
+
+        IntentFilter allUsersFilter = new IntentFilter();
+        allUsersFilter.addAction(
+                DevicePolicyManager.ACTION_DEVICE_POLICY_MANAGER_STATE_CHANGED);
+        mContext.registerReceiverAsUser(mAllUsersReceiver, UserHandle.ALL, allUsersFilter,
+                null, null);
+        updateCurrentProfilesCache();
+
+        IVrManager vrManager = IVrManager.Stub.asInterface(ServiceManager.getService("vrmanager"));
+        try {
+            vrManager.registerListener(mVrStateCallbacks);
+        } catch (RemoteException e) {
+            Slog.e(TAG, "Failed to register VR mode state listener: " + e);
+        }
+
+!!!30953527.java!!!	notifyUserAboutHiddenNotifications() : void
+        if (0 != Settings.Secure.getInt(mContext.getContentResolver(),
+                Settings.Secure.SHOW_NOTE_ABOUT_NOTIFICATION_HIDING, 1)) {
+            Log.d(TAG, "user hasn't seen notification about hidden notifications");
+            if (!mLockPatternUtils.isSecure(KeyguardUpdateMonitor.getCurrentUser())) {
+                Log.d(TAG, "insecure lockscreen, skipping notification");
+                Settings.Secure.putInt(mContext.getContentResolver(),
+                        Settings.Secure.SHOW_NOTE_ABOUT_NOTIFICATION_HIDING, 0);
+                return;
+            }
+            Log.d(TAG, "disabling lockecreen notifications and alerting the user");
+            // disable lockscreen notifications until user acts on the banner.
+            Settings.Secure.putInt(mContext.getContentResolver(),
+                    Settings.Secure.LOCK_SCREEN_SHOW_NOTIFICATIONS, 0);
+            Settings.Secure.putInt(mContext.getContentResolver(),
+                    Settings.Secure.LOCK_SCREEN_ALLOW_PRIVATE_NOTIFICATIONS, 0);
+
+            final String packageName = mContext.getPackageName();
+            PendingIntent cancelIntent = PendingIntent.getBroadcast(mContext, 0,
+                    new Intent(BANNER_ACTION_CANCEL).setPackage(packageName),
+                    PendingIntent.FLAG_CANCEL_CURRENT);
+            PendingIntent setupIntent = PendingIntent.getBroadcast(mContext, 0,
+                    new Intent(BANNER_ACTION_SETUP).setPackage(packageName),
+                    PendingIntent.FLAG_CANCEL_CURRENT);
+
+            final int colorRes = com.android.internal.R.color.system_notification_accent_color;
+            Notification.Builder note = new Notification.Builder(mContext)
+                    .setSmallIcon(R.drawable.ic_android)
+                    .setContentTitle(mContext.getString(R.string.hidden_notifications_title))
+                    .setContentText(mContext.getString(R.string.hidden_notifications_text))
+                    .setPriority(Notification.PRIORITY_HIGH)
+                    .setOngoing(true)
+                    .setColor(mContext.getColor(colorRes))
+                    .setContentIntent(setupIntent)
+                    .addAction(R.drawable.ic_close,
+                            mContext.getString(R.string.hidden_notifications_cancel),
+                            cancelIntent)
+                    .addAction(R.drawable.ic_settings,
+                            mContext.getString(R.string.hidden_notifications_setup),
+                            setupIntent);
+            overrideNotificationAppName(mContext, note);
+
+            NotificationManager noMan =
+                    (NotificationManager) mContext.getSystemService(Context.NOTIFICATION_SERVICE);
+            noMan.notify(R.id.notification_hidden, note.build());
+        }
+!!!30953655.java!!!	userSwitched(in newUserId : int) : void
+        setHeadsUpUser(newUserId);
+!!!30953911.java!!!	isNotificationForCurrentProfiles(inout n : StatusBarNotification) : boolean
+        final int thisUserId = mCurrentUserId;
+        final int notificationUserId = n.getUserId();
+        if (DEBUG && MULTIUSER_DEBUG) {
+            Log.v(TAG, String.format("%s: current userid: %d, notification userid: %d",
+                    n, thisUserId, notificationUserId));
+        }
+        return isCurrentProfile(notificationUserId);
+!!!30954039.java!!!	setNotificationShown(inout n : StatusBarNotification) : void
+        setNotificationsShown(new String[]{n.getKey()});
+!!!30954167.java!!!	setNotificationsShown(inout keys : String) : void
+        try {
+            mNotificationListener.setNotificationsShown(keys);
+        } catch (RuntimeException e) {
+            Log.d(TAG, "failed setNotificationsShown: ", e);
+        }
+!!!30954295.java!!!	isCurrentProfile(in userId : int) : boolean
+        synchronized (mCurrentProfiles) {
+            return userId == UserHandle.USER_ALL || mCurrentProfiles.get(userId) != null;
+        }
+!!!30954423.java!!!	getCurrentMediaNotificationKey() : String
+        return null;
+!!!30954551.java!!!	getGroupManager() : NotificationGroupManager
+        return mGroupManager;
+!!!30954679.java!!!	dismissKeyguardThenExecute(inout action : KeyguardHostView::OnDismissAction, inout afterKeyguardGone : boolean) : void
+        action.onDismiss();
+!!!30954807.java!!!	onConfigurationChanged(inout newConfig : Configuration) : void
+        final Locale locale = mContext.getResources().getConfiguration().locale;
+        final int ld = TextUtils.getLayoutDirectionFromLocale(locale);
+        final float fontScale = newConfig.fontScale;
+        final int density = newConfig.densityDpi;
+        if (density != mDensity || mFontScale != fontScale) {
+            onDensityOrFontScaleChanged();
+            mDensity = density;
+            mFontScale = fontScale;
+        }
+        if (! locale.equals(mLocale) || ld != mLayoutDirection) {
+            if (DEBUG) {
+                Log.v(TAG, String.format(
+                        "config changed locale/LD: %s (%d) -> %s (%d)", mLocale, mLayoutDirection,
+                        locale, ld));
+            }
+            mLocale = locale;
+            mLayoutDirection = ld;
+            refreshLayout(ld);
+        }
+!!!30954935.java!!!	onDensityOrFontScaleChanged() : void
+        ArrayList<Entry> activeNotifications = mNotificationData.getActiveNotifications();
+        for (int i = 0; i < activeNotifications.size(); i++) {
+            Entry entry = activeNotifications.get(i);
+            boolean exposedGuts = entry.row.getGuts() == mNotificationGutsExposed;
+            entry.row.reInflateViews();
+            if (exposedGuts) {
+                mNotificationGutsExposed = entry.row.getGuts();
+                bindGuts(entry.row);
+            }
+            entry.cacheContentViews(mContext, null /* updatedNotification */);
+            inflateViews(entry, mStackScroller);
+        }
+!!!30955063.java!!!	bindDismissListener(in row : ExpandableNotificationRow) : void
+        row.setOnDismissListener(new View.OnClickListener() {
+            public void onClick(View v) {
+                // Accessibility feedback
+                v.announceForAccessibility(
+                        mContext.getString(R.string.accessibility_notification_dismissed));
+                performRemoveNotification(row.getStatusBarNotification(), false /* removeView */);
+            }
+        });
+!!!30955191.java!!!	performRemoveNotification(inout n : StatusBarNotification, inout removeView : boolean) : void
+        final String pkg = n.getPackageName();
+        final String tag = n.getTag();
+        final int id = n.getId();
+        final int userId = n.getUserId();
+        try {
+            mBarService.onNotificationClear(pkg, tag, id, userId);
+            if (FORCE_REMOTE_INPUT_HISTORY
+                    && mKeysKeptForRemoteInput.contains(n.getKey())) {
+                mKeysKeptForRemoteInput.remove(n.getKey());
+                removeView = true;
+            }
+            if (mRemoteInputEntriesToRemoveOnCollapse.remove(mNotificationData.get(n.getKey()))) {
+                removeView = true;
+            }
+            if (removeView) {
+                removeNotification(n.getKey(), null);
+            }
+
+        } catch (RemoteException ex) {
+            // system process is dead if we're here.
+        }
+!!!30955319.java!!!	applyColorsAndBackgrounds(inout sbn : StatusBarNotification, inout entry : NotificationData::Entry) : void
+
+        if (entry.getContentView().getId()
+                != com.android.internal.R.id.status_bar_latest_event_content) {
+            // Using custom RemoteViews
+            if (entry.targetSdk >= Build.VERSION_CODES.GINGERBREAD
+                    && entry.targetSdk < Build.VERSION_CODES.LOLLIPOP) {
+                entry.row.setShowingLegacyBackground(true);
+                entry.legacy = true;
+            }
+        }
+
+        if (entry.icon != null) {
+            entry.icon.setTag(R.id.icon_is_pre_L, entry.targetSdk < Build.VERSION_CODES.LOLLIPOP);
+        }
+!!!30955447.java!!!	isMediaNotification(inout entry : NotificationData::Entry) : boolean
+        // TODO: confirm that there's a valid media key
+        return entry.getExpandedContentView() != null &&
+               entry.getExpandedContentView()
+                       .findViewById(com.android.internal.R.id.media_actions) != null;
+!!!30955575.java!!!	startAppNotificationSettingsActivity(inout packageName : String, in appUid : int) : void
+        final Intent intent = new Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS);
+        intent.putExtra(Settings.EXTRA_APP_PACKAGE, packageName);
+        intent.putExtra(Settings.EXTRA_APP_UID, appUid);
+        startNotificationGutsIntent(intent, appUid);
+!!!30955703.java!!!	startNotificationGutsIntent(in intent : Intent, in appUid : int) : void
+        final boolean keyguardShowing = mStatusBarKeyguardViewManager.isShowing();
+        dismissKeyguardThenExecute(new OnDismissAction() {
+            @Override
+            public boolean onDismiss() {
+                AsyncTask.execute(new Runnable() {
+                    public void run() {
+                        try {
+                            if (keyguardShowing) {
+                                ActivityManagerNative.getDefault()
+                                        .keyguardWaitingForActivityDrawn();
+                            }
+                            TaskStackBuilder.create(mContext)
+                                    .addNextIntentWithParentStack(intent)
+                                    .startActivities(getActivityOptions(),
+                                            new UserHandle(UserHandle.getUserId(appUid)));
+                            overrideActivityPendingAppTransition(keyguardShowing);
+                        } catch (RemoteException e) {
+                        }
+                    }
+                });
+                animateCollapsePanels(CommandQueue.FLAG_EXCLUDE_RECENTS_PANEL, true /* force */);
+                return true;
+            }
+        }, false /* afterKeyguardGone */);
+!!!30955831.java!!!	bindGuts(in row : ExpandableNotificationRow) : void
+        row.inflateGuts();
+        final StatusBarNotification sbn = row.getStatusBarNotification();
+        PackageManager pmUser = getPackageManagerForUser(mContext, sbn.getUser().getIdentifier());
+        row.setTag(sbn.getPackageName());
+        final NotificationGuts guts = row.getGuts();
+        guts.setClosedListener(this);
+        final String pkg = sbn.getPackageName();
+        String appname = pkg;
+        Drawable pkgicon = null;
+        int appUid = -1;
+        try {
+            final ApplicationInfo info = pmUser.getApplicationInfo(pkg,
+                    PackageManager.GET_UNINSTALLED_PACKAGES
+                            | PackageManager.GET_DISABLED_COMPONENTS);
+            if (info != null) {
+                appname = String.valueOf(pmUser.getApplicationLabel(info));
+                pkgicon = pmUser.getApplicationIcon(info);
+                appUid = info.uid;
+            }
+        } catch (NameNotFoundException e) {
+            // app is gone, just show package name and generic icon
+            pkgicon = pmUser.getDefaultActivityIcon();
+        }
+
+        ((ImageView) guts.findViewById(R.id.app_icon)).setImageDrawable(pkgicon);
+        ((TextView) guts.findViewById(R.id.pkgname)).setText(appname);
+
+        final TextView settingsButton = (TextView) guts.findViewById(R.id.more_settings);
+        if (appUid >= 0) {
+            final int appUidF = appUid;
+            settingsButton.setOnClickListener(new View.OnClickListener() {
+                public void onClick(View v) {
+                    MetricsLogger.action(mContext, MetricsEvent.ACTION_NOTE_INFO);
+                    guts.resetFalsingCheck();
+                    startAppNotificationSettingsActivity(pkg, appUidF);
+                }
+            });
+            settingsButton.setText(R.string.notification_more_settings);
+        } else {
+            settingsButton.setVisibility(View.GONE);
+        }
+
+        guts.bindImportance(pmUser, sbn, mNotificationData.getImportance(sbn.getKey()));
+
+        final TextView doneButton = (TextView) guts.findViewById(R.id.done);
+        doneButton.setText(R.string.notification_done);
+        doneButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                // If the user has security enabled, show challenge if the setting is changed.
+                if (guts.hasImportanceChanged() && isLockscreenPublicMode() &&
+                        (mState == StatusBarState.KEYGUARD
+                        || mState == StatusBarState.SHADE_LOCKED)) {
+                    OnDismissAction dismissAction = new OnDismissAction() {
+                        @Override
+                        public boolean onDismiss() {
+                            saveImportanceCloseControls(sbn, row, guts, v);
+                            return true;
+                        }
+                    };
+                    onLockedNotificationImportanceChange(dismissAction);
+                } else {
+                    saveImportanceCloseControls(sbn, row, guts, v);
+                }
+            }
+        });
+!!!30955959.java!!!	saveImportanceCloseControls(inout sbn : StatusBarNotification, inout row : ExpandableNotificationRow, inout guts : NotificationGuts, inout done : View) : void
+        guts.resetFalsingCheck();
+        guts.saveImportance(sbn);
+
+        int[] rowLocation = new int[2];
+        int[] doneLocation = new int[2];
+        row.getLocationOnScreen(rowLocation);
+        done.getLocationOnScreen(doneLocation);
+
+        final int centerX = done.getWidth() / 2;
+        final int centerY = done.getHeight() / 2;
+        final int x = doneLocation[0] - rowLocation[0] + centerX;
+        final int y = doneLocation[1] - rowLocation[1] + centerY;
+        dismissPopups(x, y);
+!!!30956087.java!!!	getNotificationLongClicker() : SwipeHelper::LongPressListener
+        return new SwipeHelper.LongPressListener() {
+            @Override
+            public boolean onLongPress(View v, final int x, final int y) {
+                if (!(v instanceof ExpandableNotificationRow)) {
+                    return false;
+                }
+                if (v.getWindowToken() == null) {
+                    Log.e(TAG, "Trying to show notification guts, but not attached to window");
+                    return false;
+                }
+
+                final ExpandableNotificationRow row = (ExpandableNotificationRow) v;
+                bindGuts(row);
+
+                // Assume we are a status_bar_notification_row
+                final NotificationGuts guts = row.getGuts();
+                if (guts == null) {
+                    // This view has no guts. Examples are the more card or the dismiss all view
+                    return false;
+                }
+
+                // Already showing?
+                if (guts.getVisibility() == View.VISIBLE) {
+                    dismissPopups(x, y);
+                    return false;
+                }
+
+                MetricsLogger.action(mContext, MetricsEvent.ACTION_NOTE_CONTROLS);
+
+                // ensure that it's laid but not visible until actually laid out
+                guts.setVisibility(View.INVISIBLE);
+                // Post to ensure the the guts are properly laid out.
+                guts.post(new Runnable() {
+                    public void run() {
+                        dismissPopups(-1 /* x */, -1 /* y */, false /* resetGear */,
+                                false /* animate */);
+                        guts.setVisibility(View.VISIBLE);
+                        final double horz = Math.max(guts.getWidth() - x, x);
+                        final double vert = Math.max(guts.getHeight() - y, y);
+                        final float r = (float) Math.hypot(horz, vert);
+                        final Animator a
+                                = ViewAnimationUtils.createCircularReveal(guts, x, y, 0, r);
+                        a.setDuration(StackStateAnimator.ANIMATION_DURATION_STANDARD);
+                        a.setInterpolator(Interpolators.LINEAR_OUT_SLOW_IN);
+                        a.addListener(new AnimatorListenerAdapter() {
+                            @Override
+                            public void onAnimationEnd(Animator animation) {
+                                super.onAnimationEnd(animation);
+                                // Move the notification view back over the gear
+                                row.resetTranslation();
+                            }
+                        });
+                        a.start();
+                        guts.setExposed(true /* exposed */,
+                                mState == StatusBarState.KEYGUARD /* needsFalsingProtection */);
+                        row.closeRemoteInput();
+                        mStackScroller.onHeightChanged(null, true /* needsAnimation */);
+                        mNotificationGutsExposed = guts;
+                    }
+                });
+                return true;
+            }
+        };
+!!!30956215.java!!!	getExposedGuts() : NotificationGuts
+        return mNotificationGutsExposed;
+!!!30956343.java!!!	dismissPopups() : void
+        dismissPopups(-1 /* x */, -1 /* y */, true /* resetGear */, false /* animate */);
+!!!30956471.java!!!	dismissPopups(in x : int, in y : int) : void
+        dismissPopups(x, y, true /* resetGear */, false /* animate */);
+!!!30956599.java!!!	dismissPopups(in x : int, in y : int, inout resetGear : boolean, inout animate : boolean) : void
+        if (mNotificationGutsExposed != null) {
+            mNotificationGutsExposed.closeControls(x, y, true /* notify */);
+        }
+        if (resetGear) {
+            mStackScroller.resetExposedGearView(animate, true /* force */);
+        }
+!!!30956727.java!!!	onGutsClosed(inout guts : NotificationGuts) : void
+        mStackScroller.onHeightChanged(null, true /* needsAnimation */);
+        mNotificationGutsExposed = null;
+!!!30956855.java!!!	showRecentApps(inout triggeredFromAltTab : boolean, inout fromHome : boolean) : void
+        int msg = MSG_SHOW_RECENT_APPS;
+        mHandler.removeMessages(msg);
+        mHandler.obtainMessage(msg, triggeredFromAltTab ? 1 : 0, fromHome ? 1 : 0).sendToTarget();
+!!!30956983.java!!!	hideRecentApps(inout triggeredFromAltTab : boolean, inout triggeredFromHomeKey : boolean) : void
+        int msg = MSG_HIDE_RECENT_APPS;
+        mHandler.removeMessages(msg);
+        mHandler.obtainMessage(msg, triggeredFromAltTab ? 1 : 0,
+                triggeredFromHomeKey ? 1 : 0).sendToTarget();
+!!!30957111.java!!!	toggleRecentApps() : void
+        toggleRecents();
+!!!30957239.java!!!	toggleSplitScreen() : void
+        toggleSplitScreenMode(-1 /* metricsDockAction */, -1 /* metricsUndockAction */);
+!!!30957367.java!!!	preloadRecentApps() : void
+        int msg = MSG_PRELOAD_RECENT_APPS;
+        mHandler.removeMessages(msg);
+        mHandler.sendEmptyMessage(msg);
+!!!30957495.java!!!	cancelPreloadRecentApps() : void
+        int msg = MSG_CANCEL_PRELOAD_RECENT_APPS;
+        mHandler.removeMessages(msg);
+        mHandler.sendEmptyMessage(msg);
+!!!30957623.java!!!	dismissKeyboardShortcutsMenu() : void
+        int msg = MSG_DISMISS_KEYBOARD_SHORTCUTS_MENU;
+        mHandler.removeMessages(msg);
+        mHandler.sendEmptyMessage(msg);
+!!!30957751.java!!!	toggleKeyboardShortcutsMenu(in deviceId : int) : void
+        int msg = MSG_TOGGLE_KEYBOARD_SHORTCUTS_MENU;
+        mHandler.removeMessages(msg);
+        mHandler.obtainMessage(msg, deviceId, 0).sendToTarget();
+!!!30957879.java!!!	showNextAffiliatedTask() : void
+        int msg = MSG_SHOW_NEXT_AFFILIATED_TASK;
+        mHandler.removeMessages(msg);
+        mHandler.sendEmptyMessage(msg);
+!!!30958007.java!!!	showPreviousAffiliatedTask() : void
+        int msg = MSG_SHOW_PREV_AFFILIATED_TASK;
+        mHandler.removeMessages(msg);
+        mHandler.sendEmptyMessage(msg);
+!!!30958135.java!!!	createHandler() : CommandQueue::H
+         return new H();
+!!!30958263.java!!!	sendCloseSystemWindows(inout reason : String) : void
+        if (ActivityManagerNative.isSystemReady()) {
+            try {
+                ActivityManagerNative.getDefault().closeSystemDialogs(reason);
+            } catch (RemoteException e) {
+            }
+        }
+!!!30958647.java!!!	showRecents(inout triggeredFromAltTab : boolean, inout fromHome : boolean) : void
+        if (mRecents != null) {
+            sendCloseSystemWindows(SYSTEM_DIALOG_REASON_RECENT_APPS);
+            mRecents.showRecents(triggeredFromAltTab, fromHome);
+        }
+!!!30958775.java!!!	hideRecents(inout triggeredFromAltTab : boolean, inout triggeredFromHomeKey : boolean) : void
+        if (mRecents != null) {
+            mRecents.hideRecents(triggeredFromAltTab, triggeredFromHomeKey);
+        }
+!!!30958903.java!!!	toggleRecents() : void
+        if (mRecents != null) {
+            mRecents.toggleRecents(mDisplay);
+        }
+!!!30959031.java!!!	preloadRecents() : void
+        if (mRecents != null) {
+            mRecents.preloadRecents();
+        }
+!!!30959159.java!!!	toggleKeyboardShortcuts(in deviceId : int) : void
+        KeyboardShortcuts.toggle(mContext, deviceId);
+!!!30959287.java!!!	dismissKeyboardShortcuts() : void
+        KeyboardShortcuts.dismiss();
+!!!30959415.java!!!	cancelPreloadingRecents() : void
+        if (mRecents != null) {
+            mRecents.cancelPreloadingRecents();
+        }
+!!!30959543.java!!!	showRecentsNextAffiliatedTask() : void
+        if (mRecents != null) {
+            mRecents.showNextAffiliatedTask();
+        }
+!!!30959671.java!!!	showRecentsPreviousAffiliatedTask() : void
+        if (mRecents != null) {
+            mRecents.showPrevAffiliatedTask();
+        }
+!!!30959927.java!!!	setLockscreenPublicMode(inout publicMode : boolean) : void
+        mLockscreenPublicMode = publicMode;
+!!!30960055.java!!!	isLockscreenPublicMode() : boolean
+        return mLockscreenPublicMode;
+!!!30960311.java!!!	userAllowsNotificationsInPublic(in userHandle : int) : boolean
+        if (userHandle == UserHandle.USER_ALL) {
+            return true;
+        }
+
+        if (mUsersAllowingNotifications.indexOfKey(userHandle) < 0) {
+            final boolean allowed = 0 != Settings.Secure.getIntForUser(
+                    mContext.getContentResolver(),
+                    Settings.Secure.LOCK_SCREEN_SHOW_NOTIFICATIONS, 0, userHandle);
+            mUsersAllowingNotifications.append(userHandle, allowed);
+            return allowed;
+        }
+
+        return mUsersAllowingNotifications.get(userHandle);
+!!!30960439.java!!!	userAllowsPrivateNotificationsInPublic(in userHandle : int) : boolean
+        if (userHandle == UserHandle.USER_ALL) {
+            return true;
+        }
+
+        if (mUsersAllowingPrivateNotifications.indexOfKey(userHandle) < 0) {
+            final boolean allowedByUser = 0 != Settings.Secure.getIntForUser(
+                    mContext.getContentResolver(),
+                    Settings.Secure.LOCK_SCREEN_ALLOW_PRIVATE_NOTIFICATIONS, 0, userHandle);
+            final boolean allowedByDpm = adminAllowsUnredactedNotifications(userHandle);
+            final boolean allowed = allowedByUser && allowedByDpm;
+            mUsersAllowingPrivateNotifications.append(userHandle, allowed);
+            return allowed;
+        }
+
+        return mUsersAllowingPrivateNotifications.get(userHandle);
+!!!30960567.java!!!	adminAllowsUnredactedNotifications(in userHandle : int) : boolean
+        if (userHandle == UserHandle.USER_ALL) {
+            return true;
+        }
+        final int dpmFlags = mDevicePolicyManager.getKeyguardDisabledFeatures(null /* admin */,
+                    userHandle);
+        return (dpmFlags & DevicePolicyManager.KEYGUARD_DISABLE_UNREDACTED_NOTIFICATIONS) == 0;
+!!!30960695.java!!!	shouldHideNotifications(in userid : int) : boolean
+        return isLockscreenPublicMode() && !userAllowsNotificationsInPublic(userid);
+!!!30960823.java!!!	shouldHideNotifications(inout key : String) : boolean
+        return isLockscreenPublicMode()
+                && mNotificationData.getVisibilityOverride(key) == Notification.VISIBILITY_SECRET;
+!!!30960951.java!!!	onSecureLockScreen() : boolean
+        return isLockscreenPublicMode();
+!!!30961079.java!!!	onNotificationClear(inout notification : StatusBarNotification) : void
+        try {
+            mBarService.onNotificationClear(
+                    notification.getPackageName(),
+                    notification.getTag(),
+                    notification.getId(),
+                    notification.getUserId());
+        } catch (android.os.RemoteException ex) {
+            // oh well
+        }
+!!!30961207.java!!!	onPanelLaidOut() : void
+        if (mState == StatusBarState.KEYGUARD) {
+            // Since the number of notifications is determined based on the height of the view, we
+            // need to update them.
+            int maxBefore = getMaxKeyguardNotifications(false /* recompute */);
+            int maxNotifications = getMaxKeyguardNotifications(true /* recompute */);
+            if (maxBefore != maxNotifications) {
+                updateRowStates();
+            }
+        }

@@ -1,0 +1,112 @@
+class WebmFrameSinkThread
+!!!40035895.cpp!!!	run() : void
+    int numVideoKeyFrames = 0;
+    List<const sp<WebmFrame> > outstandingFrames;
+    while (!mDone) {
+        ALOGV("wait v frame");
+        const sp<WebmFrame> videoFrame = mVideoFrames.peek();
+        ALOGV("v frame: %p", videoFrame.get());
+
+        ALOGV("wait a frame");
+        const sp<WebmFrame> audioFrame = mAudioFrames.peek();
+        ALOGV("a frame: %p", audioFrame.get());
+
+        if (videoFrame->mEos && audioFrame->mEos) {
+            break;
+        }
+
+        if (*audioFrame < *videoFrame) {
+            ALOGV("take a frame");
+            mAudioFrames.take();
+            outstandingFrames.push_back(audioFrame);
+        } else {
+            ALOGV("take v frame");
+            mVideoFrames.take();
+            outstandingFrames.push_back(videoFrame);
+            if (videoFrame->mKey)
+                numVideoKeyFrames++;
+        }
+
+        if (numVideoKeyFrames == 2) {
+            flushFrames(outstandingFrames, /* last = */ false);
+            numVideoKeyFrames--;
+        }
+    }
+    ALOGV("flushing last cluster (size %zu)", outstandingFrames.size());
+    flushFrames(outstandingFrames, /* last = */ true);
+    mDone = true;
+!!!40036151.cpp!!!	start() : status_t
+    mDone = false;
+    return WebmFrameThread::start();
+!!!40036279.cpp!!!	stop() : status_t
+    mDone = true;
+    mVideoFrames.push(WebmFrame::EOS);
+    mAudioFrames.push(WebmFrame::EOS);
+    return WebmFrameThread::stop();
+!!!40036407.cpp!!!	initCluster(inout frames : List<const sp<WebmFrame> >, inout clusterTimecodeL : uint64_t, inout children : List<sp<WebmElement> >) : void
+    CHECK(!frames.empty() && children.empty());
+
+    const sp<WebmFrame> f = *(frames.begin());
+    clusterTimecodeL = f->mAbsTimecode;
+    WebmUnsigned *clusterTimecode = new WebmUnsigned(kMkvTimecode, clusterTimecodeL);
+    children.clear();
+    children.push_back(clusterTimecode);
+!!!40036535.cpp!!!	writeCluster(inout children : List<sp<WebmElement> >) : void
+    // children must contain at least one simpleblock and its timecode
+    CHECK_GE(children.size(), 2);
+
+    uint64_t size;
+    sp<WebmElement> cluster = new WebmMaster(kMkvCluster, children);
+    cluster->write(mFd, size);
+    children.clear();
+!!!40036663.cpp!!!	flushFrames(inout frames : List<const sp<WebmFrame> >, in last : bool) : void
+    if (frames.empty()) {
+        return;
+    }
+
+    uint64_t clusterTimecodeL;
+    List<sp<WebmElement> > children;
+    initCluster(frames, clusterTimecodeL, children);
+
+    uint64_t cueTime = clusterTimecodeL;
+    off_t fpos = ::lseek(mFd, 0, SEEK_CUR);
+    size_t n = frames.size();
+    if (!last) {
+        // If we are not flushing the last sequence of outstanding frames, flushFrames
+        // must have been called right after we have pushed a second outstanding video key
+        // frame (the last frame), which belongs to the next cluster; also hold back on
+        // flushing the second to last frame before we check its type. A audio frame
+        // should precede the aforementioned video key frame in the next sequence, a video
+        // frame should be the last frame in the current (to-be-flushed) sequence.
+        CHECK_GE(n, 2);
+        n -= 2;
+    }
+
+    for (size_t i = 0; i < n; i++) {
+        const sp<WebmFrame> f = *(frames.begin());
+        if (f->mType == kVideoType && f->mKey) {
+            cueTime = f->mAbsTimecode;
+        }
+
+        if (f->mAbsTimecode - clusterTimecodeL > INT16_MAX) {
+            writeCluster(children);
+            initCluster(frames, clusterTimecodeL, children);
+        }
+
+        frames.erase(frames.begin());
+        children.push_back(f->SimpleBlock(clusterTimecodeL));
+    }
+
+    // equivalent to last==false
+    if (!frames.empty()) {
+        // decide whether to write out the second to last frame.
+        const sp<WebmFrame> secondLastFrame = *(frames.begin());
+        if (secondLastFrame->mType == kVideoType) {
+            frames.erase(frames.begin());
+            children.push_back(secondLastFrame->SimpleBlock(clusterTimecodeL));
+        }
+    }
+
+    writeCluster(children);
+    sp<WebmElement> cuePoint = WebmElement::CuePointEntry(cueTime, 1, fpos - mSegmentDataStart);
+    mCues.push_back(cuePoint);

@@ -1,0 +1,904 @@
+class RequestThread
+!!!41159223.cpp!!!	setNotificationListener(inout listener : NotificationListener) : void
+    Mutex::Autolock l(mRequestLock);
+    mListener = listener;
+!!!41159351.cpp!!!	configurationComplete(in isConstrainedHighSpeed : bool) : void
+    Mutex::Autolock l(mRequestLock);
+    mReconfigured = true;
+    // Prepare video stream for high speed recording.
+    mPrepareVideoStream = isConstrainedHighSpeed;
+!!!41159479.cpp!!!	setRepeatingRequests(in requests : Camera3Device::RequestList, inout lastFrameNumber : int64_t = NULL) : status_t
+    Mutex::Autolock l(mRequestLock);
+    if (lastFrameNumber != NULL) {
+        *lastFrameNumber = mRepeatingLastFrameNumber;
+    }
+    mRepeatingRequests.clear();
+    mRepeatingRequests.insert(mRepeatingRequests.begin(),
+            requests.begin(), requests.end());
+
+    unpauseForNewRequests();
+
+    mRepeatingLastFrameNumber = hardware::camera2::ICameraDeviceUser::NO_IN_FLIGHT_REPEATING_FRAMES;
+    return OK;
+!!!41159607.cpp!!!	clearRepeatingRequests(inout lastFrameNumber : int64_t = NULL) : status_t
+    Mutex::Autolock l(mRequestLock);
+    return clearRepeatingRequestsLocked(lastFrameNumber);
+
+!!!41159735.cpp!!!	queueRequestList(inout requests : List<sp<CaptureRequest> >, inout lastFrameNumber : int64_t = NULL) : status_t
+    Mutex::Autolock l(mRequestLock);
+    for (List<sp<CaptureRequest> >::iterator it = requests.begin(); it != requests.end();
+            ++it) {
+        mRequestQueue.push_back(*it);
+    }
+
+    if (lastFrameNumber != NULL) {
+        *lastFrameNumber = mFrameNumber + mRequestQueue.size() - 1;
+        ALOGV("%s: requestId %d, mFrameNumber %" PRId32 ", lastFrameNumber %" PRId64 ".",
+              __FUNCTION__, (*(requests.begin()))->mResultExtras.requestId, mFrameNumber,
+              *lastFrameNumber);
+    }
+
+    unpauseForNewRequests();
+
+    return OK;
+!!!41159863.cpp!!!	clear(inout listener : NotificationListener, inout lastFrameNumber : int64_t = NULL) : status_t
+    Mutex::Autolock l(mRequestLock);
+    ALOGV("RequestThread::%s:", __FUNCTION__);
+
+    mRepeatingRequests.clear();
+
+    // Send errors for all requests pending in the request queue, including
+    // pending repeating requests
+    if (listener != NULL) {
+        for (RequestList::iterator it = mRequestQueue.begin();
+                 it != mRequestQueue.end(); ++it) {
+            // Abort the input buffers for reprocess requests.
+            if ((*it)->mInputStream != NULL) {
+                camera3_stream_buffer_t inputBuffer;
+                status_t res = (*it)->mInputStream->getInputBuffer(&inputBuffer);
+                if (res != OK) {
+                    ALOGW("%s: %d: couldn't get input buffer while clearing the request "
+                            "list: %s (%d)", __FUNCTION__, __LINE__, strerror(-res), res);
+                } else {
+                    res = (*it)->mInputStream->returnInputBuffer(inputBuffer);
+                    if (res != OK) {
+                        ALOGE("%s: %d: couldn't return input buffer while clearing the request "
+                                "list: %s (%d)", __FUNCTION__, __LINE__, strerror(-res), res);
+                    }
+                }
+            }
+            // Set the frame number this request would have had, if it
+            // had been submitted; this frame number will not be reused.
+            // The requestId and burstId fields were set when the request was
+            // submitted originally (in convertMetadataListToRequestListLocked)
+            (*it)->mResultExtras.frameNumber = mFrameNumber++;
+            listener->notifyError(hardware::camera2::ICameraDeviceCallbacks::ERROR_CAMERA_REQUEST,
+                    (*it)->mResultExtras);
+        }
+    }
+    mRequestQueue.clear();
+    mTriggerMap.clear();
+    if (lastFrameNumber != NULL) {
+        *lastFrameNumber = mRepeatingLastFrameNumber;
+    }
+    mRepeatingLastFrameNumber = hardware::camera2::ICameraDeviceUser::NO_IN_FLIGHT_REPEATING_FRAMES;
+    return OK;
+!!!41159991.cpp!!!	flush() : status_t
+    ATRACE_CALL();
+    Mutex::Autolock l(mFlushLock);
+
+    if (mHal3Device->common.version >= CAMERA_DEVICE_API_VERSION_3_1) {
+        return mHal3Device->ops->flush(mHal3Device);
+    }
+
+    return -ENOTSUP;
+!!!41160119.cpp!!!	queueTrigger(in trigger : Camera3Device::RequestTrigger, in count : size_t) : status_t
+
+    Mutex::Autolock l(mTriggerMutex);
+    status_t ret;
+
+    for (size_t i = 0; i < count; ++i) {
+        ret = queueTriggerLocked(trigger[i]);
+
+        if (ret != OK) {
+            return ret;
+        }
+    }
+
+    return OK;
+!!!41160247.cpp!!!	setPaused(in paused : bool) : void
+    Mutex::Autolock l(mPauseLock);
+    mDoPause = paused;
+    mDoPauseSignal.signal();
+!!!41160375.cpp!!!	waitUntilRequestProcessed(in requestId : int32_t, in timeout : nsecs_t) : status_t
+    Mutex::Autolock l(mLatestRequestMutex);
+    status_t res;
+    while (mLatestRequestId != requestId) {
+        nsecs_t startTime = systemTime();
+
+        res = mLatestRequestSignal.waitRelative(mLatestRequestMutex, timeout);
+        if (res != OK) return res;
+
+        timeout -= (systemTime() - startTime);
+    }
+
+    return OK;
+!!!41160503.cpp!!!	requestExit() : void
+    // Call parent to set up shutdown
+    Thread::requestExit();
+    // The exit from any possible waits
+    mDoPauseSignal.signal();
+    mRequestSignal.signal();
+!!!41160631.cpp!!!	getLatestRequest() : CameraMetadata
+    Mutex::Autolock al(mLatestRequestMutex);
+
+    ALOGV("RequestThread::%s", __FUNCTION__);
+
+    return mLatestRequest;
+!!!41160887.cpp!!!	threadLoop() : bool
+    ATRACE_CALL();
+    status_t res;
+
+    // Handle paused state.
+    if (waitIfPaused()) {
+        return true;
+    }
+
+    // Wait for the next batch of requests.
+    waitForNextRequestBatch();
+    if (mNextRequests.size() == 0) {
+        return true;
+    }
+
+    // Get the latest request ID, if any
+    int latestRequestId;
+    camera_metadata_entry_t requestIdEntry = mNextRequests[mNextRequests.size() - 1].
+            captureRequest->mSettings.find(ANDROID_REQUEST_ID);
+    if (requestIdEntry.count > 0) {
+        latestRequestId = requestIdEntry.data.i32[0];
+    } else {
+        ALOGW("%s: Did not have android.request.id set in the request.", __FUNCTION__);
+        latestRequestId = NAME_NOT_FOUND;
+    }
+
+    // Prepare a batch of HAL requests and output buffers.
+    res = prepareHalRequests();
+    if (res == TIMED_OUT) {
+        // Not a fatal error if getting output buffers time out.
+        cleanUpFailedRequests(/*sendRequestError*/ true);
+        // Check if any stream is abandoned.
+        checkAndStopRepeatingRequest();
+        return true;
+    } else if (res != OK) {
+        cleanUpFailedRequests(/*sendRequestError*/ false);
+        return false;
+    }
+
+    // Inform waitUntilRequestProcessed thread of a new request ID
+    {
+        Mutex::Autolock al(mLatestRequestMutex);
+
+        mLatestRequestId = latestRequestId;
+        mLatestRequestSignal.signal();
+    }
+
+    // Submit a batch of requests to HAL.
+    // Use flush lock only when submitting multilple requests in a batch.
+    // TODO: The problem with flush lock is flush() will be blocked by process_capture_request()
+    // which may take a long time to finish so synchronizing flush() and
+    // process_capture_request() defeats the purpose of cancelling requests ASAP with flush().
+    // For now, only synchronize for high speed recording and we should figure something out for
+    // removing the synchronization.
+    bool useFlushLock = mNextRequests.size() > 1;
+
+    if (useFlushLock) {
+        mFlushLock.lock();
+    }
+
+    ALOGVV("%s: %d: submitting %d requests in a batch.", __FUNCTION__, __LINE__,
+            mNextRequests.size());
+    for (auto& nextRequest : mNextRequests) {
+        // Submit request and block until ready for next one
+        ATRACE_ASYNC_BEGIN("frame capture", nextRequest.halRequest.frame_number);
+        ATRACE_BEGIN("camera3->process_capture_request");
+        res = mHal3Device->ops->process_capture_request(mHal3Device, &nextRequest.halRequest);
+        ATRACE_END();
+
+        if (res != OK) {
+            // Should only get a failure here for malformed requests or device-level
+            // errors, so consider all errors fatal.  Bad metadata failures should
+            // come through notify.
+            SET_ERR("RequestThread: Unable to submit capture request %d to HAL"
+                    " device: %s (%d)", nextRequest.halRequest.frame_number, strerror(-res),
+                    res);
+            cleanUpFailedRequests(/*sendRequestError*/ false);
+            if (useFlushLock) {
+                mFlushLock.unlock();
+            }
+            return false;
+        }
+
+        // Mark that the request has be submitted successfully.
+        nextRequest.submitted = true;
+
+        // Update the latest request sent to HAL
+        if (nextRequest.halRequest.settings != NULL) { // Don't update if they were unchanged
+            Mutex::Autolock al(mLatestRequestMutex);
+
+            camera_metadata_t* cloned = clone_camera_metadata(nextRequest.halRequest.settings);
+            mLatestRequest.acquire(cloned);
+        }
+
+        if (nextRequest.halRequest.settings != NULL) {
+            nextRequest.captureRequest->mSettings.unlock(nextRequest.halRequest.settings);
+        }
+
+        // Remove any previously queued triggers (after unlock)
+        res = removeTriggers(mPrevRequest);
+        if (res != OK) {
+            SET_ERR("RequestThread: Unable to remove triggers "
+                  "(capture request %d, HAL device: %s (%d)",
+                  nextRequest.halRequest.frame_number, strerror(-res), res);
+            cleanUpFailedRequests(/*sendRequestError*/ false);
+            if (useFlushLock) {
+                mFlushLock.unlock();
+            }
+            return false;
+        }
+    }
+
+    if (useFlushLock) {
+        mFlushLock.unlock();
+    }
+
+    // Unset as current request
+    {
+        Mutex::Autolock l(mRequestLock);
+        mNextRequests.clear();
+    }
+
+    return true;
+!!!41161015.cpp!!!	getId(in device : wp<Camera3Device>) : int
+    sp<Camera3Device> d = device.promote();
+    if (d != NULL) return d->mId;
+    return 0;
+!!!41161143.cpp!!!	queueTriggerLocked(in trigger : Camera3Device::RequestTrigger) : status_t
+
+    uint32_t tag = trigger.metadataTag;
+    ssize_t index = mTriggerMap.indexOfKey(tag);
+
+    switch (trigger.getTagType()) {
+        case TYPE_BYTE:
+        // fall-through
+        case TYPE_INT32:
+            break;
+        default:
+            ALOGE("%s: Type not supported: 0x%x", __FUNCTION__,
+                    trigger.getTagType());
+            return INVALID_OPERATION;
+    }
+
+    /**
+     * Collect only the latest trigger, since we only have 1 field
+     * in the request settings per trigger tag, and can't send more than 1
+     * trigger per request.
+     */
+    if (index != NAME_NOT_FOUND) {
+        mTriggerMap.editValueAt(index) = trigger;
+    } else {
+        mTriggerMap.add(tag, trigger);
+    }
+
+    return OK;
+!!!41161271.cpp!!!	insertTriggers(in request : sp<CaptureRequest>) : int32_t
+
+    Mutex::Autolock al(mTriggerMutex);
+
+    sp<Camera3Device> parent = mParent.promote();
+    if (parent == NULL) {
+        CLOGE("RequestThread: Parent is gone");
+        return DEAD_OBJECT;
+    }
+
+    CameraMetadata &metadata = request->mSettings;
+    size_t count = mTriggerMap.size();
+
+    for (size_t i = 0; i < count; ++i) {
+        RequestTrigger trigger = mTriggerMap.valueAt(i);
+        uint32_t tag = trigger.metadataTag;
+
+        if (tag == ANDROID_CONTROL_AF_TRIGGER_ID || tag == ANDROID_CONTROL_AE_PRECAPTURE_ID) {
+            bool isAeTrigger = (trigger.metadataTag == ANDROID_CONTROL_AE_PRECAPTURE_ID);
+            uint32_t triggerId = static_cast<uint32_t>(trigger.entryValue);
+            if (isAeTrigger) {
+                request->mResultExtras.precaptureTriggerId = triggerId;
+                mCurrentPreCaptureTriggerId = triggerId;
+            } else {
+                request->mResultExtras.afTriggerId = triggerId;
+                mCurrentAfTriggerId = triggerId;
+            }
+            if (parent->mDeviceVersion >= CAMERA_DEVICE_API_VERSION_3_2) {
+                continue; // Trigger ID tag is deprecated since device HAL 3.2
+            }
+        }
+
+        camera_metadata_entry entry = metadata.find(tag);
+
+        if (entry.count > 0) {
+            /**
+             * Already has an entry for this trigger in the request.
+             * Rewrite it with our requested trigger value.
+             */
+            RequestTrigger oldTrigger = trigger;
+
+            oldTrigger.entryValue = entry.data.u8[0];
+
+            mTriggerReplacedMap.add(tag, oldTrigger);
+        } else {
+            /**
+             * More typical, no trigger entry, so we just add it
+             */
+            mTriggerRemovedMap.add(tag, trigger);
+        }
+
+        status_t res;
+
+        switch (trigger.getTagType()) {
+            case TYPE_BYTE: {
+                uint8_t entryValue = static_cast<uint8_t>(trigger.entryValue);
+                res = metadata.update(tag,
+                                      &entryValue,
+                                      /*count*/1);
+                break;
+            }
+            case TYPE_INT32:
+                res = metadata.update(tag,
+                                      &trigger.entryValue,
+                                      /*count*/1);
+                break;
+            default:
+                ALOGE("%s: Type not supported: 0x%x",
+                      __FUNCTION__,
+                      trigger.getTagType());
+                return INVALID_OPERATION;
+        }
+
+        if (res != OK) {
+            ALOGE("%s: Failed to update request metadata with trigger tag %s"
+                  ", value %d", __FUNCTION__, trigger.getTagName(),
+                  trigger.entryValue);
+            return res;
+        }
+
+        ALOGV("%s: Mixed in trigger %s, value %d", __FUNCTION__,
+              trigger.getTagName(),
+              trigger.entryValue);
+    }
+
+    mTriggerMap.clear();
+
+    return count;
+!!!41161399.cpp!!!	removeTriggers(in request : sp<CaptureRequest>) : status_t
+    Mutex::Autolock al(mTriggerMutex);
+
+    CameraMetadata &metadata = request->mSettings;
+
+    /**
+     * Replace all old entries with their old values.
+     */
+    for (size_t i = 0; i < mTriggerReplacedMap.size(); ++i) {
+        RequestTrigger trigger = mTriggerReplacedMap.valueAt(i);
+
+        status_t res;
+
+        uint32_t tag = trigger.metadataTag;
+        switch (trigger.getTagType()) {
+            case TYPE_BYTE: {
+                uint8_t entryValue = static_cast<uint8_t>(trigger.entryValue);
+                res = metadata.update(tag,
+                                      &entryValue,
+                                      /*count*/1);
+                break;
+            }
+            case TYPE_INT32:
+                res = metadata.update(tag,
+                                      &trigger.entryValue,
+                                      /*count*/1);
+                break;
+            default:
+                ALOGE("%s: Type not supported: 0x%x",
+                      __FUNCTION__,
+                      trigger.getTagType());
+                return INVALID_OPERATION;
+        }
+
+        if (res != OK) {
+            ALOGE("%s: Failed to restore request metadata with trigger tag %s"
+                  ", trigger value %d", __FUNCTION__,
+                  trigger.getTagName(), trigger.entryValue);
+            return res;
+        }
+    }
+    mTriggerReplacedMap.clear();
+
+    /**
+     * Remove all new entries.
+     */
+    for (size_t i = 0; i < mTriggerRemovedMap.size(); ++i) {
+        RequestTrigger trigger = mTriggerRemovedMap.valueAt(i);
+        status_t res = metadata.erase(trigger.metadataTag);
+
+        if (res != OK) {
+            ALOGE("%s: Failed to erase metadata with trigger tag %s"
+                  ", trigger value %d", __FUNCTION__,
+                  trigger.getTagName(), trigger.entryValue);
+            return res;
+        }
+    }
+    mTriggerRemovedMap.clear();
+
+    return OK;
+!!!41161527.cpp!!!	addDummyTriggerIds(in request : sp<CaptureRequest>) : status_t
+    // Trigger ID 0 had special meaning in the HAL2 spec, so avoid it here
+    static const int32_t dummyTriggerId = 1;
+    status_t res;
+
+    CameraMetadata &metadata = request->mSettings;
+
+    // If AF trigger is active, insert a dummy AF trigger ID if none already
+    // exists
+    camera_metadata_entry afTrigger = metadata.find(ANDROID_CONTROL_AF_TRIGGER);
+    camera_metadata_entry afId = metadata.find(ANDROID_CONTROL_AF_TRIGGER_ID);
+    if (afTrigger.count > 0 &&
+            afTrigger.data.u8[0] != ANDROID_CONTROL_AF_TRIGGER_IDLE &&
+            afId.count == 0) {
+        res = metadata.update(ANDROID_CONTROL_AF_TRIGGER_ID, &dummyTriggerId, 1);
+        if (res != OK) return res;
+    }
+
+    // If AE precapture trigger is active, insert a dummy precapture trigger ID
+    // if none already exists
+    camera_metadata_entry pcTrigger =
+            metadata.find(ANDROID_CONTROL_AE_PRECAPTURE_TRIGGER);
+    camera_metadata_entry pcId = metadata.find(ANDROID_CONTROL_AE_PRECAPTURE_ID);
+    if (pcTrigger.count > 0 &&
+            pcTrigger.data.u8[0] != ANDROID_CONTROL_AE_PRECAPTURE_TRIGGER_IDLE &&
+            pcId.count == 0) {
+        res = metadata.update(ANDROID_CONTROL_AE_PRECAPTURE_ID,
+                &dummyTriggerId, 1);
+        if (res != OK) return res;
+    }
+
+    return OK;
+!!!41161655.cpp!!!	waitForNextRequestBatch() : void
+    // Optimized a bit for the simple steady-state case (single repeating
+    // request), to avoid putting that request in the queue temporarily.
+    Mutex::Autolock l(mRequestLock);
+
+    assert(mNextRequests.empty());
+
+    NextRequest nextRequest;
+    nextRequest.captureRequest = waitForNextRequestLocked();
+    if (nextRequest.captureRequest == nullptr) {
+        return;
+    }
+
+    nextRequest.halRequest = camera3_capture_request_t();
+    nextRequest.submitted = false;
+    mNextRequests.add(nextRequest);
+
+    // Wait for additional requests
+    const size_t batchSize = nextRequest.captureRequest->mBatchSize;
+
+    for (size_t i = 1; i < batchSize; i++) {
+        NextRequest additionalRequest;
+        additionalRequest.captureRequest = waitForNextRequestLocked();
+        if (additionalRequest.captureRequest == nullptr) {
+            break;
+        }
+
+        additionalRequest.halRequest = camera3_capture_request_t();
+        additionalRequest.submitted = false;
+        mNextRequests.add(additionalRequest);
+    }
+
+    if (mNextRequests.size() < batchSize) {
+        ALOGE("RequestThread: only get %zu out of %zu requests. Skipping requests.",
+                mNextRequests.size(), batchSize);
+        cleanUpFailedRequests(/*sendRequestError*/true);
+    }
+
+    return;
+!!!41161783.cpp!!!	waitForNextRequestLocked() : sp<CaptureRequest>
+    status_t res;
+    sp<CaptureRequest> nextRequest;
+
+    while (mRequestQueue.empty()) {
+        if (!mRepeatingRequests.empty()) {
+            // Always atomically enqueue all requests in a repeating request
+            // list. Guarantees a complete in-sequence set of captures to
+            // application.
+            const RequestList &requests = mRepeatingRequests;
+            RequestList::const_iterator firstRequest =
+                    requests.begin();
+            nextRequest = *firstRequest;
+            mRequestQueue.insert(mRequestQueue.end(),
+                    ++firstRequest,
+                    requests.end());
+            // No need to wait any longer
+
+            mRepeatingLastFrameNumber = mFrameNumber + requests.size() - 1;
+
+            break;
+        }
+
+        res = mRequestSignal.waitRelative(mRequestLock, kRequestTimeout);
+
+        if ((mRequestQueue.empty() && mRepeatingRequests.empty()) ||
+                exitPending()) {
+            Mutex::Autolock pl(mPauseLock);
+            if (mPaused == false) {
+                ALOGV("%s: RequestThread: Going idle", __FUNCTION__);
+                mPaused = true;
+                // Let the tracker know
+                sp<StatusTracker> statusTracker = mStatusTracker.promote();
+                if (statusTracker != 0) {
+                    statusTracker->markComponentIdle(mStatusId, Fence::NO_FENCE);
+                }
+            }
+            // Stop waiting for now and let thread management happen
+            return NULL;
+        }
+    }
+
+    if (nextRequest == NULL) {
+        // Don't have a repeating request already in hand, so queue
+        // must have an entry now.
+        RequestList::iterator firstRequest =
+                mRequestQueue.begin();
+        nextRequest = *firstRequest;
+        mRequestQueue.erase(firstRequest);
+    }
+
+    // In case we've been unpaused by setPaused clearing mDoPause, need to
+    // update internal pause state (capture/setRepeatingRequest unpause
+    // directly).
+    Mutex::Autolock pl(mPauseLock);
+    if (mPaused) {
+        ALOGV("%s: RequestThread: Unpaused", __FUNCTION__);
+        sp<StatusTracker> statusTracker = mStatusTracker.promote();
+        if (statusTracker != 0) {
+            statusTracker->markComponentActive(mStatusId);
+        }
+    }
+    mPaused = false;
+
+    // Check if we've reconfigured since last time, and reset the preview
+    // request if so. Can't use 'NULL request == repeat' across configure calls.
+    if (mReconfigured) {
+        mPrevRequest.clear();
+        mReconfigured = false;
+    }
+
+    if (nextRequest != NULL) {
+        nextRequest->mResultExtras.frameNumber = mFrameNumber++;
+        nextRequest->mResultExtras.afTriggerId = mCurrentAfTriggerId;
+        nextRequest->mResultExtras.precaptureTriggerId = mCurrentPreCaptureTriggerId;
+
+        // Since RequestThread::clear() removes buffers from the input stream,
+        // get the right buffer here before unlocking mRequestLock
+        if (nextRequest->mInputStream != NULL) {
+            res = nextRequest->mInputStream->getInputBuffer(&nextRequest->mInputBuffer);
+            if (res != OK) {
+                // Can't get input buffer from gralloc queue - this could be due to
+                // disconnected queue or other producer misbehavior, so not a fatal
+                // error
+                ALOGE("%s: Can't get input buffer, skipping request:"
+                        " %s (%d)", __FUNCTION__, strerror(-res), res);
+                if (mListener != NULL) {
+                    mListener->notifyError(
+                            hardware::camera2::ICameraDeviceCallbacks::ERROR_CAMERA_REQUEST,
+                            nextRequest->mResultExtras);
+                }
+                return NULL;
+            }
+        }
+    }
+
+    handleAePrecaptureCancelRequest(nextRequest);
+
+    return nextRequest;
+!!!41161911.cpp!!!	prepareHalRequests() : status_t
+    ATRACE_CALL();
+
+    for (auto& nextRequest : mNextRequests) {
+        sp<CaptureRequest> captureRequest = nextRequest.captureRequest;
+        camera3_capture_request_t* halRequest = &nextRequest.halRequest;
+        Vector<camera3_stream_buffer_t>* outputBuffers = &nextRequest.outputBuffers;
+
+        // Prepare a request to HAL
+        halRequest->frame_number = captureRequest->mResultExtras.frameNumber;
+
+        // Insert any queued triggers (before metadata is locked)
+        status_t res = insertTriggers(captureRequest);
+
+        if (res < 0) {
+            SET_ERR("RequestThread: Unable to insert triggers "
+                    "(capture request %d, HAL device: %s (%d)",
+                    halRequest->frame_number, strerror(-res), res);
+            return INVALID_OPERATION;
+        }
+        int triggerCount = res;
+        bool triggersMixedIn = (triggerCount > 0 || mPrevTriggers > 0);
+        mPrevTriggers = triggerCount;
+
+        // If the request is the same as last, or we had triggers last time
+        if (mPrevRequest != captureRequest || triggersMixedIn) {
+            /**
+             * HAL workaround:
+             * Insert a dummy trigger ID if a trigger is set but no trigger ID is
+             */
+            res = addDummyTriggerIds(captureRequest);
+            if (res != OK) {
+                SET_ERR("RequestThread: Unable to insert dummy trigger IDs "
+                        "(capture request %d, HAL device: %s (%d)",
+                        halRequest->frame_number, strerror(-res), res);
+                return INVALID_OPERATION;
+            }
+
+            /**
+             * The request should be presorted so accesses in HAL
+             *   are O(logn). Sidenote, sorting a sorted metadata is nop.
+             */
+            captureRequest->mSettings.sort();
+            halRequest->settings = captureRequest->mSettings.getAndLock();
+            mPrevRequest = captureRequest;
+            ALOGVV("%s: Request settings are NEW", __FUNCTION__);
+
+            IF_ALOGV() {
+                camera_metadata_ro_entry_t e = camera_metadata_ro_entry_t();
+                find_camera_metadata_ro_entry(
+                        halRequest->settings,
+                        ANDROID_CONTROL_AF_TRIGGER,
+                        &e
+                );
+                if (e.count > 0) {
+                    ALOGV("%s: Request (frame num %d) had AF trigger 0x%x",
+                          __FUNCTION__,
+                          halRequest->frame_number,
+                          e.data.u8[0]);
+                }
+            }
+        } else {
+            // leave request.settings NULL to indicate 'reuse latest given'
+            ALOGVV("%s: Request settings are REUSED",
+                   __FUNCTION__);
+        }
+
+        uint32_t totalNumBuffers = 0;
+
+        // Fill in buffers
+        if (captureRequest->mInputStream != NULL) {
+            halRequest->input_buffer = &captureRequest->mInputBuffer;
+            totalNumBuffers += 1;
+        } else {
+            halRequest->input_buffer = NULL;
+        }
+
+        outputBuffers->insertAt(camera3_stream_buffer_t(), 0,
+                captureRequest->mOutputStreams.size());
+        halRequest->output_buffers = outputBuffers->array();
+        for (size_t i = 0; i < captureRequest->mOutputStreams.size(); i++) {
+            sp<Camera3OutputStreamInterface> outputStream = captureRequest->mOutputStreams.editItemAt(i);
+
+            // Prepare video buffers for high speed recording on the first video request.
+            if (mPrepareVideoStream && outputStream->isVideoStream()) {
+                // Only try to prepare video stream on the first video request.
+                mPrepareVideoStream = false;
+
+                res = outputStream->startPrepare(Camera3StreamInterface::ALLOCATE_PIPELINE_MAX);
+                while (res == NOT_ENOUGH_DATA) {
+                    res = outputStream->prepareNextBuffer();
+                }
+                if (res != OK) {
+                    ALOGW("%s: Preparing video buffers for high speed failed: %s (%d)",
+                        __FUNCTION__, strerror(-res), res);
+                    outputStream->cancelPrepare();
+                }
+            }
+
+            res = outputStream->getBuffer(&outputBuffers->editItemAt(i));
+            if (res != OK) {
+                // Can't get output buffer from gralloc queue - this could be due to
+                // abandoned queue or other consumer misbehavior, so not a fatal
+                // error
+                ALOGE("RequestThread: Can't get output buffer, skipping request:"
+                        " %s (%d)", strerror(-res), res);
+
+                return TIMED_OUT;
+            }
+            halRequest->num_output_buffers++;
+        }
+        totalNumBuffers += halRequest->num_output_buffers;
+
+        // Log request in the in-flight queue
+        sp<Camera3Device> parent = mParent.promote();
+        if (parent == NULL) {
+            // Should not happen, and nowhere to send errors to, so just log it
+            CLOGE("RequestThread: Parent is gone");
+            return INVALID_OPERATION;
+        }
+        res = parent->registerInFlight(halRequest->frame_number,
+                totalNumBuffers, captureRequest->mResultExtras,
+                /*hasInput*/halRequest->input_buffer != NULL,
+                captureRequest->mAeTriggerCancelOverride);
+        ALOGVV("%s: registered in flight requestId = %" PRId32 ", frameNumber = %" PRId64
+               ", burstId = %" PRId32 ".",
+                __FUNCTION__,
+                captureRequest->mResultExtras.requestId, captureRequest->mResultExtras.frameNumber,
+                captureRequest->mResultExtras.burstId);
+        if (res != OK) {
+            SET_ERR("RequestThread: Unable to register new in-flight request:"
+                    " %s (%d)", strerror(-res), res);
+            return INVALID_OPERATION;
+        }
+    }
+
+    return OK;
+!!!41162039.cpp!!!	cleanUpFailedRequests(in sendRequestError : bool) : void
+    if (mNextRequests.empty()) {
+        return;
+    }
+
+    for (auto& nextRequest : mNextRequests) {
+        // Skip the ones that have been submitted successfully.
+        if (nextRequest.submitted) {
+            continue;
+        }
+
+        sp<CaptureRequest> captureRequest = nextRequest.captureRequest;
+        camera3_capture_request_t* halRequest = &nextRequest.halRequest;
+        Vector<camera3_stream_buffer_t>* outputBuffers = &nextRequest.outputBuffers;
+
+        if (halRequest->settings != NULL) {
+            captureRequest->mSettings.unlock(halRequest->settings);
+        }
+
+        if (captureRequest->mInputStream != NULL) {
+            captureRequest->mInputBuffer.status = CAMERA3_BUFFER_STATUS_ERROR;
+            captureRequest->mInputStream->returnInputBuffer(captureRequest->mInputBuffer);
+        }
+
+        for (size_t i = 0; i < halRequest->num_output_buffers; i++) {
+            outputBuffers->editItemAt(i).status = CAMERA3_BUFFER_STATUS_ERROR;
+            captureRequest->mOutputStreams.editItemAt(i)->returnBuffer((*outputBuffers)[i], 0);
+        }
+
+        if (sendRequestError) {
+            Mutex::Autolock l(mRequestLock);
+            if (mListener != NULL) {
+                mListener->notifyError(
+                        hardware::camera2::ICameraDeviceCallbacks::ERROR_CAMERA_REQUEST,
+                        captureRequest->mResultExtras);
+            }
+        }
+    }
+
+    Mutex::Autolock l(mRequestLock);
+    mNextRequests.clear();
+!!!41162167.cpp!!!	checkAndStopRepeatingRequest() : void
+    bool surfaceAbandoned = false;
+    int64_t lastFrameNumber = 0;
+    {
+        Mutex::Autolock l(mRequestLock);
+        // Check all streams needed by repeating requests are still valid. Otherwise, stop
+        // repeating requests.
+        for (const auto& request : mRepeatingRequests) {
+            for (const auto& s : request->mOutputStreams) {
+                if (s->isAbandoned()) {
+                    surfaceAbandoned = true;
+                    clearRepeatingRequestsLocked(&lastFrameNumber);
+                    break;
+                }
+            }
+            if (surfaceAbandoned) {
+                break;
+            }
+        }
+    }
+    if (surfaceAbandoned) {
+        mListener->notifyRepeatingRequestError(lastFrameNumber);
+    }
+!!!41162295.cpp!!!	waitIfPaused() : bool
+    status_t res;
+    Mutex::Autolock l(mPauseLock);
+    while (mDoPause) {
+        if (mPaused == false) {
+            mPaused = true;
+            ALOGV("%s: RequestThread: Paused", __FUNCTION__);
+            // Let the tracker know
+            sp<StatusTracker> statusTracker = mStatusTracker.promote();
+            if (statusTracker != 0) {
+                statusTracker->markComponentIdle(mStatusId, Fence::NO_FENCE);
+            }
+        }
+
+        res = mDoPauseSignal.waitRelative(mPauseLock, kRequestTimeout);
+        if (res == TIMED_OUT || exitPending()) {
+            return true;
+        }
+    }
+    // We don't set mPaused to false here, because waitForNextRequest needs
+    // to further manage the paused state in case of starvation.
+    return false;
+!!!41162423.cpp!!!	unpauseForNewRequests() : void
+    // With work to do, mark thread as unpaused.
+    // If paused by request (setPaused), don't resume, to avoid
+    // extra signaling/waiting overhead to waitUntilPaused
+    mRequestSignal.signal();
+    Mutex::Autolock p(mPauseLock);
+    if (!mDoPause) {
+        ALOGV("%s: RequestThread: Going active", __FUNCTION__);
+        if (mPaused) {
+            sp<StatusTracker> statusTracker = mStatusTracker.promote();
+            if (statusTracker != 0) {
+                statusTracker->markComponentActive(mStatusId);
+            }
+        }
+        mPaused = false;
+    }
+!!!41162551.cpp!!!	setErrorState(in fmt : char) : void
+    sp<Camera3Device> parent = mParent.promote();
+    if (parent != NULL) {
+        va_list args;
+        va_start(args, fmt);
+
+        parent->setErrorStateV(fmt, args);
+
+        va_end(args);
+    }
+!!!41162679.cpp!!!	isRepeatingRequestLocked(in requestIn : sp<CaptureRequest>) : bool
+    if (mRepeatingRequests.empty()) {
+        return false;
+    }
+    int32_t requestId = requestIn->mResultExtras.requestId;
+    const RequestList &repeatRequests = mRepeatingRequests;
+    // All repeating requests are guaranteed to have same id so only check first quest
+    const sp<CaptureRequest> firstRequest = *repeatRequests.begin();
+    return (firstRequest->mResultExtras.requestId == requestId);
+!!!41162807.cpp!!!	handleAePrecaptureCancelRequest(in request : sp<CaptureRequest>) : void
+    request->mAeTriggerCancelOverride.applyAeLock = false;
+    request->mAeTriggerCancelOverride.applyAePrecaptureTrigger = false;
+
+    if (mHal3Device->common.version > CAMERA_DEVICE_API_VERSION_3_2) {
+        return;
+    }
+
+    camera_metadata_entry_t aePrecaptureTrigger =
+            request->mSettings.find(ANDROID_CONTROL_AE_PRECAPTURE_TRIGGER);
+    if (aePrecaptureTrigger.count > 0 &&
+            aePrecaptureTrigger.data.u8[0] == ANDROID_CONTROL_AE_PRECAPTURE_TRIGGER_CANCEL) {
+        // Always override CANCEL to IDLE
+        uint8_t aePrecaptureTrigger = ANDROID_CONTROL_AE_PRECAPTURE_TRIGGER_IDLE;
+        request->mSettings.update(ANDROID_CONTROL_AE_PRECAPTURE_TRIGGER, &aePrecaptureTrigger, 1);
+        request->mAeTriggerCancelOverride.applyAePrecaptureTrigger = true;
+        request->mAeTriggerCancelOverride.aePrecaptureTrigger =
+                ANDROID_CONTROL_AE_PRECAPTURE_TRIGGER_CANCEL;
+
+        if (mAeLockAvailable == true) {
+            camera_metadata_entry_t aeLock = request->mSettings.find(ANDROID_CONTROL_AE_LOCK);
+            if (aeLock.count == 0 ||  aeLock.data.u8[0] == ANDROID_CONTROL_AE_LOCK_OFF) {
+                uint8_t aeLock = ANDROID_CONTROL_AE_LOCK_ON;
+                request->mSettings.update(ANDROID_CONTROL_AE_LOCK, &aeLock, 1);
+                request->mAeTriggerCancelOverride.applyAeLock = true;
+                request->mAeTriggerCancelOverride.aeLock = ANDROID_CONTROL_AE_LOCK_OFF;
+            }
+        }
+    }
+!!!41162935.cpp!!!	clearRepeatingRequestsLocked(inout lastFrameNumber : int64_t = NULL) : status_t
+    mRepeatingRequests.clear();
+    if (lastFrameNumber != NULL) {
+        *lastFrameNumber = mRepeatingLastFrameNumber;
+    }
+    mRepeatingLastFrameNumber = hardware::camera2::ICameraDeviceUser::NO_IN_FLIGHT_REPEATING_FRAMES;
+    return OK;

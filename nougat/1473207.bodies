@@ -1,0 +1,330 @@
+class NetworkMonitor
+!!!32653623.java!!!	NetworkMonitor(inout context : Context, inout handler : Handler, inout networkAgentInfo : NetworkAgentInfo, inout defaultRequest : NetworkRequest)
+        // Add suffix indicating which NetworkMonitor we're talking about.
+        super(TAG + networkAgentInfo.name());
+
+        mContext = context;
+        mConnectivityServiceHandler = handler;
+        mNetworkAgentInfo = networkAgentInfo;
+        mNetId = mNetworkAgentInfo.network.netId;
+        mTelephonyManager = (TelephonyManager) context.getSystemService(Context.TELEPHONY_SERVICE);
+        mWifiManager = (WifiManager) context.getSystemService(Context.WIFI_SERVICE);
+        mAlarmManager = (AlarmManager) context.getSystemService(Context.ALARM_SERVICE);
+        mDefaultRequest = defaultRequest;
+
+        addState(mDefaultState);
+        addState(mValidatedState, mDefaultState);
+        addState(mMaybeNotifyState, mDefaultState);
+            addState(mEvaluatingState, mMaybeNotifyState);
+            addState(mCaptivePortalState, mMaybeNotifyState);
+        addState(mLingeringState, mDefaultState);
+        setInitialState(mDefaultState);
+
+        mLingerDelayMs = SystemProperties.getInt(LINGER_DELAY_PROPERTY, DEFAULT_LINGER_DELAY_MS);
+
+        mIsCaptivePortalCheckEnabled = Settings.Global.getInt(mContext.getContentResolver(),
+                Settings.Global.CAPTIVE_PORTAL_DETECTION_ENABLED, 1) == 1;
+        mUseHttps = Settings.Global.getInt(mContext.getContentResolver(),
+                Settings.Global.CAPTIVE_PORTAL_USE_HTTPS, 1) == 1;
+
+        start();
+!!!32653751.java!!!	log(inout s : String) : void
+        if (DBG) Log.d(TAG + "/" + mNetworkAgentInfo.name(), s);
+!!!32653879.java!!!	validationLog(inout s : String) : void
+        if (DBG) log(s);
+        validationLogs.log(s);
+!!!32654007.java!!!	getValidationLogs() : LocalLog::ReadOnlyLocalLog
+        return validationLogs.readOnlyLocalLog();
+!!!32656567.java!!!	getCaptivePortalServerUrl(inout context : Context, inout isHttps : boolean) : String
+        String server = Settings.Global.getString(context.getContentResolver(),
+                Settings.Global.CAPTIVE_PORTAL_SERVER);
+        if (server == null) server = DEFAULT_SERVER;
+        return (isHttps ? "https" : "http") + "://" + server + "/generate_204";
+!!!32656695.java!!!	getCaptivePortalServerUrl(inout context : Context) : String
+        return getCaptivePortalServerUrl(context, false);
+!!!32656823.java!!!	isCaptivePortal() : NetworkMonitor::CaptivePortalProbeResult
+        if (!mIsCaptivePortalCheckEnabled) return new CaptivePortalProbeResult(204, null);
+
+        URL pacUrl = null, httpUrl = null, httpsUrl = null;
+
+        // On networks with a PAC instead of fetching a URL that should result in a 204
+        // response, we instead simply fetch the PAC script.  This is done for a few reasons:
+        // 1. At present our PAC code does not yet handle multiple PACs on multiple networks
+        //    until something like https://android-review.googlesource.com/#/c/115180/ lands.
+        //    Network.openConnection() will ignore network-specific PACs and instead fetch
+        //    using NO_PROXY.  If a PAC is in place, the only fetch we know will succeed with
+        //    NO_PROXY is the fetch of the PAC itself.
+        // 2. To proxy the generate_204 fetch through a PAC would require a number of things
+        //    happen before the fetch can commence, namely:
+        //        a) the PAC script be fetched
+        //        b) a PAC script resolver service be fired up and resolve the captive portal
+        //           server.
+        //    Network validation could be delayed until these prerequisities are satisifed or
+        //    could simply be left to race them.  Neither is an optimal solution.
+        // 3. PAC scripts are sometimes used to block or restrict Internet access and may in
+        //    fact block fetching of the generate_204 URL which would lead to false negative
+        //    results for network validation.
+        final ProxyInfo proxyInfo = mNetworkAgentInfo.linkProperties.getHttpProxy();
+        if (proxyInfo != null && !Uri.EMPTY.equals(proxyInfo.getPacFileUrl())) {
+            try {
+                pacUrl = new URL(proxyInfo.getPacFileUrl().toString());
+            } catch (MalformedURLException e) {
+                validationLog("Invalid PAC URL: " + proxyInfo.getPacFileUrl().toString());
+                return CaptivePortalProbeResult.FAILED;
+            }
+        }
+
+        if (pacUrl == null) {
+            try {
+                httpUrl = new URL(getCaptivePortalServerUrl(mContext, false));
+                httpsUrl = new URL(getCaptivePortalServerUrl(mContext, true));
+            } catch (MalformedURLException e) {
+                validationLog("Bad validation URL: " + getCaptivePortalServerUrl(mContext, false));
+                return CaptivePortalProbeResult.FAILED;
+            }
+        }
+
+        long startTime = SystemClock.elapsedRealtime();
+
+        // Pre-resolve the captive portal server host so we can log it.
+        // Only do this if HttpURLConnection is about to, to avoid any potentially
+        // unnecessary resolution.
+        String hostToResolve = null;
+        if (pacUrl != null) {
+            hostToResolve = pacUrl.getHost();
+        } else if (proxyInfo != null) {
+            hostToResolve = proxyInfo.getHost();
+        } else {
+            hostToResolve = httpUrl.getHost();
+        }
+
+        if (!TextUtils.isEmpty(hostToResolve)) {
+            String probeName = ValidationProbeEvent.getProbeName(ValidationProbeEvent.PROBE_DNS);
+            final Stopwatch dnsTimer = new Stopwatch().start();
+            try {
+                InetAddress[] addresses = mNetworkAgentInfo.network.getAllByName(hostToResolve);
+                long dnsLatency = dnsTimer.stop();
+                ValidationProbeEvent.logEvent(mNetId, dnsLatency,
+                        ValidationProbeEvent.PROBE_DNS, ValidationProbeEvent.DNS_SUCCESS);
+                final StringBuffer connectInfo = new StringBuffer(", " + hostToResolve + "=");
+                for (InetAddress address : addresses) {
+                    connectInfo.append(address.getHostAddress());
+                    if (address != addresses[addresses.length-1]) connectInfo.append(",");
+                }
+                validationLog(probeName + " OK " + dnsLatency + "ms" + connectInfo);
+            } catch (UnknownHostException e) {
+                long dnsLatency = dnsTimer.stop();
+                ValidationProbeEvent.logEvent(mNetId, dnsLatency,
+                        ValidationProbeEvent.PROBE_DNS, ValidationProbeEvent.DNS_FAILURE);
+                validationLog(probeName + " FAIL " + dnsLatency + "ms, " + hostToResolve);
+            }
+        }
+
+        CaptivePortalProbeResult result;
+        if (pacUrl != null) {
+            result = sendHttpProbe(pacUrl, ValidationProbeEvent.PROBE_PAC);
+        } else if (mUseHttps) {
+            result = sendParallelHttpProbes(httpsUrl, httpUrl);
+        } else {
+            result = sendHttpProbe(httpUrl, ValidationProbeEvent.PROBE_HTTP);
+        }
+
+        long endTime = SystemClock.elapsedRealtime();
+
+        sendNetworkConditionsBroadcast(true /* response received */,
+                result.isPortal() /* isCaptivePortal */,
+                startTime, endTime);
+
+        return result;
+!!!32656951.java!!!	sendHttpProbe(inout url : URL, in probeType : int) : NetworkMonitor::CaptivePortalProbeResult
+        HttpURLConnection urlConnection = null;
+        int httpResponseCode = 599;
+        String redirectUrl = null;
+        final Stopwatch probeTimer = new Stopwatch().start();
+        try {
+            urlConnection = (HttpURLConnection) mNetworkAgentInfo.network.openConnection(url);
+            urlConnection.setInstanceFollowRedirects(probeType == ValidationProbeEvent.PROBE_PAC);
+            urlConnection.setConnectTimeout(SOCKET_TIMEOUT_MS);
+            urlConnection.setReadTimeout(SOCKET_TIMEOUT_MS);
+            urlConnection.setUseCaches(false);
+
+            // Time how long it takes to get a response to our request
+            long requestTimestamp = SystemClock.elapsedRealtime();
+
+            httpResponseCode = urlConnection.getResponseCode();
+            redirectUrl = urlConnection.getHeaderField("location");
+
+            // Time how long it takes to get a response to our request
+            long responseTimestamp = SystemClock.elapsedRealtime();
+
+            validationLog(ValidationProbeEvent.getProbeName(probeType) + " " + url +
+                    " time=" + (responseTimestamp - requestTimestamp) + "ms" +
+                    " ret=" + httpResponseCode +
+                    " headers=" + urlConnection.getHeaderFields());
+            // NOTE: We may want to consider an "HTTP/1.0 204" response to be a captive
+            // portal.  The only example of this seen so far was a captive portal.  For
+            // the time being go with prior behavior of assuming it's not a captive
+            // portal.  If it is considered a captive portal, a different sign-in URL
+            // is needed (i.e. can't browse a 204).  This could be the result of an HTTP
+            // proxy server.
+
+            // Consider 200 response with "Content-length=0" to not be a captive portal.
+            // There's no point in considering this a captive portal as the user cannot
+            // sign-in to an empty page.  Probably the result of a broken transparent proxy.
+            // See http://b/9972012.
+            if (httpResponseCode == 200 && urlConnection.getContentLength() == 0) {
+                validationLog("Empty 200 response interpreted as 204 response.");
+                httpResponseCode = 204;
+            }
+
+            if (httpResponseCode == 200 && probeType == ValidationProbeEvent.PROBE_PAC) {
+                validationLog("PAC fetch 200 response interpreted as 204 response.");
+                httpResponseCode = 204;
+            }
+        } catch (IOException e) {
+            validationLog("Probably not a portal: exception " + e);
+            if (httpResponseCode == 599) {
+                // TODO: Ping gateway and DNS server and log results.
+            }
+        } finally {
+            if (urlConnection != null) {
+                urlConnection.disconnect();
+            }
+        }
+        ValidationProbeEvent.logEvent(mNetId, probeTimer.stop(), probeType, httpResponseCode);
+        return new CaptivePortalProbeResult(httpResponseCode, redirectUrl);
+!!!32657079.java!!!	sendParallelHttpProbes(inout httpsUrl : URL, inout httpUrl : URL) : NetworkMonitor::CaptivePortalProbeResult
+        // Number of probes to wait for. We might wait for all of them, but we might also return if
+        // only one of them has replied. For example, we immediately return if the HTTP probe finds
+        // a captive portal, even if the HTTPS probe is timing out.
+        final CountDownLatch latch = new CountDownLatch(2);
+
+        // Which probe result we're going to use. This doesn't need to be atomic, but it does need
+        // to be final because otherwise we can't set it from the ProbeThreads.
+        final AtomicReference<CaptivePortalProbeResult> finalResult = new AtomicReference<>();
+
+        final class ProbeThread extends Thread {
+            private final boolean mIsHttps;
+            private volatile CaptivePortalProbeResult mResult;
+
+            public ProbeThread(boolean isHttps) {
+                mIsHttps = isHttps;
+            }
+
+            public CaptivePortalProbeResult getResult() {
+                return mResult;
+            }
+
+            @Override
+            public void run() {
+                if (mIsHttps) {
+                    mResult = sendHttpProbe(httpsUrl, ValidationProbeEvent.PROBE_HTTPS);
+                } else {
+                    mResult = sendHttpProbe(httpUrl, ValidationProbeEvent.PROBE_HTTP);
+                }
+                if ((mIsHttps && mResult.isSuccessful()) || (!mIsHttps && mResult.isPortal())) {
+                    // HTTPS succeeded, or HTTP found a portal. Don't wait for the other probe.
+                    finalResult.compareAndSet(null, mResult);
+                    latch.countDown();
+                }
+                // Signal that one probe has completed. If we've already made a decision, or if this
+                // is the second probe, the latch will be at zero and we'll return a result.
+                latch.countDown();
+            }
+        }
+
+        ProbeThread httpsProbe = new ProbeThread(true);
+        ProbeThread httpProbe = new ProbeThread(false);
+        httpsProbe.start();
+        httpProbe.start();
+
+        try {
+            latch.await();
+        } catch (InterruptedException e) {
+            validationLog("Error: probe wait interrupted!");
+            return CaptivePortalProbeResult.FAILED;
+        }
+
+        // If there was no deciding probe, that means that both probes completed. Return HTTPS.
+        finalResult.compareAndSet(null, httpsProbe.getResult());
+
+        return finalResult.get();
+!!!32657207.java!!!	sendNetworkConditionsBroadcast(inout responseReceived : boolean, inout isCaptivePortal : boolean, in requestTimestampMs : long, in responseTimestampMs : long) : void
+        if (Settings.Global.getInt(mContext.getContentResolver(),
+                Settings.Global.WIFI_SCAN_ALWAYS_AVAILABLE, 0) == 0) {
+            return;
+        }
+
+        if (systemReady == false) return;
+
+        Intent latencyBroadcast = new Intent(ACTION_NETWORK_CONDITIONS_MEASURED);
+        switch (mNetworkAgentInfo.networkInfo.getType()) {
+            case ConnectivityManager.TYPE_WIFI:
+                WifiInfo currentWifiInfo = mWifiManager.getConnectionInfo();
+                if (currentWifiInfo != null) {
+                    // NOTE: getSSID()'s behavior changed in API 17; before that, SSIDs were not
+                    // surrounded by double quotation marks (thus violating the Javadoc), but this
+                    // was changed to match the Javadoc in API 17. Since clients may have started
+                    // sanitizing the output of this method since API 17 was released, we should
+                    // not change it here as it would become impossible to tell whether the SSID is
+                    // simply being surrounded by quotes due to the API, or whether those quotes
+                    // are actually part of the SSID.
+                    latencyBroadcast.putExtra(EXTRA_SSID, currentWifiInfo.getSSID());
+                    latencyBroadcast.putExtra(EXTRA_BSSID, currentWifiInfo.getBSSID());
+                } else {
+                    if (DBG) logw("network info is TYPE_WIFI but no ConnectionInfo found");
+                    return;
+                }
+                break;
+            case ConnectivityManager.TYPE_MOBILE:
+                latencyBroadcast.putExtra(EXTRA_NETWORK_TYPE, mTelephonyManager.getNetworkType());
+                List<CellInfo> info = mTelephonyManager.getAllCellInfo();
+                if (info == null) return;
+                int numRegisteredCellInfo = 0;
+                for (CellInfo cellInfo : info) {
+                    if (cellInfo.isRegistered()) {
+                        numRegisteredCellInfo++;
+                        if (numRegisteredCellInfo > 1) {
+                            log("more than one registered CellInfo.  Can't " +
+                                    "tell which is active.  Bailing.");
+                            return;
+                        }
+                        if (cellInfo instanceof CellInfoCdma) {
+                            CellIdentityCdma cellId = ((CellInfoCdma) cellInfo).getCellIdentity();
+                            latencyBroadcast.putExtra(EXTRA_CELL_ID, cellId);
+                        } else if (cellInfo instanceof CellInfoGsm) {
+                            CellIdentityGsm cellId = ((CellInfoGsm) cellInfo).getCellIdentity();
+                            latencyBroadcast.putExtra(EXTRA_CELL_ID, cellId);
+                        } else if (cellInfo instanceof CellInfoLte) {
+                            CellIdentityLte cellId = ((CellInfoLte) cellInfo).getCellIdentity();
+                            latencyBroadcast.putExtra(EXTRA_CELL_ID, cellId);
+                        } else if (cellInfo instanceof CellInfoWcdma) {
+                            CellIdentityWcdma cellId = ((CellInfoWcdma) cellInfo).getCellIdentity();
+                            latencyBroadcast.putExtra(EXTRA_CELL_ID, cellId);
+                        } else {
+                            if (DBG) logw("Registered cellinfo is unrecognized");
+                            return;
+                        }
+                    }
+                }
+                break;
+            default:
+                return;
+        }
+        latencyBroadcast.putExtra(EXTRA_CONNECTIVITY_TYPE, mNetworkAgentInfo.networkInfo.getType());
+        latencyBroadcast.putExtra(EXTRA_RESPONSE_RECEIVED, responseReceived);
+        latencyBroadcast.putExtra(EXTRA_REQUEST_TIMESTAMP_MS, requestTimestampMs);
+
+        if (responseReceived) {
+            latencyBroadcast.putExtra(EXTRA_IS_CAPTIVE_PORTAL, isCaptivePortal);
+            latencyBroadcast.putExtra(EXTRA_RESPONSE_TIMESTAMP_MS, responseTimestampMs);
+        }
+        mContext.sendBroadcastAsUser(latencyBroadcast, UserHandle.CURRENT,
+                PERMISSION_ACCESS_NETWORK_CONDITIONS);
+!!!32657335.java!!!	SetDefaultLingerTime(in time_ms : int) : void
+        if (Process.myUid() == Process.SYSTEM_UID) {
+            throw new SecurityException("SetDefaultLingerTime only for internal testing.");
+        }
+        DEFAULT_LINGER_DELAY_MS = time_ms;
+!!!32657463.java!!!	makeWakeupMessage(inout c : Context, inout h : Handler, inout s : String, in i : int) : WakeupMessage
+        return new WakeupMessage(c, h, s, i);

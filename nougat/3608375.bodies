@@ -1,0 +1,314 @@
+class ATSParser::Program
+!!!40221111.cpp!!!	parsePID(in pid : uint, in continuity_counter : uint, in payload_unit_start_indicator : uint, inout br : ABitReader, inout err : status_t, inout event : SyncEvent) : bool
+    *err = OK;
+
+    ssize_t index = mStreams.indexOfKey(pid);
+    if (index < 0) {
+        return false;
+    }
+
+    *err = mStreams.editValueAt(index)->parse(
+            continuity_counter, payload_unit_start_indicator, br, event);
+
+    return true;
+!!!40221239.cpp!!!	signalDiscontinuity(in type : DiscontinuityType, in extra : sp<AMessage>) : void
+    int64_t mediaTimeUs;
+    if ((type & DISCONTINUITY_TIME)
+            && extra != NULL
+            && extra->findInt64(
+                IStreamListener::kKeyMediaTimeUs, &mediaTimeUs)) {
+        mFirstPTSValid = false;
+    }
+
+    for (size_t i = 0; i < mStreams.size(); ++i) {
+        mStreams.editValueAt(i)->signalDiscontinuity(type, extra);
+    }
+!!!40221367.cpp!!!	signalEOS(in finalResult : status_t) : void
+    for (size_t i = 0; i < mStreams.size(); ++i) {
+        mStreams.editValueAt(i)->signalEOS(finalResult);
+    }
+!!!40221495.cpp!!!	getSource(in type : SourceType) : sp<MediaSource>
+    for (size_t i = 0; i < mStreams.size(); ++i) {
+        sp<MediaSource> source = mStreams.editValueAt(i)->getSource(type);
+        if (source != NULL) {
+            return source;
+        }
+    }
+
+    return NULL;
+!!!40221623.cpp!!!	hasSource(in type : SourceType) : bool
+    for (size_t i = 0; i < mStreams.size(); ++i) {
+        const sp<Stream> &stream = mStreams.valueAt(i);
+        if (type == AUDIO && stream->isAudio()) {
+            return true;
+        } else if (type == VIDEO && stream->isVideo()) {
+            return true;
+        } else if (type == META && stream->isMeta()) {
+            return true;
+        }
+    }
+
+    return false;
+!!!40221751.cpp!!!	convertPTSToTimestamp(in PTS : uint64_t) : int64_t
+    PTS = recoverPTS(PTS);
+
+    if (!(mParser->mFlags & TS_TIMESTAMPS_ARE_ABSOLUTE)) {
+        if (!mFirstPTSValid) {
+            mFirstPTSValid = true;
+            mFirstPTS = PTS;
+            PTS = 0;
+        } else if (PTS < mFirstPTS) {
+            PTS = 0;
+        } else {
+            PTS -= mFirstPTS;
+        }
+    }
+
+    int64_t timeUs = (PTS * 100) / 9;
+
+    if (mParser->mAbsoluteTimeAnchorUs >= 0ll) {
+        timeUs += mParser->mAbsoluteTimeAnchorUs;
+    }
+
+    if (mParser->mTimeOffsetValid) {
+        timeUs += mParser->mTimeOffsetUs;
+    }
+
+    return timeUs;
+!!!40222519.cpp!!!	parseProgramMap(inout br : ABitReader) : status_t
+    unsigned table_id = br->getBits(8);
+    ALOGV("  table_id = %u", table_id);
+    if (table_id != 0x02u) {
+        ALOGE("PMT data error!");
+        return ERROR_MALFORMED;
+    }
+    unsigned section_syntax_indicator = br->getBits(1);
+    ALOGV("  section_syntax_indicator = %u", section_syntax_indicator);
+    if (section_syntax_indicator != 1u) {
+        ALOGE("PMT data error!");
+        return ERROR_MALFORMED;
+    }
+
+    br->skipBits(1);  // '0'
+    MY_LOGV("  reserved = %u", br->getBits(2));
+
+    unsigned section_length = br->getBits(12);
+    ALOGV("  section_length = %u", section_length);
+
+    MY_LOGV("  program_number = %u", br->getBits(16));
+    MY_LOGV("  reserved = %u", br->getBits(2));
+    MY_LOGV("  version_number = %u", br->getBits(5));
+    MY_LOGV("  current_next_indicator = %u", br->getBits(1));
+    MY_LOGV("  section_number = %u", br->getBits(8));
+    MY_LOGV("  last_section_number = %u", br->getBits(8));
+    MY_LOGV("  reserved = %u", br->getBits(3));
+
+    unsigned PCR_PID = br->getBits(13);
+    ALOGV("  PCR_PID = 0x%04x", PCR_PID);
+
+    MY_LOGV("  reserved = %u", br->getBits(4));
+
+    unsigned program_info_length = br->getBits(12);
+    ALOGV("  program_info_length = %u", program_info_length);
+
+    br->skipBits(program_info_length * 8);  // skip descriptors
+
+    Vector<StreamInfo> infos;
+
+    // infoBytesRemaining is the number of bytes that make up the
+    // variable length section of ES_infos. It does not include the
+    // final CRC.
+    size_t infoBytesRemaining = section_length - 9 - program_info_length - 4;
+
+    while (infoBytesRemaining >= 5) {
+
+        unsigned streamType = br->getBits(8);
+        ALOGV("    stream_type = 0x%02x", streamType);
+
+        MY_LOGV("    reserved = %u", br->getBits(3));
+
+        unsigned elementaryPID = br->getBits(13);
+        ALOGV("    elementary_PID = 0x%04x", elementaryPID);
+
+        MY_LOGV("    reserved = %u", br->getBits(4));
+
+        unsigned ES_info_length = br->getBits(12);
+        ALOGV("    ES_info_length = %u", ES_info_length);
+
+#if 0
+        br->skipBits(ES_info_length * 8);  // skip descriptors
+#else
+        unsigned info_bytes_remaining = ES_info_length;
+        while (info_bytes_remaining >= 2) {
+            MY_LOGV("      tag = 0x%02x", br->getBits(8));
+
+            unsigned descLength = br->getBits(8);
+            ALOGV("      len = %u", descLength);
+
+            if (info_bytes_remaining < descLength) {
+                return ERROR_MALFORMED;
+            }
+            br->skipBits(descLength * 8);
+
+            info_bytes_remaining -= descLength + 2;
+        }
+#endif
+
+        StreamInfo info;
+        info.mType = streamType;
+        info.mPID = elementaryPID;
+        infos.push(info);
+
+        infoBytesRemaining -= 5 + ES_info_length;
+    }
+
+    if (infoBytesRemaining != 0) {
+        ALOGW("Section data remains unconsumed");
+    }
+    MY_LOGV("  CRC = 0x%08x", br->getBits(32));
+
+    bool PIDsChanged = false;
+    for (size_t i = 0; i < infos.size(); ++i) {
+        StreamInfo &info = infos.editItemAt(i);
+
+        ssize_t index = mStreams.indexOfKey(info.mPID);
+
+        if (index >= 0 && mStreams.editValueAt(index)->type() != info.mType) {
+            ALOGI("uh oh. stream PIDs have changed.");
+            PIDsChanged = true;
+            break;
+        }
+    }
+
+    if (PIDsChanged) {
+#if 0
+        ALOGI("before:");
+        for (size_t i = 0; i < mStreams.size(); ++i) {
+            sp<Stream> stream = mStreams.editValueAt(i);
+
+            ALOGI("PID 0x%08x => type 0x%02x", stream->pid(), stream->type());
+        }
+
+        ALOGI("after:");
+        for (size_t i = 0; i < infos.size(); ++i) {
+            StreamInfo &info = infos.editItemAt(i);
+
+            ALOGI("PID 0x%08x => type 0x%02x", info.mPID, info.mType);
+        }
+#endif
+
+        // we can recover if number of streams for each type remain the same
+        bool success = switchPIDs(infos);
+
+        if (!success) {
+            ALOGI("Stream PIDs changed and we cannot recover.");
+            return ERROR_MALFORMED;
+        }
+    }
+
+    for (size_t i = 0; i < infos.size(); ++i) {
+        StreamInfo &info = infos.editItemAt(i);
+
+        ssize_t index = mStreams.indexOfKey(info.mPID);
+
+        if (index < 0) {
+            sp<Stream> stream = new Stream(
+                    this, info.mPID, info.mType, PCR_PID);
+
+            mStreams.add(info.mPID, stream);
+        }
+    }
+
+    return OK;
+!!!40222647.cpp!!!	recoverPTS(in PTS_33bit : uint64_t) : int64_t
+    // We only have the lower 33-bit of the PTS. It could overflow within a
+    // reasonable amount of time. To handle the wrap-around, use fancy math
+    // to get an extended PTS that is within [-0xffffffff, 0xffffffff]
+    // of the latest recovered PTS.
+    if (mLastRecoveredPTS < 0ll) {
+        // Use the original 33bit number for 1st frame, the reason is that
+        // if 1st frame wraps to negative that's far away from 0, we could
+        // never start. Only start wrapping around from 2nd frame.
+        mLastRecoveredPTS = static_cast<int64_t>(PTS_33bit);
+    } else {
+        mLastRecoveredPTS = static_cast<int64_t>(
+                ((mLastRecoveredPTS - static_cast<int64_t>(PTS_33bit) + 0x100000000ll)
+                & 0xfffffffe00000000ull) | PTS_33bit);
+        // We start from 0, but recovered PTS could be slightly below 0.
+        // Clamp it to 0 as rest of the pipeline doesn't take negative pts.
+        // (eg. video is read first and starts at 0, but audio starts at 0xfffffff0)
+        if (mLastRecoveredPTS < 0ll) {
+            ALOGI("Clamping negative recovered PTS (%" PRId64 ") to 0", mLastRecoveredPTS);
+            mLastRecoveredPTS = 0ll;
+        }
+    }
+
+    return mLastRecoveredPTS;
+!!!40222775.cpp!!!	switchPIDs(in infos : Vector<StreamInfo>) : bool
+    bool success = false;
+
+    if (mStreams.size() == infos.size()) {
+        // build type->PIDs map for old and new mapping
+        size_t i;
+        KeyedVector<int32_t, Vector<int32_t> > oldType2PIDs, newType2PIDs;
+        for (i = 0; i < mStreams.size(); ++i) {
+            ssize_t index = oldType2PIDs.indexOfKey(mStreams[i]->type());
+            if (index < 0) {
+                oldType2PIDs.add(mStreams[i]->type(), Vector<int32_t>());
+            }
+            oldType2PIDs.editValueFor(mStreams[i]->type()).push_back(mStreams[i]->pid());
+        }
+        for (i = 0; i < infos.size(); ++i) {
+            ssize_t index = newType2PIDs.indexOfKey(infos[i].mType);
+            if (index < 0) {
+                newType2PIDs.add(infos[i].mType, Vector<int32_t>());
+            }
+            newType2PIDs.editValueFor(infos[i].mType).push_back(infos[i].mPID);
+        }
+
+        // we can recover if the number of streams for each type hasn't changed
+        if (oldType2PIDs.size() == newType2PIDs.size()) {
+            success = true;
+            for (i = 0; i < oldType2PIDs.size(); ++i) {
+                // KeyedVector is sorted, we just compare key and size of each index
+                if (oldType2PIDs.keyAt(i) != newType2PIDs.keyAt(i)
+                        || oldType2PIDs[i].size() != newType2PIDs[i].size()) {
+                     success = false;
+                     break;
+                }
+            }
+        }
+
+        if (success) {
+            // save current streams to temp
+            KeyedVector<int32_t, sp<Stream> > temp;
+            for (i = 0; i < mStreams.size(); ++i) {
+                 temp.add(mStreams.keyAt(i), mStreams.editValueAt(i));
+            }
+
+            mStreams.clear();
+            for (i = 0; i < temp.size(); ++i) {
+                // The two checks below shouldn't happen,
+                // we already checked above the stream count matches
+                ssize_t index = newType2PIDs.indexOfKey(temp[i]->type());
+                if (index < 0) {
+                    return false;
+                }
+                Vector<int32_t> &newPIDs = newType2PIDs.editValueAt(index);
+                if (newPIDs.isEmpty()) {
+                    return false;
+                }
+
+                // get the next PID for temp[i]->type() in the new PID map
+                Vector<int32_t>::iterator it = newPIDs.begin();
+
+                // change the PID of the stream, and add it back
+                temp.editValueAt(i)->setPID(*it);
+                mStreams.add(temp[i]->pid(), temp.editValueAt(i));
+
+                // removed the used PID
+                newPIDs.erase(it);
+            }
+        }
+    }
+    return success;

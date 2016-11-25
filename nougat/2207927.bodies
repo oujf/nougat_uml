@@ -1,0 +1,524 @@
+class CdmaSmsCbTest
+!!!38342711.java!!!	createBroadcastParcel(in serviceCategory : int) : Parcel
+        Parcel p = Parcel.obtain();
+
+        p.writeInt(SmsEnvelope.TELESERVICE_NOT_SET);
+        p.writeByte((byte) 1);  // non-zero for MESSAGE_TYPE_BROADCAST
+        p.writeInt(serviceCategory);
+
+        // dummy address (RIL may generate a different dummy address for broadcasts)
+        p.writeInt(CdmaSmsAddress.DIGIT_MODE_4BIT_DTMF);            // sAddress.digit_mode
+        p.writeInt(CdmaSmsAddress.NUMBER_MODE_NOT_DATA_NETWORK);    // sAddress.number_mode
+        p.writeInt(CdmaSmsAddress.TON_UNKNOWN);                     // sAddress.number_type
+        p.writeInt(CdmaSmsAddress.NUMBERING_PLAN_ISDN_TELEPHONY);   // sAddress.number_plan
+        p.writeByte((byte) 0);      // sAddress.number_of_digits
+        p.writeInt((byte) 0);       // sSubAddress.subaddressType
+        p.writeByte((byte) 0);      // sSubAddress.odd
+        p.writeByte((byte) 0);      // sSubAddress.number_of_digits
+        return p;
+!!!38342839.java!!!	createBearerDataStream(in messageId : int, in priority : int, in language : int) : BitwiseOutputStream
+        BitwiseOutputStream bos = new BitwiseOutputStream(10);
+        bos.write(8, SUBPARAM_MESSAGE_IDENTIFIER);
+        bos.write(8, 3);    // length: 3 bytes
+        bos.write(4, BearerData.MESSAGE_TYPE_DELIVER);
+        bos.write(8, ((messageId >>> 8) & 0xff));
+        bos.write(8, (messageId & 0xff));
+        bos.write(1, 0);    // no User Data Header
+        bos.write(3, 0);    // reserved
+
+        if (priority != -1) {
+            bos.write(8, SUBPARAM_PRIORITY_INDICATOR);
+            bos.write(8, 1);    // length: 1 byte
+            bos.write(2, (priority & 0x03));
+            bos.write(6, 0);    // reserved
+        }
+
+        if (language != -1) {
+            bos.write(8, SUBPARAM_LANGUAGE_INDICATOR);
+            bos.write(8, 1);    // length: 1 byte
+            bos.write(8, (language & 0xff));
+        }
+
+        return bos;
+!!!38342967.java!!!	createMessageFromParcel(inout p : Parcel, inout bearerData : byte) : SmsMessage
+        p.writeInt(bearerData.length);
+        for (byte b : bearerData) {
+            p.writeByte(b);
+        }
+        p.setDataPosition(0);   // reset position for reading
+        SmsMessage message = SmsMessage.newFromParcel(p);
+        p.recycle();
+        return message;
+!!!38343095.java!!!	createCmasSmsMessage(in serviceCategory : int, in messageId : int, in priority : int, in language : int, in encoding : int, inout body : String, in cmasCategory : int, in responseType : int, in severity : int, in urgency : int, in certainty : int) : SmsMessage
+        BitwiseOutputStream cmasBos = new BitwiseOutputStream(10);
+        cmasBos.write(8, 0);    // CMAE protocol version 0
+
+        if (body != null) {
+            cmasBos.write(8, 0);        // Type 0 elements (alert text)
+            encodeBody(encoding, body, true, cmasBos);
+        }
+
+        if (cmasCategory != SmsCbCmasInfo.CMAS_CATEGORY_UNKNOWN) {
+            cmasBos.write(8, 1);    // Type 1 elements
+            cmasBos.write(8, 4);    // length: 4 bytes
+            cmasBos.write(8, (cmasCategory & 0xff));
+            cmasBos.write(8, (responseType & 0xff));
+            cmasBos.write(4, (severity & 0x0f));
+            cmasBos.write(4, (urgency & 0x0f));
+            cmasBos.write(4, (certainty & 0x0f));
+            cmasBos.write(4, 0);    // pad to octet boundary
+        }
+
+        byte[] cmasUserData = cmasBos.toByteArray();
+
+        Parcel p = createBroadcastParcel(serviceCategory);
+        BitwiseOutputStream bos = createBearerDataStream(messageId, priority, language);
+
+        bos.write(8, SUBPARAM_USER_DATA);
+        bos.write(8, cmasUserData.length + 2);  // add 2 bytes for msg_encoding and num_fields
+        bos.write(5, UserData.ENCODING_OCTET);
+        bos.write(8, cmasUserData.length);
+        bos.writeByteArray(cmasUserData.length * 8, cmasUserData);
+        bos.write(3, 0);    // pad to byte boundary
+
+        return createMessageFromParcel(p, bos.toByteArray());
+!!!38343223.java!!!	createBroadcastSmsMessage(in serviceCategory : int, in messageId : int, in priority : int, in language : int, in encoding : int, inout body : String) : SmsMessage
+        Parcel p = createBroadcastParcel(serviceCategory);
+        BitwiseOutputStream bos = createBearerDataStream(messageId, priority, language);
+
+        bos.write(8, SUBPARAM_USER_DATA);
+        encodeBody(encoding, body, false, bos);
+
+        return createMessageFromParcel(p, bos.toByteArray());
+!!!38343351.java!!!	encodeBody(in encoding : int, inout body : String, inout isCmasRecord : boolean, inout bos : BitwiseOutputStream) : void
+        if (encoding == UserData.ENCODING_7BIT_ASCII || encoding == UserData.ENCODING_IA5) {
+            int charCount = body.length();
+            int recordBits = (charCount * 7) + 5;       // add 5 bits for char set field
+            int recordOctets = (recordBits + 7) / 8;    // round up to octet boundary
+            int padBits = (recordOctets * 8) - recordBits;
+
+            if (!isCmasRecord) {
+                recordOctets++;                         // add 8 bits for num_fields
+            }
+
+            bos.write(8, recordOctets);
+            bos.write(5, (encoding & 0x1f));
+
+            if (!isCmasRecord) {
+                bos.write(8, charCount);
+            }
+
+            for (int i = 0; i < charCount; i++) {
+                bos.write(7, body.charAt(i));
+            }
+
+            bos.write(padBits, 0);      // pad to octet boundary
+        } else if (encoding == UserData.ENCODING_GSM_7BIT_ALPHABET
+                || encoding == UserData.ENCODING_GSM_DCS) {
+            // convert to 7-bit packed encoding with septet count in index 0 of byte array
+            byte[] encodedBody = GsmAlphabet.stringToGsm7BitPacked(body);
+
+            int charCount = encodedBody[0];             // septet count
+            int recordBits = (charCount * 7) + 5;       // add 5 bits for char set field
+            int recordOctets = (recordBits + 7) / 8;    // round up to octet boundary
+            int padBits = (recordOctets * 8) - recordBits;
+
+            if (!isCmasRecord) {
+                recordOctets++;                         // add 8 bits for num_fields
+                if (encoding == UserData.ENCODING_GSM_DCS) {
+                    recordOctets++;                     // add 8 bits for DCS (message type)
+                }
+            }
+
+            bos.write(8, recordOctets);
+            bos.write(5, (encoding & 0x1f));
+
+            if (!isCmasRecord && encoding == UserData.ENCODING_GSM_DCS) {
+                bos.write(8, 0);        // GSM DCS: 7 bit default alphabet, no msg class
+            }
+
+            if (!isCmasRecord) {
+                bos.write(8, charCount);
+            }
+            byte[] bodySeptets = Arrays.copyOfRange(encodedBody, 1, encodedBody.length);
+            bos.writeByteArray(charCount * 7, bodySeptets);
+            bos.write(padBits, 0);      // pad to octet boundary
+        } else if (encoding == UserData.ENCODING_IS91_EXTENDED_PROTOCOL) {
+            // 6 bit packed encoding with 0x20 offset (ASCII 0x20 - 0x60)
+            int charCount = body.length();
+            int recordBits = (charCount * 6) + 21;      // add 21 bits for header fields
+            int recordOctets = (recordBits + 7) / 8;    // round up to octet boundary
+            int padBits = (recordOctets * 8) - recordBits;
+
+            bos.write(8, recordOctets);
+
+            bos.write(5, (encoding & 0x1f));
+            bos.write(8, UserData.IS91_MSG_TYPE_SHORT_MESSAGE);
+            bos.write(8, charCount);
+
+            for (int i = 0; i < charCount; i++) {
+                bos.write(6, ((int) body.charAt(i) - 0x20));
+            }
+
+            bos.write(padBits, 0);      // pad to octet boundary
+        } else {
+            byte[] encodedBody;
+            switch (encoding) {
+                case UserData.ENCODING_UNICODE_16:
+                    encodedBody = body.getBytes("UTF-16BE");
+                    break;
+
+                case UserData.ENCODING_SHIFT_JIS:
+                    encodedBody = body.getBytes("Shift_JIS");
+                    break;
+
+                case UserData.ENCODING_KOREAN:
+                    encodedBody = body.getBytes("KSC5601");
+                    break;
+
+                case UserData.ENCODING_LATIN_HEBREW:
+                    encodedBody = body.getBytes("ISO-8859-8");
+                    break;
+
+                case UserData.ENCODING_LATIN:
+                default:
+                    encodedBody = body.getBytes("ISO-8859-1");
+                    break;
+            }
+            int charCount = body.length();              // use actual char count for num fields
+            int recordOctets = encodedBody.length + 1;  // add 1 byte for encoding and pad bits
+            if (!isCmasRecord) {
+                recordOctets++;                         // add 8 bits for num_fields
+            }
+            bos.write(8, recordOctets);
+            bos.write(5, (encoding & 0x1f));
+            if (!isCmasRecord) {
+                bos.write(8, charCount);
+            }
+            bos.writeByteArray(encodedBody.length * 8, encodedBody);
+            bos.write(3, 0);            // pad to octet boundary
+        }
+!!!38343479.java!!!	verifyCbValues(inout cbMessage : SmsCbMessage) : void
+        assertEquals(SmsCbMessage.MESSAGE_FORMAT_3GPP2, cbMessage.getMessageFormat());
+        assertEquals(SmsCbMessage.GEOGRAPHICAL_SCOPE_PLMN_WIDE, cbMessage.getGeographicalScope());
+        assertEquals(false, cbMessage.isEtwsMessage()); // ETWS on CDMA not currently supported
+!!!38343607.java!!!	doTestNonEmergencyBroadcast(in encoding : int) : void
+        SmsMessage msg = createBroadcastSmsMessage(123, 456, BearerData.PRIORITY_NORMAL,
+                BearerData.LANGUAGE_ENGLISH, encoding, TEST_TEXT);
+
+        SmsCbMessage cbMessage = msg.parseBroadcastSms();
+        verifyCbValues(cbMessage);
+        assertEquals(123, cbMessage.getServiceCategory());
+        assertEquals(456, cbMessage.getSerialNumber());
+        assertEquals(SmsCbMessage.MESSAGE_PRIORITY_NORMAL, cbMessage.getMessagePriority());
+        assertEquals("en", cbMessage.getLanguageCode());
+        assertEquals(TEST_TEXT, cbMessage.getMessageBody());
+        assertEquals(false, cbMessage.isEmergencyMessage());
+        assertEquals(false, cbMessage.isCmasMessage());
+!!!38343735.java!!!	testNonEmergencyBroadcast7bitAscii() : void
+        doTestNonEmergencyBroadcast(UserData.ENCODING_7BIT_ASCII);
+!!!38343863.java!!!	testNonEmergencyBroadcast7bitGsm() : void
+        doTestNonEmergencyBroadcast(UserData.ENCODING_GSM_7BIT_ALPHABET);
+!!!38343991.java!!!	testNonEmergencyBroadcast16bitUnicode() : void
+        doTestNonEmergencyBroadcast(UserData.ENCODING_UNICODE_16);
+!!!38344119.java!!!	testNonEmergencyBroadcastIs91Extended() : void
+        // IS-91 doesn't support language or priority subparameters, max 14 chars text
+        SmsMessage msg = createBroadcastSmsMessage(987, 654, -1, -1,
+                UserData.ENCODING_IS91_EXTENDED_PROTOCOL, IS91_TEXT);
+
+        SmsCbMessage cbMessage = msg.parseBroadcastSms();
+        verifyCbValues(cbMessage);
+        assertEquals(987, cbMessage.getServiceCategory());
+        assertEquals(654, cbMessage.getSerialNumber());
+        assertEquals(SmsCbMessage.MESSAGE_PRIORITY_NORMAL, cbMessage.getMessagePriority());
+        assertEquals(null, cbMessage.getLanguageCode());
+        assertEquals(IS91_TEXT, cbMessage.getMessageBody());
+        assertEquals(false, cbMessage.isEmergencyMessage());
+        assertEquals(false, cbMessage.isCmasMessage());
+!!!38344247.java!!!	doTestCmasBroadcast(in serviceCategory : int, in messageClass : int, inout body : String) : void
+        SmsMessage msg = createCmasSmsMessage(
+                serviceCategory, 1234, BearerData.PRIORITY_EMERGENCY, BearerData.LANGUAGE_ENGLISH,
+                UserData.ENCODING_7BIT_ASCII, body, -1, -1, -1, -1, -1);
+
+        SmsCbMessage cbMessage = msg.parseBroadcastSms();
+        verifyCbValues(cbMessage);
+        assertEquals(serviceCategory, cbMessage.getServiceCategory());
+        assertEquals(1234, cbMessage.getSerialNumber());
+        assertEquals(SmsCbMessage.MESSAGE_PRIORITY_EMERGENCY, cbMessage.getMessagePriority());
+        assertEquals("en", cbMessage.getLanguageCode());
+        assertEquals(body, cbMessage.getMessageBody());
+        assertEquals(true, cbMessage.isEmergencyMessage());
+        assertEquals(true, cbMessage.isCmasMessage());
+        SmsCbCmasInfo cmasInfo = cbMessage.getCmasWarningInfo();
+        assertEquals(messageClass, cmasInfo.getMessageClass());
+        assertEquals(SmsCbCmasInfo.CMAS_CATEGORY_UNKNOWN, cmasInfo.getCategory());
+        assertEquals(SmsCbCmasInfo.CMAS_RESPONSE_TYPE_UNKNOWN, cmasInfo.getResponseType());
+        assertEquals(SmsCbCmasInfo.CMAS_SEVERITY_UNKNOWN, cmasInfo.getSeverity());
+        assertEquals(SmsCbCmasInfo.CMAS_URGENCY_UNKNOWN, cmasInfo.getUrgency());
+        assertEquals(SmsCbCmasInfo.CMAS_CERTAINTY_UNKNOWN, cmasInfo.getCertainty());
+!!!38344375.java!!!	testCmasPresidentialAlert() : void
+        doTestCmasBroadcast(SmsEnvelope.SERVICE_CATEGORY_CMAS_PRESIDENTIAL_LEVEL_ALERT,
+                SmsCbCmasInfo.CMAS_CLASS_PRESIDENTIAL_LEVEL_ALERT, PRES_ALERT);
+!!!38344503.java!!!	testCmasExtremeAlert() : void
+        doTestCmasBroadcast(SmsEnvelope.SERVICE_CATEGORY_CMAS_EXTREME_THREAT,
+                SmsCbCmasInfo.CMAS_CLASS_EXTREME_THREAT, EXTREME_ALERT);
+!!!38344631.java!!!	testCmasSevereAlert() : void
+        doTestCmasBroadcast(SmsEnvelope.SERVICE_CATEGORY_CMAS_SEVERE_THREAT,
+                SmsCbCmasInfo.CMAS_CLASS_SEVERE_THREAT, SEVERE_ALERT);
+!!!38344759.java!!!	testCmasAmberAlert() : void
+        doTestCmasBroadcast(SmsEnvelope.SERVICE_CATEGORY_CMAS_CHILD_ABDUCTION_EMERGENCY,
+                SmsCbCmasInfo.CMAS_CLASS_CHILD_ABDUCTION_EMERGENCY, AMBER_ALERT);
+!!!38344887.java!!!	testCmasTestMessage() : void
+        doTestCmasBroadcast(SmsEnvelope.SERVICE_CATEGORY_CMAS_TEST_MESSAGE,
+                SmsCbCmasInfo.CMAS_CLASS_REQUIRED_MONTHLY_TEST, MONTHLY_TEST_ALERT);
+!!!38345015.java!!!	testCmasExtremeAlertType1Elements() : void
+        SmsMessage msg = createCmasSmsMessage(SmsEnvelope.SERVICE_CATEGORY_CMAS_EXTREME_THREAT,
+                5678, BearerData.PRIORITY_EMERGENCY, BearerData.LANGUAGE_ENGLISH,
+                UserData.ENCODING_7BIT_ASCII, EXTREME_ALERT, SmsCbCmasInfo.CMAS_CATEGORY_ENV,
+                SmsCbCmasInfo.CMAS_RESPONSE_TYPE_MONITOR, SmsCbCmasInfo.CMAS_SEVERITY_SEVERE,
+                SmsCbCmasInfo.CMAS_URGENCY_EXPECTED, SmsCbCmasInfo.CMAS_CERTAINTY_LIKELY);
+
+        SmsCbMessage cbMessage = msg.parseBroadcastSms();
+        verifyCbValues(cbMessage);
+        assertEquals(SmsEnvelope.SERVICE_CATEGORY_CMAS_EXTREME_THREAT,
+                cbMessage.getServiceCategory());
+        assertEquals(5678, cbMessage.getSerialNumber());
+        assertEquals(SmsCbMessage.MESSAGE_PRIORITY_EMERGENCY, cbMessage.getMessagePriority());
+        assertEquals("en", cbMessage.getLanguageCode());
+        assertEquals(EXTREME_ALERT, cbMessage.getMessageBody());
+        assertEquals(true, cbMessage.isEmergencyMessage());
+        assertEquals(true, cbMessage.isCmasMessage());
+        SmsCbCmasInfo cmasInfo = cbMessage.getCmasWarningInfo();
+        assertEquals(SmsCbCmasInfo.CMAS_CLASS_EXTREME_THREAT, cmasInfo.getMessageClass());
+        assertEquals(SmsCbCmasInfo.CMAS_CATEGORY_ENV, cmasInfo.getCategory());
+        assertEquals(SmsCbCmasInfo.CMAS_RESPONSE_TYPE_MONITOR, cmasInfo.getResponseType());
+        assertEquals(SmsCbCmasInfo.CMAS_SEVERITY_SEVERE, cmasInfo.getSeverity());
+        assertEquals(SmsCbCmasInfo.CMAS_URGENCY_EXPECTED, cmasInfo.getUrgency());
+        assertEquals(SmsCbCmasInfo.CMAS_CERTAINTY_LIKELY, cmasInfo.getCertainty());
+!!!38345143.java!!!	testCmasUnsupportedCharSet() : void
+        SmsMessage msg = createCmasSmsMessage(SmsEnvelope.SERVICE_CATEGORY_CMAS_EXTREME_THREAT,
+                12345, BearerData.PRIORITY_EMERGENCY, BearerData.LANGUAGE_ENGLISH,
+                UserData.ENCODING_GSM_DCS, EXTREME_ALERT, -1, -1, -1, -1, -1);
+
+        SmsCbMessage cbMessage = msg.parseBroadcastSms();
+        assertNull("expected null for unsupported charset", cbMessage);
+!!!38345271.java!!!	testCmasUnsupportedCharSet2() : void
+        SmsMessage msg = createCmasSmsMessage(SmsEnvelope.SERVICE_CATEGORY_CMAS_EXTREME_THREAT,
+                67890, BearerData.PRIORITY_EMERGENCY, BearerData.LANGUAGE_ENGLISH,
+                UserData.ENCODING_KOREAN, EXTREME_ALERT, -1, -1, -1, -1, -1);
+
+        SmsCbMessage cbMessage = msg.parseBroadcastSms();
+        assertNull("expected null for unsupported charset", cbMessage);
+!!!38345399.java!!!	testCmasNoRecordType0() : void
+        SmsMessage msg = createCmasSmsMessage(
+                SmsEnvelope.SERVICE_CATEGORY_CMAS_PRESIDENTIAL_LEVEL_ALERT, 1234,
+                BearerData.PRIORITY_EMERGENCY, BearerData.LANGUAGE_ENGLISH,
+                UserData.ENCODING_7BIT_ASCII, null, -1, -1, -1, -1, -1);
+
+        SmsCbMessage cbMessage = msg.parseBroadcastSms();
+        verifyCbValues(cbMessage);
+        assertEquals(SmsEnvelope.SERVICE_CATEGORY_CMAS_PRESIDENTIAL_LEVEL_ALERT,
+                cbMessage.getServiceCategory());
+        assertEquals(1234, cbMessage.getSerialNumber());
+        assertEquals(SmsCbMessage.MESSAGE_PRIORITY_EMERGENCY, cbMessage.getMessagePriority());
+        assertEquals("en", cbMessage.getLanguageCode());
+        assertEquals(null, cbMessage.getMessageBody());
+        assertEquals(true, cbMessage.isEmergencyMessage());
+        assertEquals(true, cbMessage.isCmasMessage());
+        SmsCbCmasInfo cmasInfo = cbMessage.getCmasWarningInfo();
+        assertEquals(SmsCbCmasInfo.CMAS_CLASS_PRESIDENTIAL_LEVEL_ALERT, cmasInfo.getMessageClass());
+        assertEquals(SmsCbCmasInfo.CMAS_CATEGORY_UNKNOWN, cmasInfo.getCategory());
+        assertEquals(SmsCbCmasInfo.CMAS_RESPONSE_TYPE_UNKNOWN, cmasInfo.getResponseType());
+        assertEquals(SmsCbCmasInfo.CMAS_SEVERITY_UNKNOWN, cmasInfo.getSeverity());
+        assertEquals(SmsCbCmasInfo.CMAS_URGENCY_UNKNOWN, cmasInfo.getUrgency());
+        assertEquals(SmsCbCmasInfo.CMAS_CERTAINTY_UNKNOWN, cmasInfo.getCertainty());
+!!!38345527.java!!!	testRandomBearerStreamData() : void
+        Random r = new Random(54321);
+        for (int run = 0; run < 1000; run++) {
+            int len = r.nextInt(140);
+            byte[] data = new byte[len];
+            for (int i = 0; i < len; i++) {
+                data[i] = (byte) r.nextInt(256);
+            }
+            // Rlog.d("CdmaSmsCbTest", "trying random bearer data run " + run + " length " + len);
+            try {
+                int category = 0x0ff0 + r.nextInt(32);  // half CMAS, half non-CMAS
+                Parcel p = createBroadcastParcel(category);
+                SmsMessage msg = createMessageFromParcel(p, data);
+                SmsCbMessage cbMessage = msg.parseBroadcastSms();
+                // with random input, cbMessage will almost always be null (log when it isn't)
+                if (cbMessage != null) {
+                    Rlog.d("CdmaSmsCbTest", "success: " + cbMessage);
+                }
+            } catch (Exception e) {
+                Rlog.d("CdmaSmsCbTest", "exception thrown", e);
+                fail("Exception in decoder at run " + run + " length " + len + ": " + e);
+            }
+        }
+!!!38345655.java!!!	testRandomUserData() : void
+        Random r = new Random(94040);
+        for (int run = 0; run < 1000; run++) {
+            int category = 0x0ff0 + r.nextInt(32);  // half CMAS, half non-CMAS
+            Parcel p = createBroadcastParcel(category);
+            int len = r.nextInt(140);
+            // Rlog.d("CdmaSmsCbTest", "trying random user data run " + run + " length " + len);
+
+            try {
+                BitwiseOutputStream bos = createBearerDataStream(r.nextInt(65536), r.nextInt(4),
+                        r.nextInt(256));
+
+                bos.write(8, SUBPARAM_USER_DATA);
+                bos.write(8, len);
+
+                for (int i = 0; i < len; i++) {
+                    bos.write(8, r.nextInt(256));
+                }
+
+                SmsMessage msg = createMessageFromParcel(p, bos.toByteArray());
+                SmsCbMessage cbMessage = msg.parseBroadcastSms();
+            } catch (Exception e) {
+                Rlog.d("CdmaSmsCbTest", "exception thrown", e);
+                fail("Exception in decoder at run " + run + " length " + len + ": " + e);
+            }
+        }
+!!!38345783.java!!!	createServiceCategoryProgramDataParcel() : Parcel
+        Parcel p = Parcel.obtain();
+
+        p.writeInt(SmsEnvelope.TELESERVICE_SCPT);
+        p.writeByte((byte) 0);  // non-zero for MESSAGE_TYPE_BROADCAST
+        p.writeInt(0);
+
+        // dummy address (RIL may generate a different dummy address for broadcasts)
+        p.writeInt(CdmaSmsAddress.DIGIT_MODE_4BIT_DTMF);            // sAddress.digit_mode
+        p.writeInt(CdmaSmsAddress.NUMBER_MODE_NOT_DATA_NETWORK);    // sAddress.number_mode
+        p.writeInt(CdmaSmsAddress.TON_UNKNOWN);                     // sAddress.number_type
+        p.writeInt(CdmaSmsAddress.NUMBERING_PLAN_ISDN_TELEPHONY);   // sAddress.number_plan
+        p.writeByte((byte) 0);      // sAddress.number_of_digits
+        p.writeInt((byte) 0);       // sSubAddress.subaddressType
+        p.writeByte((byte) 0);      // sSubAddress.odd
+        p.writeByte((byte) 0);      // sSubAddress.number_of_digits
+        return p;
+!!!38345911.java!!!	testServiceCategoryProgramDataAddCategory() : void
+        Parcel p = createServiceCategoryProgramDataParcel();
+        BitwiseOutputStream bos = createBearerDataStream(123, -1, -1);
+
+        int categoryNameLength = CAT_EXTREME_THREAT.length();
+        int subparamLengthBits = (53 + (categoryNameLength * 7));
+        int subparamLengthBytes = (subparamLengthBits + 7) / 8;
+        int subparamPadBits = (subparamLengthBytes * 8) - subparamLengthBits;
+
+        bos.write(8, SUBPARAM_SERVICE_CATEGORY_PROGRAM_DATA);
+        bos.write(8, subparamLengthBytes);
+        bos.write(5, UserData.ENCODING_7BIT_ASCII);
+
+        bos.write(4, CdmaSmsCbProgramData.OPERATION_ADD_CATEGORY);
+        bos.write(8, (SmsEnvelope.SERVICE_CATEGORY_CMAS_EXTREME_THREAT >>> 8));
+        bos.write(8, (SmsEnvelope.SERVICE_CATEGORY_CMAS_EXTREME_THREAT & 0xff));
+        bos.write(8, BearerData.LANGUAGE_ENGLISH);
+        bos.write(8, 100);  // max messages
+        bos.write(4, CdmaSmsCbProgramData.ALERT_OPTION_DEFAULT_ALERT);
+
+        bos.write(8, categoryNameLength);
+        for (int i = 0; i < categoryNameLength; i++) {
+            bos.write(7, CAT_EXTREME_THREAT.charAt(i));
+        }
+        bos.write(subparamPadBits, 0);
+
+        SmsMessage msg = createMessageFromParcel(p, bos.toByteArray());
+        assertNotNull(msg);
+        msg.parseSms();
+        List<CdmaSmsCbProgramData> programDataList = msg.getSmsCbProgramData();
+        assertNotNull(programDataList);
+        assertEquals(1, programDataList.size());
+        CdmaSmsCbProgramData programData = programDataList.get(0);
+        assertEquals(CdmaSmsCbProgramData.OPERATION_ADD_CATEGORY, programData.getOperation());
+        assertEquals(SmsEnvelope.SERVICE_CATEGORY_CMAS_EXTREME_THREAT, programData.getCategory());
+        assertEquals(CAT_EXTREME_THREAT, programData.getCategoryName());
+        assertEquals(BearerData.LANGUAGE_ENGLISH, programData.getLanguage());
+        assertEquals(100, programData.getMaxMessages());
+        assertEquals(CdmaSmsCbProgramData.ALERT_OPTION_DEFAULT_ALERT, programData.getAlertOption());
+!!!38346039.java!!!	testServiceCategoryProgramDataDeleteTwoCategories() : void
+        Parcel p = createServiceCategoryProgramDataParcel();
+        BitwiseOutputStream bos = createBearerDataStream(456, -1, -1);
+
+        int category1NameLength = CAT_SEVERE_THREAT.length();
+        int category2NameLength = CAT_AMBER_ALERTS.length();
+
+        int subparamLengthBits = (101 + (category1NameLength * 7) + (category2NameLength * 7));
+        int subparamLengthBytes = (subparamLengthBits + 7) / 8;
+        int subparamPadBits = (subparamLengthBytes * 8) - subparamLengthBits;
+
+        bos.write(8, SUBPARAM_SERVICE_CATEGORY_PROGRAM_DATA);
+        bos.write(8, subparamLengthBytes);
+        bos.write(5, UserData.ENCODING_7BIT_ASCII);
+
+        bos.write(4, CdmaSmsCbProgramData.OPERATION_DELETE_CATEGORY);
+        bos.write(8, (SmsEnvelope.SERVICE_CATEGORY_CMAS_SEVERE_THREAT >>> 8));
+        bos.write(8, (SmsEnvelope.SERVICE_CATEGORY_CMAS_SEVERE_THREAT & 0xff));
+        bos.write(8, BearerData.LANGUAGE_ENGLISH);
+        bos.write(8, 0);  // max messages
+        bos.write(4, CdmaSmsCbProgramData.ALERT_OPTION_NO_ALERT);
+
+        bos.write(8, category1NameLength);
+        for (int i = 0; i < category1NameLength; i++) {
+            bos.write(7, CAT_SEVERE_THREAT.charAt(i));
+        }
+
+        bos.write(4, CdmaSmsCbProgramData.OPERATION_DELETE_CATEGORY);
+        bos.write(8, (SmsEnvelope.SERVICE_CATEGORY_CMAS_CHILD_ABDUCTION_EMERGENCY >>> 8));
+        bos.write(8, (SmsEnvelope.SERVICE_CATEGORY_CMAS_CHILD_ABDUCTION_EMERGENCY & 0xff));
+        bos.write(8, BearerData.LANGUAGE_ENGLISH);
+        bos.write(8, 0);  // max messages
+        bos.write(4, CdmaSmsCbProgramData.ALERT_OPTION_NO_ALERT);
+
+        bos.write(8, category2NameLength);
+        for (int i = 0; i < category2NameLength; i++) {
+            bos.write(7, CAT_AMBER_ALERTS.charAt(i));
+        }
+
+        bos.write(subparamPadBits, 0);
+
+        SmsMessage msg = createMessageFromParcel(p, bos.toByteArray());
+        assertNotNull(msg);
+        msg.parseSms();
+        List<CdmaSmsCbProgramData> programDataList = msg.getSmsCbProgramData();
+        assertNotNull(programDataList);
+        assertEquals(2, programDataList.size());
+
+        CdmaSmsCbProgramData programData = programDataList.get(0);
+        assertEquals(CdmaSmsCbProgramData.OPERATION_DELETE_CATEGORY, programData.getOperation());
+        assertEquals(SmsEnvelope.SERVICE_CATEGORY_CMAS_SEVERE_THREAT, programData.getCategory());
+        assertEquals(CAT_SEVERE_THREAT, programData.getCategoryName());
+        assertEquals(BearerData.LANGUAGE_ENGLISH, programData.getLanguage());
+        assertEquals(0, programData.getMaxMessages());
+        assertEquals(CdmaSmsCbProgramData.ALERT_OPTION_NO_ALERT, programData.getAlertOption());
+
+        programData = programDataList.get(1);
+        assertEquals(CdmaSmsCbProgramData.OPERATION_DELETE_CATEGORY, programData.getOperation());
+        assertEquals(SmsEnvelope.SERVICE_CATEGORY_CMAS_CHILD_ABDUCTION_EMERGENCY,
+                programData.getCategory());
+        assertEquals(CAT_AMBER_ALERTS, programData.getCategoryName());
+        assertEquals(BearerData.LANGUAGE_ENGLISH, programData.getLanguage());
+        assertEquals(0, programData.getMaxMessages());
+        assertEquals(CdmaSmsCbProgramData.ALERT_OPTION_NO_ALERT, programData.getAlertOption());
+!!!38346167.java!!!	testDecodeRawBearerData() : void
+        Parcel p = createBroadcastParcel(SmsEnvelope.SERVICE_CATEGORY_CMAS_TEST_MESSAGE);
+        SmsMessage msg = createMessageFromParcel(p, CMAS_TEST_BEARER_DATA);
+
+        SmsCbMessage cbMessage = msg.parseBroadcastSms();
+        assertNotNull("expected non-null for bearer data", cbMessage);
+        assertEquals("geoScope", cbMessage.getGeographicalScope(), 1);
+        assertEquals("serialNumber", cbMessage.getSerialNumber(), 51072);
+        assertEquals("serviceCategory", cbMessage.getServiceCategory(),
+                SmsEnvelope.SERVICE_CATEGORY_CMAS_TEST_MESSAGE);
+        assertEquals("payload", cbMessage.getMessageBody(),
+                "This is a test of the Commercial Mobile Alert System. This is only a test.");
+
+        SmsCbCmasInfo cmasInfo = cbMessage.getCmasWarningInfo();
+        assertNotNull("expected non-null for CMAS info", cmasInfo);
+        assertEquals("category", cmasInfo.getCategory(), SmsCbCmasInfo.CMAS_CATEGORY_OTHER);
+        assertEquals("responseType", cmasInfo.getResponseType(),
+                SmsCbCmasInfo.CMAS_RESPONSE_TYPE_NONE);
+        assertEquals("severity", cmasInfo.getSeverity(), SmsCbCmasInfo.CMAS_SEVERITY_SEVERE);
+        assertEquals("urgency", cmasInfo.getUrgency(), SmsCbCmasInfo.CMAS_URGENCY_EXPECTED);
+        assertEquals("certainty", cmasInfo.getCertainty(), SmsCbCmasInfo.CMAS_CERTAINTY_LIKELY);

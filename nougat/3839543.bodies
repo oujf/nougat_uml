@@ -1,0 +1,201 @@
+class FullBackupEngine
+!!!41326135.java!!!	FullBackupEngine(inout output : OutputStream, inout preflightHook : BackupManagerService::FullBackupPreflight, inout pkg : PackageInfo, inout alsoApks : boolean, inout timeoutMonitor : BackupManagerService::BackupRestoreTask)
+            mOutput = output;
+            mPreflightHook = preflightHook;
+            mPkg = pkg;
+            mIncludeApks = alsoApks;
+            mTimeoutMonitor = timeoutMonitor;
+            mFilesDir = new File("/data/system");
+            mManifestFile = new File(mFilesDir, BACKUP_MANIFEST_FILENAME);
+            mMetadataFile = new File(mFilesDir, BACKUP_METADATA_FILENAME);
+!!!41326263.java!!!	preflightCheck() : int
+            if (mPreflightHook == null) {
+                if (MORE_DEBUG) {
+                    Slog.v(TAG, "No preflight check");
+                }
+                return BackupTransport.TRANSPORT_OK;
+            }
+            if (initializeAgent()) {
+                int result = mPreflightHook.preflightFullBackup(mPkg, mAgent);
+                if (MORE_DEBUG) {
+                    Slog.v(TAG, "preflight returned " + result);
+                }
+                return result;
+            } else {
+                Slog.w(TAG, "Unable to bind to full agent for " + mPkg.packageName);
+                return BackupTransport.AGENT_ERROR;
+            }
+!!!41326391.java!!!	backupOnePackage() : int
+            int result = BackupTransport.AGENT_ERROR;
+
+            if (initializeAgent()) {
+                ParcelFileDescriptor[] pipes = null;
+                try {
+                    pipes = ParcelFileDescriptor.createPipe();
+
+                    ApplicationInfo app = mPkg.applicationInfo;
+                    final boolean isSharedStorage =
+                            mPkg.packageName.equals(SHARED_BACKUP_AGENT_PACKAGE);
+                    final boolean sendApk = mIncludeApks
+                            && !isSharedStorage
+                            && ((app.privateFlags & ApplicationInfo.PRIVATE_FLAG_FORWARD_LOCK) == 0)
+                            && ((app.flags & ApplicationInfo.FLAG_SYSTEM) == 0 ||
+                            (app.flags & ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) != 0);
+
+                    // TODO: http://b/22388012
+                    byte[] widgetBlob = AppWidgetBackupBridge.getWidgetState(mPkg.packageName,
+                            UserHandle.USER_SYSTEM);
+
+                    final int token = generateToken();
+                    FullBackupRunner runner = new FullBackupRunner(mPkg, mAgent, pipes[1],
+                            token, sendApk, !isSharedStorage, widgetBlob);
+                    pipes[1].close();   // the runner has dup'd it
+                    pipes[1] = null;
+                    Thread t = new Thread(runner, "app-data-runner");
+                    t.start();
+
+                    // Now pull data from the app and stuff it into the output
+                    routeSocketDataToOutput(pipes[0], mOutput);
+
+                    if (!waitUntilOperationComplete(token)) {
+                        Slog.e(TAG, "Full backup failed on package " + mPkg.packageName);
+                    } else {
+                        if (MORE_DEBUG) {
+                            Slog.d(TAG, "Full package backup success: " + mPkg.packageName);
+                        }
+                        result = BackupTransport.TRANSPORT_OK;
+                    }
+                } catch (IOException e) {
+                    Slog.e(TAG, "Error backing up " + mPkg.packageName + ": " + e.getMessage());
+                    result = BackupTransport.AGENT_ERROR;
+                } finally {
+                    try {
+                        // flush after every package
+                        mOutput.flush();
+                        if (pipes != null) {
+                            if (pipes[0] != null) pipes[0].close();
+                            if (pipes[1] != null) pipes[1].close();
+                        }
+                    } catch (IOException e) {
+                        Slog.w(TAG, "Error bringing down backup stack");
+                        result = BackupTransport.TRANSPORT_ERROR;
+                    }
+                }
+            } else {
+                Slog.w(TAG, "Unable to bind to full agent for " + mPkg.packageName);
+            }
+            tearDown();
+            return result;
+!!!41326519.java!!!	sendQuotaExceeded(in backupDataBytes : long, in quotaBytes : long) : void
+            if (initializeAgent()) {
+                try {
+                    mAgent.doQuotaExceeded(backupDataBytes, quotaBytes);
+                } catch (RemoteException e) {
+                    Slog.e(TAG, "Remote exception while telling agent about quota exceeded");
+                }
+            }
+!!!41326647.java!!!	initializeAgent() : boolean
+            if (mAgent == null) {
+                if (MORE_DEBUG) {
+                    Slog.d(TAG, "Binding to full backup agent : " + mPkg.packageName);
+                }
+                mAgent = bindToAgentSynchronous(mPkg.applicationInfo,
+                        IApplicationThread.BACKUP_MODE_FULL);
+            }
+            return mAgent != null;
+!!!41326775.java!!!	writeApkToBackup(inout pkg : PackageInfo, inout output : FullBackupDataOutput) : void
+            // Forward-locked apps, system-bundled .apks, etc are filtered out before we get here
+            // TODO: handle backing up split APKs
+            final String appSourceDir = pkg.applicationInfo.getBaseCodePath();
+            final String apkDir = new File(appSourceDir).getParent();
+            FullBackup.backupToTar(pkg.packageName, FullBackup.APK_TREE_TOKEN, null,
+                    apkDir, appSourceDir, output);
+
+            // TODO: migrate this to SharedStorageBackup, since AID_SYSTEM
+            // doesn't have access to external storage.
+
+            // Save associated .obb content if it exists and we did save the apk
+            // check for .obb and save those too
+            // TODO: http://b/22388012
+            final UserEnvironment userEnv = new UserEnvironment(UserHandle.USER_SYSTEM);
+            final File obbDir = userEnv.buildExternalStorageAppObbDirs(pkg.packageName)[0];
+            if (obbDir != null) {
+                if (MORE_DEBUG) Log.i(TAG, "obb dir: " + obbDir.getAbsolutePath());
+                File[] obbFiles = obbDir.listFiles();
+                if (obbFiles != null) {
+                    final String obbDirName = obbDir.getAbsolutePath();
+                    for (File obb : obbFiles) {
+                        FullBackup.backupToTar(pkg.packageName, FullBackup.OBB_TREE_TOKEN, null,
+                                obbDirName, obb.getAbsolutePath(), output);
+                    }
+                }
+            }
+!!!41326903.java!!!	writeAppManifest(inout pkg : PackageInfo, inout manifestFile : File, inout withApk : boolean, inout withWidgets : boolean) : void
+            // Manifest format. All data are strings ending in LF:
+            //     BACKUP_MANIFEST_VERSION, currently 1
+            //
+            // Version 1:
+            //     package name
+            //     package's versionCode
+            //     platform versionCode
+            //     getInstallerPackageName() for this package (maybe empty)
+            //     boolean: "1" if archive includes .apk; any other string means not
+            //     number of signatures == N
+            // N*:    signature byte array in ascii format per Signature.toCharsString()
+            StringBuilder builder = new StringBuilder(4096);
+            StringBuilderPrinter printer = new StringBuilderPrinter(builder);
+
+            printer.println(Integer.toString(BACKUP_MANIFEST_VERSION));
+            printer.println(pkg.packageName);
+            printer.println(Integer.toString(pkg.versionCode));
+            printer.println(Integer.toString(Build.VERSION.SDK_INT));
+
+            String installerName = mPackageManager.getInstallerPackageName(pkg.packageName);
+            printer.println((installerName != null) ? installerName : "");
+
+            printer.println(withApk ? "1" : "0");
+            if (pkg.signatures == null) {
+                printer.println("0");
+            } else {
+                printer.println(Integer.toString(pkg.signatures.length));
+                for (Signature sig : pkg.signatures) {
+                    printer.println(sig.toCharsString());
+                }
+            }
+
+            FileOutputStream outstream = new FileOutputStream(manifestFile);
+            outstream.write(builder.toString().getBytes());
+            outstream.close();
+
+            // We want the manifest block in the archive stream to be idempotent:
+            // each time we generate a backup stream for the app, we want the manifest
+            // block to be identical.  The underlying tar mechanism sees it as a file,
+            // though, and will propagate its mtime, causing the tar header to vary.
+            // Avoid this problem by pinning the mtime to zero.
+            manifestFile.setLastModified(0);
+!!!41327031.java!!!	writeMetadata(inout pkg : PackageInfo, inout destination : File, inout widgetData : byte) : void
+            StringBuilder b = new StringBuilder(512);
+            StringBuilderPrinter printer = new StringBuilderPrinter(b);
+            printer.println(Integer.toString(BACKUP_METADATA_VERSION));
+            printer.println(pkg.packageName);
+
+            FileOutputStream fout = new FileOutputStream(destination);
+            BufferedOutputStream bout = new BufferedOutputStream(fout);
+            DataOutputStream out = new DataOutputStream(bout);
+            bout.write(b.toString().getBytes());    // bypassing DataOutputStream
+
+            if (widgetData != null && widgetData.length > 0) {
+                out.writeInt(BACKUP_WIDGET_METADATA_TOKEN);
+                out.writeInt(widgetData.length);
+                out.write(widgetData);
+            }
+            bout.flush();
+            out.close();
+
+            // As with the manifest file, guarantee idempotence of the archive metadata
+            // for the widget block by using a fixed mtime on the transient file.
+            destination.setLastModified(0);
+!!!41327159.java!!!	tearDown() : void
+            if (mPkg != null) {
+                tearDownAgentAndKill(mPkg.applicationInfo);
+            }

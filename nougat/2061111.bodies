@@ -1,0 +1,283 @@
+class WifiLastResortWatchdog
+!!!36843191.java!!!	WifiLastResortWatchdog(inout wifiMetrics : WifiMetrics)
+        mWifiMetrics = wifiMetrics;
+!!!36843319.java!!!	updateAvailableNetworks(inout availableNetworks : List<Pair<ScanDetail, WifiConfiguration>>) : void
+        if (VDBG) Log.v(TAG, "updateAvailableNetworks: size = " + availableNetworks.size());
+        // Add new networks to mRecentAvailableNetworks
+        if (availableNetworks != null) {
+            for (Pair<ScanDetail, WifiConfiguration> pair : availableNetworks) {
+                final ScanDetail scanDetail = pair.first;
+                final WifiConfiguration config = pair.second;
+                ScanResult scanResult = scanDetail.getScanResult();
+                if (scanResult == null) continue;
+                String bssid = scanResult.BSSID;
+                String ssid = "\"" + scanDetail.getSSID() + "\"";
+                if (VDBG) Log.v(TAG, " " + bssid + ": " + scanDetail.getSSID());
+                // Cache the scanResult & WifiConfig
+                AvailableNetworkFailureCount availableNetworkFailureCount =
+                        mRecentAvailableNetworks.get(bssid);
+                if (availableNetworkFailureCount == null) {
+                    // New network is available
+                    availableNetworkFailureCount = new AvailableNetworkFailureCount(config);
+                    availableNetworkFailureCount.ssid = ssid;
+
+                    // Count AP for this SSID
+                    Pair<AvailableNetworkFailureCount, Integer> ssidFailsAndApCount =
+                            mSsidFailureCount.get(ssid);
+                    if (ssidFailsAndApCount == null) {
+                        // This is a new SSID, create new FailureCount for it and set AP count to 1
+                        ssidFailsAndApCount = Pair.create(new AvailableNetworkFailureCount(config),
+                                1);
+                        setWatchdogTriggerEnabled(true);
+                    } else {
+                        final Integer numberOfAps = ssidFailsAndApCount.second;
+                        // This is not a new SSID, increment the AP count for it
+                        ssidFailsAndApCount = Pair.create(ssidFailsAndApCount.first,
+                                numberOfAps + 1);
+                    }
+                    mSsidFailureCount.put(ssid, ssidFailsAndApCount);
+                }
+                // refresh config if it is not null
+                if (config != null) {
+                    availableNetworkFailureCount.config = config;
+                }
+                // If we saw a network, set its Age to -1 here, aging iteration will set it to 0
+                availableNetworkFailureCount.age = -1;
+                mRecentAvailableNetworks.put(bssid, availableNetworkFailureCount);
+            }
+        }
+
+        // Iterate through available networks updating timeout counts & removing networks.
+        Iterator<Map.Entry<String, AvailableNetworkFailureCount>> it =
+                mRecentAvailableNetworks.entrySet().iterator();
+        while (it.hasNext()) {
+            Map.Entry<String, AvailableNetworkFailureCount> entry = it.next();
+            if (entry.getValue().age < MAX_BSSID_AGE - 1) {
+                entry.getValue().age++;
+            } else {
+                // Decrement this SSID : AP count
+                String ssid = entry.getValue().ssid;
+                Pair<AvailableNetworkFailureCount, Integer> ssidFails =
+                            mSsidFailureCount.get(ssid);
+                if (ssidFails != null) {
+                    Integer apCount = ssidFails.second - 1;
+                    if (apCount > 0) {
+                        ssidFails = Pair.create(ssidFails.first, apCount);
+                        mSsidFailureCount.put(ssid, ssidFails);
+                    } else {
+                        mSsidFailureCount.remove(ssid);
+                    }
+                } else {
+                    if (DBG) {
+                        Log.d(TAG, "updateAvailableNetworks: SSID to AP count mismatch for "
+                                + ssid);
+                    }
+                }
+                it.remove();
+            }
+        }
+        if (VDBG) Log.v(TAG, toString());
+!!!36843447.java!!!	noteConnectionFailureAndTriggerIfNeeded(inout ssid : String, inout bssid : String, in reason : int) : boolean
+        if (VDBG) {
+            Log.v(TAG, "noteConnectionFailureAndTriggerIfNeeded: [" + ssid + ", " + bssid + ", "
+                    + reason + "]");
+        }
+        // Update failure count for the failing network
+        updateFailureCountForNetwork(ssid, bssid, reason);
+
+        // Have we met conditions to trigger the Watchdog Wifi restart?
+        boolean isRestartNeeded = checkTriggerCondition();
+        if (VDBG) Log.v(TAG, "isRestartNeeded = " + isRestartNeeded);
+        if (isRestartNeeded) {
+            // Stop the watchdog from triggering until re-enabled
+            setWatchdogTriggerEnabled(false);
+            restartWifiStack();
+            // increment various watchdog trigger count stats
+            incrementWifiMetricsTriggerCounts();
+            clearAllFailureCounts();
+        }
+        return isRestartNeeded;
+!!!36843575.java!!!	connectedStateTransition(inout isEntering : boolean) : void
+        if (VDBG) Log.v(TAG, "connectedStateTransition: isEntering = " + isEntering);
+        mWifiIsConnected = isEntering;
+        if (isEntering) {
+            // We connected to something! Reset failure counts for everything
+            clearAllFailureCounts();
+            // If the watchdog trigger was disabled (it triggered), connecting means we did
+            // something right, re-enable it so it can fire again.
+            setWatchdogTriggerEnabled(true);
+        }
+!!!36843703.java!!!	updateFailureCountForNetwork(inout ssid : String, inout bssid : String, in reason : int) : void
+        if (VDBG) {
+            Log.v(TAG, "updateFailureCountForNetwork: [" + ssid + ", " + bssid + ", "
+                    + reason + "]");
+        }
+        if (BSSID_ANY.equals(bssid)) {
+            incrementSsidFailureCount(ssid, reason);
+        } else {
+            // Bssid count is actually unused except for logging purposes
+            // SSID count is incremented within the BSSID counting method
+            incrementBssidFailureCount(ssid, bssid, reason);
+        }
+!!!36843831.java!!!	incrementSsidFailureCount(inout ssid : String, in reason : int) : void
+        Pair<AvailableNetworkFailureCount, Integer> ssidFails = mSsidFailureCount.get(ssid);
+        if (ssidFails == null) {
+            if (DBG) {
+                Log.v(TAG, "updateFailureCountForNetwork: No networks for ssid = " + ssid);
+            }
+            return;
+        }
+        AvailableNetworkFailureCount failureCount = ssidFails.first;
+        failureCount.incrementFailureCount(reason);
+!!!36843959.java!!!	incrementBssidFailureCount(inout ssid : String, inout bssid : String, in reason : int) : void
+        AvailableNetworkFailureCount availableNetworkFailureCount =
+                mRecentAvailableNetworks.get(bssid);
+        if (availableNetworkFailureCount == null) {
+            if (DBG) {
+                Log.d(TAG, "updateFailureCountForNetwork: Unable to find Network [" + ssid
+                        + ", " + bssid + "]");
+            }
+            return;
+        }
+        if (!availableNetworkFailureCount.ssid.equals(ssid)) {
+            if (DBG) {
+                Log.d(TAG, "updateFailureCountForNetwork: Failed connection attempt has"
+                        + " wrong ssid. Failed [" + ssid + ", " + bssid + "], buffered ["
+                        + availableNetworkFailureCount.ssid + ", " + bssid + "]");
+            }
+            return;
+        }
+        if (availableNetworkFailureCount.config == null) {
+            if (VDBG) {
+                Log.v(TAG, "updateFailureCountForNetwork: network has no config ["
+                        + ssid + ", " + bssid + "]");
+            }
+        }
+        availableNetworkFailureCount.incrementFailureCount(reason);
+        incrementSsidFailureCount(ssid, reason);
+!!!36844087.java!!!	checkTriggerCondition() : boolean
+        if (VDBG) Log.v(TAG, "checkTriggerCondition.");
+        // Don't check Watchdog trigger if wifi is in a connected state
+        // (This should not occur, but we want to protect against any race conditions)
+        if (mWifiIsConnected) return false;
+        // Don't check Watchdog trigger if trigger is not enabled
+        if (!mWatchdogAllowedToTrigger) return false;
+
+        boolean atleastOneNetworkHasEverConnected = false;
+        for (Map.Entry<String, AvailableNetworkFailureCount> entry
+                : mRecentAvailableNetworks.entrySet()) {
+            if (entry.getValue().config != null
+                    && entry.getValue().config.getNetworkSelectionStatus().getHasEverConnected()) {
+                atleastOneNetworkHasEverConnected = true;
+            }
+            if (!isOverFailureThreshold(entry.getKey())) {
+                // This available network is not over failure threshold, meaning we still have a
+                // network to try connecting to
+                return false;
+            }
+        }
+        // We have met the failure count for every available network & there is at-least one network
+        // we have previously connected to present.
+        if (VDBG) {
+            Log.v(TAG, "checkTriggerCondition: return = " + atleastOneNetworkHasEverConnected);
+        }
+        return atleastOneNetworkHasEverConnected;
+!!!36844215.java!!!	restartWifiStack() : void
+        if (VDBG) Log.v(TAG, "restartWifiStack.");
+        Log.i(TAG, "Triggered.");
+        if (DBG) Log.d(TAG, toString());
+        // <TODO>
+!!!36844343.java!!!	incrementWifiMetricsTriggerCounts() : void
+        if (VDBG) Log.v(TAG, "incrementWifiMetricsTriggerCounts.");
+        mWifiMetrics.incrementNumLastResortWatchdogTriggers();
+        mWifiMetrics.addCountToNumLastResortWatchdogAvailableNetworksTotal(
+                mSsidFailureCount.size());
+        // Number of networks over each failure type threshold, present at trigger time
+        int badAuth = 0;
+        int badAssoc = 0;
+        int badDhcp = 0;
+        for (Map.Entry<String, Pair<AvailableNetworkFailureCount, Integer>> entry
+                : mSsidFailureCount.entrySet()) {
+            badAuth += (entry.getValue().first.authenticationFailure >= FAILURE_THRESHOLD) ? 1 : 0;
+            badAssoc += (entry.getValue().first.associationRejection >= FAILURE_THRESHOLD) ? 1 : 0;
+            badDhcp += (entry.getValue().first.dhcpFailure >= FAILURE_THRESHOLD) ? 1 : 0;
+        }
+        if (badAuth > 0) {
+            mWifiMetrics.addCountToNumLastResortWatchdogBadAuthenticationNetworksTotal(badAuth);
+            mWifiMetrics.incrementNumLastResortWatchdogTriggersWithBadAuthentication();
+        }
+        if (badAssoc > 0) {
+            mWifiMetrics.addCountToNumLastResortWatchdogBadAssociationNetworksTotal(badAssoc);
+            mWifiMetrics.incrementNumLastResortWatchdogTriggersWithBadAssociation();
+        }
+        if (badDhcp > 0) {
+            mWifiMetrics.addCountToNumLastResortWatchdogBadDhcpNetworksTotal(badDhcp);
+            mWifiMetrics.incrementNumLastResortWatchdogTriggersWithBadDhcp();
+        }
+!!!36844471.java!!!	clearAllFailureCounts() : void
+        if (VDBG) Log.v(TAG, "clearAllFailureCounts.");
+        for (Map.Entry<String, AvailableNetworkFailureCount> entry
+                : mRecentAvailableNetworks.entrySet()) {
+            final AvailableNetworkFailureCount failureCount = entry.getValue();
+            entry.getValue().resetCounts();
+        }
+        for (Map.Entry<String, Pair<AvailableNetworkFailureCount, Integer>> entry
+                : mSsidFailureCount.entrySet()) {
+            final AvailableNetworkFailureCount failureCount = entry.getValue().first;
+            failureCount.resetCounts();
+        }
+!!!36844599.java!!!	getRecentAvailableNetworks() : String
+        return mRecentAvailableNetworks;
+!!!36844727.java!!!	setWatchdogTriggerEnabled(inout enable : boolean) : void
+        if (VDBG) Log.v(TAG, "setWatchdogTriggerEnabled: enable = " + enable);
+        mWatchdogAllowedToTrigger = enable;
+!!!36844855.java!!!	toString() : String
+        StringBuilder sb = new StringBuilder();
+        sb.append("mWatchdogAllowedToTrigger: ").append(mWatchdogAllowedToTrigger);
+        sb.append("\nmWifiIsConnected: ").append(mWifiIsConnected);
+        sb.append("\nmRecentAvailableNetworks: ").append(mRecentAvailableNetworks.size());
+        for (Map.Entry<String, AvailableNetworkFailureCount> entry
+                : mRecentAvailableNetworks.entrySet()) {
+            sb.append("\n ").append(entry.getKey()).append(": ").append(entry.getValue());
+        }
+        sb.append("\nmSsidFailureCount:");
+        for (Map.Entry<String, Pair<AvailableNetworkFailureCount, Integer>> entry :
+                mSsidFailureCount.entrySet()) {
+            final AvailableNetworkFailureCount failureCount = entry.getValue().first;
+            final Integer apCount = entry.getValue().second;
+            sb.append("\n").append(entry.getKey()).append(": ").append(apCount).append(", ")
+                    .append(failureCount.toString());
+        }
+        return sb.toString();
+!!!36844983.java!!!	isOverFailureThreshold(inout bssid : String) : boolean
+        if ((getFailureCount(bssid, FAILURE_CODE_ASSOCIATION) >= FAILURE_THRESHOLD)
+                || (getFailureCount(bssid, FAILURE_CODE_AUTHENTICATION) >= FAILURE_THRESHOLD)
+                || (getFailureCount(bssid, FAILURE_CODE_DHCP) >= FAILURE_THRESHOLD)) {
+            return true;
+        }
+        return false;
+!!!36845111.java!!!	getFailureCount(inout bssid : String, in reason : int) : int
+        AvailableNetworkFailureCount availableNetworkFailureCount =
+                mRecentAvailableNetworks.get(bssid);
+        if (availableNetworkFailureCount == null) {
+            return 0;
+        }
+        String ssid = availableNetworkFailureCount.ssid;
+        Pair<AvailableNetworkFailureCount, Integer> ssidFails = mSsidFailureCount.get(ssid);
+        if (ssidFails == null) {
+            if (DBG) {
+                Log.d(TAG, "getFailureCount: Could not find SSID count for " + ssid);
+            }
+            return 0;
+        }
+        final AvailableNetworkFailureCount failCount = ssidFails.first;
+        switch (reason) {
+            case FAILURE_CODE_ASSOCIATION:
+                return failCount.associationRejection;
+            case FAILURE_CODE_AUTHENTICATION:
+                return failCount.authenticationFailure;
+            case FAILURE_CODE_DHCP:
+                return failCount.dhcpFailure;
+            default:
+                return 0;
+        }

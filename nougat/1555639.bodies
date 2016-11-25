@@ -1,0 +1,167 @@
+class HotplugDetectionAction
+!!!32900535.java!!!	HotplugDetectionAction(inout source : HdmiCecLocalDevice)
+        super(source);
+!!!32900663.java!!!	start() : boolean
+        Slog.v(TAG, "Hot-plug dection started.");
+
+        mState = STATE_WAIT_FOR_NEXT_POLLING;
+        mTimeoutCount = 0;
+
+        // Start timer without polling.
+        // The first check for all devices will be initiated 15 seconds later.
+        addTimer(mState, POLLING_INTERVAL_MS);
+        return true;
+!!!32900791.java!!!	processCommand(inout cmd : HdmiCecMessage) : boolean
+        // No-op
+        return false;
+!!!32900919.java!!!	handleTimerEvent(in state : int) : void
+        if (mState != state) {
+            return;
+        }
+
+        if (mState == STATE_WAIT_FOR_NEXT_POLLING) {
+            mTimeoutCount = (mTimeoutCount + 1) % TIMEOUT_COUNT;
+            pollDevices();
+        }
+!!!32901047.java!!!	pollAllDevicesNow() : void
+        // Clear existing timer to avoid overlapped execution
+        mActionTimer.clearTimerMessage();
+
+        mTimeoutCount = 0;
+        mState = STATE_WAIT_FOR_NEXT_POLLING;
+        pollAllDevices();
+
+        addTimer(mState, POLLING_INTERVAL_MS);
+!!!32901175.java!!!	pollDevices() : void
+        // All device check called every 15 seconds.
+        if (mTimeoutCount == 0) {
+            pollAllDevices();
+        } else {
+            if (tv().isSystemAudioActivated()) {
+                pollAudioSystem();
+            }
+        }
+
+        addTimer(mState, POLLING_INTERVAL_MS);
+!!!32901303.java!!!	pollAllDevices() : void
+        Slog.v(TAG, "Poll all devices.");
+
+        pollDevices(new DevicePollingCallback() {
+            @Override
+            public void onPollingFinished(List<Integer> ackedAddress) {
+                checkHotplug(ackedAddress, false);
+            }
+        }, Constants.POLL_ITERATION_IN_ORDER
+                | Constants.POLL_STRATEGY_REMOTES_DEVICES, HdmiConfig.HOTPLUG_DETECTION_RETRY);
+!!!32901431.java!!!	pollAudioSystem() : void
+        Slog.v(TAG, "Poll audio system.");
+
+        pollDevices(new DevicePollingCallback() {
+            @Override
+            public void onPollingFinished(List<Integer> ackedAddress) {
+                checkHotplug(ackedAddress, true);
+            }
+        }, Constants.POLL_ITERATION_IN_ORDER
+                | Constants.POLL_STRATEGY_SYSTEM_AUDIO, HdmiConfig.HOTPLUG_DETECTION_RETRY);
+!!!32901559.java!!!	checkHotplug(inout ackedAddress : List<Integer>, inout audioOnly : boolean) : void
+        BitSet currentInfos = infoListToBitSet(tv().getDeviceInfoList(false), audioOnly);
+        BitSet polledResult = addressListToBitSet(ackedAddress);
+
+        // At first, check removed devices.
+        BitSet removed = complement(currentInfos, polledResult);
+        int index = -1;
+        while ((index = removed.nextSetBit(index + 1)) != -1) {
+            if (index == Constants.ADDR_AUDIO_SYSTEM) {
+                HdmiDeviceInfo avr = tv().getAvrDeviceInfo();
+                if (avr != null && tv().isConnected(avr.getPortId())) {
+                    ++mAvrStatusCount;
+                    Slog.w(TAG, "Ack not returned from AVR. count: " + mAvrStatusCount);
+                    if (mAvrStatusCount < AVR_COUNT_MAX) {
+                        continue;
+                    }
+                }
+            }
+            Slog.v(TAG, "Remove device by hot-plug detection:" + index);
+            removeDevice(index);
+        }
+
+        // Reset the counter if the ack is returned from AVR.
+        if (!removed.get(Constants.ADDR_AUDIO_SYSTEM)) {
+            mAvrStatusCount = 0;
+        }
+
+        // Next, check added devices.
+        BitSet added = complement(polledResult, currentInfos);
+        index = -1;
+        while ((index = added.nextSetBit(index + 1)) != -1) {
+            Slog.v(TAG, "Add device by hot-plug detection:" + index);
+            addDevice(index);
+        }
+!!!32901687.java!!!	infoListToBitSet(inout infoList : List<HdmiDeviceInfo>, inout audioOnly : boolean) : BitSet
+        BitSet set = new BitSet(NUM_OF_ADDRESS);
+        for (HdmiDeviceInfo info : infoList) {
+            if (audioOnly) {
+                if (info.getDeviceType() == HdmiDeviceInfo.DEVICE_AUDIO_SYSTEM) {
+                    set.set(info.getLogicalAddress());
+                }
+            } else {
+                set.set(info.getLogicalAddress());
+            }
+        }
+        return set;
+!!!32901815.java!!!	addressListToBitSet(inout list : List<Integer>) : BitSet
+        BitSet set = new BitSet(NUM_OF_ADDRESS);
+        for (Integer value : list) {
+            set.set(value);
+        }
+        return set;
+!!!32901943.java!!!	complement(inout first : BitSet, inout second : BitSet) : BitSet
+        // Need to clone it so that it doesn't touch original set.
+        BitSet clone = (BitSet) first.clone();
+        clone.andNot(second);
+        return clone;
+!!!32902071.java!!!	addDevice(in addedAddress : int) : void
+        // Sending <Give Physical Address> will initiate new device action.
+        sendCommand(HdmiCecMessageBuilder.buildGivePhysicalAddress(getSourceAddress(),
+                addedAddress));
+!!!32902199.java!!!	removeDevice(in removedAddress : int) : void
+        mayChangeRoutingPath(removedAddress);
+        mayCancelDeviceSelect(removedAddress);
+        mayCancelOneTouchRecord(removedAddress);
+        mayDisableSystemAudioAndARC(removedAddress);
+
+        tv().removeCecDevice(removedAddress);
+!!!32902327.java!!!	mayChangeRoutingPath(in address : int) : void
+        HdmiDeviceInfo info = tv().getCecDeviceInfo(address);
+        if (info != null) {
+            tv().handleRemoveActiveRoutingPath(info.getPhysicalAddress());
+        }
+!!!32902455.java!!!	mayCancelDeviceSelect(in address : int) : void
+        List<DeviceSelectAction> actions = getActions(DeviceSelectAction.class);
+        if (actions.isEmpty()) {
+            return;
+        }
+
+        // Should have only one Device Select Action
+        DeviceSelectAction action = actions.get(0);
+        if (action.getTargetAddress() == address) {
+            removeAction(DeviceSelectAction.class);
+        }
+!!!32902583.java!!!	mayCancelOneTouchRecord(in address : int) : void
+        List<OneTouchRecordAction> actions = getActions(OneTouchRecordAction.class);
+        for (OneTouchRecordAction action : actions) {
+            if (action.getRecorderAddress() == address) {
+                removeAction(action);
+            }
+        }
+!!!32902711.java!!!	mayDisableSystemAudioAndARC(in address : int) : void
+        if (HdmiUtils.getTypeFromAddress(address) != HdmiDeviceInfo.DEVICE_AUDIO_SYSTEM) {
+            return;
+        }
+
+        // Turn off system audio mode and update settings.
+        tv().setSystemAudioMode(false, true);
+        if (tv().isArcEstablished()) {
+            tv().setAudioReturnChannel(false);
+            addAndStartAction(new RequestArcTerminationAction(localDevice(), address));
+        }

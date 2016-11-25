@@ -1,0 +1,146 @@
+class UnrefedPooledCache
+!!!36428343.java!!!	UnrefedPooledCache(in targetSize : int, in nonPooledFraction : float)
+        mCache = new LinkedHashMap<K, V>(0, 0.75f, true);
+        mPool = new LinkedBlockingQueue<V>();
+        final int nonPooledSize = Math.round(targetSize * nonPooledFraction);
+        if (nonPooledSize > 0) {
+            mNonPooledCache = new NonPooledCache(nonPooledSize);
+        } else {
+            mNonPooledCache = null;
+        }
+        mTargetSize = targetSize - nonPooledSize;
+!!!36428471.java!!!	get(inout key : K, inout incrementRefCount : boolean) : V
+        Trace.beginSection("cache get");
+        synchronized (mCache) {
+            V result = mCache.get(key);
+            if (result == null && mNonPooledCache != null) {
+                result = mNonPooledCache.get(key);
+            }
+            if (incrementRefCount && result != null) {
+                result.acquireReference();
+            }
+            Trace.endSection();
+            return result;
+        }
+!!!36428599.java!!!	put(inout key : K, inout value : V) : V
+        Trace.beginSection("cache put");
+        // Null values not supported.
+        if (value == null) {
+            Trace.endSection();
+            return null;
+        }
+        synchronized (mCache) {
+            final V prev;
+            if (value.isEligibleForPooling()) {
+                prev = mCache.put(key, value);
+            } else if (mNonPooledCache != null) {
+                prev = mNonPooledCache.put(key, value);
+            } else {
+                prev = null;
+            }
+            Trace.endSection();
+            return prev;
+        }
+!!!36428727.java!!!	offer(inout value : V) : void
+        Trace.beginSection("pool offer");
+        if (value.getRefCount() != 0 || !value.isEligibleForPooling()) {
+            Trace.endSection();
+            throw new IllegalArgumentException("unexpected offer of an invalid object: " + value);
+        }
+        mPool.offer(value);
+        Trace.endSection();
+!!!36428855.java!!!	poll() : V
+        Trace.beginSection("pool poll");
+        final V pooled = mPool.poll();
+        if (pooled != null) {
+            Trace.endSection();
+            return pooled;
+        }
+
+        synchronized (mCache) {
+            int unrefSize = 0;
+            Map.Entry<K, V> eldestUnref = null;
+            for (Map.Entry<K, V> entry : mCache.entrySet()) {
+                final V value = entry.getValue();
+                if (value.getRefCount() > 0 || !value.isEligibleForPooling()) {
+                    continue;
+                }
+                if (eldestUnref == null) {
+                    eldestUnref = entry;
+                }
+                unrefSize += sizeOf(value);
+                if (unrefSize > mTargetSize) {
+                    break;
+                }
+            }
+            // only return a scavenged cache entry if the cache has enough
+            // eligible (unreferenced) items
+            if (unrefSize <= mTargetSize) {
+                if (DEBUG) {
+                    Log.e(TAG, "POOL SCAVENGE FAILED, cache not fully warm yet. szDelta="
+                            + (mTargetSize-unrefSize));
+                }
+                Trace.endSection();
+                return null;
+            } else {
+                mCache.remove(eldestUnref.getKey());
+                if (DEBUG) {
+                    Log.e(TAG, "POOL SCAVENGE SUCCESS, oldKey=" + eldestUnref.getKey());
+                }
+                Trace.endSection();
+                return eldestUnref.getValue();
+            }
+        }
+!!!36428983.java!!!	sizeOf(inout value : V) : int
+        return 1;
+!!!36429111.java!!!	toDebugString() : String
+        if (DEBUG) {
+            final StringBuilder sb = new StringBuilder("[");
+            sb.append(super.toString());
+            int size = 0;
+            synchronized (mCache) {
+                sb.append(" poolCount=");
+                sb.append(mPool.size());
+                sb.append(" cacheSize=");
+                sb.append(mCache.size());
+                if (mNonPooledCache != null) {
+                    sb.append(" nonPooledCacheSize=");
+                    sb.append(mNonPooledCache.size());
+                }
+                sb.append("\n---------------------");
+                for (V val : mPool) {
+                    size += sizeOf(val);
+                    sb.append("\n\tpool item: ");
+                    sb.append(val);
+                }
+                sb.append("\n---------------------");
+                for (Map.Entry<K, V> item : mCache.entrySet()) {
+                    final V val = item.getValue();
+                    sb.append("\n\tcache key=");
+                    sb.append(item.getKey());
+                    sb.append(" val=");
+                    sb.append(val);
+                    size += sizeOf(val);
+                }
+                sb.append("\n---------------------");
+                if (mNonPooledCache != null) {
+                    for (Map.Entry<K, V> item : mNonPooledCache.snapshot().entrySet()) {
+                        final V val = item.getValue();
+                        sb.append("\n\tnon-pooled cache key=");
+                        sb.append(item.getKey());
+                        sb.append(" val=");
+                        sb.append(val);
+                        size += sizeOf(val);
+                    }
+                    sb.append("\n---------------------");
+                }
+                sb.append("\nTOTAL SIZE=" + size);
+            }
+            sb.append("]");
+            return sb.toString();
+        } else {
+            return null;
+        }
+!!!36429495.java!!!	clear() : void
+        mCache.clear();
+        mPool.clear();

@@ -1,0 +1,365 @@
+class ATSParser
+!!!39986231.cpp!!!	ATSParser(in flags : uint32_t = 0)
+    mPSISections.add(0 /* PID */, new PSISection);
+!!!39986359.cpp!!!	feedTSPacket(in data : void, in size : size_t, inout event : ATSParser::SyncEvent = NULL) : status_t
+    if (size != kTSPacketSize) {
+        ALOGE("Wrong TS packet size");
+        return BAD_VALUE;
+    }
+
+    ABitReader br((const uint8_t *)data, kTSPacketSize);
+    return parseTS(&br, event);
+!!!39986487.cpp!!!	signalDiscontinuity(in type : ATSParser::DiscontinuityType, in extra : sp<AMessage>) : void
+    int64_t mediaTimeUs;
+    if ((type & DISCONTINUITY_TIME) && extra != NULL) {
+        if (extra->findInt64(IStreamListener::kKeyMediaTimeUs, &mediaTimeUs)) {
+            mAbsoluteTimeAnchorUs = mediaTimeUs;
+        }
+        if ((mFlags & TS_TIMESTAMPS_ARE_ABSOLUTE)
+                && extra->findInt64(
+                    IStreamListener::kKeyRecentMediaTimeUs, &mediaTimeUs)) {
+            if (mAbsoluteTimeAnchorUs >= 0ll) {
+                mediaTimeUs -= mAbsoluteTimeAnchorUs;
+            }
+            if (mTimeOffsetValid) {
+                mediaTimeUs -= mTimeOffsetUs;
+            }
+            mLastRecoveredPTS = (mediaTimeUs * 9) / 100;
+        }
+    } else if (type == DISCONTINUITY_ABSOLUTE_TIME) {
+        int64_t timeUs;
+        if (!extra->findInt64("timeUs", &timeUs)) {
+            ALOGE("timeUs not found");
+            return;
+        }
+
+        if (!mPrograms.empty()) {
+            ALOGE("mPrograms is not empty");
+            return;
+        }
+        mAbsoluteTimeAnchorUs = timeUs;
+        return;
+    } else if (type == DISCONTINUITY_TIME_OFFSET) {
+        int64_t offset;
+        if (!extra->findInt64("offset", &offset)) {
+            ALOGE("offset not found");
+            return;
+        }
+
+        mTimeOffsetValid = true;
+        mTimeOffsetUs = offset;
+        return;
+    }
+
+    for (size_t i = 0; i < mPrograms.size(); ++i) {
+        mPrograms.editItemAt(i)->signalDiscontinuity(type, extra);
+    }
+!!!39986615.cpp!!!	signalEOS(in finalResult : status_t) : void
+    if (finalResult == (status_t) OK) {
+        ALOGE("finalResult not OK");
+        return;
+    }
+
+    for (size_t i = 0; i < mPrograms.size(); ++i) {
+        mPrograms.editItemAt(i)->signalEOS(finalResult);
+    }
+!!!39986743.cpp!!!	getSource(in type : ATSParser::SourceType) : sp<MediaSource>
+    sp<MediaSource> firstSourceFound;
+    for (size_t i = 0; i < mPrograms.size(); ++i) {
+        const sp<Program> &program = mPrograms.editItemAt(i);
+        sp<MediaSource> source = program->getSource(type);
+        if (source == NULL) {
+            continue;
+        }
+        if (firstSourceFound == NULL) {
+            firstSourceFound = source;
+        }
+        // Prefer programs with both audio/video
+        switch (type) {
+            case VIDEO: {
+                if (program->hasSource(AUDIO)) {
+                    return source;
+                }
+                break;
+            }
+
+            case AUDIO: {
+                if (program->hasSource(VIDEO)) {
+                    return source;
+                }
+                break;
+            }
+
+            default:
+                return source;
+        }
+    }
+
+    return firstSourceFound;
+!!!39986871.cpp!!!	hasSource(in type : ATSParser::SourceType) : bool
+    for (size_t i = 0; i < mPrograms.size(); ++i) {
+        const sp<Program> &program = mPrograms.itemAt(i);
+        if (program->hasSource(type)) {
+            return true;
+        }
+    }
+
+    return false;
+!!!39986999.cpp!!!	PTSTimeDeltaEstablished() : bool
+    if (mPrograms.isEmpty()) {
+        return false;
+    }
+
+    return mPrograms.editItemAt(0)->PTSTimeDeltaEstablished();
+!!!39987255.cpp!!!	parseProgramAssociationTable(inout br : ABitReader) : void
+    unsigned table_id = br->getBits(8);
+    ALOGV("  table_id = %u", table_id);
+    if (table_id != 0x00u) {
+        ALOGE("PAT data error!");
+        return ;
+    }
+    unsigned section_syntax_indictor = br->getBits(1);
+    ALOGV("  section_syntax_indictor = %u", section_syntax_indictor);
+
+    br->skipBits(1);  // '0'
+    MY_LOGV("  reserved = %u", br->getBits(2));
+
+    unsigned section_length = br->getBits(12);
+    ALOGV("  section_length = %u", section_length);
+
+    MY_LOGV("  transport_stream_id = %u", br->getBits(16));
+    MY_LOGV("  reserved = %u", br->getBits(2));
+    MY_LOGV("  version_number = %u", br->getBits(5));
+    MY_LOGV("  current_next_indicator = %u", br->getBits(1));
+    MY_LOGV("  section_number = %u", br->getBits(8));
+    MY_LOGV("  last_section_number = %u", br->getBits(8));
+
+    size_t numProgramBytes = (section_length - 5 /* header */ - 4 /* crc */);
+
+    for (size_t i = 0; i < numProgramBytes / 4; ++i) {
+        unsigned program_number = br->getBits(16);
+        ALOGV("    program_number = %u", program_number);
+
+        MY_LOGV("    reserved = %u", br->getBits(3));
+
+        if (program_number == 0) {
+            MY_LOGV("    network_PID = 0x%04x", br->getBits(13));
+        } else {
+            unsigned programMapPID = br->getBits(13);
+
+            ALOGV("    program_map_PID = 0x%04x", programMapPID);
+
+            bool found = false;
+            for (size_t index = 0; index < mPrograms.size(); ++index) {
+                const sp<Program> &program = mPrograms.itemAt(index);
+
+                if (program->number() == program_number) {
+                    program->updateProgramMapPID(programMapPID);
+                    found = true;
+                    break;
+                }
+            }
+
+            if (!found) {
+                mPrograms.push(
+                        new Program(this, program_number, programMapPID, mLastRecoveredPTS));
+            }
+
+            if (mPSISections.indexOfKey(programMapPID) < 0) {
+                mPSISections.add(programMapPID, new PSISection);
+            }
+        }
+    }
+
+    MY_LOGV("  CRC = 0x%08x", br->getBits(32));
+!!!39987639.cpp!!!	parsePID(inout br : ABitReader, in PID : uint, in continuity_counter : uint, in payload_unit_start_indicator : uint, inout event : ATSParser::SyncEvent) : status_t
+    ssize_t sectionIndex = mPSISections.indexOfKey(PID);
+
+    if (sectionIndex >= 0) {
+        sp<PSISection> section = mPSISections.valueAt(sectionIndex);
+
+        if (payload_unit_start_indicator) {
+            if (!section->isEmpty()) {
+                ALOGW("parsePID encounters payload_unit_start_indicator when section is not empty");
+                section->clear();
+            }
+
+            unsigned skip = br->getBits(8);
+            section->setSkipBytes(skip + 1);  // skip filler bytes + pointer field itself
+            br->skipBits(skip * 8);
+        }
+
+        if (br->numBitsLeft() % 8 != 0) {
+            return ERROR_MALFORMED;
+        }
+        status_t err = section->append(br->data(), br->numBitsLeft() / 8);
+
+        if (err != OK) {
+            return err;
+        }
+
+        if (!section->isComplete()) {
+            return OK;
+        }
+
+        if (!section->isCRCOkay()) {
+            return BAD_VALUE;
+        }
+        ABitReader sectionBits(section->data(), section->size());
+
+        if (PID == 0) {
+            parseProgramAssociationTable(&sectionBits);
+        } else {
+            bool handled = false;
+            for (size_t i = 0; i < mPrograms.size(); ++i) {
+                status_t err;
+                if (!mPrograms.editItemAt(i)->parsePSISection(
+                            PID, &sectionBits, &err)) {
+                    continue;
+                }
+
+                if (err != OK) {
+                    return err;
+                }
+
+                handled = true;
+                break;
+            }
+
+            if (!handled) {
+                mPSISections.removeItem(PID);
+                section.clear();
+            }
+        }
+
+        if (section != NULL) {
+            section->clear();
+        }
+
+        return OK;
+    }
+
+    bool handled = false;
+    for (size_t i = 0; i < mPrograms.size(); ++i) {
+        status_t err;
+        if (mPrograms.editItemAt(i)->parsePID(
+                    PID, continuity_counter, payload_unit_start_indicator,
+                    br, &err, event)) {
+            if (err != OK) {
+                return err;
+            }
+
+            handled = true;
+            break;
+        }
+    }
+
+    if (!handled) {
+        ALOGV("PID 0x%04x not handled.", PID);
+    }
+
+    return OK;
+!!!39987767.cpp!!!	parseAdaptationField(inout br : ABitReader, in PID : uint) : status_t
+    unsigned adaptation_field_length = br->getBits(8);
+
+    if (adaptation_field_length > 0) {
+        if (adaptation_field_length * 8 > br->numBitsLeft()) {
+            ALOGV("Adaptation field should be included in a single TS packet.");
+            return ERROR_MALFORMED;
+        }
+
+        unsigned discontinuity_indicator = br->getBits(1);
+
+        if (discontinuity_indicator) {
+            ALOGV("PID 0x%04x: discontinuity_indicator = 1 (!!!)", PID);
+        }
+
+        br->skipBits(2);
+        unsigned PCR_flag = br->getBits(1);
+
+        size_t numBitsRead = 4;
+
+        if (PCR_flag) {
+            if (adaptation_field_length * 8 < 52) {
+                return ERROR_MALFORMED;
+            }
+            br->skipBits(4);
+            uint64_t PCR_base = br->getBits(32);
+            PCR_base = (PCR_base << 1) | br->getBits(1);
+
+            br->skipBits(6);
+            unsigned PCR_ext = br->getBits(9);
+
+            // The number of bytes from the start of the current
+            // MPEG2 transport stream packet up and including
+            // the final byte of this PCR_ext field.
+            size_t byteOffsetFromStartOfTSPacket =
+                (188 - br->numBitsLeft() / 8);
+
+            uint64_t PCR = PCR_base * 300 + PCR_ext;
+
+            ALOGV("PID 0x%04x: PCR = 0x%016" PRIx64 " (%.2f)",
+                  PID, PCR, PCR / 27E6);
+
+            // The number of bytes received by this parser up to and
+            // including the final byte of this PCR_ext field.
+            uint64_t byteOffsetFromStart =
+                uint64_t(mNumTSPacketsParsed) * 188 + byteOffsetFromStartOfTSPacket;
+
+            for (size_t i = 0; i < mPrograms.size(); ++i) {
+                updatePCR(PID, PCR, byteOffsetFromStart);
+            }
+
+            numBitsRead += 52;
+        }
+
+        br->skipBits(adaptation_field_length * 8 - numBitsRead);
+    }
+    return OK;
+!!!39987895.cpp!!!	parseTS(inout br : ABitReader, inout event : ATSParser::SyncEvent) : status_t
+    ALOGV("---");
+
+    unsigned sync_byte = br->getBits(8);
+    if (sync_byte != 0x47u) {
+        ALOGE("[error] parseTS: return error as sync_byte=0x%x", sync_byte);
+        return BAD_VALUE;
+    }
+
+    if (br->getBits(1)) {  // transport_error_indicator
+        // silently ignore.
+        return OK;
+    }
+
+    unsigned payload_unit_start_indicator = br->getBits(1);
+    ALOGV("payload_unit_start_indicator = %u", payload_unit_start_indicator);
+
+    MY_LOGV("transport_priority = %u", br->getBits(1));
+
+    unsigned PID = br->getBits(13);
+    ALOGV("PID = 0x%04x", PID);
+
+    MY_LOGV("transport_scrambling_control = %u", br->getBits(2));
+
+    unsigned adaptation_field_control = br->getBits(2);
+    ALOGV("adaptation_field_control = %u", adaptation_field_control);
+
+    unsigned continuity_counter = br->getBits(4);
+    ALOGV("PID = 0x%04x, continuity_counter = %u", PID, continuity_counter);
+
+    // ALOGI("PID = 0x%04x, continuity_counter = %u", PID, continuity_counter);
+
+    status_t err = OK;
+
+    if (adaptation_field_control == 2 || adaptation_field_control == 3) {
+        err = parseAdaptationField(br, PID);
+    }
+    if (err == OK) {
+        if (adaptation_field_control == 1 || adaptation_field_control == 3) {
+            err = parsePID(br, PID, continuity_counter,
+                    payload_unit_start_indicator, event);
+        }
+    }
+
+    ++mNumTSPacketsParsed;
+
+    return err;

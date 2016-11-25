@@ -1,0 +1,147 @@
+class WriteCommand
+!!!44101431.java!!!	WriteCommand(inout context : Context, inout looper : Looper, inout adapter : IPrintDocumentAdapter, inout document : RemotePrintDocument::RemotePrintDocumentInfo, in pageCount : int, inout pages : PageRange, inout fileProvider : MutexFileProvider, inout callback : RemotePrintDocument::CommandDoneCallback)
+            super(looper, adapter, document, callback);
+            mContext = context;
+            mHandler = new WriteHandler(looper);
+            mRemoteResultCallback = new WriteResultCallback(mHandler);
+            mPageCount = pageCount;
+            mPages = Arrays.copyOf(pages, pages.length);
+            mFileProvider = fileProvider;
+            mWriteDoneCallback = callback;
+!!!44101559.java!!!	run() : void
+            running();
+
+            // This is a long running operation as we will be reading fully
+            // the written data. In case of a cancellation, we ask the client
+            // to stop writing data and close the file descriptor after
+            // which we will reach the end of the stream, thus stop reading.
+            new AsyncTask<Void, Void, Void>() {
+                @Override
+                protected Void doInBackground(Void... params) {
+                    File file = null;
+                    InputStream in = null;
+                    OutputStream out = null;
+                    ParcelFileDescriptor source = null;
+                    ParcelFileDescriptor sink = null;
+                    try {
+                        file = mFileProvider.acquireFile(null);
+                        ParcelFileDescriptor[] pipe = ParcelFileDescriptor.createPipe();
+                        source = pipe[0];
+                        sink = pipe[1];
+
+                        in = new FileInputStream(source.getFileDescriptor());
+                        out = new FileOutputStream(file);
+
+                        // Async call to initiate the other process writing the data.
+                        if (DEBUG) {
+                            Log.i(LOG_TAG, "[PERFORMING] write");
+                        }
+                        mAdapter.write(mPages, sink, mRemoteResultCallback, mSequence);
+
+                        // Close the source. It is now held by the client.
+                        sink.close();
+                        sink = null;
+
+                        // Read the data.
+                        final byte[] buffer = new byte[8192];
+                        while (true) {
+                            final int readByteCount = in.read(buffer);
+                            if (readByteCount < 0) {
+                                break;
+                            }
+                            out.write(buffer, 0, readByteCount);
+                        }
+                    } catch (RemoteException | IOException e) {
+                        Log.e(LOG_TAG, "Error calling write()", e);
+                    } finally {
+                        IoUtils.closeQuietly(in);
+                        IoUtils.closeQuietly(out);
+                        IoUtils.closeQuietly(sink);
+                        IoUtils.closeQuietly(source);
+                        if (file != null) {
+                            mFileProvider.releaseFile();
+                        }
+                    }
+                    return null;
+                }
+            }.executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR, (Void[]) null);
+!!!44101687.java!!!	handleOnWriteStarted(inout cancellation : ICancellationSignal, in sequence : int) : void
+            if (sequence != mSequence) {
+                return;
+            }
+
+            if (DEBUG) {
+                Log.i(LOG_TAG, "[CALLBACK] onWriteStarted");
+            }
+
+            if (isCanceling()) {
+                try {
+                    cancellation.cancel();
+                } catch (RemoteException re) {
+                    Log.e(LOG_TAG, "Error cancelling", re);
+                    handleOnWriteFailed(null, sequence);
+                }
+            } else {
+                mCancellation = cancellation;
+            }
+!!!44101815.java!!!	handleOnWriteFinished(inout pages : PageRange, in sequence : int) : void
+            if (sequence != mSequence) {
+                return;
+            }
+
+            if (DEBUG) {
+                Log.i(LOG_TAG, "[CALLBACK] onWriteFinished");
+            }
+
+            PageRange[] writtenPages = PageRangeUtils.normalize(pages);
+            PageRange[] printedPages = PageRangeUtils.computePrintedPages(
+                    mPages, writtenPages, mPageCount);
+
+            // Handle if we got invalid pages
+            if (printedPages != null) {
+                mDocument.writtenPages = writtenPages;
+                mDocument.printedPages = printedPages;
+                completed();
+            } else {
+                mDocument.writtenPages = null;
+                mDocument.printedPages = null;
+                failed(mContext.getString(R.string.print_error_default_message));
+            }
+
+            // Release the remote cancellation interface.
+            mCancellation = null;
+
+            // Done.
+            mWriteDoneCallback.onDone();
+!!!44101943.java!!!	handleOnWriteFailed(inout error : CharSequence, in sequence : int) : void
+            if (sequence != mSequence) {
+                return;
+            }
+
+            if (DEBUG) {
+                Log.i(LOG_TAG, "[CALLBACK] onWriteFailed");
+            }
+
+            failed(error);
+
+            // Release the remote cancellation interface.
+            mCancellation = null;
+
+            // Done.
+            mWriteDoneCallback.onDone();
+!!!44102071.java!!!	handleOnWriteCanceled(in sequence : int) : void
+            if (sequence != mSequence) {
+                return;
+            }
+
+            if (DEBUG) {
+                Log.i(LOG_TAG, "[CALLBACK] onWriteCanceled");
+            }
+
+            canceled();
+
+            // Release the remote cancellation interface.
+            mCancellation = null;
+
+            // Done.
+            mWriteDoneCallback.onDone();

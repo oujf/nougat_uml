@@ -1,0 +1,428 @@
+class GsmInboundSmsHandlerTest
+!!!38367159.java!!!	getCurrentState() : IState
+        try {
+            Method method = StateMachine.class.getDeclaredMethod("getCurrentState");
+            method.setAccessible(true);
+            return (IState) method.invoke(mGsmInboundSmsHandler);
+        } catch (Exception e) {
+            fail(e.toString());
+            return null;
+        }
+!!!38367287.java!!!	setUp() : void
+        super.setUp("GsmInboundSmsHandlerTest");
+
+        doReturn(true).when(mTelephonyManager).getSmsReceiveCapableForPhone(anyInt(), anyBoolean());
+        doReturn(true).when(mSmsStorageMonitor).isStorageAvailable();
+
+        UserManager userManager = (UserManager)mContext.getSystemService(Context.USER_SERVICE);
+        doReturn(true).when(userManager).isUserUnlocked();
+
+        try {
+            doReturn(new int[]{UserHandle.USER_SYSTEM}).when(mIActivityManager).getRunningUserIds();
+        } catch (RemoteException re) {
+            fail("Unexpected RemoteException: " + re.getStackTrace());
+        }
+
+        mSmsMessage.mWrappedSmsMessage = mGsmSmsMessage;
+        mInboundSmsTrackerCV.put("destination_port", 1 << 16);
+        mInboundSmsTrackerCV.put("pdu", HexDump.toHexString(mSmsPdu));
+        mInboundSmsTrackerCV.put("address", "1234567890");
+        mInboundSmsTrackerCV.put("reference_number", 1);
+        mInboundSmsTrackerCV.put("sequence", 1);
+        mInboundSmsTrackerCV.put("count", 1);
+        mInboundSmsTrackerCV.put("date", System.currentTimeMillis());
+        mInboundSmsTrackerCV.put("message_body", mMessageBody);
+
+        doReturn(1).when(mInboundSmsTracker).getMessageCount();
+        doReturn(1).when(mInboundSmsTracker).getReferenceNumber();
+        doReturn("1234567890").when(mInboundSmsTracker).getAddress();
+        doReturn(1).when(mInboundSmsTracker).getSequenceNumber();
+        doReturn(1).when(mInboundSmsTracker).getIndexOffset();
+        doReturn(-1).when(mInboundSmsTracker).getDestPort();
+        doReturn(mMessageBody).when(mInboundSmsTracker).getMessageBody();
+        doReturn(mSmsPdu).when(mInboundSmsTracker).getPdu();
+        doReturn(mInboundSmsTrackerCV.get("date")).when(mInboundSmsTracker).getTimestamp();
+        doReturn(mInboundSmsTrackerCV).when(mInboundSmsTracker).getContentValues();
+
+        mContentProvider = new FakeSmsContentProvider();
+        ((MockContentResolver)mContext.getContentResolver()).addProvider(
+                Telephony.Sms.CONTENT_URI.getAuthority(), mContentProvider);
+
+        new GsmInboundSmsHandlerTestHandler(TAG).start();
+        waitUntilReady();
+!!!38367415.java!!!	tearDown() : void
+        // wait for wakelock to be released; timeout at 10s
+        int i = 0;
+        while (mGsmInboundSmsHandler.getWakeLock().isHeld() && i < 100) {
+            waitForMs(100);
+            i++;
+        }
+        assertFalse(mGsmInboundSmsHandler.getWakeLock().isHeld());
+        mGsmInboundSmsHandler = null;
+        super.tearDown();
+!!!38367543.java!!!	transitionFromStartupToIdle() : void
+        // verify initially in StartupState
+        assertEquals("StartupState", getCurrentState().getName());
+
+        // trigger transition to IdleState
+        mGsmInboundSmsHandler.sendMessage(InboundSmsHandler.EVENT_START_ACCEPTING_SMS);
+        waitForMs(50);
+
+        assertEquals("IdleState", getCurrentState().getName());
+!!!38367671.java!!!	verifySmsIntentBroadcasts(in numPastBroadcasts : int) : void
+        ArgumentCaptor<Intent> intentArgumentCaptor = ArgumentCaptor.forClass(Intent.class);
+        verify(mContext, times(1 + numPastBroadcasts)).sendBroadcast(
+                intentArgumentCaptor.capture());
+        assertEquals(Telephony.Sms.Intents.SMS_DELIVER_ACTION,
+                intentArgumentCaptor.getAllValues().get(numPastBroadcasts).getAction());
+        assertEquals("WaitingState", getCurrentState().getName());
+
+        mContextFixture.sendBroadcastToOrderedBroadcastReceivers();
+
+        intentArgumentCaptor = ArgumentCaptor.forClass(Intent.class);
+        verify(mContext, times(2 + numPastBroadcasts)).sendBroadcast(
+                intentArgumentCaptor.capture());
+        assertEquals(Telephony.Sms.Intents.SMS_RECEIVED_ACTION,
+                intentArgumentCaptor.getAllValues().get(numPastBroadcasts + 1).getAction());
+        assertEquals("WaitingState", getCurrentState().getName());
+
+        mContextFixture.sendBroadcastToOrderedBroadcastReceivers();
+        waitForMs(50);
+
+        assertEquals("IdleState", getCurrentState().getName());
+!!!38367799.java!!!	testNewSms() : void
+        transitionFromStartupToIdle();
+
+        // send new SMS to state machine and verify that triggers SMS_DELIVER_ACTION
+        mGsmInboundSmsHandler.sendMessage(InboundSmsHandler.EVENT_NEW_SMS,
+                new AsyncResult(null, mSmsMessage, null));
+        waitForMs(100);
+
+        verifySmsIntentBroadcasts(0);
+
+        // send same SMS again, verify no broadcasts are sent
+        mGsmInboundSmsHandler.sendMessage(InboundSmsHandler.EVENT_NEW_SMS,
+                new AsyncResult(null, mSmsMessage, null));
+        waitForMs(100);
+
+        verify(mContext, times(2)).sendBroadcast(any(Intent.class));
+        assertEquals("IdleState", getCurrentState().getName());
+!!!38367927.java!!!	testNewSmsFromBlockedNumber_noBroadcastsSent() : void
+        String blockedNumber = "123456789";
+        doReturn(blockedNumber).when(mInboundSmsTracker).getAddress();
+        mFakeBlockedNumberContentProvider.mBlockedNumbers.add(blockedNumber);
+
+        transitionFromStartupToIdle();
+
+        mGsmInboundSmsHandler.sendMessage(InboundSmsHandler.EVENT_NEW_SMS,
+                new AsyncResult(null, mSmsMessage, null));
+        waitForMs(100);
+
+        verify(mContext, never()).sendBroadcast(any(Intent.class));
+        assertEquals("IdleState", getCurrentState().getName());
+!!!38368055.java!!!	verifyDataSmsIntentBroadcasts(in numPastBroadcasts : int) : void
+        ArgumentCaptor<Intent> intentArgumentCaptor = ArgumentCaptor.forClass(Intent.class);
+        verify(mContext, times(1 + numPastBroadcasts)).sendBroadcast(
+                intentArgumentCaptor.capture());
+        assertEquals(Telephony.Sms.Intents.DATA_SMS_RECEIVED_ACTION,
+                intentArgumentCaptor.getAllValues().get(numPastBroadcasts).getAction());
+        assertEquals("WaitingState", getCurrentState().getName());
+
+        mContextFixture.sendBroadcastToOrderedBroadcastReceivers();
+        waitForMs(50);
+
+        assertEquals("IdleState", getCurrentState().getName());
+!!!38368183.java!!!	testBroadcastSms() : void
+        transitionFromStartupToIdle();
+
+        doReturn(0).when(mInboundSmsTracker).getDestPort();
+        mGsmInboundSmsHandler.sendMessage(InboundSmsHandler.EVENT_BROADCAST_SMS,
+                mInboundSmsTracker);
+        waitForMs(100);
+
+        verifyDataSmsIntentBroadcasts(0);
+
+        // send same data sms again, and since it's not text sms it should be broadcast again
+        mGsmInboundSmsHandler.sendMessage(InboundSmsHandler.EVENT_BROADCAST_SMS,
+                mInboundSmsTracker);
+        waitForMs(100);
+
+        verifyDataSmsIntentBroadcasts(1);
+!!!38368311.java!!!	testInjectSms() : void
+        transitionFromStartupToIdle();
+
+        mGsmInboundSmsHandler.sendMessage(InboundSmsHandler.EVENT_INJECT_SMS, new AsyncResult(null,
+                mSmsMessage, null));
+        waitForMs(100);
+
+        verifySmsIntentBroadcasts(0);
+
+        // inject same SMS again, verify no broadcasts are sent
+        mGsmInboundSmsHandler.sendMessage(InboundSmsHandler.EVENT_INJECT_SMS, new AsyncResult(null,
+                mSmsMessage, null));
+        waitForMs(100);
+
+        verify(mContext, times(2)).sendBroadcast(any(Intent.class));
+        assertEquals("IdleState", getCurrentState().getName());
+!!!38368439.java!!!	prepareMultiPartSms() : void
+        // Part 1
+        mInboundSmsTrackerCVPart1 = new ContentValues();
+        mInboundSmsTrackerCVPart1.put("destination_port", 1 << 16);
+        mInboundSmsTrackerCVPart1.put("pdu", HexDump.toHexString(mSmsPdu));
+        mInboundSmsTrackerCVPart1.put("address", "1234567890");
+        mInboundSmsTrackerCVPart1.put("reference_number", 1);
+        mInboundSmsTrackerCVPart1.put("sequence", 1);
+        mInboundSmsTrackerCVPart1.put("count", 2);
+        mInboundSmsTrackerCVPart1.put("date", System.currentTimeMillis());
+        mInboundSmsTrackerCVPart1.put("message_body", mMessageBodyPart1);
+
+        doReturn(2).when(mInboundSmsTrackerPart1).getMessageCount();
+        doReturn(1).when(mInboundSmsTrackerPart1).getReferenceNumber();
+        doReturn("1234567890").when(mInboundSmsTrackerPart1).getAddress();
+        doReturn(1).when(mInboundSmsTrackerPart1).getSequenceNumber();
+        doReturn(1).when(mInboundSmsTrackerPart1).getIndexOffset();
+        doReturn(-1).when(mInboundSmsTrackerPart1).getDestPort();
+        doReturn(mMessageBodyPart1).when(mInboundSmsTrackerPart1).getMessageBody();
+        doReturn(mSmsPdu).when(mInboundSmsTrackerPart1).getPdu();
+        doReturn(mInboundSmsTrackerCVPart1.get("date")).when(mInboundSmsTrackerPart1).
+                getTimestamp();
+        doReturn(mInboundSmsTrackerCVPart1).when(mInboundSmsTrackerPart1).getContentValues();
+
+        // Part 2
+        mInboundSmsTrackerCVPart2 = new ContentValues();
+        mInboundSmsTrackerCVPart2.put("destination_port", 1 << 16);
+        mInboundSmsTrackerCVPart2.put("pdu", HexDump.toHexString(mSmsPdu));
+        mInboundSmsTrackerCVPart2.put("address", "1234567890");
+        mInboundSmsTrackerCVPart2.put("reference_number", 1);
+        mInboundSmsTrackerCVPart2.put("sequence", 2);
+        mInboundSmsTrackerCVPart2.put("count", 2);
+        mInboundSmsTrackerCVPart2.put("date", System.currentTimeMillis());
+        mInboundSmsTrackerCVPart2.put("message_body", mMessageBodyPart2);
+
+        doReturn(2).when(mInboundSmsTrackerPart2).getMessageCount();
+        doReturn(1).when(mInboundSmsTrackerPart2).getReferenceNumber();
+        doReturn("1234567890").when(mInboundSmsTrackerPart2).getAddress();
+        doReturn(2).when(mInboundSmsTrackerPart2).getSequenceNumber();
+        doReturn(1).when(mInboundSmsTrackerPart2).getIndexOffset();
+        doReturn(-1).when(mInboundSmsTrackerPart2).getDestPort();
+        doReturn(mMessageBodyPart2).when(mInboundSmsTrackerPart2).getMessageBody();
+        doReturn(mSmsPdu).when(mInboundSmsTrackerPart2).getPdu();
+        doReturn(mInboundSmsTrackerCVPart2.get("date")).when(mInboundSmsTrackerPart2).
+                getTimestamp();
+        doReturn(mInboundSmsTrackerCVPart2).when(mInboundSmsTrackerPart2).getContentValues();
+!!!38368567.java!!!	testMultiPartSms() : void
+        transitionFromStartupToIdle();
+
+        // prepare SMS part 1 and part 2
+        prepareMultiPartSms();
+
+        mSmsHeader.concatRef = new SmsHeader.ConcatRef();
+        doReturn(mSmsHeader).when(mGsmSmsMessage).getUserDataHeader();
+
+        doReturn(mInboundSmsTrackerPart1).when(mTelephonyComponentFactory)
+                .makeInboundSmsTracker(any(byte[].class), anyLong(), anyInt(), anyBoolean(),
+                        anyString(), anyInt(), anyInt(), anyInt(), anyBoolean(), anyString());
+        mGsmInboundSmsHandler.sendMessage(InboundSmsHandler.EVENT_NEW_SMS, new AsyncResult(null,
+                mSmsMessage, null));
+        waitForMs(100);
+
+        // State machine should go back to idle and wait for second part
+        assertEquals("IdleState", getCurrentState().getName());
+
+        doReturn(mInboundSmsTrackerPart2).when(mTelephonyComponentFactory)
+                .makeInboundSmsTracker(any(byte[].class), anyLong(), anyInt(), anyBoolean(),
+                        anyString(), anyInt(), anyInt(), anyInt(), anyBoolean(), anyString());
+        mGsmInboundSmsHandler.sendMessage(InboundSmsHandler.EVENT_NEW_SMS, new AsyncResult(null,
+                mSmsMessage, null));
+        waitForMs(100);
+
+        // verify broadcast intents
+        verifySmsIntentBroadcasts(0);
+
+        // if an additional copy of one of the segments above is received, it should not be kept in
+        // the db and should not be combined with any subsequent messages received from the same
+        // sender
+
+        // additional copy of part 2 of message
+        doReturn(mInboundSmsTrackerPart2).when(mTelephonyComponentFactory)
+                .makeInboundSmsTracker(any(byte[].class), anyLong(), anyInt(), anyBoolean(),
+                        anyString(), anyInt(), anyInt(), anyInt(), anyBoolean(), anyString());
+        mGsmInboundSmsHandler.sendMessage(InboundSmsHandler.EVENT_NEW_SMS, new AsyncResult(null,
+                mSmsMessage, null));
+        waitForMs(100);
+
+        // verify no additional broadcasts sent
+        verify(mContext, times(2)).sendBroadcast(any(Intent.class));
+
+        // part 1 of new sms recieved from same sender with same parameters, just different
+        // timestamps, should not be combined with the additional part 2 received above
+
+        // call prepareMultiPartSms() to update timestamps
+        prepareMultiPartSms();
+
+        // part 1 of new sms
+        doReturn(mInboundSmsTrackerPart1).when(mTelephonyComponentFactory)
+                .makeInboundSmsTracker(any(byte[].class), anyLong(), anyInt(), anyBoolean(),
+                        anyString(), anyInt(), anyInt(), anyInt(), anyBoolean(), anyString());
+        mGsmInboundSmsHandler.sendMessage(InboundSmsHandler.EVENT_NEW_SMS, new AsyncResult(null,
+                mSmsMessage, null));
+        waitForMs(100);
+
+        // verify no additional broadcasts sent
+        verify(mContext, times(2)).sendBroadcast(any(Intent.class));
+
+        assertEquals("IdleState", getCurrentState().getName());
+!!!38368695.java!!!	testMultiPartIncompleteSms() : void
+        /**
+         * Test scenario: 2 messages are received with same address, ref number, count, and
+         * seqNumber, with count = 2 and seqNumber = 1. We should not try to merge these.
+         */
+        transitionFromStartupToIdle();
+
+        // prepare SMS part 1 and part 2
+        prepareMultiPartSms();
+        // change seqNumber in part 2 to 1
+        mInboundSmsTrackerCVPart2.put("sequence", 1);
+
+        mSmsHeader.concatRef = new SmsHeader.ConcatRef();
+        doReturn(mSmsHeader).when(mGsmSmsMessage).getUserDataHeader();
+
+        doReturn(mInboundSmsTrackerPart1).when(mTelephonyComponentFactory)
+                .makeInboundSmsTracker(any(byte[].class), anyLong(), anyInt(), anyBoolean(),
+                        anyString(), anyInt(), anyInt(), anyInt(), anyBoolean(), anyString());
+        mGsmInboundSmsHandler.sendMessage(InboundSmsHandler.EVENT_NEW_SMS, new AsyncResult(null,
+                mSmsMessage, null));
+        waitForMs(100);
+
+        // State machine should go back to idle and wait for second part
+        assertEquals("IdleState", getCurrentState().getName());
+
+        doReturn(mInboundSmsTrackerPart2).when(mTelephonyComponentFactory)
+                .makeInboundSmsTracker(any(byte[].class), anyLong(), anyInt(), anyBoolean(),
+                        anyString(), anyInt(), anyInt(), anyInt(), anyBoolean(), anyString());
+        mGsmInboundSmsHandler.sendMessage(InboundSmsHandler.EVENT_NEW_SMS, new AsyncResult(null,
+                mSmsMessage, null));
+        waitForMs(100);
+
+        // verify no broadcasts sent
+        verify(mContext, never()).sendBroadcast(any(Intent.class));
+        // State machine should go back to idle
+        assertEquals("IdleState", getCurrentState().getName());
+!!!38368823.java!!!	testMultipartSmsFromBlockedNumber_noBroadcastsSent() : void
+        mFakeBlockedNumberContentProvider.mBlockedNumbers.add("1234567890");
+
+        transitionFromStartupToIdle();
+
+        // prepare SMS part 1 and part 2
+        prepareMultiPartSms();
+
+        mSmsHeader.concatRef = new SmsHeader.ConcatRef();
+        doReturn(mSmsHeader).when(mGsmSmsMessage).getUserDataHeader();
+        doReturn(mInboundSmsTrackerPart1).when(mTelephonyComponentFactory)
+                .makeInboundSmsTracker(any(byte[].class), anyLong(), anyInt(), anyBoolean(),
+                        anyString(), anyInt(), anyInt(), anyInt(), anyBoolean(), anyString());
+
+        mGsmInboundSmsHandler.sendMessage(InboundSmsHandler.EVENT_NEW_SMS, new AsyncResult(null,
+                mSmsMessage, null));
+        waitForMs(100);
+
+        // State machine should go back to idle and wait for second part
+        assertEquals("IdleState", getCurrentState().getName());
+
+        doReturn(mInboundSmsTrackerPart2).when(mTelephonyComponentFactory)
+                .makeInboundSmsTracker(any(byte[].class), anyLong(), anyInt(), anyBoolean(),
+                        anyString(), anyInt(), anyInt(), anyInt(), anyBoolean(), anyString());
+        mGsmInboundSmsHandler.sendMessage(InboundSmsHandler.EVENT_NEW_SMS, new AsyncResult(null,
+                mSmsMessage, null));
+        waitForMs(100);
+
+        verify(mContext, never()).sendBroadcast(any(Intent.class));
+        assertEquals("IdleState", getCurrentState().getName());
+!!!38368951.java!!!	testBroadcastUndeliveredUserLocked() : void
+        replaceInstance(SmsBroadcastUndelivered.class, "instance", null, null);
+        doReturn(0).when(mInboundSmsTracker).getDestPort();
+
+        // add a fake entry to db
+        ContentValues rawSms = new ContentValues();
+        mContentProvider.insert(sRawUri, rawSms);
+
+        // make it a single-part message
+        doReturn(1).when(mInboundSmsTracker).getMessageCount();
+
+        // user locked
+        UserManager userManager = (UserManager)mContext.getSystemService(Context.USER_SERVICE);
+        doReturn(false).when(userManager).isUserUnlocked();
+
+        SmsBroadcastUndelivered.initialize(mContext, mGsmInboundSmsHandler, mCdmaInboundSmsHandler);
+
+        // verify that a broadcast receiver is registered for current user (user == null) based on
+        // implementation in ContextFixture
+        verify(mContext).registerReceiverAsUser(any(BroadcastReceiver.class), eq((UserHandle)null),
+                any(IntentFilter.class), eq((String)null), eq((Handler)null));
+
+        waitForMs(100);
+
+        // verify no broadcasts sent because due to !isUserUnlocked
+        verify(mContext, never()).sendBroadcast(any(Intent.class));
+
+        // when user unlocks the device, the message in db should be broadcast
+        doReturn(true).when(userManager).isUserUnlocked();
+        mContext.sendBroadcast(new Intent(Intent.ACTION_USER_UNLOCKED));
+        waitForMs(100);
+
+        verifyDataSmsIntentBroadcasts(1);
+!!!38369079.java!!!	testBroadcastUndeliveredUserUnlocked() : void
+        replaceInstance(SmsBroadcastUndelivered.class, "instance", null, null);
+        doReturn(0).when(mInboundSmsTracker).getDestPort();
+
+        // add a fake entry to db
+        ContentValues rawSms = new ContentValues();
+        mContentProvider.insert(sRawUri, rawSms);
+
+        // make it a single-part message
+        doReturn(1).when(mInboundSmsTracker).getMessageCount();
+
+        SmsBroadcastUndelivered.initialize(mContext, mGsmInboundSmsHandler, mCdmaInboundSmsHandler);
+        waitForMs(100);
+
+        // user is unlocked; intent should be broadcast right away
+        verifyDataSmsIntentBroadcasts(0);
+!!!38369207.java!!!	testBroadcastUndeliveredDeleted() : void
+        replaceInstance(SmsBroadcastUndelivered.class, "instance", null, null);
+        SmsBroadcastUndelivered.initialize(mContext, mGsmInboundSmsHandler, mCdmaInboundSmsHandler);
+        doReturn(0).when(mInboundSmsTracker).getDestPort();
+
+        //add a fake entry to db
+        ContentValues rawSms = new ContentValues();
+        rawSms.put("deleted", 1);
+        mContentProvider.insert(sRawUri, rawSms);
+
+        //make it a single-part message
+        doReturn(1).when(mInboundSmsTracker).getMessageCount();
+
+        //when user unlocks the device, broadcast should not be sent for new message
+        mContext.sendBroadcast(new Intent(Intent.ACTION_USER_UNLOCKED));
+        waitForMs(100);
+
+        verify(mContext, times(1)).sendBroadcast(any(Intent.class));
+        assertEquals("IdleState", getCurrentState().getName());
+
+!!!38369335.java!!!	testBroadcastUndeliveredMultiPart() : void
+        replaceInstance(SmsBroadcastUndelivered.class, "instance", null, null);
+
+        // prepare SMS part 1 and part 2
+        prepareMultiPartSms();
+
+        //add the 2 SMS parts to db
+        mContentProvider.insert(sRawUri, mInboundSmsTrackerCVPart1);
+        mContentProvider.insert(sRawUri, mInboundSmsTrackerCVPart2);
+
+        //return InboundSmsTracker objects corresponding to the 2 parts
+        doReturn(mInboundSmsTrackerPart1).doReturn(mInboundSmsTrackerPart2).
+                when(mTelephonyComponentFactory).makeInboundSmsTracker(any(Cursor.class),
+                anyBoolean());
+
+        SmsBroadcastUndelivered.initialize(mContext, mGsmInboundSmsHandler, mCdmaInboundSmsHandler);
+        waitForMs(100);
+
+        verifySmsIntentBroadcasts(0);

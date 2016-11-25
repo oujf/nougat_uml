@@ -1,0 +1,136 @@
+class RecentsLoader
+!!!43637175.java!!!	RecentsLoader(inout context : Context, inout roots : RootsCache, inout state : State)
+        super(context);
+        mRoots = roots;
+        mState = state;
+
+        // Keep clients around on high-RAM devices, since we'd be spinning them
+        // up moments later to fetch thumbnails anyway.
+        final ActivityManager am = (ActivityManager) getContext().getSystemService(
+                Context.ACTIVITY_SERVICE);
+        mQueryPermits = new Semaphore(
+                am.isLowRamDevice() ? MAX_OUTSTANDING_RECENTS_SVELTE : MAX_OUTSTANDING_RECENTS);
+!!!43637303.java!!!	loadInBackground() : DirectoryResult
+        synchronized (mTasks) {
+            return loadInBackgroundLocked();
+        }
+!!!43637431.java!!!	loadInBackgroundLocked() : DirectoryResult
+        if (mFirstPassLatch == null) {
+            // First time through we kick off all the recent tasks, and wait
+            // around to see if everyone finishes quickly.
+
+            final Collection<RootInfo> roots = mRoots.getMatchingRootsBlocking(mState);
+            for (RootInfo root : roots) {
+                if (root.supportsRecents()) {
+                    mTasks.put(root, new RecentsTask(root.authority, root.rootId));
+                }
+            }
+
+            mFirstPassLatch = new CountDownLatch(mTasks.size());
+            for (RecentsTask task : mTasks.values()) {
+                ProviderExecutor.forAuthority(task.authority).execute(task);
+            }
+
+            try {
+                mFirstPassLatch.await(MAX_FIRST_PASS_WAIT_MILLIS, TimeUnit.MILLISECONDS);
+                mFirstPassDone = true;
+            } catch (InterruptedException e) {
+                throw new RuntimeException(e);
+            }
+        }
+
+        final long rejectBefore = System.currentTimeMillis() - REJECT_OLDER_THAN;
+
+        // Collect all finished tasks
+        boolean allDone = true;
+        List<Cursor> cursors = new ArrayList<>();
+        for (RecentsTask task : mTasks.values()) {
+            if (task.isDone()) {
+                try {
+                    final Cursor cursor = task.get();
+                    if (cursor == null) continue;
+
+                    final FilteringCursorWrapper filtered = new FilteringCursorWrapper(
+                            cursor, mState.acceptMimes, RECENT_REJECT_MIMES, rejectBefore) {
+                        @Override
+                        public void close() {
+                            // Ignored, since we manage cursor lifecycle internally
+                        }
+                    };
+                    cursors.add(filtered);
+                } catch (InterruptedException e) {
+                    throw new RuntimeException(e);
+                } catch (ExecutionException e) {
+                    // We already logged on other side
+                }
+            } else {
+                allDone = false;
+            }
+        }
+
+        if (DEBUG) {
+            Log.d(TAG, "Found " + cursors.size() + " of " + mTasks.size() + " recent queries done");
+        }
+
+        final DirectoryResult result = new DirectoryResult();
+        result.sortOrder = SORT_ORDER_LAST_MODIFIED;
+
+        final Cursor merged;
+        if (cursors.size() > 0) {
+            merged = new MergeCursor(cursors.toArray(new Cursor[cursors.size()]));
+        } else {
+            // Return something when nobody is ready
+            merged = new MatrixCursor(new String[0]);
+        }
+
+        // Tell the UI if this is an in-progress result. When loading is complete, another update is
+        // sent with EXTRA_LOADING set to false.
+        Bundle extras = new Bundle();
+        extras.putBoolean(DocumentsContract.EXTRA_LOADING, !allDone);
+        merged.setExtras(extras);
+
+        result.cursor = merged;
+
+        return result;
+!!!43637559.java!!!	cancelLoadInBackground() : void
+        super.cancelLoadInBackground();
+!!!43637687.java!!!	deliverResult(inout result : DirectoryResult) : void
+        if (isReset()) {
+            IoUtils.closeQuietly(result);
+            return;
+        }
+        DirectoryResult oldResult = mResult;
+        mResult = result;
+
+        if (isStarted()) {
+            super.deliverResult(result);
+        }
+
+        if (oldResult != null && oldResult != result) {
+            IoUtils.closeQuietly(oldResult);
+        }
+!!!43637815.java!!!	onStartLoading() : void
+        if (mResult != null) {
+            deliverResult(mResult);
+        }
+        if (takeContentChanged() || mResult == null) {
+            forceLoad();
+        }
+!!!43637943.java!!!	onStopLoading() : void
+        cancelLoad();
+!!!43638071.java!!!	onCanceled(inout result : DirectoryResult) : void
+        IoUtils.closeQuietly(result);
+!!!43638199.java!!!	onReset() : void
+        super.onReset();
+
+        // Ensure the loader is stopped
+        onStopLoading();
+
+        synchronized (mTasks) {
+            for (RecentsTask task : mTasks.values()) {
+                IoUtils.closeQuietly(task);
+            }
+        }
+
+        IoUtils.closeQuietly(mResult);
+        mResult = null;

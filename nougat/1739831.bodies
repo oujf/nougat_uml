@@ -1,0 +1,246 @@
+class GraphRunLoop
+!!!34813111.java!!!	loop() : void
+            boolean killed = false;
+            while (!killed) {
+                try {
+                    Event event = nextEvent();
+                    if (event == null) continue;
+                    switch (event.code) {
+                        case Event.PREPARE:
+                            onPrepare((FilterGraph)event.object);
+                            break;
+                        case Event.BEGIN:
+                            onBegin();
+                            break;
+                        case Event.STEP:
+                            onStep();
+                            break;
+                        case Event.STOP:
+                            onStop();
+                            break;
+                        case Event.PAUSE:
+                            onPause();
+                            break;
+                        case Event.HALT:
+                            onHalt();
+                            break;
+                        case Event.RESUME:
+                            onResume();
+                            break;
+                        case Event.RESTART:
+                            onRestart();
+                            break;
+                        case Event.FLUSH:
+                            onFlush();
+                            break;
+                        case Event.TEARDOWN:
+                            onTearDown((FilterGraph)event.object);
+                            break;
+                        case Event.KILL:
+                            killed = true;
+                            break;
+                        case Event.RELEASE_FRAMES:
+                            onReleaseFrames();
+                            break;
+                    }
+                } catch (Exception e) {
+                    if (mCaughtException == null) {
+                        mCaughtException = e;
+                        mClosedSuccessfully = true;
+                        e.printStackTrace();
+                        pushEvent(STOP_EVENT);
+                    } else {
+                        // Exception during exception recovery? Abort all processing. Do not
+                        // overwrite the original exception.
+                        mClosedSuccessfully = false;
+                        mEventQueue.clear();
+                        cleanUp();
+                    }
+                }
+            }
+!!!34813239.java!!!	GraphRunLoop(inout allowOpenGL : boolean)
+            mAllowOpenGL = allowOpenGL;
+!!!34813367.java!!!	run() : void
+            onInit();
+            loop();
+            onDestroy();
+!!!34813495.java!!!	enterSubGraph(inout graph : FilterGraph, inout listener : GraphRunner::SubListener) : void
+            if (mState.check(State.RUNNING)) {
+                onOpenGraph(graph);
+                mSubListeners.push(listener);
+            }
+!!!34813623.java!!!	pushWakeEvent(inout event : GraphRunner::Event) : void
+            // This is of course not race-condition proof. The worst case is that the event
+            // is pushed even though the queue was not empty, which is acceptible for our cases.
+            if (mEventQueue.isEmpty()) {
+                pushEvent(event);
+            }
+!!!34813751.java!!!	pushEvent(inout event : GraphRunner::Event) : void
+            mEventQueue.offer(event);
+!!!34813879.java!!!	pushEvent(in eventId : int, inout object : Object) : void
+            mEventQueue.offer(new Event(eventId, object));
+!!!34814007.java!!!	checkState(in state : int) : boolean
+            return mState.check(state);
+!!!34814135.java!!!	getStopCondition() : ConditionVariable
+            return mStopCondition;
+!!!34814263.java!!!	isOpenGLAllowed() : boolean
+            // Does not need synchronization as mAllowOpenGL flag is final.
+            return mAllowOpenGL;
+!!!34814391.java!!!	nextEvent() : GraphRunner::Event
+            try {
+                return mEventQueue.take();
+            } catch (InterruptedException e) {
+                // Ignore and keep going.
+                Log.w("GraphRunner", "Event queue processing was interrupted.");
+                return null;
+            }
+!!!34814519.java!!!	onPause() : void
+            mState.addState(State.PAUSED);
+!!!34814647.java!!!	onResume() : void
+            if (mState.removeState(State.PAUSED)) {
+                if (mState.current() == State.RUNNING) {
+                    pushEvent(STEP_EVENT);
+                }
+            }
+!!!34814775.java!!!	onHalt() : void
+            if (mState.addState(State.HALTED) && mState.check(State.RUNNING)) {
+                closeAllFilters();
+            }
+!!!34814903.java!!!	onRestart() : void
+            if (mState.removeState(State.HALTED)) {
+                if (mState.current() == State.RUNNING) {
+                    pushEvent(STEP_EVENT);
+                }
+            }
+!!!34815031.java!!!	onDestroy() : void
+            mFrameManager.destroyBackings();
+            if (mRenderTarget != null) {
+                mRenderTarget.release();
+                mRenderTarget = null;
+            }
+!!!34815159.java!!!	onReleaseFrames() : void
+            mFrameManager.destroyBackings();
+!!!34815287.java!!!	onInit() : void
+            mThreadRunner.set(GraphRunner.this);
+            if (getContext().isOpenGLSupported()) {
+                mRenderTarget = RenderTarget.newTarget(1, 1);
+                mRenderTarget.focus();
+            }
+!!!34815415.java!!!	onPrepare(inout graph : FilterGraph) : void
+            if (mState.current() == State.STOPPED) {
+                mState.setState(State.PREPARING);
+                mCaughtException = null;
+                onOpenGraph(graph);
+            }
+!!!34815543.java!!!	onOpenGraph(inout graph : FilterGraph) : void
+            loadFilters(graph);
+            mOpenedGraphs.add(graph);
+            mScheduler.prepare(currentFilters());
+            pushEvent(BEGIN_EVENT);
+!!!34815671.java!!!	onBegin() : void
+            if (mState.current() == State.PREPARING) {
+                mState.setState(State.RUNNING);
+                pushEvent(STEP_EVENT);
+            }
+!!!34815799.java!!!	onStarve() : void
+            mFilters.pop();
+            if (mFilters.empty()) {
+                onStop();
+            } else {
+                SubListener listener = mSubListeners.pop();
+                if (listener != null) {
+                    listener.onSubGraphRunEnded(GraphRunner.this);
+                }
+                mScheduler.prepare(currentFilters());
+                pushEvent(STEP_EVENT);
+            }
+!!!34815927.java!!!	onStop() : void
+            if (mState.check(State.RUNNING)) {
+                // Close filters if not already halted (and already closed)
+                if (!mState.check(State.HALTED)) {
+                    closeAllFilters();
+                }
+                cleanUp();
+            }
+!!!34816055.java!!!	cleanUp() : void
+            mState.setState(State.STOPPED);
+            if (flushOnClose()) {
+                onFlush();
+            }
+            mOpenedGraphs.clear();
+            mFilters.clear();
+            onRunnerStopped(mCaughtException, mClosedSuccessfully);
+            mStopCondition.open();
+!!!34816183.java!!!	onStep() : void
+            if (mState.current() == State.RUNNING) {
+                Filter bestFilter = null;
+                long maxPriority = PRIORITY_STOP;
+                mScheduler.beginStep();
+                Filter[] filters = currentFilters();
+                for (int i = 0; i < filters.length; ++i) {
+                    Filter filter = filters[i];
+                    long priority = mScheduler.priorityForFilter(filter);
+                    if (priority > maxPriority) {
+                        maxPriority = priority;
+                        bestFilter = filter;
+                    }
+                }
+                if (maxPriority == PRIORITY_SLEEP) {
+                    // NOOP: When going into sleep mode, we simply do not schedule another node.
+                    // If some other event (such as a resume()) does schedule, then we may schedule
+                    // during sleeping. This is an edge case an irrelevant. (On the other hand,
+                    // going into a dedicated "sleep state" requires highly complex synchronization
+                    // to not "miss" a wake-up event. Thus we choose the more defensive approach
+                    // here).
+                } else if (maxPriority == PRIORITY_STOP) {
+                    onStarve();
+                } else {
+                    scheduleFilter(bestFilter);
+                    pushEvent(STEP_EVENT);
+                }
+            } else {
+                Log.w("GraphRunner", "State is not running! (" + mState.current() + ")");
+            }
+!!!34816311.java!!!	onFlush() : void
+           if (mState.check(State.HALTED) || mState.check(State.STOPPED)) {
+               for (FilterGraph graph : mOpenedGraphs) {
+                   graph.flushFrames();
+               }
+           }
+!!!34816439.java!!!	onTearDown(inout graph : FilterGraph) : void
+            for (Filter filter : graph.getAllFilters()) {
+                filter.performTearDown();
+            }
+            graph.wipe();
+!!!34816567.java!!!	loadFilters(inout graph : FilterGraph) : void
+            Filter[] filters = graph.getAllFilters();
+            mFilters.push(filters);
+!!!34816695.java!!!	closeAllFilters() : void
+            for (FilterGraph graph : mOpenedGraphs) {
+                closeFilters(graph);
+            }
+!!!34816823.java!!!	closeFilters(inout graph : FilterGraph) : void
+            // [Non-iterator looping]
+            Log.v("GraphRunner", "CLOSING FILTERS");
+            Filter[] filters = graph.getAllFilters();
+            boolean isVerbose = isVerbose();
+            for (int i = 0; i < filters.length; ++i) {
+                if (isVerbose) {
+                    Log.i("GraphRunner", "Closing Filter " + filters[i] + "!");
+                }
+                filters[i].softReset();
+            }
+!!!34816951.java!!!	currentFilters() : Filter
+            return mFilters.peek();
+!!!34817079.java!!!	scheduleFilter(inout filter : Filter) : void
+            long scheduleTime = 0;
+            if (isVerbose()) {
+                scheduleTime = SystemClock.elapsedRealtime();
+                Log.i("GraphRunner", scheduleTime + ": Scheduling " + filter + "!");
+            }
+            filter.execute();
+            if (isVerbose()) {
+                long nowTime = SystemClock.elapsedRealtime();
+                Log.i("GraphRunner",
+                        "-> Schedule time (" + filter + ") = " + (nowTime - scheduleTime) + " ms.");
+            }

@@ -1,0 +1,328 @@
+class WindowsForAccessibilityObserver
+!!!33672119.java!!!	WindowsForAccessibilityObserver(inout windowManagerService : WindowManagerService, inout callback : WindowManagerInternal::WindowsForAccessibilityCallback)
+            mContext = windowManagerService.mContext;
+            mWindowManagerService = windowManagerService;
+            mCallback = callback;
+            mHandler = new MyHandler(mWindowManagerService.mH.getLooper());
+            mRecurringAccessibilityEventsIntervalMillis = ViewConfiguration
+                    .getSendRecurringAccessibilityEventsInterval();
+            computeChangedWindows();
+!!!33672247.java!!!	performComputeChangedWindowsNotLocked() : void
+            mHandler.removeMessages(MyHandler.MESSAGE_COMPUTE_CHANGED_WINDOWS);
+            computeChangedWindows();
+!!!33672375.java!!!	scheduleComputeChangedWindowsLocked() : void
+            if (!mHandler.hasMessages(MyHandler.MESSAGE_COMPUTE_CHANGED_WINDOWS)) {
+                mHandler.sendEmptyMessageDelayed(MyHandler.MESSAGE_COMPUTE_CHANGED_WINDOWS,
+                        mRecurringAccessibilityEventsIntervalMillis);
+            }
+!!!33672503.java!!!	computeChangedWindows() : void
+            if (DEBUG) {
+                Slog.i(LOG_TAG, "computeChangedWindows()");
+            }
+
+            boolean windowsChanged = false;
+            List<WindowInfo> windows = new ArrayList<WindowInfo>();
+
+            synchronized (mWindowManagerService.mWindowMap) {
+                // Do not send the windows if there is no current focus as
+                // the window manager is still looking for where to put it.
+                // We will do the work when we get a focus change callback.
+                if (mWindowManagerService.mCurrentFocus == null) {
+                    return;
+                }
+
+                WindowManager windowManager = (WindowManager)
+                        mContext.getSystemService(Context.WINDOW_SERVICE);
+                windowManager.getDefaultDisplay().getRealSize(mTempPoint);
+                final int screenWidth = mTempPoint.x;
+                final int screenHeight = mTempPoint.y;
+
+                Region unaccountedSpace = mTempRegion;
+                unaccountedSpace.set(0, 0, screenWidth, screenHeight);
+
+                SparseArray<WindowState> visibleWindows = mTempWindowStates;
+                populateVisibleWindowsOnScreenLocked(visibleWindows);
+
+                Set<IBinder> addedWindows = mTempBinderSet;
+                addedWindows.clear();
+
+                boolean focusedWindowAdded = false;
+
+                final int visibleWindowCount = visibleWindows.size();
+                int skipRemainingWindowsForTaskId = -1;
+                HashSet<Integer> skipRemainingWindowsForTasks = new HashSet<>();
+                for (int i = visibleWindowCount - 1; i >= 0; i--) {
+                    final WindowState windowState = visibleWindows.valueAt(i);
+                    final int flags = windowState.mAttrs.flags;
+                    final Task task = windowState.getTask();
+
+                    // If the window is part of a task that we're finished with - ignore.
+                    if (task != null && skipRemainingWindowsForTasks.contains(task.mTaskId)) {
+                        continue;
+                    }
+
+                    // If the window is not touchable - ignore.
+                    if ((flags & WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE) != 0) {
+                        continue;
+                    }
+
+                    // Compute the bounds in the screen.
+                    final Rect boundsInScreen = mTempRect;
+                    computeWindowBoundsInScreen(windowState, boundsInScreen);
+
+                    // If the window is completely covered by other windows - ignore.
+                    if (unaccountedSpace.quickReject(boundsInScreen)) {
+                        continue;
+                    }
+
+                    // Add windows of certain types not covered by modal windows.
+                    if (isReportedWindowType(windowState.mAttrs.type)) {
+                        // Add the window to the ones to be reported.
+                        WindowInfo window = obtainPopulatedWindowInfo(windowState, boundsInScreen);
+                        addedWindows.add(window.token);
+                        windows.add(window);
+                        if (windowState.isFocused()) {
+                            focusedWindowAdded = true;
+                        }
+                    }
+
+                    // Account for the space this window takes if the window
+                    // is not an accessibility overlay which does not change
+                    // the reported windows.
+                    if (windowState.mAttrs.type !=
+                            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY) {
+                        unaccountedSpace.op(boundsInScreen, unaccountedSpace,
+                                Region.Op.REVERSE_DIFFERENCE);
+                    }
+
+                    // We figured out what is touchable for the entire screen - done.
+                    if (unaccountedSpace.isEmpty()) {
+                        break;
+                    }
+
+                    // If a window is modal it prevents other windows from being touched
+                    if ((flags & (WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                            | WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL)) == 0) {
+                        if (task != null) {
+                            // If the window is associated with a particular task, we can skip the
+                            // rest of the windows for that task.
+                            skipRemainingWindowsForTasks.add(task.mTaskId);
+                            continue;
+                        } else {
+                            // If the window is not associated with a particular task, then it is
+                            // globally modal. In this case we can skip all remaining windows.
+                            break;
+                        }
+                    }
+                }
+
+                // Always report the focused window.
+                if (!focusedWindowAdded) {
+                    for (int i = visibleWindowCount - 1; i >= 0; i--) {
+                        WindowState windowState = visibleWindows.valueAt(i);
+                        if (windowState.isFocused()) {
+                            // Compute the bounds in the screen.
+                            Rect boundsInScreen = mTempRect;
+                            computeWindowBoundsInScreen(windowState, boundsInScreen);
+
+                            // Add the window to the ones to be reported.
+                            WindowInfo window = obtainPopulatedWindowInfo(windowState,
+                                    boundsInScreen);
+                            addedWindows.add(window.token);
+                            windows.add(window);
+                            break;
+                        }
+                    }
+                }
+
+                // Remove child/parent references to windows that were not added.
+                final int windowCount = windows.size();
+                for (int i = 0; i < windowCount; i++) {
+                    WindowInfo window = windows.get(i);
+                    if (!addedWindows.contains(window.parentToken)) {
+                        window.parentToken = null;
+                    }
+                    if (window.childTokens != null) {
+                        final int childTokenCount = window.childTokens.size();
+                        for (int j = childTokenCount - 1; j >= 0; j--) {
+                            if (!addedWindows.contains(window.childTokens.get(j))) {
+                                window.childTokens.remove(j);
+                            }
+                        }
+                        // Leave the child token list if empty.
+                    }
+                }
+
+                visibleWindows.clear();
+                addedWindows.clear();
+
+                // We computed the windows and if they changed notify the client.
+                if (mOldWindows.size() != windows.size()) {
+                    // Different size means something changed.
+                    windowsChanged = true;
+                } else if (!mOldWindows.isEmpty() || !windows.isEmpty()) {
+                    // Since we always traverse windows from high to low layer
+                    // the old and new windows at the same index should be the
+                    // same, otherwise something changed.
+                    for (int i = 0; i < windowCount; i++) {
+                        WindowInfo oldWindow = mOldWindows.get(i);
+                        WindowInfo newWindow = windows.get(i);
+                        // We do not care for layer changes given the window
+                        // order does not change. This brings no new information
+                        // to the clients.
+                        if (windowChangedNoLayer(oldWindow, newWindow)) {
+                            windowsChanged = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (windowsChanged) {
+                    cacheWindows(windows);
+                }
+            }
+
+            // Now we do not hold the lock, so send the windows over.
+            if (windowsChanged) {
+                if (DEBUG) {
+                    Log.i(LOG_TAG, "Windows changed:" + windows);
+                }
+                mCallback.onWindowsForAccessibilityChanged(windows);
+            } else {
+                if (DEBUG) {
+                    Log.i(LOG_TAG, "No windows changed.");
+                }
+            }
+
+            // Recycle the windows as we do not need them.
+            clearAndRecycleWindows(windows);
+!!!33672631.java!!!	computeWindowBoundsInScreen(inout windowState : WindowState, inout outBounds : Rect) : void
+            // Get the touchable frame.
+            Region touchableRegion = mTempRegion1;
+            windowState.getTouchableRegion(touchableRegion);
+            Rect touchableFrame = mTempRect;
+            touchableRegion.getBounds(touchableFrame);
+
+            // Move to origin as all transforms are captured by the matrix.
+            RectF windowFrame = mTempRectF;
+            windowFrame.set(touchableFrame);
+            windowFrame.offset(-windowState.mFrame.left, -windowState.mFrame.top);
+
+            // Map the frame to get what appears on the screen.
+            Matrix matrix = mTempMatrix;
+            populateTransformationMatrixLocked(windowState, matrix);
+            matrix.mapRect(windowFrame);
+
+            // Got the bounds.
+            outBounds.set((int) windowFrame.left, (int) windowFrame.top,
+                    (int) windowFrame.right, (int) windowFrame.bottom);
+!!!33672759.java!!!	obtainPopulatedWindowInfo(inout windowState : WindowState, inout boundsInScreen : Rect) : WindowInfo
+            WindowInfo window = WindowInfo.obtain();
+            window.type = windowState.mAttrs.type;
+            window.layer = windowState.mLayer;
+            window.token = windowState.mClient.asBinder();
+            window.title = windowState.mAttrs.accessibilityTitle;
+            window.accessibilityIdOfAnchor = windowState.mAttrs.accessibilityIdOfAnchor;
+
+            WindowState attachedWindow = windowState.mAttachedWindow;
+            if (attachedWindow != null) {
+                window.parentToken = attachedWindow.mClient.asBinder();
+            }
+
+            window.focused = windowState.isFocused();
+            window.boundsInScreen.set(boundsInScreen);
+
+            final int childCount = windowState.mChildWindows.size();
+            if (childCount > 0) {
+                if (window.childTokens == null) {
+                    window.childTokens = new ArrayList<IBinder>();
+                }
+                for (int j = 0; j < childCount; j++) {
+                    WindowState child = windowState.mChildWindows.get(j);
+                    window.childTokens.add(child.mClient.asBinder());
+                }
+            }
+
+            return window;
+!!!33672887.java!!!	cacheWindows(inout windows : List<WindowInfo>) : void
+            final int oldWindowCount = mOldWindows.size();
+            for (int i = oldWindowCount - 1; i >= 0; i--) {
+                mOldWindows.remove(i).recycle();
+            }
+            final int newWindowCount = windows.size();
+            for (int i = 0; i < newWindowCount; i++) {
+                WindowInfo newWindow = windows.get(i);
+                mOldWindows.add(WindowInfo.obtain(newWindow));
+            }
+!!!33673015.java!!!	windowChangedNoLayer(inout oldWindow : WindowInfo, inout newWindow : WindowInfo) : boolean
+            if (oldWindow == newWindow) {
+                return false;
+            }
+            if (oldWindow == null) {
+                return true;
+            }
+            if (newWindow == null) {
+                return true;
+            }
+            if (oldWindow.type != newWindow.type) {
+                return true;
+            }
+            if (oldWindow.focused != newWindow.focused) {
+                return true;
+            }
+            if (oldWindow.token == null) {
+                if (newWindow.token != null) {
+                    return true;
+                }
+            } else if (!oldWindow.token.equals(newWindow.token)) {
+                return true;
+            }
+            if (oldWindow.parentToken == null) {
+                if (newWindow.parentToken != null) {
+                    return true;
+                }
+            } else if (!oldWindow.parentToken.equals(newWindow.parentToken)) {
+                return true;
+            }
+            if (!oldWindow.boundsInScreen.equals(newWindow.boundsInScreen)) {
+                return true;
+            }
+            if (oldWindow.childTokens != null && newWindow.childTokens != null
+                    && !oldWindow.childTokens.equals(newWindow.childTokens)) {
+                return true;
+            }
+            if (!TextUtils.equals(oldWindow.title, newWindow.title)) {
+                return true;
+            }
+            if (oldWindow.accessibilityIdOfAnchor != newWindow.accessibilityIdOfAnchor) {
+                return true;
+            }
+            return false;
+!!!33673143.java!!!	clearAndRecycleWindows(inout windows : List<WindowInfo>) : void
+            final int windowCount = windows.size();
+            for (int i = windowCount - 1; i >= 0; i--) {
+                windows.remove(i).recycle();
+            }
+!!!33673271.java!!!	isReportedWindowType(in windowType : int) : boolean
+            return (windowType != WindowManager.LayoutParams.TYPE_KEYGUARD_SCRIM
+                    && windowType != WindowManager.LayoutParams.TYPE_WALLPAPER
+                    && windowType != WindowManager.LayoutParams.TYPE_BOOT_PROGRESS
+                    && windowType != WindowManager.LayoutParams.TYPE_DISPLAY_OVERLAY
+                    && windowType != WindowManager.LayoutParams.TYPE_DRAG
+                    && windowType != WindowManager.LayoutParams.TYPE_INPUT_CONSUMER
+                    && windowType != WindowManager.LayoutParams.TYPE_POINTER
+                    && windowType != WindowManager.LayoutParams.TYPE_MAGNIFICATION_OVERLAY
+                    && windowType != WindowManager.LayoutParams.TYPE_APPLICATION_MEDIA_OVERLAY
+                    && windowType != WindowManager.LayoutParams.TYPE_SECURE_SYSTEM_OVERLAY
+                    && windowType != WindowManager.LayoutParams.TYPE_PRIVATE_PRESENTATION);
+!!!33673399.java!!!	populateVisibleWindowsOnScreenLocked(inout outWindows : SparseArray) : void
+            DisplayContent displayContent = mWindowManagerService
+                    .getDefaultDisplayContentLocked();
+            WindowList windowList = displayContent.getWindowList();
+            final int windowCount = windowList.size();
+            for (int i = 0; i < windowCount; i++) {
+                WindowState windowState = windowList.get(i);
+                if (windowState.isVisibleLw()) {
+                    outWindows.put(windowState.mLayer, windowState);
+                }
+            }

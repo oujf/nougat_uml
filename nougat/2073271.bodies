@@ -1,0 +1,297 @@
+class ConnectedState
+!!!36956471.java!!!	enter() : void
+            String address;
+            updateDefaultRouteMacAddress(1000);
+            if (DBG) {
+                log("Enter ConnectedState "
+                       + " mScreenOn=" + mScreenOn);
+            }
+
+            if (mWifiConnectivityManager != null) {
+                mWifiConnectivityManager.handleConnectionStateChanged(
+                        WifiConnectivityManager.WIFI_STATE_CONNECTED);
+            }
+            registerConnected();
+            lastConnectAttemptTimestamp = 0;
+            targetWificonfiguration = null;
+            // Paranoia
+            linkDebouncing = false;
+
+            // Not roaming anymore
+            mAutoRoaming = false;
+
+            if (testNetworkDisconnect) {
+                testNetworkDisconnectCounter++;
+                logd("ConnectedState Enter start disconnect test " +
+                        testNetworkDisconnectCounter);
+                sendMessageDelayed(obtainMessage(CMD_TEST_NETWORK_DISCONNECT,
+                        testNetworkDisconnectCounter, 0), 15000);
+            }
+
+            // Reenable all networks, allow for hidden networks to be scanned
+            mWifiConfigManager.enableAllNetworks();
+
+            mLastDriverRoamAttempt = 0;
+            mTargetNetworkId = WifiConfiguration.INVALID_NETWORK_ID;
+            mWifiLastResortWatchdog.connectedStateTransition(true);
+!!!36956599.java!!!	processMessage(inout message : Message) : boolean
+            WifiConfiguration config = null;
+            logStateAndMessage(message, this);
+
+            switch (message.what) {
+                case CMD_UPDATE_ASSOCIATED_SCAN_PERMISSION:
+                    updateAssociatedScanPermission();
+                    break;
+                case CMD_UNWANTED_NETWORK:
+                    if (message.arg1 == NETWORK_STATUS_UNWANTED_DISCONNECT) {
+                        mWifiConfigManager.handleBadNetworkDisconnectReport(
+                                mLastNetworkId, mWifiInfo);
+                        mWifiNative.disconnect();
+                        transitionTo(mDisconnectingState);
+                    } else if (message.arg1 == NETWORK_STATUS_UNWANTED_DISABLE_AUTOJOIN ||
+                            message.arg1 == NETWORK_STATUS_UNWANTED_VALIDATION_FAILED) {
+                        Log.d(TAG, (message.arg1 == NETWORK_STATUS_UNWANTED_DISABLE_AUTOJOIN
+                                ? "NETWORK_STATUS_UNWANTED_DISABLE_AUTOJOIN"
+                                : "NETWORK_STATUS_UNWANTED_VALIDATION_FAILED"));
+                        config = getCurrentWifiConfiguration();
+                        if (config != null) {
+                            // Disable autojoin
+                            if (message.arg1 == NETWORK_STATUS_UNWANTED_DISABLE_AUTOJOIN) {
+                                config.validatedInternetAccess = false;
+                                // Clear last-selected status, as being last-selected also avoids
+                                // disabling auto-join.
+                                if (mWifiConfigManager.isLastSelectedConfiguration(config)) {
+                                    mWifiConfigManager.setAndEnableLastSelectedConfiguration(
+                                        WifiConfiguration.INVALID_NETWORK_ID);
+                                }
+                                mWifiConfigManager.updateNetworkSelectionStatus(config,
+                                        WifiConfiguration.NetworkSelectionStatus
+                                        .DISABLED_NO_INTERNET);
+                            }
+                            config.numNoInternetAccessReports += 1;
+                            mWifiConfigManager.writeKnownNetworkHistory();
+                        }
+                    }
+                    return HANDLED;
+                case CMD_NETWORK_STATUS:
+                    if (message.arg1 == NetworkAgent.VALID_NETWORK) {
+                        config = getCurrentWifiConfiguration();
+                        if (config != null) {
+                            // re-enable autojoin
+                            config.numNoInternetAccessReports = 0;
+                            config.validatedInternetAccess = true;
+                            mWifiConfigManager.writeKnownNetworkHistory();
+                        }
+                    }
+                    return HANDLED;
+                case CMD_ACCEPT_UNVALIDATED:
+                    boolean accept = (message.arg1 != 0);
+                    config = getCurrentWifiConfiguration();
+                    if (config != null) {
+                        config.noInternetAccessExpected = accept;
+                        mWifiConfigManager.writeKnownNetworkHistory();
+                    }
+                    return HANDLED;
+                case CMD_TEST_NETWORK_DISCONNECT:
+                    // Force a disconnect
+                    if (message.arg1 == testNetworkDisconnectCounter) {
+                        mWifiNative.disconnect();
+                    }
+                    break;
+                case CMD_ASSOCIATED_BSSID:
+                    // ASSOCIATING to a new BSSID while already connected, indicates
+                    // that driver is roaming
+                    mLastDriverRoamAttempt = System.currentTimeMillis();
+                    return NOT_HANDLED;
+                case WifiMonitor.NETWORK_DISCONNECTION_EVENT:
+                    long lastRoam = 0;
+                    reportConnectionAttemptEnd(
+                            WifiMetrics.ConnectionEvent.FAILURE_NETWORK_DISCONNECTION,
+                            WifiMetricsProto.ConnectionEvent.HLF_NONE);
+                    if (mLastDriverRoamAttempt != 0) {
+                        // Calculate time since last driver roam attempt
+                        lastRoam = System.currentTimeMillis() - mLastDriverRoamAttempt;
+                        mLastDriverRoamAttempt = 0;
+                    }
+                    if (unexpectedDisconnectedReason(message.arg2)) {
+                        mWifiLogger.captureBugReportData(
+                                WifiLogger.REPORT_REASON_UNEXPECTED_DISCONNECT);
+                    }
+                    config = getCurrentWifiConfiguration();
+                    if (mScreenOn
+                            && !linkDebouncing
+                            && config != null
+                            && config.getNetworkSelectionStatus().isNetworkEnabled()
+                            && !mWifiConfigManager.isLastSelectedConfiguration(config)
+                            && (message.arg2 != 3 /* reason cannot be 3, i.e. locally generated */
+                                || (lastRoam > 0 && lastRoam < 2000) /* unless driver is roaming */)
+                            && ((ScanResult.is24GHz(mWifiInfo.getFrequency())
+                                    && mWifiInfo.getRssi() >
+                                    WifiQualifiedNetworkSelector.QUALIFIED_RSSI_24G_BAND)
+                                    || (ScanResult.is5GHz(mWifiInfo.getFrequency())
+                                    && mWifiInfo.getRssi() >
+                                    mWifiConfigManager.mThresholdQualifiedRssi5.get()))) {
+                        // Start de-bouncing the L2 disconnection:
+                        // this L2 disconnection might be spurious.
+                        // Hence we allow 4 seconds for the state machine to try
+                        // to reconnect, go thru the
+                        // roaming cycle and enter Obtaining IP address
+                        // before signalling the disconnect to ConnectivityService and L3
+                        startScanForConfiguration(getCurrentWifiConfiguration());
+                        linkDebouncing = true;
+
+                        sendMessageDelayed(obtainMessage(CMD_DELAYED_NETWORK_DISCONNECT,
+                                0, mLastNetworkId), LINK_FLAPPING_DEBOUNCE_MSEC);
+                        if (DBG) {
+                            log("NETWORK_DISCONNECTION_EVENT in connected state"
+                                    + " BSSID=" + mWifiInfo.getBSSID()
+                                    + " RSSI=" + mWifiInfo.getRssi()
+                                    + " freq=" + mWifiInfo.getFrequency()
+                                    + " reason=" + message.arg2
+                                    + " -> debounce");
+                        }
+                        return HANDLED;
+                    } else {
+                        if (DBG) {
+                            log("NETWORK_DISCONNECTION_EVENT in connected state"
+                                    + " BSSID=" + mWifiInfo.getBSSID()
+                                    + " RSSI=" + mWifiInfo.getRssi()
+                                    + " freq=" + mWifiInfo.getFrequency()
+                                    + " was debouncing=" + linkDebouncing
+                                    + " reason=" + message.arg2
+                                    + " Network Selection Status=" + (config == null ? "Unavailable"
+                                    : config.getNetworkSelectionStatus().getNetworkStatusString()));
+                        }
+                    }
+                    break;
+                case CMD_AUTO_ROAM:
+                    // Clear the driver roam indication since we are attempting a framework roam
+                    mLastDriverRoamAttempt = 0;
+
+                    /*<TODO> 2016-02-24
+                        Fix CMD_AUTO_ROAM to use the candidate (message.arg1) networkID, rather than
+                        the old networkID.
+                        The current code only handles roaming between BSSIDs on the same networkID,
+                        and will break for roams between different (but linked) networkIDs. This
+                        case occurs for DBDC roaming, and the CMD_AUTO_ROAM sent due to it will
+                        fail.
+                    */
+                    /* Connect command coming from auto-join */
+                    ScanResult candidate = (ScanResult)message.obj;
+                    String bssid = "any";
+                    if (candidate != null) {
+                        bssid = candidate.BSSID;
+                    }
+                    int netId = message.arg1;
+                    if (netId == WifiConfiguration.INVALID_NETWORK_ID) {
+                        loge("AUTO_ROAM and no config, bail out...");
+                        break;
+                    } else {
+                        config = mWifiConfigManager.getWifiConfiguration(netId);
+                    }
+
+                    logd("CMD_AUTO_ROAM sup state "
+                            + mSupplicantStateTracker.getSupplicantStateName()
+                            + " my state " + getCurrentState().getName()
+                            + " nid=" + Integer.toString(netId)
+                            + " config " + config.configKey()
+                            + " roam=" + Integer.toString(message.arg2)
+                            + " to " + bssid
+                            + " targetRoamBSSID " + mTargetRoamBSSID);
+
+                    setTargetBssid(config, bssid);
+                    mTargetNetworkId = netId;
+
+                    /* Determine if this is a regular roam (between BSSIDs sharing the same SSID),
+                       or a DBDC roam (between 2.4 & 5GHz networks on different SSID's, but with
+                       matching 16 byte BSSID prefixes):
+                     */
+                    WifiConfiguration currentConfig = getCurrentWifiConfiguration();
+                    if (currentConfig != null && currentConfig.isLinked(config)) {
+                        // This is dual band roaming
+                        mWifiMetrics.startConnectionEvent(config, mTargetRoamBSSID,
+                                WifiMetricsProto.ConnectionEvent.ROAM_DBDC);
+                    } else {
+                        // This is regular roaming
+                        mWifiMetrics.startConnectionEvent(config, mTargetRoamBSSID,
+                                WifiMetricsProto.ConnectionEvent.ROAM_ENTERPRISE);
+                    }
+
+                    if (deferForUserInput(message, netId, false)) {
+                        reportConnectionAttemptEnd(
+                                WifiMetrics.ConnectionEvent.FAILURE_CONNECT_NETWORK_FAILED,
+                                WifiMetricsProto.ConnectionEvent.HLF_NONE);
+                        break;
+                    } else if (mWifiConfigManager.getWifiConfiguration(netId).userApproved ==
+                            WifiConfiguration.USER_BANNED) {
+                        replyToMessage(message, WifiManager.CONNECT_NETWORK_FAILED,
+                                WifiManager.NOT_AUTHORIZED);
+                        reportConnectionAttemptEnd(
+                                WifiMetrics.ConnectionEvent.FAILURE_CONNECT_NETWORK_FAILED,
+                                WifiMetricsProto.ConnectionEvent.HLF_NONE);
+                        break;
+                    }
+
+                    boolean ret = false;
+                    if (mLastNetworkId != netId) {
+                        if (mWifiConfigManager.selectNetwork(config, /* updatePriorities = */ false,
+                                WifiConfiguration.UNKNOWN_UID) && mWifiNative.reconnect()) {
+                            ret = true;
+                        }
+                    } else {
+                        ret = mWifiNative.reassociate();
+                    }
+                    if (ret) {
+                        lastConnectAttemptTimestamp = System.currentTimeMillis();
+                        targetWificonfiguration = mWifiConfigManager.getWifiConfiguration(netId);
+
+                        // replyToMessage(message, WifiManager.CONNECT_NETWORK_SUCCEEDED);
+                        mAutoRoaming = true;
+                        transitionTo(mRoamingState);
+
+                    } else {
+                        loge("Failed to connect config: " + config + " netId: " + netId);
+                        replyToMessage(message, WifiManager.CONNECT_NETWORK_FAILED,
+                                WifiManager.ERROR);
+                        messageHandlingStatus = MESSAGE_HANDLING_STATUS_FAIL;
+                        reportConnectionAttemptEnd(
+                                WifiMetrics.ConnectionEvent.FAILURE_CONNECT_NETWORK_FAILED,
+                                WifiMetricsProto.ConnectionEvent.HLF_NONE);
+                        break;
+                    }
+                    break;
+                case CMD_START_IP_PACKET_OFFLOAD: {
+                        int slot = message.arg1;
+                        int intervalSeconds = message.arg2;
+                        KeepalivePacketData pkt = (KeepalivePacketData) message.obj;
+                        byte[] dstMac;
+                        try {
+                            InetAddress gateway = RouteInfo.selectBestRoute(
+                                    mLinkProperties.getRoutes(), pkt.dstAddress).getGateway();
+                            String dstMacStr = macAddressFromRoute(gateway.getHostAddress());
+                            dstMac = macAddressFromString(dstMacStr);
+                        } catch (NullPointerException|IllegalArgumentException e) {
+                            loge("Can't find MAC address for next hop to " + pkt.dstAddress);
+                            mNetworkAgent.onPacketKeepaliveEvent(slot,
+                                    ConnectivityManager.PacketKeepalive.ERROR_INVALID_IP_ADDRESS);
+                            break;
+                        }
+                        pkt.dstMac = dstMac;
+                        int result = startWifiIPPacketOffload(slot, pkt, intervalSeconds);
+                        mNetworkAgent.onPacketKeepaliveEvent(slot, result);
+                        break;
+                    }
+                default:
+                    return NOT_HANDLED;
+            }
+            return HANDLED;
+!!!36956727.java!!!	exit() : void
+            logd("WifiStateMachine: Leaving Connected state");
+            if (mWifiConnectivityManager != null) {
+                mWifiConnectivityManager.handleConnectionStateChanged(
+                         WifiConnectivityManager.WIFI_STATE_TRANSITIONING);
+            }
+
+            mLastDriverRoamAttempt = 0;
+            mWhiteListedSsids = null;
+            mWifiLastResortWatchdog.connectedStateTransition(false);

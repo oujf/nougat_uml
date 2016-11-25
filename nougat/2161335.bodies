@@ -1,0 +1,138 @@
+class RILSender
+!!!37724855.java!!!	RILSender(inout looper : Looper)
+            super(looper);
+!!!37724983.java!!!	run() : void
+            //setup if needed
+!!!37725111.java!!!	handleMessage(inout msg : Message) : void
+            RILRequest rr = (RILRequest)(msg.obj);
+            RILRequest req = null;
+
+            switch (msg.what) {
+                case EVENT_SEND:
+                case EVENT_SEND_ACK:
+                    try {
+                        LocalSocket s;
+
+                        s = mSocket;
+
+                        if (s == null) {
+                            rr.onError(RADIO_NOT_AVAILABLE, null);
+                            decrementWakeLock(rr);
+                            rr.release();
+                            return;
+                        }
+
+                        // Acks should not be stored in list before sending
+                        if (msg.what != EVENT_SEND_ACK) {
+                            synchronized (mRequestList) {
+                                mRequestList.append(rr.mSerial, rr);
+                            }
+                        }
+
+                        byte[] data;
+
+                        data = rr.mParcel.marshall();
+                        rr.mParcel.recycle();
+                        rr.mParcel = null;
+
+                        if (data.length > RIL_MAX_COMMAND_BYTES) {
+                            throw new RuntimeException(
+                                    "Parcel larger than max bytes allowed! "
+                                                          + data.length);
+                        }
+
+                        // parcel length in big endian
+                        dataLength[0] = dataLength[1] = 0;
+                        dataLength[2] = (byte)((data.length >> 8) & 0xff);
+                        dataLength[3] = (byte)((data.length) & 0xff);
+
+                        //Rlog.v(RILJ_LOG_TAG, "writing packet: " + data.length + " bytes");
+
+                        s.getOutputStream().write(dataLength);
+                        s.getOutputStream().write(data);
+                        if (msg.what == EVENT_SEND_ACK) {
+                            rr.release();
+                            return;
+                        }
+                    } catch (IOException ex) {
+                        Rlog.e(RILJ_LOG_TAG, "IOException", ex);
+                        req = findAndRemoveRequestFromList(rr.mSerial);
+                        // make sure this request has not already been handled,
+                        // eg, if RILReceiver cleared the list.
+                        if (req != null) {
+                            rr.onError(RADIO_NOT_AVAILABLE, null);
+                            decrementWakeLock(rr);
+                            rr.release();
+                            return;
+                        }
+                    } catch (RuntimeException exc) {
+                        Rlog.e(RILJ_LOG_TAG, "Uncaught exception ", exc);
+                        req = findAndRemoveRequestFromList(rr.mSerial);
+                        // make sure this request has not already been handled,
+                        // eg, if RILReceiver cleared the list.
+                        if (req != null) {
+                            rr.onError(GENERIC_FAILURE, null);
+                            decrementWakeLock(rr);
+                            rr.release();
+                            return;
+                        }
+                    }
+
+                    break;
+
+                case EVENT_WAKE_LOCK_TIMEOUT:
+                    // Haven't heard back from the last request.  Assume we're
+                    // not getting a response and  release the wake lock.
+
+                    // The timer of WAKE_LOCK_TIMEOUT is reset with each
+                    // new send request. So when WAKE_LOCK_TIMEOUT occurs
+                    // all requests in mRequestList already waited at
+                    // least DEFAULT_WAKE_LOCK_TIMEOUT_MS but no response.
+                    //
+                    // Note: Keep mRequestList so that delayed response
+                    // can still be handled when response finally comes.
+
+                    synchronized (mRequestList) {
+                        if (msg.arg1 == mWlSequenceNum && clearWakeLock(FOR_WAKELOCK)) {
+                            if (RILJ_LOGD) {
+                                int count = mRequestList.size();
+                                Rlog.d(RILJ_LOG_TAG, "WAKE_LOCK_TIMEOUT " +
+                                        " mRequestList=" + count);
+                                for (int i = 0; i < count; i++) {
+                                    rr = mRequestList.valueAt(i);
+                                    Rlog.d(RILJ_LOG_TAG, i + ": [" + rr.mSerial + "] "
+                                            + requestToString(rr.mRequest));
+                                }
+                            }
+                        }
+                    }
+                    break;
+
+                case EVENT_ACK_WAKE_LOCK_TIMEOUT:
+                    if (msg.arg1 == mAckWlSequenceNum && clearWakeLock(FOR_ACK_WAKELOCK)) {
+                        if (RILJ_LOGD) {
+                            Rlog.d(RILJ_LOG_TAG, "ACK_WAKE_LOCK_TIMEOUT");
+                        }
+                    }
+                    break;
+
+                case EVENT_BLOCKING_RESPONSE_TIMEOUT:
+                    int serial = msg.arg1;
+                    rr = findAndRemoveRequestFromList(serial);
+                    // If the request has already been processed, do nothing
+                    if(rr == null) {
+                        break;
+                    }
+
+                    //build a response if expected
+                    if (rr.mResult != null) {
+                        Object timeoutResponse = getResponseForTimedOutRILRequest(rr);
+                        AsyncResult.forMessage( rr.mResult, timeoutResponse, null);
+                        rr.mResult.sendToTarget();
+                        mEventLog.writeOnRilTimeoutResponse(rr.mSerial, rr.mRequest);
+                    }
+
+                    decrementWakeLock(rr);
+                    rr.release();
+                    break;
+            }

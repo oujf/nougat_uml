@@ -1,0 +1,209 @@
+class FrameSequenceDrawable
+!!!36332343.java!!!	initializeDecodingThread() : void
+        synchronized (sLock) {
+            if (sDecodingThread != null) return;
+
+            sDecodingThread = new HandlerThread("FrameSequence decoding thread",
+                    Process.THREAD_PRIORITY_BACKGROUND);
+            sDecodingThread.start();
+            sDecodingThreadHandler = new Handler(sDecodingThread.getLooper());
+        }
+!!!36332855.java!!!	setOnFinishedListener(inout onFinishedListener : FrameSequenceDrawable::OnFinishedListener) : void
+        mOnFinishedListener = onFinishedListener;
+!!!36332983.java!!!	setLoopBehavior(in loopBehavior : int) : void
+        mLoopBehavior = loopBehavior;
+!!!36333111.java!!!	acquireAndValidateBitmap(inout bitmapProvider : FrameSequenceDrawable::BitmapProvider, in minWidth : int, in minHeight : int) : Bitmap
+        Bitmap bitmap = bitmapProvider.acquireBitmap(minWidth, minHeight);
+
+        if (bitmap.getWidth() < minWidth
+                || bitmap.getHeight() < minHeight
+                || bitmap.getConfig() != Bitmap.Config.ARGB_8888) {
+            throw new IllegalArgumentException("Invalid bitmap provided");
+        }
+
+        return bitmap;
+!!!36333239.java!!!	FrameSequenceDrawable(inout frameSequence : FrameSequence)
+        this(frameSequence, sAllocatingBitmapProvider);
+!!!36333367.java!!!	FrameSequenceDrawable(inout frameSequence : FrameSequence, inout bitmapProvider : FrameSequenceDrawable::BitmapProvider)
+        if (frameSequence == null || bitmapProvider == null) throw new IllegalArgumentException();
+
+        mFrameSequence = frameSequence;
+        mFrameSequenceState = frameSequence.createState();
+        final int width = frameSequence.getWidth();
+        final int height = frameSequence.getHeight();
+
+        mBitmapProvider = bitmapProvider;
+        mFrontBitmap = acquireAndValidateBitmap(bitmapProvider, width, height);
+        mBackBitmap = acquireAndValidateBitmap(bitmapProvider, width, height);
+        mSrcRect = new Rect(0, 0, width, height);
+        mPaint = new Paint();
+        mPaint.setFilterBitmap(true);
+
+        mFrontBitmapShader
+            = new BitmapShader(mFrontBitmap, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP);
+        mBackBitmapShader
+            = new BitmapShader(mBackBitmap, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP);
+
+        mLastSwap = 0;
+
+        mNextFrameToDecode = -1;
+        mFrameSequenceState.getFrame(0, mFrontBitmap, -1);
+        initializeDecodingThread();
+!!!36333495.java!!!	setCircleMaskEnabled(inout circleMaskEnabled : boolean) : void
+        mCircleMaskEnabled = circleMaskEnabled;
+        // Anti alias only necessary when using circular mask
+        mPaint.setAntiAlias(circleMaskEnabled);
+!!!36333623.java!!!	checkDestroyedLocked() : void
+        if (mDestroyed) {
+            throw new IllegalStateException("Cannot perform operation on recycled drawable");
+        }
+!!!36333751.java!!!	isDestroyed() : boolean
+        synchronized (mLock) {
+            return mDestroyed;
+        }
+!!!36333879.java!!!	destroy() : void
+        if (mBitmapProvider == null) {
+            throw new IllegalStateException("BitmapProvider must be non-null");
+        }
+
+        Bitmap bitmapToReleaseA;
+        Bitmap bitmapToReleaseB = null;
+        synchronized (mLock) {
+            checkDestroyedLocked();
+
+            bitmapToReleaseA = mFrontBitmap;
+            mFrontBitmap = null;
+
+            if (mState != STATE_DECODING) {
+                bitmapToReleaseB = mBackBitmap;
+                mBackBitmap = null;
+            }
+
+            mDestroyed = true;
+        }
+
+        // For simplicity and safety, we don't destroy the state object here
+        mBitmapProvider.releaseBitmap(bitmapToReleaseA);
+        if (bitmapToReleaseB != null) {
+            mBitmapProvider.releaseBitmap(bitmapToReleaseB);
+        }
+!!!36334007.java!!!	finalize() : void
+        try {
+            mFrameSequenceState.destroy();
+        } finally {
+            super.finalize();
+        }
+!!!36334135.java!!!	draw(inout canvas : Canvas) : void
+        synchronized (mLock) {
+            checkDestroyedLocked();
+            if (mState == STATE_WAITING_TO_SWAP) {
+                // may have failed to schedule mark ready runnable,
+                // so go ahead and swap if swapping is due
+                if (mNextSwap - SystemClock.uptimeMillis() <= 0) {
+                    mState = STATE_READY_TO_SWAP;
+                }
+            }
+
+            if (isRunning() && mState == STATE_READY_TO_SWAP) {
+                // Because draw has occurred, the view system is guaranteed to no longer hold a
+                // reference to the old mFrontBitmap, so we now use it to produce the next frame
+                Bitmap tmp = mBackBitmap;
+                mBackBitmap = mFrontBitmap;
+                mFrontBitmap = tmp;
+
+                BitmapShader tmpShader = mBackBitmapShader;
+                mBackBitmapShader = mFrontBitmapShader;
+                mFrontBitmapShader = tmpShader;
+
+                mLastSwap = SystemClock.uptimeMillis();
+
+                boolean continueLooping = true;
+                if (mNextFrameToDecode == mFrameSequence.getFrameCount() - 1) {
+                    mCurrentLoop++;
+                    if ((mLoopBehavior == LOOP_ONCE && mCurrentLoop == 1) ||
+                            (mLoopBehavior == LOOP_DEFAULT && mCurrentLoop == mFrameSequence.getDefaultLoopCount())) {
+                        continueLooping = false;
+                    }
+                }
+
+                if (continueLooping) {
+                    scheduleDecodeLocked();
+                } else {
+                    scheduleSelf(mCallbackRunnable, 0);
+                }
+            }
+        }
+
+        if (mCircleMaskEnabled) {
+            Rect bounds = getBounds();
+            mPaint.setShader(mFrontBitmapShader);
+            float width = bounds.width();
+            float height = bounds.height();
+            float circleRadius = (Math.min(width, height)) / 2f;
+            canvas.drawCircle(width / 2f, height / 2f, circleRadius, mPaint);
+        } else {
+            mPaint.setShader(null);
+            canvas.drawBitmap(mFrontBitmap, mSrcRect, getBounds(), mPaint);
+        }
+!!!36334263.java!!!	scheduleDecodeLocked() : void
+        mState = STATE_SCHEDULED;
+        mNextFrameToDecode = (mNextFrameToDecode + 1) % mFrameSequence.getFrameCount();
+        sDecodingThreadHandler.post(mDecodeRunnable);
+!!!36334391.java!!!	run() : void
+        // set ready to swap as necessary
+        boolean invalidate = false;
+        synchronized (mLock) {
+            if (mNextFrameToDecode >= 0 && mState == STATE_WAITING_TO_SWAP) {
+                mState = STATE_READY_TO_SWAP;
+                invalidate = true;
+            }
+        }
+        if (invalidate) {
+            invalidateSelf();
+        }
+!!!36334519.java!!!	start() : void
+        if (!isRunning()) {
+            synchronized (mLock) {
+                checkDestroyedLocked();
+                if (mState == STATE_SCHEDULED) return; // already scheduled
+                mCurrentLoop = 0;
+                scheduleDecodeLocked();
+            }
+        }
+!!!36334647.java!!!	stop() : void
+        if (isRunning()) {
+            unscheduleSelf(this);
+        }
+!!!36334775.java!!!	isRunning() : boolean
+        synchronized (mLock) {
+            return mNextFrameToDecode > -1 && !mDestroyed;
+        }
+!!!36334903.java!!!	unscheduleSelf(inout what : Runnable) : void
+        synchronized (mLock) {
+            mNextFrameToDecode = -1;
+            mState = 0;
+        }
+        super.unscheduleSelf(what);
+!!!36335031.java!!!	setVisible(inout visible : boolean, inout restart : boolean) : boolean
+        boolean changed = super.setVisible(visible, restart);
+
+        if (!visible) {
+            stop();
+        } else if (restart || changed) {
+            stop();
+            start();
+        }
+
+        return changed;
+!!!36335159.java!!!	setFilterBitmap(inout filter : boolean) : void
+        mPaint.setFilterBitmap(filter);
+!!!36335287.java!!!	setAlpha(in alpha : int) : void
+        mPaint.setAlpha(alpha);
+!!!36335415.java!!!	setColorFilter(inout colorFilter : ColorFilter) : void
+        mPaint.setColorFilter(colorFilter);
+!!!36335543.java!!!	getIntrinsicWidth() : int
+        return mFrameSequence.getWidth();
+!!!36335671.java!!!	getIntrinsicHeight() : int
+        return mFrameSequence.getHeight();
+!!!36335799.java!!!	getOpacity() : int
+        return mFrameSequence.isOpaque() ? PixelFormat.OPAQUE : PixelFormat.TRANSPARENT;

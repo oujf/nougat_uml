@@ -1,0 +1,216 @@
+class KeyStoreCryptoOperationChunkedStreamer
+!!!28061879.java!!!	KeyStoreCryptoOperationChunkedStreamer(inout operation : KeyStoreCryptoOperationChunkedStreamer::Stream)
+        this(operation, DEFAULT_MAX_CHUNK_SIZE);
+!!!28062007.java!!!	KeyStoreCryptoOperationChunkedStreamer(inout operation : KeyStoreCryptoOperationChunkedStreamer::Stream, in maxChunkSize : int)
+        mKeyStoreStream = operation;
+        mMaxChunkSize = maxChunkSize;
+!!!28062135.java!!!	update(inout input : byte, in inputOffset : int, in inputLength : int) : byte
+        if (inputLength == 0) {
+            // No input provided
+            return EmptyArray.BYTE;
+        }
+
+        ByteArrayOutputStream bufferedOutput = null;
+
+        while (inputLength > 0) {
+            byte[] chunk;
+            int inputBytesInChunk;
+            if ((mBufferedLength + inputLength) > mMaxChunkSize) {
+                // Too much input for one chunk -- extract one max-sized chunk and feed it into the
+                // update operation.
+                inputBytesInChunk = mMaxChunkSize - mBufferedLength;
+                chunk = ArrayUtils.concat(mBuffered, mBufferedOffset, mBufferedLength,
+                        input, inputOffset, inputBytesInChunk);
+            } else {
+                // All of available input fits into one chunk.
+                if ((mBufferedLength == 0) && (inputOffset == 0)
+                        && (inputLength == input.length)) {
+                    // Nothing buffered and all of input array needs to be fed into the update
+                    // operation.
+                    chunk = input;
+                    inputBytesInChunk = input.length;
+                } else {
+                    // Need to combine buffered data with input data into one array.
+                    inputBytesInChunk = inputLength;
+                    chunk = ArrayUtils.concat(mBuffered, mBufferedOffset, mBufferedLength,
+                            input, inputOffset, inputBytesInChunk);
+                }
+            }
+            // Update input array references to reflect that some of its bytes are now in mBuffered.
+            inputOffset += inputBytesInChunk;
+            inputLength -= inputBytesInChunk;
+            mConsumedInputSizeBytes += inputBytesInChunk;
+
+            OperationResult opResult = mKeyStoreStream.update(chunk);
+            if (opResult == null) {
+                throw new KeyStoreConnectException();
+            } else if (opResult.resultCode != KeyStore.NO_ERROR) {
+                throw KeyStore.getKeyStoreException(opResult.resultCode);
+            }
+
+            if (opResult.inputConsumed == chunk.length) {
+                // The whole chunk was consumed
+                mBuffered = EmptyArray.BYTE;
+                mBufferedOffset = 0;
+                mBufferedLength = 0;
+            } else if (opResult.inputConsumed <= 0) {
+                // Nothing was consumed. More input needed.
+                if (inputLength > 0) {
+                    // More input is available, but it wasn't included into the previous chunk
+                    // because the chunk reached its maximum permitted size.
+                    // Shouldn't have happened.
+                    throw new KeyStoreException(KeymasterDefs.KM_ERROR_UNKNOWN_ERROR,
+                            "Keystore consumed nothing from max-sized chunk: " + chunk.length
+                                    + " bytes");
+                }
+                mBuffered = chunk;
+                mBufferedOffset = 0;
+                mBufferedLength = chunk.length;
+            } else if (opResult.inputConsumed < chunk.length) {
+                // The chunk was consumed only partially -- buffer the rest of the chunk
+                mBuffered = chunk;
+                mBufferedOffset = opResult.inputConsumed;
+                mBufferedLength = chunk.length - opResult.inputConsumed;
+            } else {
+                throw new KeyStoreException(KeymasterDefs.KM_ERROR_UNKNOWN_ERROR,
+                        "Keystore consumed more input than provided. Provided: " + chunk.length
+                                + ", consumed: " + opResult.inputConsumed);
+            }
+
+            if ((opResult.output != null) && (opResult.output.length > 0)) {
+                if (inputLength > 0) {
+                    // More output might be produced in this loop -- buffer the current output
+                    if (bufferedOutput == null) {
+                        bufferedOutput = new ByteArrayOutputStream();
+                        try {
+                            bufferedOutput.write(opResult.output);
+                        } catch (IOException e) {
+                            throw new ProviderException("Failed to buffer output", e);
+                        }
+                    }
+                } else {
+                    // No more output will be produced in this loop
+                    byte[] result;
+                    if (bufferedOutput == null) {
+                        // No previously buffered output
+                        result = opResult.output;
+                    } else {
+                        // There was some previously buffered output
+                        try {
+                            bufferedOutput.write(opResult.output);
+                        } catch (IOException e) {
+                            throw new ProviderException("Failed to buffer output", e);
+                        }
+                        result = bufferedOutput.toByteArray();
+                    }
+                    mProducedOutputSizeBytes += result.length;
+                    return result;
+                }
+            }
+        }
+
+        byte[] result;
+        if (bufferedOutput == null) {
+            // No output produced
+            result = EmptyArray.BYTE;
+        } else {
+            result = bufferedOutput.toByteArray();
+        }
+        mProducedOutputSizeBytes += result.length;
+        return result;
+!!!28062263.java!!!	doFinal(inout input : byte, in inputOffset : int, in inputLength : int, inout signature : byte, inout additionalEntropy : byte) : byte
+        if (inputLength == 0) {
+            // No input provided -- simplify the rest of the code
+            input = EmptyArray.BYTE;
+            inputOffset = 0;
+        }
+
+        // Flush all buffered input and provided input into keystore/keymaster.
+        byte[] output = update(input, inputOffset, inputLength);
+        output = ArrayUtils.concat(output, flush());
+
+        OperationResult opResult = mKeyStoreStream.finish(signature, additionalEntropy);
+        if (opResult == null) {
+            throw new KeyStoreConnectException();
+        } else if (opResult.resultCode != KeyStore.NO_ERROR) {
+            throw KeyStore.getKeyStoreException(opResult.resultCode);
+        }
+        mProducedOutputSizeBytes += opResult.output.length;
+
+        return ArrayUtils.concat(output, opResult.output);
+!!!28062391.java!!!	flush() : byte
+        if (mBufferedLength <= 0) {
+            return EmptyArray.BYTE;
+        }
+
+        // Keep invoking the update operation with remaining buffered data until either all of the
+        // buffered data is consumed or until update fails to consume anything.
+        ByteArrayOutputStream bufferedOutput = null;
+        while (mBufferedLength > 0) {
+            byte[] chunk = ArrayUtils.subarray(mBuffered, mBufferedOffset, mBufferedLength);
+            OperationResult opResult = mKeyStoreStream.update(chunk);
+            if (opResult == null) {
+                throw new KeyStoreConnectException();
+            } else if (opResult.resultCode != KeyStore.NO_ERROR) {
+                throw KeyStore.getKeyStoreException(opResult.resultCode);
+            }
+
+            if (opResult.inputConsumed <= 0) {
+                // Nothing was consumed. Break out of the loop to avoid an infinite loop.
+                break;
+            }
+
+            if (opResult.inputConsumed >= chunk.length) {
+                // All of the input was consumed
+                mBuffered = EmptyArray.BYTE;
+                mBufferedOffset = 0;
+                mBufferedLength = 0;
+            } else {
+                // Some of the input was not consumed
+                mBuffered = chunk;
+                mBufferedOffset = opResult.inputConsumed;
+                mBufferedLength = chunk.length - opResult.inputConsumed;
+            }
+
+            if (opResult.inputConsumed > chunk.length) {
+                throw new KeyStoreException(KeymasterDefs.KM_ERROR_UNKNOWN_ERROR,
+                        "Keystore consumed more input than provided. Provided: "
+                                + chunk.length + ", consumed: " + opResult.inputConsumed);
+            }
+
+            if ((opResult.output != null) && (opResult.output.length > 0)) {
+                // Some output was produced by this update operation
+                if (bufferedOutput == null) {
+                    // No output buffered yet.
+                    if (mBufferedLength == 0) {
+                        // No more output will be produced by this flush operation
+                        mProducedOutputSizeBytes += opResult.output.length;
+                        return opResult.output;
+                    } else {
+                        // More output might be produced by this flush operation -- buffer output.
+                        bufferedOutput = new ByteArrayOutputStream();
+                    }
+                }
+                // Buffer the output from this update operation
+                try {
+                    bufferedOutput.write(opResult.output);
+                } catch (IOException e) {
+                    throw new ProviderException("Failed to buffer output", e);
+                }
+            }
+        }
+
+        if (mBufferedLength > 0) {
+            throw new KeyStoreException(KeymasterDefs.KM_ERROR_INVALID_INPUT_LENGTH,
+                    "Keystore failed to consume last "
+                            + ((mBufferedLength != 1) ? (mBufferedLength + " bytes") : "byte")
+                            + " of input");
+        }
+
+        byte[] result = (bufferedOutput != null) ? bufferedOutput.toByteArray() : EmptyArray.BYTE;
+        mProducedOutputSizeBytes += result.length;
+        return result;
+!!!28062519.java!!!	getConsumedInputSizeBytes() : long
+        return mConsumedInputSizeBytes;
+!!!28062647.java!!!	getProducedOutputSizeBytes() : long
+        return mProducedOutputSizeBytes;

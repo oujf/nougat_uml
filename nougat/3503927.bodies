@@ -1,0 +1,245 @@
+class SoftVPX
+!!!39865783.cpp!!!	SoftVPX(in name : char, in componentRole : char, in codingType : OMX_VIDEO_CODINGTYPE, in callbacks : OMX_CALLBACKTYPE, in appData : OMX_PTR, inout component : OMX_COMPONENTTYPE)
+    // arbitrary from avc/hevc as vpx does not specify a min compression ratio
+    const size_t kMinCompressionRatio = mMode == MODE_VP8 ? 2 : 4;
+    const char *mime = mMode == MODE_VP8 ? MEDIA_MIMETYPE_VIDEO_VP8 : MEDIA_MIMETYPE_VIDEO_VP9;
+    const size_t kMaxOutputBufferSize = 2048 * 2048 * 3 / 2;
+    initPorts(
+            kNumBuffers, kMaxOutputBufferSize / kMinCompressionRatio /* inputBufferSize */,
+            kNumBuffers, mime, kMinCompressionRatio);
+    CHECK_EQ(initDecoder(), (status_t)OK);
+!!!39865911.cpp!!!	~SoftVPX()
+    destroyDecoder();
+!!!39866039.cpp!!!	onQueueFilled(in portIndex : OMX_U32) : void
+    if (mOutputPortSettingsChange != NONE || mEOSStatus == OUTPUT_FRAMES_FLUSHED) {
+        return;
+    }
+
+    List<BufferInfo *> &inQueue = getPortQueue(0);
+    List<BufferInfo *> &outQueue = getPortQueue(1);
+    bool EOSseen = false;
+    bool portWillReset = false;
+
+    while ((mEOSStatus == INPUT_EOS_SEEN || !inQueue.empty())
+            && !outQueue.empty()) {
+        // Output the pending frames that left from last port reset or decoder flush.
+        if (mEOSStatus == INPUT_EOS_SEEN || mImg != NULL) {
+            if (!outputBuffers(
+                     mEOSStatus == INPUT_EOS_SEEN, true /* display */,
+                     mEOSStatus == INPUT_EOS_SEEN, &portWillReset)) {
+                ALOGE("on2 decoder failed to output frame.");
+                notify(OMX_EventError, OMX_ErrorUndefined, 0, NULL);
+                return;
+            }
+            if (portWillReset || mEOSStatus == OUTPUT_FRAMES_FLUSHED ||
+                    mEOSStatus == INPUT_EOS_SEEN) {
+                return;
+            }
+            // Continue as outQueue may be empty now.
+            continue;
+        }
+
+        BufferInfo *inInfo = *inQueue.begin();
+        OMX_BUFFERHEADERTYPE *inHeader = inInfo->mHeader;
+
+        // Software VP9 Decoder does not need the Codec Specific Data (CSD)
+        // (specified in http://www.webmproject.org/vp9/profiles/). Ignore it if
+        // it was passed.
+        if (inHeader->nFlags & OMX_BUFFERFLAG_CODECCONFIG) {
+            // Only ignore CSD buffer for VP9.
+            if (mMode == MODE_VP9) {
+                inQueue.erase(inQueue.begin());
+                inInfo->mOwnedByUs = false;
+                notifyEmptyBufferDone(inHeader);
+                continue;
+            } else {
+                // Tolerate the CSD buffer for VP8. This is a workaround
+                // for b/28689536.
+                ALOGW("WARNING: Got CSD buffer for VP8.");
+            }
+        }
+
+        mTimeStamps[mTimeStampIdx] = inHeader->nTimeStamp;
+
+        if (inHeader->nFlags & OMX_BUFFERFLAG_EOS) {
+            mEOSStatus = INPUT_EOS_SEEN;
+            EOSseen = true;
+        }
+
+        if (inHeader->nFilledLen > 0) {
+            vpx_codec_err_t err = vpx_codec_decode(
+                    (vpx_codec_ctx_t *)mCtx, inHeader->pBuffer + inHeader->nOffset,
+                    inHeader->nFilledLen, &mTimeStamps[mTimeStampIdx], 0);
+            if (err == VPX_CODEC_OK) {
+                inInfo->mOwnedByUs = false;
+                inQueue.erase(inQueue.begin());
+                inInfo = NULL;
+                notifyEmptyBufferDone(inHeader);
+                inHeader = NULL;
+            } else {
+                ALOGE("on2 decoder failed to decode frame. err: %d", err);
+                notify(OMX_EventError, OMX_ErrorUndefined, 0, NULL);
+                return;
+            }
+        }
+
+        mTimeStampIdx = (mTimeStampIdx + 1) % kNumBuffers;
+
+        if (!outputBuffers(
+                 EOSseen /* flushDecoder */, true /* display */, EOSseen, &portWillReset)) {
+            ALOGE("on2 decoder failed to output frame.");
+            notify(OMX_EventError, OMX_ErrorUndefined, 0, NULL);
+            return;
+        }
+        if (portWillReset) {
+            return;
+        }
+    }
+!!!39866167.cpp!!!	onPortFlushCompleted(in portIndex : OMX_U32) : void
+    if (portIndex == kInputPortIndex) {
+        bool portWillReset = false;
+        if (!outputBuffers(
+                 true /* flushDecoder */, false /* display */, false /* eos */, &portWillReset)) {
+            ALOGE("Failed to flush decoder.");
+            notify(OMX_EventError, OMX_ErrorUndefined, 0, NULL);
+            return;
+        }
+        mEOSStatus = INPUT_DATA_AVAILABLE;
+    }
+!!!39866295.cpp!!!	onReset() : void
+    bool portWillReset = false;
+    if (!outputBuffers(
+             true /* flushDecoder */, false /* display */, false /* eos */, &portWillReset)) {
+        ALOGW("Failed to flush decoder. Try to hard reset decoder");
+        destroyDecoder();
+        initDecoder();
+    }
+    mEOSStatus = INPUT_DATA_AVAILABLE;
+!!!39866423.cpp!!!	initDecoder() : status_t
+    mCtx = new vpx_codec_ctx_t;
+    vpx_codec_err_t vpx_err;
+    vpx_codec_dec_cfg_t cfg;
+    vpx_codec_flags_t flags;
+    memset(&cfg, 0, sizeof(vpx_codec_dec_cfg_t));
+    memset(&flags, 0, sizeof(vpx_codec_flags_t));
+    cfg.threads = GetCPUCoreCount();
+
+    if (mFrameParallelMode) {
+        flags |= VPX_CODEC_USE_FRAME_THREADING;
+    }
+
+    if ((vpx_err = vpx_codec_dec_init(
+                (vpx_codec_ctx_t *)mCtx,
+                 mMode == MODE_VP8 ? &vpx_codec_vp8_dx_algo : &vpx_codec_vp9_dx_algo,
+                 &cfg, flags))) {
+        ALOGE("on2 decoder failed to initialize. (%d)", vpx_err);
+        return UNKNOWN_ERROR;
+    }
+
+    return OK;
+!!!39866551.cpp!!!	destroyDecoder() : status_t
+    vpx_codec_destroy((vpx_codec_ctx_t *)mCtx);
+    delete (vpx_codec_ctx_t *)mCtx;
+    mCtx = NULL;
+    return OK;
+!!!39866679.cpp!!!	outputBuffers(in flushDecoder : bool, in display : bool, in eos : bool, inout portWillReset : bool) : bool
+    List<BufferInfo *> &outQueue = getPortQueue(1);
+    BufferInfo *outInfo = NULL;
+    OMX_BUFFERHEADERTYPE *outHeader = NULL;
+    vpx_codec_iter_t iter = NULL;
+
+    if (flushDecoder && mFrameParallelMode) {
+        // Flush decoder by passing NULL data ptr and 0 size.
+        // Ideally, this should never fail.
+        if (vpx_codec_decode((vpx_codec_ctx_t *)mCtx, NULL, 0, NULL, 0)) {
+            ALOGE("Failed to flush on2 decoder.");
+            return false;
+        }
+    }
+
+    if (!display) {
+        if (!flushDecoder) {
+            ALOGE("Invalid operation.");
+            return false;
+        }
+        // Drop all the decoded frames in decoder.
+        while ((mImg = vpx_codec_get_frame((vpx_codec_ctx_t *)mCtx, &iter))) {
+        }
+        return true;
+    }
+
+    while (!outQueue.empty()) {
+        if (mImg == NULL) {
+            mImg = vpx_codec_get_frame((vpx_codec_ctx_t *)mCtx, &iter);
+            if (mImg == NULL) {
+                break;
+            }
+        }
+        uint32_t width = mImg->d_w;
+        uint32_t height = mImg->d_h;
+        outInfo = *outQueue.begin();
+        outHeader = outInfo->mHeader;
+        CHECK_EQ(mImg->fmt, VPX_IMG_FMT_I420);
+        handlePortSettingsChange(portWillReset, width, height);
+        if (*portWillReset) {
+            return true;
+        }
+
+        outHeader->nOffset = 0;
+        outHeader->nFlags = 0;
+        outHeader->nFilledLen = (outputBufferWidth() * outputBufferHeight() * 3) / 2;
+        outHeader->nTimeStamp = *(OMX_TICKS *)mImg->user_priv;
+        if (outputBufferSafe(outHeader)) {
+            uint8_t *dst = outHeader->pBuffer;
+            const uint8_t *srcY = (const uint8_t *)mImg->planes[VPX_PLANE_Y];
+            const uint8_t *srcU = (const uint8_t *)mImg->planes[VPX_PLANE_U];
+            const uint8_t *srcV = (const uint8_t *)mImg->planes[VPX_PLANE_V];
+            size_t srcYStride = mImg->stride[VPX_PLANE_Y];
+            size_t srcUStride = mImg->stride[VPX_PLANE_U];
+            size_t srcVStride = mImg->stride[VPX_PLANE_V];
+            copyYV12FrameToOutputBuffer(dst, srcY, srcU, srcV, srcYStride, srcUStride, srcVStride);
+        } else {
+            outHeader->nFilledLen = 0;
+        }
+
+        mImg = NULL;
+        outInfo->mOwnedByUs = false;
+        outQueue.erase(outQueue.begin());
+        outInfo = NULL;
+        notifyFillBufferDone(outHeader);
+        outHeader = NULL;
+    }
+
+    if (!eos) {
+        return true;
+    }
+
+    if (!outQueue.empty()) {
+        outInfo = *outQueue.begin();
+        outQueue.erase(outQueue.begin());
+        outHeader = outInfo->mHeader;
+        outHeader->nTimeStamp = 0;
+        outHeader->nFilledLen = 0;
+        outHeader->nFlags = OMX_BUFFERFLAG_EOS;
+        outInfo->mOwnedByUs = false;
+        notifyFillBufferDone(outHeader);
+        mEOSStatus = OUTPUT_FRAMES_FLUSHED;
+    }
+    return true;
+!!!39866807.cpp!!!	outputBufferSafe(inout outHeader : OMX_BUFFERHEADERTYPE) : bool
+    uint32_t width = outputBufferWidth();
+    uint32_t height = outputBufferHeight();
+    uint64_t nFilledLen = width;
+    nFilledLen *= height;
+    if (nFilledLen > UINT32_MAX / 3) {
+        ALOGE("b/29421675, nFilledLen overflow %llu w %u h %u",
+                (unsigned long long)nFilledLen, width, height);
+        android_errorWriteLog(0x534e4554, "29421675");
+        return false;
+    } else if (outHeader->nAllocLen < outHeader->nFilledLen) {
+        ALOGE("b/27597103, buffer too small");
+        android_errorWriteLog(0x534e4554, "27597103");
+        return false;
+    }
+
+    return true;

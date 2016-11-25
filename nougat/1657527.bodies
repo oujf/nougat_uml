@@ -1,0 +1,270 @@
+class LockSettingsStorageTests
+!!!34056375.java!!!	setUp() : void
+        super.setUp();
+        mStorageDir = new File(getContext().getFilesDir(), "locksettings");
+        mDb = getContext().getDatabasePath("locksettings.db");
+
+        assertTrue(mStorageDir.exists() || mStorageDir.mkdirs());
+        assertTrue(FileUtils.deleteContents(mStorageDir));
+        assertTrue(!mDb.exists() || mDb.delete());
+
+        final Context ctx = getContext();
+        setContext(new ContextWrapper(ctx) {
+            @Override
+            public Object getSystemService(String name) {
+                if (USER_SERVICE.equals(name)) {
+                    return new UserManager(ctx, null) {
+                        @Override
+                        public UserInfo getProfileParent(int userHandle) {
+                            if (userHandle == 2) {
+                                // User 2 is a profile of user 1.
+                                return new UserInfo(1, "name", 0);
+                            }
+                            if (userHandle == 3) {
+                                // User 3 is a profile of user 0.
+                                return new UserInfo(0, "name", 0);
+                            }
+                            return null;
+                        }
+                    };
+                }
+                return super.getSystemService(name);
+            }
+        });
+
+        mStorage = new LockSettingsStorage(getContext(), new LockSettingsStorage.Callback() {
+            @Override
+            public void initialize(SQLiteDatabase db) {
+                mStorage.writeKeyValue(db, "initializedKey", "initialValue", 0);
+            }
+        }) {
+            @Override
+            String getLockPatternFilename(int userId) {
+                return new File(mStorageDir,
+                        super.getLockPatternFilename(userId).replace('/', '-')).getAbsolutePath();
+            }
+
+            @Override
+            String getLockPasswordFilename(int userId) {
+                return new File(mStorageDir,
+                        super.getLockPasswordFilename(userId).replace('/', '-')).getAbsolutePath();
+            }
+
+            @Override
+            String getChildProfileLockFile(int userId) {
+                return new File(mStorageDir,
+                        super.getChildProfileLockFile(userId).replace('/', '-')).getAbsolutePath();
+            }
+        };
+!!!34056503.java!!!	tearDown() : void
+        super.tearDown();
+        mStorage.closeDatabase();
+!!!34056631.java!!!	testKeyValue_InitializeWorked() : void
+        assertEquals("initialValue", mStorage.readKeyValue("initializedKey", "default", 0));
+        mStorage.clearCache();
+        assertEquals("initialValue", mStorage.readKeyValue("initializedKey", "default", 0));
+!!!34056759.java!!!	testKeyValue_WriteThenRead() : void
+        mStorage.writeKeyValue("key", "value", 0);
+        assertEquals("value", mStorage.readKeyValue("key", "default", 0));
+        mStorage.clearCache();
+        assertEquals("value", mStorage.readKeyValue("key", "default", 0));
+!!!34056887.java!!!	testKeyValue_DefaultValue() : void
+        assertEquals("default", mStorage.readKeyValue("unititialized key", "default", 0));
+        assertEquals("default2", mStorage.readKeyValue("unititialized key", "default2", 0));
+!!!34057015.java!!!	testKeyValue_Concurrency() : void
+        final Object monitor = new Object();
+        List<Thread> threads = new ArrayList<>();
+        for (int i = 0; i < 100; i++) {
+            final int threadId = i;
+            threads.add(new Thread() {
+                @Override
+                public void run() {
+                    synchronized (monitor) {
+                        try {
+                            monitor.wait();
+                        } catch (InterruptedException e) {
+                            return;
+                        }
+                        mStorage.writeKeyValue("key", "1 from thread " + threadId, 0);
+                        mStorage.readKeyValue("key", "default", 0);
+                        mStorage.writeKeyValue("key", "2 from thread " + threadId, 0);
+                        mStorage.readKeyValue("key", "default", 0);
+                        mStorage.writeKeyValue("key", "3 from thread " + threadId, 0);
+                        mStorage.readKeyValue("key", "default", 0);
+                        mStorage.writeKeyValue("key", "4 from thread " + threadId, 0);
+                        mStorage.readKeyValue("key", "default", 0);
+                        mStorage.writeKeyValue("key", "5 from thread " + threadId, 0);
+                        mStorage.readKeyValue("key", "default", 0);
+                    }
+                }
+            });
+            threads.get(i).start();
+        }
+        mStorage.writeKeyValue("key", "initalValue", 0);
+        synchronized (monitor) {
+            monitor.notifyAll();
+        }
+        for (int i = 0; i < threads.size(); i++) {
+            try {
+                threads.get(i).join();
+            } catch (InterruptedException e) {
+            }
+        }
+        assertEquals('5', mStorage.readKeyValue("key", "default", 0).charAt(0));
+        mStorage.clearCache();
+        assertEquals('5', mStorage.readKeyValue("key", "default", 0).charAt(0));
+!!!34057143.java!!!	testKeyValue_CacheStarvedWriter() : void
+        final CountDownLatch latch = new CountDownLatch(1);
+        List<Thread> threads = new ArrayList<>();
+        for (int i = 0; i < 100; i++) {
+            final int threadId = i;
+            threads.add(new Thread() {
+                @Override
+                public void run() {
+                    try {
+                        latch.await();
+                    } catch (InterruptedException e) {
+                        return;
+                    }
+                    if (threadId == 50) {
+                        mStorage.writeKeyValue("starvedWriterKey", "value", 0);
+                    } else {
+                        mStorage.readKeyValue("starvedWriterKey", "default", 0);
+                    }
+                }
+            });
+            threads.get(i).start();
+        }
+        latch.countDown();
+        for (int i = 0; i < threads.size(); i++) {
+            try {
+                threads.get(i).join();
+            } catch (InterruptedException e) {
+            }
+        }
+        String cached = mStorage.readKeyValue("key", "default", 0);
+        mStorage.clearCache();
+        String storage = mStorage.readKeyValue("key", "default", 0);
+        assertEquals("Cached value didn't match stored value", storage, cached);
+!!!34057271.java!!!	testRemoveUser() : void
+        mStorage.writeKeyValue("key", "value", 0);
+        mStorage.writePasswordHash(new byte[]{1}, 0);
+        mStorage.writePatternHash(new byte[]{2}, 0);
+
+        mStorage.writeKeyValue("key", "value", 1);
+        mStorage.writePasswordHash(new byte[]{1}, 1);
+        mStorage.writePatternHash(new byte[]{2}, 1);
+
+        mStorage.removeUser(0);
+
+        assertEquals("value", mStorage.readKeyValue("key", "default", 1));
+        assertEquals("default", mStorage.readKeyValue("key", "default", 0));
+        assertNotNull(mStorage.readPasswordHash(1));
+        assertNull(mStorage.readPasswordHash(0));
+        assertNotNull(mStorage.readPatternHash(1));
+        assertNull(mStorage.readPatternHash(0));
+!!!34057399.java!!!	testPassword_Default() : void
+        assertNull(mStorage.readPasswordHash(0));
+!!!34057527.java!!!	testPassword_Write() : void
+        mStorage.writePasswordHash("thepassword".getBytes(), 0);
+
+        assertArrayEquals("thepassword".getBytes(), mStorage.readPasswordHash(0).hash);
+        mStorage.clearCache();
+        assertArrayEquals("thepassword".getBytes(), mStorage.readPasswordHash(0).hash);
+!!!34057655.java!!!	testPassword_WriteProfileWritesParent() : void
+        mStorage.writePasswordHash("parentpasswordd".getBytes(), 1);
+        mStorage.writePasswordHash("profilepassword".getBytes(), 2);
+
+        assertArrayEquals("profilepassword".getBytes(), mStorage.readPasswordHash(1).hash);
+        assertArrayEquals("profilepassword".getBytes(), mStorage.readPasswordHash(2).hash);
+        mStorage.clearCache();
+        assertArrayEquals("profilepassword".getBytes(), mStorage.readPasswordHash(1).hash);
+        assertArrayEquals("profilepassword".getBytes(), mStorage.readPasswordHash(2).hash);
+!!!34057783.java!!!	testLockType_WriteProfileWritesParent() : void
+        mStorage.writePasswordHash("parentpassword".getBytes(), 10);
+        mStorage.writePatternHash("12345678".getBytes(), 20);
+
+        assertEquals(2, mStorage.getStoredCredentialType(10));
+        assertEquals(1, mStorage.getStoredCredentialType(20));
+        mStorage.clearCache();
+        assertEquals(2, mStorage.getStoredCredentialType(10));
+        assertEquals(1, mStorage.getStoredCredentialType(20));
+!!!34057911.java!!!	testProfileLock_ReadWriteChildProfileLock() : void
+        assertFalse(mStorage.hasChildProfileLock(20));
+        mStorage.writeChildProfileLock(20, "profilepassword".getBytes());
+        assertArrayEquals("profilepassword".getBytes(), mStorage.readChildProfileLock(20));
+        assertTrue(mStorage.hasChildProfileLock(20));
+        mStorage.clearCache();
+        assertArrayEquals("profilepassword".getBytes(), mStorage.readChildProfileLock(20));
+        assertTrue(mStorage.hasChildProfileLock(20));
+!!!34058039.java!!!	testPassword_WriteParentWritesProfile() : void
+        mStorage.writePasswordHash("profilepassword".getBytes(), 2);
+        mStorage.writePasswordHash("parentpasswordd".getBytes(), 1);
+
+        assertArrayEquals("parentpasswordd".getBytes(), mStorage.readPasswordHash(1).hash);
+        assertArrayEquals("parentpasswordd".getBytes(), mStorage.readPasswordHash(2).hash);
+        mStorage.clearCache();
+        assertArrayEquals("parentpasswordd".getBytes(), mStorage.readPasswordHash(1).hash);
+        assertArrayEquals("parentpasswordd".getBytes(), mStorage.readPasswordHash(2).hash);
+!!!34058167.java!!!	testPattern_Default() : void
+        assertNull(mStorage.readPasswordHash(0));
+!!!34058295.java!!!	testPattern_Write() : void
+        mStorage.writePatternHash("thepattern".getBytes(), 0);
+
+        assertArrayEquals("thepattern".getBytes(), mStorage.readPatternHash(0).hash);
+        mStorage.clearCache();
+        assertArrayEquals("thepattern".getBytes(), mStorage.readPatternHash(0).hash);
+!!!34058423.java!!!	testPattern_WriteProfileWritesParent() : void
+        mStorage.writePatternHash("parentpatternn".getBytes(), 1);
+        mStorage.writePatternHash("profilepattern".getBytes(), 2);
+
+        assertArrayEquals("profilepattern".getBytes(), mStorage.readPatternHash(1).hash);
+        assertArrayEquals("profilepattern".getBytes(), mStorage.readPatternHash(2).hash);
+        mStorage.clearCache();
+        assertArrayEquals("profilepattern".getBytes(), mStorage.readPatternHash(1).hash);
+        assertArrayEquals("profilepattern".getBytes(), mStorage.readPatternHash(2).hash);
+!!!34058551.java!!!	testPattern_WriteParentWritesProfile() : void
+        mStorage.writePatternHash("profilepattern".getBytes(), 2);
+        mStorage.writePatternHash("parentpatternn".getBytes(), 1);
+
+        assertArrayEquals("parentpatternn".getBytes(), mStorage.readPatternHash(1).hash);
+        assertArrayEquals("parentpatternn".getBytes(), mStorage.readPatternHash(2).hash);
+        mStorage.clearCache();
+        assertArrayEquals("parentpatternn".getBytes(), mStorage.readPatternHash(1).hash);
+        assertArrayEquals("parentpatternn".getBytes(), mStorage.readPatternHash(2).hash);
+!!!34058679.java!!!	testPrefetch() : void
+        mStorage.writeKeyValue("key", "toBeFetched", 0);
+        mStorage.writePatternHash("pattern".getBytes(), 0);
+        mStorage.writePasswordHash("password".getBytes(), 0);
+
+        mStorage.clearCache();
+        mStorage.prefetchUser(0);
+
+        assertEquals("toBeFetched", mStorage.readKeyValue("key", "default", 0));
+        assertArrayEquals("pattern".getBytes(), mStorage.readPatternHash(0).hash);
+        assertArrayEquals("password".getBytes(), mStorage.readPasswordHash(0).hash);
+!!!34058807.java!!!	testFileLocation_Owner() : void
+        LockSettingsStorage storage = new LockSettingsStorage(getContext(), null);
+
+        assertEquals("/data/system/gesture.key", storage.getLockPatternFilename(0));
+        assertEquals("/data/system/password.key", storage.getLockPasswordFilename(0));
+!!!34058935.java!!!	testFileLocation_SecondaryUser() : void
+        LockSettingsStorage storage = new LockSettingsStorage(getContext(), null);
+
+        assertEquals("/data/system/users/1/gesture.key", storage.getLockPatternFilename(1));
+        assertEquals("/data/system/users/1/password.key", storage.getLockPasswordFilename(1));
+!!!34059063.java!!!	testFileLocation_ProfileToSecondary() : void
+        LockSettingsStorage storage = new LockSettingsStorage(getContext(), null);
+
+        assertEquals("/data/system/users/1/gesture.key", storage.getLockPatternFilename(2));
+        assertEquals("/data/system/users/1/password.key", storage.getLockPasswordFilename(2));
+!!!34059191.java!!!	testFileLocation_ProfileToOwner() : void
+        LockSettingsStorage storage = new LockSettingsStorage(getContext(), null);
+
+        assertEquals("/data/system/gesture.key", storage.getLockPatternFilename(3));
+        assertEquals("/data/system/password.key", storage.getLockPasswordFilename(3));
+!!!34059319.java!!!	assertArrayEquals(inout expected : byte, inout actual : byte) : void
+        if (!Arrays.equals(expected, actual)) {
+            fail("expected:<" + Arrays.toString(expected) +
+                    "> but was:<" + Arrays.toString(actual) + ">");
+        }

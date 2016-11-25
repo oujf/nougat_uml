@@ -1,0 +1,187 @@
+class FileOperationService
+!!!29762999.java!!!	onCreate() : void
+        // Allow tests to pre-set these with test doubles.
+        if (executor == null) {
+            executor = new ScheduledThreadPoolExecutor(POOL_SIZE);
+        }
+
+        if (jobFactory == null) {
+            jobFactory = Job.Factory.instance;
+        }
+
+        if (DEBUG) Log.d(TAG, "Created.");
+        mPowerManager = getSystemService(PowerManager.class);
+        mNotificationManager = getSystemService(NotificationManager.class);
+!!!29763127.java!!!	onDestroy() : void
+        if (DEBUG) Log.d(TAG, "Shutting down executor.");
+        List<Runnable> unfinished = executor.shutdownNow();
+        if (!unfinished.isEmpty()) {
+            Log.w(TAG, "Shutting down, but executor reports running jobs: " + unfinished);
+        }
+        executor = null;
+        if (DEBUG) Log.d(TAG, "Destroyed.");
+!!!29763255.java!!!	onStartCommand(inout intent : Intent, in flags : int, in serviceId : int) : int
+        // TODO: Ensure we're not being called with retry or redeliver.
+        // checkArgument(flags == 0);  // retry and redeliver are not supported.
+
+        String jobId = intent.getStringExtra(EXTRA_JOB_ID);
+        @OpType int operationType = intent.getIntExtra(EXTRA_OPERATION, OPERATION_UNKNOWN);
+        assert(jobId != null);
+
+        if (intent.hasExtra(EXTRA_CANCEL)) {
+            handleCancel(intent);
+        } else {
+            assert(operationType != OPERATION_UNKNOWN);
+            handleOperation(intent, serviceId, jobId, operationType);
+        }
+
+        return START_NOT_STICKY;
+!!!29763383.java!!!	handleOperation(inout intent : Intent, in serviceId : int, inout jobId : String, in operationType : int) : void
+        if (DEBUG) Log.d(TAG, "onStartCommand: " + jobId + " with serviceId " + serviceId);
+
+        // Track the service supplied id so we can stop the service once we're out of work to do.
+        mLastServiceId = serviceId;
+
+        Job job = null;
+        synchronized (mRunning) {
+            if (mWakeLock == null) {
+                mWakeLock = mPowerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, TAG);
+            }
+
+            List<DocumentInfo> srcs = intent.getParcelableArrayListExtra(EXTRA_SRC_LIST);
+            DocumentInfo srcParent = intent.getParcelableExtra(EXTRA_SRC_PARENT);
+            DocumentStack stack = intent.getParcelableExtra(Shared.EXTRA_STACK);
+
+            job = createJob(operationType, jobId, srcs, srcParent, stack);
+
+            if (job == null) {
+                return;
+            }
+
+            mWakeLock.acquire();
+        }
+
+        assert(job != null);
+        int delay = intent.getIntExtra(EXTRA_DELAY, DEFAULT_DELAY);
+        assert(delay <= MAX_DELAY);
+        if (DEBUG) Log.d(
+                TAG, "Scheduling job " + job.id + " to run in " + delay + " milliseconds.");
+        ScheduledFuture<?> future = executor.schedule(job, delay, TimeUnit.MILLISECONDS);
+        mRunning.put(jobId, new JobRecord(job, future));
+!!!29763511.java!!!	handleCancel(inout intent : Intent) : void
+        assert(intent.hasExtra(EXTRA_CANCEL));
+        assert(intent.getStringExtra(EXTRA_JOB_ID) != null);
+
+        String jobId = intent.getStringExtra(EXTRA_JOB_ID);
+
+        if (DEBUG) Log.d(TAG, "handleCancel: " + jobId);
+
+        synchronized (mRunning) {
+            // Do nothing if the cancelled ID doesn't match the current job ID. This prevents racey
+            // cancellation requests from affecting unrelated copy jobs.  However, if the current job ID
+            // is null, the service most likely crashed and was revived by the incoming cancel intent.
+            // In that case, always allow the cancellation to proceed.
+            JobRecord record = mRunning.get(jobId);
+            if (record != null) {
+                record.job.cancel();
+
+                // If the job hasn't been started, cancel it and explicitly clean up.
+                // If it *has* been started, we wait for it to recognize this, then
+                // allow it stop working in an orderly fashion.
+                if (record.future.getDelay(TimeUnit.MILLISECONDS) > 0) {
+                    record.future.cancel(false);
+                    onFinished(record.job);
+                }
+            }
+        }
+
+        // Dismiss the progress notification here rather than in the copy loop. This preserves
+        // interactivity for the user in case the copy loop is stalled.
+        // Try to cancel it even if we don't have a job id...in case there is some sad
+        // orphan notification.
+        mNotificationManager.cancel(jobId, NOTIFICATION_ID_PROGRESS);
+
+        // TODO: Guarantee the job is being finalized
+!!!29763639.java!!!	createJob(in operationType : int, inout id : String, inout srcs : List<DocumentInfo>, inout srcParent : DocumentInfo, inout stack : DocumentStack) : Job
+
+        if (srcs.isEmpty()) {
+            Log.w(TAG, "Ignoring job request with empty srcs list. Id: " + id);
+            return null;
+        }
+
+        if (mRunning.containsKey(id)) {
+            Log.w(TAG, "Duplicate job id: " + id
+                    + ". Ignoring job request for srcs: " + srcs + ", stack: " + stack + ".");
+            return null;
+        }
+
+        switch (operationType) {
+            case OPERATION_COPY:
+                return jobFactory.createCopy(
+                        this, getApplicationContext(), this, id, stack, srcs);
+            case OPERATION_MOVE:
+                return jobFactory.createMove(
+                        this, getApplicationContext(), this, id, stack, srcs,
+                        srcParent);
+            case OPERATION_DELETE:
+                return jobFactory.createDelete(
+                        this, getApplicationContext(), this, id, stack, srcs,
+                        srcParent);
+            default:
+                throw new UnsupportedOperationException();
+        }
+!!!29763767.java!!!	deleteJob(inout job : Job) : void
+        if (DEBUG) Log.d(TAG, "deleteJob: " + job.id);
+
+        JobRecord record = mRunning.remove(job.id);
+        assert(record != null);
+        record.job.cleanup();
+
+        if (mRunning.isEmpty()) {
+            shutdown();
+        }
+!!!29763895.java!!!	shutdown() : void
+        if (DEBUG) Log.d(TAG, "Shutting down. Last serviceId was " + mLastServiceId);
+        mWakeLock.release();
+        mWakeLock = null;
+
+        // Turns out, for us, stopSelfResult always returns false in tests,
+        // so we can't guard executor shutdown. For this reason we move
+        // executor shutdown to #onDestroy.
+        boolean gonnaStop = stopSelfResult(mLastServiceId);
+        if (DEBUG) Log.d(TAG, "Stopping service: " + gonnaStop);
+        if (!gonnaStop) {
+            Log.w(TAG, "Service should be stopping, but reports otherwise.");
+        }
+!!!29764023.java!!!	holdsWakeLock() : boolean
+        return mWakeLock != null && mWakeLock.isHeld();
+!!!29764151.java!!!	onStart(inout job : Job) : void
+        if (DEBUG) Log.d(TAG, "onStart: " + job.id);
+        mNotificationManager.notify(job.id, NOTIFICATION_ID_PROGRESS, job.getSetupNotification());
+!!!29764279.java!!!	onFinished(inout job : Job) : void
+        if (DEBUG) Log.d(TAG, "onFinished: " + job.id);
+
+        // Dismiss the ongoing copy notification when the copy is done.
+        mNotificationManager.cancel(job.id, NOTIFICATION_ID_PROGRESS);
+
+        if (job.hasFailures()) {
+            Log.e(TAG, "Job failed on files: " + job.failedFiles.size() + ".");
+            mNotificationManager.notify(
+                job.id, NOTIFICATION_ID_FAILURE, job.getFailureNotification());
+        }
+
+        if (job.hasWarnings()) {
+            if (DEBUG) Log.d(TAG, "Job finished with warnings.");
+            mNotificationManager.notify(
+                    job.id, NOTIFICATION_ID_WARNING, job.getWarningNotification());
+        }
+
+        synchronized (mRunning) {
+            deleteJob(job);
+        }
+!!!29764407.java!!!	onProgress(inout job : CopyJob) : void
+        if (DEBUG) Log.d(TAG, "onProgress: " + job.id);
+        mNotificationManager.notify(
+                job.id, NOTIFICATION_ID_PROGRESS, job.getProgressNotification());
+!!!29764663.java!!!	onBind(inout intent : Intent) : IBinder
+        return null;  // Boilerplate. See super#onBind

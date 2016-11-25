@@ -1,0 +1,193 @@
+class NetdCallbackReceiver
+!!!32210999.java!!!	onDaemonConnected() : void
+            Slog.i(TAG, "onDaemonConnected()");
+            // event is dispatched from internal NDC thread, so we prepare the
+            // daemon back on main thread.
+            if (mConnectedSignal != null) {
+                // The system is booting and we're connecting to netd for the first time.
+                mConnectedSignal.countDown();
+                mConnectedSignal = null;
+            } else {
+                // We're reconnecting to netd after the socket connection
+                // was interrupted (e.g., if it crashed).
+                mFgHandler.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        connectNativeNetdService();
+                        prepareNativeDaemon();
+                    }
+                });
+            }
+!!!32211127.java!!!	onCheckHoldWakeLock(in code : int) : boolean
+            return code == NetdResponseCode.InterfaceClassActivity;
+!!!32211255.java!!!	onEvent(in code : int, inout raw : String, inout cooked : String) : boolean
+            String errorMessage = String.format("Invalid event from daemon (%s)", raw);
+            switch (code) {
+            case NetdResponseCode.InterfaceChange:
+                    /*
+                     * a network interface change occured
+                     * Format: "NNN Iface added <name>"
+                     *         "NNN Iface removed <name>"
+                     *         "NNN Iface changed <name> <up/down>"
+                     *         "NNN Iface linkstatus <name> <up/down>"
+                     */
+                    if (cooked.length < 4 || !cooked[1].equals("Iface")) {
+                        throw new IllegalStateException(errorMessage);
+                    }
+                    if (cooked[2].equals("added")) {
+                        notifyInterfaceAdded(cooked[3]);
+                        return true;
+                    } else if (cooked[2].equals("removed")) {
+                        notifyInterfaceRemoved(cooked[3]);
+                        return true;
+                    } else if (cooked[2].equals("changed") && cooked.length == 5) {
+                        notifyInterfaceStatusChanged(cooked[3], cooked[4].equals("up"));
+                        return true;
+                    } else if (cooked[2].equals("linkstate") && cooked.length == 5) {
+                        notifyInterfaceLinkStateChanged(cooked[3], cooked[4].equals("up"));
+                        return true;
+                    }
+                    throw new IllegalStateException(errorMessage);
+                    // break;
+            case NetdResponseCode.BandwidthControl:
+                    /*
+                     * Bandwidth control needs some attention
+                     * Format: "NNN limit alert <alertName> <ifaceName>"
+                     */
+                    if (cooked.length < 5 || !cooked[1].equals("limit")) {
+                        throw new IllegalStateException(errorMessage);
+                    }
+                    if (cooked[2].equals("alert")) {
+                        notifyLimitReached(cooked[3], cooked[4]);
+                        return true;
+                    }
+                    throw new IllegalStateException(errorMessage);
+                    // break;
+            case NetdResponseCode.InterfaceClassActivity:
+                    /*
+                     * An network interface class state changed (active/idle)
+                     * Format: "NNN IfaceClass <active/idle> <label>"
+                     */
+                    if (cooked.length < 4 || !cooked[1].equals("IfaceClass")) {
+                        throw new IllegalStateException(errorMessage);
+                    }
+                    long timestampNanos = 0;
+                    int processUid = -1;
+                    if (cooked.length >= 5) {
+                        try {
+                            timestampNanos = Long.parseLong(cooked[4]);
+                            if (cooked.length == 6) {
+                                processUid = Integer.parseInt(cooked[5]);
+                            }
+                        } catch(NumberFormatException ne) {}
+                    } else {
+                        timestampNanos = SystemClock.elapsedRealtimeNanos();
+                    }
+                    boolean isActive = cooked[2].equals("active");
+                    notifyInterfaceClassActivity(Integer.parseInt(cooked[3]),
+                            isActive ? DataConnectionRealTimeInfo.DC_POWER_STATE_HIGH
+                            : DataConnectionRealTimeInfo.DC_POWER_STATE_LOW,
+                            timestampNanos, processUid, false);
+                    return true;
+                    // break;
+            case NetdResponseCode.InterfaceAddressChange:
+                    /*
+                     * A network address change occurred
+                     * Format: "NNN Address updated <addr> <iface> <flags> <scope>"
+                     *         "NNN Address removed <addr> <iface> <flags> <scope>"
+                     */
+                    if (cooked.length < 7 || !cooked[1].equals("Address")) {
+                        throw new IllegalStateException(errorMessage);
+                    }
+
+                    String iface = cooked[4];
+                    LinkAddress address;
+                    try {
+                        int flags = Integer.parseInt(cooked[5]);
+                        int scope = Integer.parseInt(cooked[6]);
+                        address = new LinkAddress(cooked[3], flags, scope);
+                    } catch(NumberFormatException e) {     // Non-numeric lifetime or scope.
+                        throw new IllegalStateException(errorMessage, e);
+                    } catch(IllegalArgumentException e) {  // Malformed/invalid IP address.
+                        throw new IllegalStateException(errorMessage, e);
+                    }
+
+                    if (cooked[2].equals("updated")) {
+                        notifyAddressUpdated(iface, address);
+                    } else {
+                        notifyAddressRemoved(iface, address);
+                    }
+                    return true;
+                    // break;
+            case NetdResponseCode.InterfaceDnsServerInfo:
+                    /*
+                     * Information about available DNS servers has been received.
+                     * Format: "NNN DnsInfo servers <interface> <lifetime> <servers>"
+                     */
+                    long lifetime;  // Actually a 32-bit unsigned integer.
+
+                    if (cooked.length == 6 &&
+                        cooked[1].equals("DnsInfo") &&
+                        cooked[2].equals("servers")) {
+                        try {
+                            lifetime = Long.parseLong(cooked[4]);
+                        } catch (NumberFormatException e) {
+                            throw new IllegalStateException(errorMessage);
+                        }
+                        String[] servers = cooked[5].split(",");
+                        notifyInterfaceDnsServerInfo(cooked[3], lifetime, servers);
+                    }
+                    return true;
+                    // break;
+            case NetdResponseCode.RouteChange:
+                    /*
+                     * A route has been updated or removed.
+                     * Format: "NNN Route <updated|removed> <dst> [via <gateway] [dev <iface>]"
+                     */
+                    if (!cooked[1].equals("Route") || cooked.length < 6) {
+                        throw new IllegalStateException(errorMessage);
+                    }
+
+                    String via = null;
+                    String dev = null;
+                    boolean valid = true;
+                    for (int i = 4; (i + 1) < cooked.length && valid; i += 2) {
+                        if (cooked[i].equals("dev")) {
+                            if (dev == null) {
+                                dev = cooked[i+1];
+                            } else {
+                                valid = false;  // Duplicate interface.
+                            }
+                        } else if (cooked[i].equals("via")) {
+                            if (via == null) {
+                                via = cooked[i+1];
+                            } else {
+                                valid = false;  // Duplicate gateway.
+                            }
+                        } else {
+                            valid = false;      // Unknown syntax.
+                        }
+                    }
+                    if (valid) {
+                        try {
+                            // InetAddress.parseNumericAddress(null) inexplicably returns ::1.
+                            InetAddress gateway = null;
+                            if (via != null) gateway = InetAddress.parseNumericAddress(via);
+                            RouteInfo route = new RouteInfo(new IpPrefix(cooked[3]), gateway, dev);
+                            notifyRouteChange(cooked[2], route);
+                            return true;
+                        } catch (IllegalArgumentException e) {}
+                    }
+                    throw new IllegalStateException(errorMessage);
+                    // break;
+            case NetdResponseCode.StrictCleartext:
+                final int uid = Integer.parseInt(cooked[1]);
+                final byte[] firstPacket = HexDump.hexStringToByteArray(cooked[2]);
+                try {
+                    ActivityManagerNative.getDefault().notifyCleartextNetwork(uid, firstPacket);
+                } catch (RemoteException ignored) {
+                }
+                break;
+            default: break;
+            }
+            return false;

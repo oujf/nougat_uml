@@ -1,0 +1,788 @@
+class SettingsBackupAgent
+!!!30374711.java!!!	networkInWhitelist(inout net : SettingsBackupAgent::Network, inout whitelist : List<WifiConfiguration>) : boolean
+        final String netConfigKey = net.configKey();
+        final int N = whitelist.size();
+        for (int i = 0; i < N; i++) {
+            if (Objects.equals(netConfigKey, whitelist.get(i).configKey(true))) {
+                return true;
+            }
+        }
+        return false;
+!!!30375223.java!!!	onCreate() : void
+        if (DEBUG_BACKUP) Log.d(TAG, "onCreate() invoked");
+
+        mSettingsHelper = new SettingsHelper(this);
+        super.onCreate();
+
+        WifiManager mWfm = (WifiManager) getSystemService(Context.WIFI_SERVICE);
+        if (mWfm != null) mWifiConfigFile = mWfm.getConfigFile();
+!!!30375351.java!!!	onBackup(inout oldState : ParcelFileDescriptor, inout data : BackupDataOutput, inout newState : ParcelFileDescriptor) : void
+
+        byte[] systemSettingsData = getSystemSettings();
+        byte[] secureSettingsData = getSecureSettings();
+        byte[] globalSettingsData = getGlobalSettings();
+        byte[] lockSettingsData   = getLockSettings();
+        byte[] locale = mSettingsHelper.getLocaleData();
+        byte[] wifiSupplicantData = getWifiSupplicant(FILE_WIFI_SUPPLICANT);
+        byte[] wifiConfigData = getFileData(mWifiConfigFile);
+        byte[] softApConfigData = getSoftAPConfiguration();
+        byte[] netPoliciesData = getNetworkPolicies();
+
+        long[] stateChecksums = readOldChecksums(oldState);
+
+        stateChecksums[STATE_SYSTEM] =
+                writeIfChanged(stateChecksums[STATE_SYSTEM], KEY_SYSTEM, systemSettingsData, data);
+        stateChecksums[STATE_SECURE] =
+                writeIfChanged(stateChecksums[STATE_SECURE], KEY_SECURE, secureSettingsData, data);
+        stateChecksums[STATE_GLOBAL] =
+                writeIfChanged(stateChecksums[STATE_GLOBAL], KEY_GLOBAL, globalSettingsData, data);
+        stateChecksums[STATE_LOCALE] =
+                writeIfChanged(stateChecksums[STATE_LOCALE], KEY_LOCALE, locale, data);
+        stateChecksums[STATE_WIFI_SUPPLICANT] =
+                writeIfChanged(stateChecksums[STATE_WIFI_SUPPLICANT], KEY_WIFI_SUPPLICANT,
+                        wifiSupplicantData, data);
+        stateChecksums[STATE_WIFI_CONFIG] =
+                writeIfChanged(stateChecksums[STATE_WIFI_CONFIG], KEY_WIFI_CONFIG, wifiConfigData,
+                        data);
+        stateChecksums[STATE_LOCK_SETTINGS] =
+                writeIfChanged(stateChecksums[STATE_LOCK_SETTINGS], KEY_LOCK_SETTINGS,
+                        lockSettingsData, data);
+        stateChecksums[STATE_SOFTAP_CONFIG] =
+                writeIfChanged(stateChecksums[STATE_SOFTAP_CONFIG], KEY_SOFTAP_CONFIG,
+                        softApConfigData, data);
+        stateChecksums[STATE_NETWORK_POLICIES] =
+                writeIfChanged(stateChecksums[STATE_NETWORK_POLICIES], KEY_NETWORK_POLICIES,
+                        netPoliciesData, data);
+
+        writeNewChecksums(stateChecksums, newState);
+!!!30376247.java!!!	initWifiRestoreIfNecessary() : void
+        if (mWifiRestore == null) {
+            mWifiRestore = new WifiRestoreRunnable();
+            mWifiDisable = new WifiDisableRunnable(mWifiRestore);
+        }
+!!!30376375.java!!!	onRestore(inout data : BackupDataInput, in appVersionCode : int, inout newState : ParcelFileDescriptor) : void
+
+        HashSet<String> movedToGlobal = new HashSet<String>();
+        Settings.System.getMovedToGlobalSettings(movedToGlobal);
+        Settings.Secure.getMovedToGlobalSettings(movedToGlobal);
+
+        while (data.readNextHeader()) {
+            final String key = data.getKey();
+            final int size = data.getDataSize();
+            switch (key) {
+                case KEY_SYSTEM :
+                    restoreSettings(data, Settings.System.CONTENT_URI, movedToGlobal);
+                    mSettingsHelper.applyAudioSettings();
+                    break;
+
+                case KEY_SECURE :
+                    restoreSettings(data, Settings.Secure.CONTENT_URI, movedToGlobal);
+                    break;
+
+                case KEY_GLOBAL :
+                    restoreSettings(data, Settings.Global.CONTENT_URI, null);
+                    break;
+
+                case KEY_WIFI_SUPPLICANT :
+                    initWifiRestoreIfNecessary();
+                    mWifiRestore.incorporateWifiSupplicant(data);
+                    break;
+
+                case KEY_LOCALE :
+                    byte[] localeData = new byte[size];
+                    data.readEntityData(localeData, 0, size);
+                    mSettingsHelper.setLocaleData(localeData, size);
+                    break;
+
+                case KEY_WIFI_CONFIG :
+                    initWifiRestoreIfNecessary();
+                    mWifiRestore.incorporateWifiConfigFile(data);
+                    break;
+
+                case KEY_LOCK_SETTINGS :
+                    restoreLockSettings(data);
+                    break;
+
+                case KEY_SOFTAP_CONFIG :
+                    byte[] softapData = new byte[size];
+                    data.readEntityData(softapData, 0, size);
+                    restoreSoftApConfiguration(softapData);
+                    break;
+
+                case KEY_NETWORK_POLICIES:
+                    byte[] netPoliciesData = new byte[size];
+                    data.readEntityData(netPoliciesData, 0, size);
+                    restoreNetworkPolicies(netPoliciesData);
+                    break;
+
+                default :
+                    data.skipEntityData();
+
+            }
+        }
+
+        // If we have wifi data to restore, post a runnable to perform the
+        // bounce-and-update operation a little ways in the future.  The
+        // 'disable' runnable brings down the stack and remembers its state,
+        // and in turn schedules the 'restore' runnable to do the rewrite
+        // and cleanup operations.
+        if (mWifiRestore != null) {
+            long wifiBounceDelayMillis = Settings.Global.getLong(
+                    getContentResolver(),
+                    Settings.Global.WIFI_BOUNCE_DELAY_OVERRIDE_MS,
+                    WIFI_BOUNCE_DELAY_MILLIS);
+            new Handler(getMainLooper()).postDelayed(mWifiDisable, wifiBounceDelayMillis);
+        }
+!!!30376503.java!!!	onFullBackup(inout data : FullBackupDataOutput) : void
+        byte[] systemSettingsData = getSystemSettings();
+        byte[] secureSettingsData = getSecureSettings();
+        byte[] globalSettingsData = getGlobalSettings();
+        byte[] lockSettingsData   = getLockSettings();
+        byte[] locale = mSettingsHelper.getLocaleData();
+        byte[] wifiSupplicantData = getWifiSupplicant(FILE_WIFI_SUPPLICANT);
+        byte[] wifiConfigData = getFileData(mWifiConfigFile);
+        byte[] softApConfigData = getSoftAPConfiguration();
+        byte[] netPoliciesData = getNetworkPolicies();
+
+        // Write the data to the staging file, then emit that as our tarfile
+        // representation of the backed-up settings.
+        String root = getFilesDir().getAbsolutePath();
+        File stage = new File(root, STAGE_FILE);
+        try {
+            FileOutputStream filestream = new FileOutputStream(stage);
+            BufferedOutputStream bufstream = new BufferedOutputStream(filestream);
+            DataOutputStream out = new DataOutputStream(bufstream);
+
+            if (DEBUG_BACKUP) Log.d(TAG, "Writing flattened data version " + FULL_BACKUP_VERSION);
+            out.writeInt(FULL_BACKUP_VERSION);
+
+            if (DEBUG_BACKUP) Log.d(TAG, systemSettingsData.length + " bytes of settings data");
+            out.writeInt(systemSettingsData.length);
+            out.write(systemSettingsData);
+            if (DEBUG_BACKUP) {
+                Log.d(TAG, secureSettingsData.length + " bytes of secure settings data");
+            }
+            out.writeInt(secureSettingsData.length);
+            out.write(secureSettingsData);
+            if (DEBUG_BACKUP) {
+                Log.d(TAG, globalSettingsData.length + " bytes of global settings data");
+            }
+            out.writeInt(globalSettingsData.length);
+            out.write(globalSettingsData);
+            if (DEBUG_BACKUP) Log.d(TAG, locale.length + " bytes of locale data");
+            out.writeInt(locale.length);
+            out.write(locale);
+            if (DEBUG_BACKUP) {
+                Log.d(TAG, wifiSupplicantData.length + " bytes of wifi supplicant data");
+            }
+            out.writeInt(wifiSupplicantData.length);
+            out.write(wifiSupplicantData);
+            if (DEBUG_BACKUP) Log.d(TAG, wifiConfigData.length + " bytes of wifi config data");
+            out.writeInt(wifiConfigData.length);
+            out.write(wifiConfigData);
+            if (DEBUG_BACKUP) Log.d(TAG, lockSettingsData.length + " bytes of lock settings data");
+            out.writeInt(lockSettingsData.length);
+            out.write(lockSettingsData);
+            if (DEBUG_BACKUP) Log.d(TAG, softApConfigData.length + " bytes of softap config data");
+            out.writeInt(softApConfigData.length);
+            out.write(softApConfigData);
+            if (DEBUG_BACKUP) Log.d(TAG, netPoliciesData.length + " bytes of net policies data");
+            out.writeInt(netPoliciesData.length);
+            out.write(netPoliciesData);
+
+            out.flush();    // also flushes downstream
+
+            // now we're set to emit the tar stream
+            fullBackupFile(stage, data);
+        } finally {
+            stage.delete();
+        }
+!!!30376631.java!!!	onRestoreFile(inout data : ParcelFileDescriptor, in size : long, in type : int, inout domain : String, inout relpath : String, in mode : long, in mtime : long) : void
+        if (DEBUG_BACKUP) Log.d(TAG, "onRestoreFile() invoked");
+        // Our data is actually a blob of flattened settings data identical to that
+        // produced during incremental backups.  Just unpack and apply it all in
+        // turn.
+        FileInputStream instream = new FileInputStream(data.getFileDescriptor());
+        DataInputStream in = new DataInputStream(instream);
+
+        int version = in.readInt();
+        if (DEBUG_BACKUP) Log.d(TAG, "Flattened data version " + version);
+        if (version <= FULL_BACKUP_VERSION) {
+            // Generate the moved-to-global lookup table
+            HashSet<String> movedToGlobal = new HashSet<String>();
+            Settings.System.getMovedToGlobalSettings(movedToGlobal);
+            Settings.Secure.getMovedToGlobalSettings(movedToGlobal);
+
+            // system settings data first
+            int nBytes = in.readInt();
+            if (DEBUG_BACKUP) Log.d(TAG, nBytes + " bytes of settings data");
+            byte[] buffer = new byte[nBytes];
+            in.readFully(buffer, 0, nBytes);
+            restoreSettings(buffer, nBytes, Settings.System.CONTENT_URI, movedToGlobal);
+
+            // secure settings
+            nBytes = in.readInt();
+            if (DEBUG_BACKUP) Log.d(TAG, nBytes + " bytes of secure settings data");
+            if (nBytes > buffer.length) buffer = new byte[nBytes];
+            in.readFully(buffer, 0, nBytes);
+            restoreSettings(buffer, nBytes, Settings.Secure.CONTENT_URI, movedToGlobal);
+
+            // Global only if sufficiently new
+            if (version >= FULL_BACKUP_ADDED_GLOBAL) {
+                nBytes = in.readInt();
+                if (DEBUG_BACKUP) Log.d(TAG, nBytes + " bytes of global settings data");
+                if (nBytes > buffer.length) buffer = new byte[nBytes];
+                in.readFully(buffer, 0, nBytes);
+                movedToGlobal.clear();  // no redirection; this *is* the global namespace
+                restoreSettings(buffer, nBytes, Settings.Global.CONTENT_URI, movedToGlobal);
+            }
+
+            // locale
+            nBytes = in.readInt();
+            if (DEBUG_BACKUP) Log.d(TAG, nBytes + " bytes of locale data");
+            if (nBytes > buffer.length) buffer = new byte[nBytes];
+            in.readFully(buffer, 0, nBytes);
+            mSettingsHelper.setLocaleData(buffer, nBytes);
+
+            // wifi supplicant
+            nBytes = in.readInt();
+            if (DEBUG_BACKUP) Log.d(TAG, nBytes + " bytes of wifi supplicant data");
+            if (nBytes > buffer.length) buffer = new byte[nBytes];
+            in.readFully(buffer, 0, nBytes);
+            int retainedWifiState = enableWifi(false);
+            restoreWifiSupplicant(FILE_WIFI_SUPPLICANT, buffer, nBytes);
+            FileUtils.setPermissions(FILE_WIFI_SUPPLICANT,
+                    FileUtils.S_IRUSR | FileUtils.S_IWUSR
+                    | FileUtils.S_IRGRP | FileUtils.S_IWGRP,
+                    Process.myUid(), Process.WIFI_UID);
+            // retain the previous WIFI state.
+            enableWifi(retainedWifiState == WifiManager.WIFI_STATE_ENABLED
+                    || retainedWifiState == WifiManager.WIFI_STATE_ENABLING);
+
+            // wifi config
+            nBytes = in.readInt();
+            if (DEBUG_BACKUP) Log.d(TAG, nBytes + " bytes of wifi config data");
+            if (nBytes > buffer.length) buffer = new byte[nBytes];
+            in.readFully(buffer, 0, nBytes);
+            restoreFileData(mWifiConfigFile, buffer, nBytes);
+
+            if (version >= FULL_BACKUP_ADDED_LOCK_SETTINGS) {
+                nBytes = in.readInt();
+                if (DEBUG_BACKUP) Log.d(TAG, nBytes + " bytes of lock settings data");
+                if (nBytes > buffer.length) buffer = new byte[nBytes];
+                if (nBytes > 0) {
+                    in.readFully(buffer, 0, nBytes);
+                    restoreLockSettings(buffer, nBytes);
+                }
+            }
+            // softap config
+            if (version >= FULL_BACKUP_ADDED_SOFTAP_CONF) {
+                nBytes = in.readInt();
+                if (DEBUG_BACKUP) Log.d(TAG, nBytes + " bytes of softap config data");
+                if (nBytes > buffer.length) buffer = new byte[nBytes];
+                if (nBytes > 0) {
+                    in.readFully(buffer, 0, nBytes);
+                    restoreSoftApConfiguration(buffer);
+                }
+            }
+            // network policies
+            if (version >= FULL_BACKUP_ADDED_NETWORK_POLICIES) {
+                nBytes = in.readInt();
+                if (DEBUG_BACKUP) Log.d(TAG, nBytes + " bytes of network policies data");
+                if (nBytes > buffer.length) buffer = new byte[nBytes];
+                if (nBytes > 0) {
+                    in.readFully(buffer, 0, nBytes);
+                    restoreNetworkPolicies(buffer);
+                }
+            }
+            if (DEBUG_BACKUP) Log.d(TAG, "Full restore complete.");
+        } else {
+            data.close();
+            throw new IOException("Invalid file schema");
+        }
+!!!30376759.java!!!	readOldChecksums(inout oldState : ParcelFileDescriptor) : long
+        long[] stateChecksums = new long[STATE_SIZE];
+
+        DataInputStream dataInput = new DataInputStream(
+                new FileInputStream(oldState.getFileDescriptor()));
+
+        try {
+            int stateVersion = dataInput.readInt();
+            if (stateVersion > STATE_VERSION) {
+                // Constrain the maximum state version this backup agent
+                // can handle in case a newer or corrupt backup set existed
+                stateVersion = STATE_VERSION;
+            }
+            for (int i = 0; i < STATE_SIZES[stateVersion]; i++) {
+                stateChecksums[i] = dataInput.readLong();
+            }
+        } catch (EOFException eof) {
+            // With the default 0 checksum we'll wind up forcing a backup of
+            // any unhandled data sets, which is appropriate.
+        }
+        dataInput.close();
+        return stateChecksums;
+!!!30376887.java!!!	writeNewChecksums(inout checksums : long, inout newState : ParcelFileDescriptor) : void
+        DataOutputStream dataOutput = new DataOutputStream(
+                new BufferedOutputStream(new FileOutputStream(newState.getFileDescriptor())));
+
+        dataOutput.writeInt(STATE_VERSION);
+        for (int i = 0; i < STATE_SIZE; i++) {
+            dataOutput.writeLong(checksums[i]);
+        }
+        dataOutput.close();
+!!!30377015.java!!!	writeIfChanged(in oldChecksum : long, inout key : String, inout data : byte, inout output : BackupDataOutput) : long
+        CRC32 checkSummer = new CRC32();
+        checkSummer.update(data);
+        long newChecksum = checkSummer.getValue();
+        if (oldChecksum == newChecksum) {
+            return oldChecksum;
+        }
+        try {
+            if (DEBUG_BACKUP) {
+                Log.v(TAG, "Writing entity " + key + " of size " + data.length);
+            }
+            output.writeEntityHeader(key, data.length);
+            output.writeEntityData(data, data.length);
+        } catch (IOException ioe) {
+            // Bail
+        }
+        return newChecksum;
+!!!30377143.java!!!	getSystemSettings() : byte
+        Cursor cursor = getContentResolver().query(Settings.System.CONTENT_URI, PROJECTION, null,
+                null, null);
+        try {
+            return extractRelevantValues(cursor, Settings.System.SETTINGS_TO_BACKUP);
+        } finally {
+            cursor.close();
+        }
+!!!30377271.java!!!	getSecureSettings() : byte
+        Cursor cursor = getContentResolver().query(Settings.Secure.CONTENT_URI, PROJECTION, null,
+                null, null);
+        try {
+            return extractRelevantValues(cursor, Settings.Secure.SETTINGS_TO_BACKUP);
+        } finally {
+            cursor.close();
+        }
+!!!30377399.java!!!	getGlobalSettings() : byte
+        Cursor cursor = getContentResolver().query(Settings.Global.CONTENT_URI, PROJECTION, null,
+                null, null);
+        try {
+            return extractRelevantValues(cursor, Settings.Global.SETTINGS_TO_BACKUP);
+        } finally {
+            cursor.close();
+        }
+!!!30377527.java!!!	getLockSettings() : byte
+        final LockPatternUtils lockPatternUtils = new LockPatternUtils(this);
+        final boolean ownerInfoEnabled = lockPatternUtils.isOwnerInfoEnabled(UserHandle.myUserId());
+        final String ownerInfo = lockPatternUtils.getOwnerInfo(UserHandle.myUserId());
+
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        DataOutputStream out = new DataOutputStream(baos);
+        try {
+            out.writeUTF(KEY_LOCK_SETTINGS_OWNER_INFO_ENABLED);
+            out.writeUTF(ownerInfoEnabled ? "1" : "0");
+            if (ownerInfo != null) {
+                out.writeUTF(KEY_LOCK_SETTINGS_OWNER_INFO);
+                out.writeUTF(ownerInfo != null ? ownerInfo : "");
+            }
+            // End marker
+            out.writeUTF("");
+            out.flush();
+        } catch (IOException ioe) {
+        }
+        return baos.toByteArray();
+!!!30377655.java!!!	restoreSettings(inout data : BackupDataInput, inout contentUri : Uri, inout movedToGlobal : HashSet<String>) : void
+        byte[] settings = new byte[data.getDataSize()];
+        try {
+            data.readEntityData(settings, 0, settings.length);
+        } catch (IOException ioe) {
+            Log.e(TAG, "Couldn't read entity data");
+            return;
+        }
+        restoreSettings(settings, settings.length, contentUri, movedToGlobal);
+!!!30377783.java!!!	restoreSettings(inout settings : byte, in bytes : int, inout contentUri : Uri, inout movedToGlobal : HashSet<String>) : void
+        if (DEBUG) {
+            Log.i(TAG, "restoreSettings: " + contentUri);
+        }
+
+        // Figure out the white list and redirects to the global table.
+        final String[] whitelist;
+        if (contentUri.equals(Settings.Secure.CONTENT_URI)) {
+            whitelist = Settings.Secure.SETTINGS_TO_BACKUP;
+        } else if (contentUri.equals(Settings.System.CONTENT_URI)) {
+            whitelist = Settings.System.SETTINGS_TO_BACKUP;
+        } else if (contentUri.equals(Settings.Global.CONTENT_URI)) {
+            whitelist = Settings.Global.SETTINGS_TO_BACKUP;
+        } else {
+            throw new IllegalArgumentException("Unknown URI: " + contentUri);
+        }
+
+        // Restore only the white list data.
+        int pos = 0;
+        Map<String, String> cachedEntries = new HashMap<String, String>();
+        ContentValues contentValues = new ContentValues(2);
+        SettingsHelper settingsHelper = mSettingsHelper;
+        ContentResolver cr = getContentResolver();
+
+        final int whiteListSize = whitelist.length;
+        for (int i = 0; i < whiteListSize; i++) {
+            String key = whitelist[i];
+            String value = cachedEntries.remove(key);
+
+            // If the value not cached, let us look it up.
+            if (value == null) {
+                while (pos < bytes) {
+                    int length = readInt(settings, pos);
+                    pos += INTEGER_BYTE_COUNT;
+                    String dataKey = length > 0 ? new String(settings, pos, length) : null;
+                    pos += length;
+                    length = readInt(settings, pos);
+                    pos += INTEGER_BYTE_COUNT;
+                    String dataValue = length > 0 ? new String(settings, pos, length) : null;
+                    pos += length;
+                    if (key.equals(dataKey)) {
+                        value = dataValue;
+                        break;
+                    }
+                    cachedEntries.put(dataKey, dataValue);
+                }
+            }
+
+            if (value == null) {
+                continue;
+            }
+
+            final Uri destination = (movedToGlobal != null && movedToGlobal.contains(key))
+                    ? Settings.Global.CONTENT_URI
+                    : contentUri;
+            settingsHelper.restoreValue(this, cr, contentValues, destination, key, value);
+
+            if (DEBUG) {
+                Log.d(TAG, "Restored setting: " + destination + " : " + key + "=" + value);
+            }
+        }
+!!!30377911.java!!!	restoreLockSettings(inout buffer : byte, in nBytes : int) : void
+        final LockPatternUtils lockPatternUtils = new LockPatternUtils(this);
+
+        ByteArrayInputStream bais = new ByteArrayInputStream(buffer, 0, nBytes);
+        DataInputStream in = new DataInputStream(bais);
+        try {
+            String key;
+            // Read until empty string marker
+            while ((key = in.readUTF()).length() > 0) {
+                final String value = in.readUTF();
+                if (DEBUG_BACKUP) {
+                    Log.v(TAG, "Restoring lock_settings " + key + " = " + value);
+                }
+                switch (key) {
+                    case KEY_LOCK_SETTINGS_OWNER_INFO_ENABLED:
+                        lockPatternUtils.setOwnerInfoEnabled("1".equals(value),
+                                UserHandle.myUserId());
+                        break;
+                    case KEY_LOCK_SETTINGS_OWNER_INFO:
+                        lockPatternUtils.setOwnerInfo(value, UserHandle.myUserId());
+                        break;
+                }
+            }
+            in.close();
+        } catch (IOException ioe) {
+        }
+!!!30378039.java!!!	restoreLockSettings(inout data : BackupDataInput) : void
+        final byte[] settings = new byte[data.getDataSize()];
+        try {
+            data.readEntityData(settings, 0, settings.length);
+        } catch (IOException ioe) {
+            Log.e(TAG, "Couldn't read entity data");
+            return;
+        }
+        restoreLockSettings(settings, settings.length);
+!!!30378167.java!!!	extractRelevantValues(inout cursor : Cursor, inout settings : String) : byte
+        final int settingsCount = settings.length;
+        byte[][] values = new byte[settingsCount * 2][]; // keys and values
+        if (!cursor.moveToFirst()) {
+            Log.e(TAG, "Couldn't read from the cursor");
+            return new byte[0];
+        }
+
+        // Obtain the relevant data in a temporary array.
+        int totalSize = 0;
+        int backedUpSettingIndex = 0;
+        Map<String, String> cachedEntries = new HashMap<String, String>();
+        for (int i = 0; i < settingsCount; i++) {
+            String key = settings[i];
+            String value = cachedEntries.remove(key);
+
+            final int nameColumnIndex = cursor.getColumnIndex(Settings.NameValueTable.NAME);
+            final int valueColumnIndex = cursor.getColumnIndex(Settings.NameValueTable.VALUE);
+
+            // If the value not cached, let us look it up.
+            if (value == null) {
+                while (!cursor.isAfterLast()) {
+                    String cursorKey = cursor.getString(nameColumnIndex);
+                    String cursorValue = cursor.getString(valueColumnIndex);
+                    cursor.moveToNext();
+                    if (key.equals(cursorKey)) {
+                        value = cursorValue;
+                        break;
+                    }
+                    cachedEntries.put(cursorKey, cursorValue);
+                }
+            }
+
+            // Intercept the keys and see if they need special handling
+            value = mSettingsHelper.onBackupValue(key, value);
+
+            if (value == null) {
+                continue;
+            }
+            // Write the key and value in the intermediary array.
+            byte[] keyBytes = key.getBytes();
+            totalSize += INTEGER_BYTE_COUNT + keyBytes.length;
+            values[backedUpSettingIndex * 2] = keyBytes;
+
+            byte[] valueBytes = value.getBytes();
+            totalSize += INTEGER_BYTE_COUNT + valueBytes.length;
+            values[backedUpSettingIndex * 2 + 1] = valueBytes;
+
+            backedUpSettingIndex++;
+
+            if (DEBUG) {
+                Log.d(TAG, "Backed up setting: " + key + "=" + value);
+            }
+        }
+
+        // Aggregate the result.
+        byte[] result = new byte[totalSize];
+        int pos = 0;
+        final int keyValuePairCount = backedUpSettingIndex * 2;
+        for (int i = 0; i < keyValuePairCount; i++) {
+            pos = writeInt(result, pos, values[i].length);
+            pos = writeBytes(result, pos, values[i]);
+        }
+        return result;
+!!!30378295.java!!!	getFileData(inout filename : String) : byte
+        InputStream is = null;
+        try {
+            File file = new File(filename);
+            is = new FileInputStream(file);
+
+            //Will truncate read on a very long file,
+            //should not happen for a config file
+            byte[] bytes = new byte[(int) file.length()];
+
+            int offset = 0;
+            int numRead = 0;
+            while (offset < bytes.length
+                    && (numRead = is.read(bytes, offset, bytes.length - offset)) >= 0) {
+                offset += numRead;
+            }
+
+            //read failure
+            if (offset < bytes.length) {
+                Log.w(TAG, "Couldn't backup " + filename);
+                return EMPTY_DATA;
+            }
+            return bytes;
+        } catch (IOException ioe) {
+            Log.w(TAG, "Couldn't backup " + filename);
+            return EMPTY_DATA;
+        } finally {
+            if (is != null) {
+                try {
+                    is.close();
+                } catch (IOException e) {
+                }
+            }
+        }
+!!!30378423.java!!!	restoreFileData(inout filename : String, inout bytes : byte, in size : int) : void
+        try {
+            File file = new File(filename);
+            if (file.exists()) file.delete();
+
+            OutputStream os = new BufferedOutputStream(new FileOutputStream(filename, true));
+            os.write(bytes, 0, size);
+            os.close();
+        } catch (IOException ioe) {
+            Log.w(TAG, "Couldn't restore " + filename);
+        }
+!!!30378551.java!!!	getWifiSupplicant(inout filename : String) : byte
+        BufferedReader br = null;
+        try {
+            File file = new File(filename);
+            if (!file.exists()) {
+                return EMPTY_DATA;
+            }
+
+            WifiManager wifi = (WifiManager) getSystemService(WIFI_SERVICE);
+            List<WifiConfiguration> configs = wifi.getConfiguredNetworks();
+
+            WifiNetworkSettings fromFile = new WifiNetworkSettings();
+            br = new BufferedReader(new FileReader(file));
+            fromFile.readNetworks(br, configs, false);
+
+            // Write the parsed networks into a packed byte array
+            if (fromFile.mKnownNetworks.size() > 0) {
+                ByteArrayOutputStream bos = new ByteArrayOutputStream();
+                OutputStreamWriter out = new OutputStreamWriter(bos);
+                fromFile.write(out);
+                out.flush();
+                return bos.toByteArray();
+            } else {
+                return EMPTY_DATA;
+            }
+        } catch (IOException ioe) {
+            Log.w(TAG, "Couldn't backup " + filename);
+            return EMPTY_DATA;
+        } finally {
+            IoUtils.closeQuietly(br);
+        }
+!!!30378679.java!!!	restoreWifiSupplicant(inout filename : String, inout bytes : byte, in size : int) : void
+        try {
+            WifiNetworkSettings supplicantImage = new WifiNetworkSettings();
+
+            File supplicantFile = new File(FILE_WIFI_SUPPLICANT);
+            if (supplicantFile.exists()) {
+                // Retain the existing APs; we'll append the restored ones to them
+                BufferedReader in = new BufferedReader(new FileReader(FILE_WIFI_SUPPLICANT));
+                supplicantImage.readNetworks(in, null, true);
+                in.close();
+
+                supplicantFile.delete();
+            }
+
+            // Incorporate the restore AP information
+            if (size > 0) {
+                char[] restoredAsBytes = new char[size];
+                for (int i = 0; i < size; i++) restoredAsBytes[i] = (char) bytes[i];
+                BufferedReader in = new BufferedReader(new CharArrayReader(restoredAsBytes));
+                supplicantImage.readNetworks(in, null, false);
+
+                if (DEBUG_BACKUP) {
+                    Log.v(TAG, "Final AP list:");
+                    supplicantImage.dump();
+                }
+            }
+
+            // Install the correct default template
+            BufferedWriter bw = new BufferedWriter(new FileWriter(FILE_WIFI_SUPPLICANT));
+            copyWifiSupplicantTemplate(bw);
+
+            // Write the restored supplicant config and we're done
+            supplicantImage.write(bw);
+            bw.close();
+        } catch (IOException ioe) {
+            Log.w(TAG, "Couldn't restore " + filename);
+        }
+!!!30378807.java!!!	copyWifiSupplicantTemplate(inout bw : BufferedWriter) : void
+        try {
+            BufferedReader br = new BufferedReader(new FileReader(FILE_WIFI_SUPPLICANT_TEMPLATE));
+            char[] temp = new char[1024];
+            int size;
+            while ((size = br.read(temp)) > 0) {
+                bw.write(temp, 0, size);
+            }
+            br.close();
+        } catch (IOException ioe) {
+            Log.w(TAG, "Couldn't copy wpa_supplicant file");
+        }
+!!!30378935.java!!!	getSoftAPConfiguration() : byte
+        WifiManager wifiManager = (WifiManager) getSystemService(Context.WIFI_SERVICE);
+        try {
+            return wifiManager.getWifiApConfiguration().getBytesForBackup();
+        } catch (IOException ioe) {
+            Log.e(TAG, "Failed to marshal SoftAPConfiguration" + ioe.getMessage());
+            return new byte[0];
+        }
+!!!30379063.java!!!	restoreSoftApConfiguration(inout data : byte) : void
+        WifiManager wifiManager = (WifiManager) getSystemService(Context.WIFI_SERVICE);
+        try {
+            WifiConfiguration config = WifiConfiguration
+                    .getWifiConfigFromBackup(new DataInputStream(new ByteArrayInputStream(data)));
+            if (DEBUG) Log.d(TAG, "Successfully unMarshaled WifiConfiguration ");
+            wifiManager.setWifiApConfiguration(config);
+        } catch (IOException | BackupUtils.BadVersionException e) {
+            Log.e(TAG, "Failed to unMarshal SoftAPConfiguration " + e.getMessage());
+        }
+!!!30379191.java!!!	getNetworkPolicies() : byte
+        NetworkPolicyManager networkPolicyManager =
+                (NetworkPolicyManager) getSystemService(NETWORK_POLICY_SERVICE);
+        NetworkPolicy[] policies = networkPolicyManager.getNetworkPolicies();
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        if (policies != null && policies.length != 0) {
+            DataOutputStream out = new DataOutputStream(baos);
+            try {
+                out.writeInt(NETWORK_POLICIES_BACKUP_VERSION);
+                out.writeInt(policies.length);
+                for (NetworkPolicy policy : policies) {
+                    if (policy != null) {
+                        byte[] marshaledPolicy = policy.getBytesForBackup();
+                        out.writeByte(BackupUtils.NOT_NULL);
+                        out.writeInt(marshaledPolicy.length);
+                        out.write(marshaledPolicy);
+                    } else {
+                        out.writeByte(BackupUtils.NULL);
+                    }
+                }
+            } catch (IOException ioe) {
+                Log.e(TAG, "Failed to convert NetworkPolicies to byte array " + ioe.getMessage());
+                baos.reset();
+            }
+        }
+        return baos.toByteArray();
+!!!30379319.java!!!	restoreNetworkPolicies(inout data : byte) : void
+        NetworkPolicyManager networkPolicyManager =
+                (NetworkPolicyManager) getSystemService(NETWORK_POLICY_SERVICE);
+        if (data != null && data.length != 0) {
+            DataInputStream in = new DataInputStream(new ByteArrayInputStream(data));
+            try {
+                int version = in.readInt();
+                if (version < 1 || version > NETWORK_POLICIES_BACKUP_VERSION) {
+                    throw new BackupUtils.BadVersionException(
+                            "Unknown Backup Serialization Version");
+                }
+                int length = in.readInt();
+                NetworkPolicy[] policies = new NetworkPolicy[length];
+                for (int i = 0; i < length; i++) {
+                    byte isNull = in.readByte();
+                    if (isNull == BackupUtils.NULL) continue;
+                    int byteLength = in.readInt();
+                    byte[] policyData = new byte[byteLength];
+                    in.read(policyData, 0, byteLength);
+                    policies[i] = NetworkPolicy.getNetworkPolicyFromBackup(
+                            new DataInputStream(new ByteArrayInputStream(policyData)));
+                }
+                // Only set the policies if there was no error in the restore operation
+                networkPolicyManager.setNetworkPolicies(policies);
+            } catch (NullPointerException | IOException | BackupUtils.BadVersionException e) {
+                // NPE can be thrown when trying to instantiate a NetworkPolicy
+                Log.e(TAG, "Failed to convert byte array to NetworkPolicies " + e.getMessage());
+            }
+        }
+!!!30379447.java!!!	writeInt(inout out : byte, in pos : int, in value : int) : int
+        out[pos + 0] = (byte) ((value >> 24) & 0xFF);
+        out[pos + 1] = (byte) ((value >> 16) & 0xFF);
+        out[pos + 2] = (byte) ((value >>  8) & 0xFF);
+        out[pos + 3] = (byte) ((value >>  0) & 0xFF);
+        return pos + INTEGER_BYTE_COUNT;
+!!!30379575.java!!!	writeBytes(inout out : byte, in pos : int, inout value : byte) : int
+        System.arraycopy(value, 0, out, pos, value.length);
+        return pos + value.length;
+!!!30379703.java!!!	readInt(inout in : byte, in pos : int) : int
+        int result = ((in[pos] & 0xFF) << 24)
+                | ((in[pos + 1] & 0xFF) << 16)
+                | ((in[pos + 2] & 0xFF) <<  8)
+                | ((in[pos + 3] & 0xFF) <<  0);
+        return result;
+!!!30379831.java!!!	enableWifi(inout enable : boolean) : int
+        if (mWfm == null) {
+            mWfm = (WifiManager) getSystemService(Context.WIFI_SERVICE);
+        }
+        if (mWfm != null) {
+            int state = mWfm.getWifiState();
+            mWfm.setWifiEnabled(enable);
+            return state;
+        } else {
+            Log.e(TAG, "Failed to fetch WifiManager instance");
+        }
+        return WifiManager.WIFI_STATE_UNKNOWN;

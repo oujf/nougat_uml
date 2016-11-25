@@ -1,0 +1,249 @@
+class SubtitleTrack
+!!!28345911.java!!!	SubtitleTrack(inout format : MediaFormat)
+        mFormat = format;
+        mCues = new CueList();
+        clearActiveCues();
+        mLastTimeMs = -1;
+!!!28346039.java!!!	getFormat() : MediaFormat
+        return mFormat;
+!!!28346167.java!!!	onData(inout data : SubtitleData) : void
+        long runID = data.getStartTimeUs() + 1;
+        onData(data.getData(), true /* eos */, runID);
+        setRunDiscardTimeMs(
+                runID,
+                (data.getStartTimeUs() + data.getDurationUs()) / 1000);
+!!!28346679.java!!!	updateActiveCues(inout rebuild : boolean, in timeMs : long) : void
+        // out-of-order times mean seeking or new active cues being added
+        // (during their own timespan)
+        if (rebuild || mLastUpdateTimeMs > timeMs) {
+            clearActiveCues();
+        }
+
+        for(Iterator<Pair<Long, Cue> > it =
+                mCues.entriesBetween(mLastUpdateTimeMs, timeMs).iterator(); it.hasNext(); ) {
+            Pair<Long, Cue> event = it.next();
+            Cue cue = event.second;
+
+            if (cue.mEndTimeMs == event.first) {
+                // remove past cues
+                if (DEBUG) Log.v(TAG, "Removing " + cue);
+                mActiveCues.remove(cue);
+                if (cue.mRunID == 0) {
+                    it.remove();
+                }
+            } else if (cue.mStartTimeMs == event.first) {
+                // add new cues
+                // TRICKY: this will happen in start order
+                if (DEBUG) Log.v(TAG, "Adding " + cue);
+                if (cue.mInnerTimesMs != null) {
+                    cue.onTime(timeMs);
+                }
+                mActiveCues.add(cue);
+            } else if (cue.mInnerTimesMs != null) {
+                // cue is modified
+                cue.onTime(timeMs);
+            }
+        }
+
+        /* complete any runs */
+        while (mRunsByEndTime.size() > 0 &&
+               mRunsByEndTime.keyAt(0) <= timeMs) {
+            removeRunsByEndTimeIndex(0); // removes element
+        }
+        mLastUpdateTimeMs = timeMs;
+!!!28346807.java!!!	removeRunsByEndTimeIndex(in ix : int) : void
+        Run run = mRunsByEndTime.valueAt(ix);
+        while (run != null) {
+            Cue cue = run.mFirstCue;
+            while (cue != null) {
+                mCues.remove(cue);
+                Cue nextCue = cue.mNextInRun;
+                cue.mNextInRun = null;
+                cue = nextCue;
+            }
+            mRunsByID.remove(run.mRunID);
+            Run nextRun = run.mNextRunAtEndTimeMs;
+            run.mPrevRunAtEndTimeMs = null;
+            run.mNextRunAtEndTimeMs = null;
+            run = nextRun;
+        }
+        mRunsByEndTime.removeAt(ix);
+!!!28346935.java!!!	finalize() : void
+        /* remove all cues (untangle all cross-links) */
+        int size = mRunsByEndTime.size();
+        for(int ix = size - 1; ix >= 0; ix--) {
+            removeRunsByEndTimeIndex(ix);
+        }
+
+        super.finalize();
+!!!28347063.java!!!	takeTime(in timeMs : long) : void
+        mLastTimeMs = timeMs;
+!!!28347191.java!!!	clearActiveCues() : void
+        if (DEBUG) Log.v(TAG, "Clearing " + mActiveCues.size() + " active cues");
+        mActiveCues.clear();
+        mLastUpdateTimeMs = -1;
+!!!28347319.java!!!	scheduleTimedEvents() : void
+        /* get times for the next event */
+        if (mTimeProvider != null) {
+            mNextScheduledTimeMs = mCues.nextTimeAfter(mLastTimeMs);
+            if (DEBUG) Log.d(TAG, "sched @" + mNextScheduledTimeMs + " after " + mLastTimeMs);
+            mTimeProvider.notifyAt(
+                    mNextScheduledTimeMs >= 0 ?
+                        (mNextScheduledTimeMs * 1000) : MediaTimeProvider.NO_TIME,
+                    this);
+        }
+!!!28347447.java!!!	onTimedEvent(in timeUs : long) : void
+        if (DEBUG) Log.d(TAG, "onTimedEvent " + timeUs);
+        synchronized (this) {
+            long timeMs = timeUs / 1000;
+            updateActiveCues(false, timeMs);
+            takeTime(timeMs);
+        }
+        updateView(mActiveCues);
+        scheduleTimedEvents();
+!!!28347575.java!!!	onSeek(in timeUs : long) : void
+        if (DEBUG) Log.d(TAG, "onSeek " + timeUs);
+        synchronized (this) {
+            long timeMs = timeUs / 1000;
+            updateActiveCues(true, timeMs);
+            takeTime(timeMs);
+        }
+        updateView(mActiveCues);
+        scheduleTimedEvents();
+!!!28347703.java!!!	onStop() : void
+        synchronized (this) {
+            if (DEBUG) Log.d(TAG, "onStop");
+            clearActiveCues();
+            mLastTimeMs = -1;
+        }
+        updateView(mActiveCues);
+        mNextScheduledTimeMs = -1;
+        mTimeProvider.notifyAt(MediaTimeProvider.NO_TIME, this);
+!!!28347831.java!!!	show() : void
+        if (mVisible) {
+            return;
+        }
+
+        mVisible = true;
+        RenderingWidget renderingWidget = getRenderingWidget();
+        if (renderingWidget != null) {
+            renderingWidget.setVisible(true);
+        }
+        if (mTimeProvider != null) {
+            mTimeProvider.scheduleUpdate(this);
+        }
+!!!28347959.java!!!	hide() : void
+        if (!mVisible) {
+            return;
+        }
+
+        if (mTimeProvider != null) {
+            mTimeProvider.cancelNotifications(this);
+        }
+        RenderingWidget renderingWidget = getRenderingWidget();
+        if (renderingWidget != null) {
+            renderingWidget.setVisible(false);
+        }
+        mVisible = false;
+!!!28348087.java!!!	addCue(inout cue : SubtitleTrack::Cue) : boolean
+        mCues.add(cue);
+
+        if (cue.mRunID != 0) {
+            Run run = mRunsByID.get(cue.mRunID);
+            if (run == null) {
+                run = new Run();
+                mRunsByID.put(cue.mRunID, run);
+                run.mEndTimeMs = cue.mEndTimeMs;
+            } else if (run.mEndTimeMs < cue.mEndTimeMs) {
+                run.mEndTimeMs = cue.mEndTimeMs;
+            }
+
+            // link-up cues in the same run
+            cue.mNextInRun = run.mFirstCue;
+            run.mFirstCue = cue;
+        }
+
+        // if a cue is added that should be visible, need to refresh view
+        long nowMs = -1;
+        if (mTimeProvider != null) {
+            try {
+                nowMs = mTimeProvider.getCurrentTimeUs(
+                        false /* precise */, true /* monotonic */) / 1000;
+            } catch (IllegalStateException e) {
+                // handle as it we are not playing
+            }
+        }
+
+        if (DEBUG) Log.v(TAG, "mVisible=" + mVisible + ", " +
+                cue.mStartTimeMs + " <= " + nowMs + ", " +
+                cue.mEndTimeMs + " >= " + mLastTimeMs);
+
+        if (mVisible &&
+                cue.mStartTimeMs <= nowMs &&
+                // we don't trust nowMs, so check any cue since last callback
+                cue.mEndTimeMs >= mLastTimeMs) {
+            if (mRunnable != null) {
+                mHandler.removeCallbacks(mRunnable);
+            }
+            final SubtitleTrack track = this;
+            final long thenMs = nowMs;
+            mRunnable = new Runnable() {
+                @Override
+                public void run() {
+                    // even with synchronized, it is possible that we are going
+                    // to do multiple updates as the runnable could be already
+                    // running.
+                    synchronized (track) {
+                        mRunnable = null;
+                        updateActiveCues(true, thenMs);
+                        updateView(mActiveCues);
+                    }
+                }
+            };
+            // delay update so we don't update view on every cue.  TODO why 10?
+            if (mHandler.postDelayed(mRunnable, 10 /* delay */)) {
+                if (DEBUG) Log.v(TAG, "scheduling update");
+            } else {
+                if (DEBUG) Log.w(TAG, "failed to schedule subtitle view update");
+            }
+            return true;
+        }
+
+        if (mVisible &&
+                cue.mEndTimeMs >= mLastTimeMs &&
+                (cue.mStartTimeMs < mNextScheduledTimeMs ||
+                 mNextScheduledTimeMs < 0)) {
+            scheduleTimedEvents();
+        }
+
+        return false;
+!!!28348215.java!!!	setTimeProvider(inout timeProvider : MediaTimeProvider) : void
+        if (mTimeProvider == timeProvider) {
+            return;
+        }
+        if (mTimeProvider != null) {
+            mTimeProvider.cancelNotifications(this);
+        }
+        mTimeProvider = timeProvider;
+        if (mTimeProvider != null) {
+            mTimeProvider.scheduleUpdate(this);
+        }
+!!!28350007.java!!!	finishedRun(in runID : long) : void
+        if (runID != 0 && runID != ~0) {
+            Run run = mRunsByID.get(runID);
+            if (run != null) {
+                run.storeByEndTimeMs(mRunsByEndTime);
+            }
+        }
+!!!28350135.java!!!	setRunDiscardTimeMs(in runID : long, in timeMs : long) : void
+        if (runID != 0 && runID != ~0) {
+            Run run = mRunsByID.get(runID);
+            if (run != null) {
+                run.mEndTimeMs = timeMs;
+                run.storeByEndTimeMs(mRunsByEndTime);
+            }
+        }
+!!!28350263.java!!!	getTrackType() : int
+        return getRenderingWidget() == null
+                ? TrackInfo.MEDIA_TRACK_TYPE_TIMEDTEXT
+                : TrackInfo.MEDIA_TRACK_TYPE_SUBTITLE;

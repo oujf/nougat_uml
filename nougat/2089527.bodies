@@ -1,0 +1,121 @@
+class GroupNegotiationState
+!!!37066295.java!!!	enter() : void
+            if (DBG) logd(getName());
+!!!37066423.java!!!	processMessage(inout message : Message) : boolean
+            if (DBG) logd(getName() + message.toString());
+            switch (message.what) {
+                // We ignore these right now, since we get a GROUP_STARTED notification
+                // afterwards
+                case WifiMonitor.P2P_GO_NEGOTIATION_SUCCESS_EVENT:
+                case WifiMonitor.P2P_GROUP_FORMATION_SUCCESS_EVENT:
+                    if (DBG) logd(getName() + " go success");
+                    break;
+                case WifiMonitor.P2P_GROUP_STARTED_EVENT:
+                    mGroup = (WifiP2pGroup) message.obj;
+                    if (DBG) logd(getName() + " group started");
+
+                    if (mGroup.getNetworkId() == WifiP2pGroup.PERSISTENT_NET_ID) {
+                        /*
+                         * update cache information and set network id to mGroup.
+                         */
+                        updatePersistentNetworks(NO_RELOAD);
+                        String devAddr = mGroup.getOwner().deviceAddress;
+                        mGroup.setNetworkId(mGroups.getNetworkId(devAddr,
+                                mGroup.getNetworkName()));
+                    }
+
+                    if (mGroup.isGroupOwner()) {
+                        /* Setting an idle time out on GO causes issues with certain scenarios
+                         * on clients where it can be off-channel for longer and with the power
+                         * save modes used.
+                         *
+                         * TODO: Verify multi-channel scenarios and supplicant behavior are
+                         * better before adding a time out in future
+                         */
+                        //Set group idle timeout of 10 sec, to avoid GO beaconing incase of any
+                        //failure during 4-way Handshake.
+                        if (!mAutonomousGroup) {
+                            mWifiNative.setP2pGroupIdle(mGroup.getInterface(), GROUP_IDLE_TIME_S);
+                        }
+                        startDhcpServer(mGroup.getInterface());
+                    } else {
+                        mWifiNative.setP2pGroupIdle(mGroup.getInterface(), GROUP_IDLE_TIME_S);
+                        startIpManager(mGroup.getInterface());
+                        WifiP2pDevice groupOwner = mGroup.getOwner();
+                        WifiP2pDevice peer = mPeers.get(groupOwner.deviceAddress);
+                        if (peer != null) {
+                            // update group owner details with peer details found at discovery
+                            groupOwner.updateSupplicantDetails(peer);
+                            mPeers.updateStatus(groupOwner.deviceAddress, WifiP2pDevice.CONNECTED);
+                            sendPeersChangedBroadcast();
+                        } else {
+                            // A supplicant bug can lead to reporting an invalid
+                            // group owner address (all zeroes) at times. Avoid a
+                            // crash, but continue group creation since it is not
+                            // essential.
+                            logw("Unknown group owner " + groupOwner);
+                        }
+                    }
+                    transitionTo(mGroupCreatedState);
+                    break;
+                case WifiMonitor.P2P_GO_NEGOTIATION_FAILURE_EVENT:
+                    P2pStatus status = (P2pStatus) message.obj;
+                    if (status == P2pStatus.NO_COMMON_CHANNEL) {
+                        transitionTo(mFrequencyConflictState);
+                        break;
+                    }
+                    /* continue with group removal handling */
+                case WifiMonitor.P2P_GROUP_REMOVED_EVENT:
+                    if (DBG) logd(getName() + " go failure");
+                    handleGroupCreationFailure();
+                    transitionTo(mInactiveState);
+                    break;
+                // A group formation failure is always followed by
+                // a group removed event. Flushing things at group formation
+                // failure causes supplicant issues. Ignore right now.
+                case WifiMonitor.P2P_GROUP_FORMATION_FAILURE_EVENT:
+                    status = (P2pStatus) message.obj;
+                    if (status == P2pStatus.NO_COMMON_CHANNEL) {
+                        transitionTo(mFrequencyConflictState);
+                        break;
+                    }
+                    break;
+                case WifiMonitor.P2P_INVITATION_RESULT_EVENT:
+                    status = (P2pStatus)message.obj;
+                    if (status == P2pStatus.SUCCESS) {
+                        // invocation was succeeded.
+                        // wait P2P_GROUP_STARTED_EVENT.
+                        break;
+                    }
+                    loge("Invitation result " + status);
+                    if (status == P2pStatus.UNKNOWN_P2P_GROUP) {
+                        // target device has already removed the credential.
+                        // So, remove this credential accordingly.
+                        int netId = mSavedPeerConfig.netId;
+                        if (netId >= 0) {
+                            if (DBG) logd("Remove unknown client from the list");
+                            removeClientFromList(netId, mSavedPeerConfig.deviceAddress, true);
+                        }
+
+                        // Reinvocation has failed, try group negotiation
+                        mSavedPeerConfig.netId = WifiP2pGroup.PERSISTENT_NET_ID;
+                        p2pConnectWithPinDisplay(mSavedPeerConfig);
+                    } else if (status == P2pStatus.INFORMATION_IS_CURRENTLY_UNAVAILABLE) {
+
+                        // Devices setting persistent_reconnect to 0 in wpa_supplicant
+                        // always defer the invocation request and return
+                        // "information is currently unable" error.
+                        // So, try another way to connect for interoperability.
+                        mSavedPeerConfig.netId = WifiP2pGroup.PERSISTENT_NET_ID;
+                        p2pConnectWithPinDisplay(mSavedPeerConfig);
+                    } else if (status == P2pStatus.NO_COMMON_CHANNEL) {
+                        transitionTo(mFrequencyConflictState);
+                    } else {
+                        handleGroupCreationFailure();
+                        transitionTo(mInactiveState);
+                    }
+                    break;
+                default:
+                    return NOT_HANDLED;
+            }
+            return HANDLED;

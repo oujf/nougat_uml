@@ -1,0 +1,691 @@
+class ApkSignatureSchemeV2Verifier
+!!!4796471.java!!!	hasSignature(inout apkFile : String) : boolean
+        try (RandomAccessFile apk = new RandomAccessFile(apkFile, "r")) {
+            findSignature(apk);
+            return true;
+        } catch (SignatureNotFoundException e) {
+            return false;
+        }
+!!!4796599.java!!!	verify(inout apkFile : String) : X509Certificate
+        try (RandomAccessFile apk = new RandomAccessFile(apkFile, "r")) {
+            return verify(apk);
+        }
+!!!4796727.java!!!	verify(inout apk : RandomAccessFile) : X509Certificate
+        SignatureInfo signatureInfo = findSignature(apk);
+        return verify(apk.getFD(), signatureInfo);
+!!!4796983.java!!!	findSignature(inout apk : RandomAccessFile) : ApkSignatureSchemeV2Verifier::SignatureInfo
+        // Find the ZIP End of Central Directory (EoCD) record.
+        Pair<ByteBuffer, Long> eocdAndOffsetInFile = getEocd(apk);
+        ByteBuffer eocd = eocdAndOffsetInFile.first;
+        long eocdOffset = eocdAndOffsetInFile.second;
+        if (ZipUtils.isZip64EndOfCentralDirectoryLocatorPresent(apk, eocdOffset)) {
+            throw new SignatureNotFoundException("ZIP64 APK not supported");
+        }
+
+        // Find the APK Signing Block. The block immediately precedes the Central Directory.
+        long centralDirOffset = getCentralDirOffset(eocd, eocdOffset);
+        Pair<ByteBuffer, Long> apkSigningBlockAndOffsetInFile =
+                findApkSigningBlock(apk, centralDirOffset);
+        ByteBuffer apkSigningBlock = apkSigningBlockAndOffsetInFile.first;
+        long apkSigningBlockOffset = apkSigningBlockAndOffsetInFile.second;
+
+        // Find the APK Signature Scheme v2 Block inside the APK Signing Block.
+        ByteBuffer apkSignatureSchemeV2Block = findApkSignatureSchemeV2Block(apkSigningBlock);
+
+        return new SignatureInfo(
+                apkSignatureSchemeV2Block,
+                apkSigningBlockOffset,
+                centralDirOffset,
+                eocdOffset,
+                eocd);
+!!!4797111.java!!!	verify(inout apkFileDescriptor : FileDescriptor, inout signatureInfo : ApkSignatureSchemeV2Verifier::SignatureInfo) : X509Certificate
+        int signerCount = 0;
+        Map<Integer, byte[]> contentDigests = new ArrayMap<>();
+        List<X509Certificate[]> signerCerts = new ArrayList<>();
+        CertificateFactory certFactory;
+        try {
+            certFactory = CertificateFactory.getInstance("X.509");
+        } catch (CertificateException e) {
+            throw new RuntimeException("Failed to obtain X.509 CertificateFactory", e);
+        }
+        ByteBuffer signers;
+        try {
+            signers = getLengthPrefixedSlice(signatureInfo.signatureBlock);
+        } catch (IOException e) {
+            throw new SecurityException("Failed to read list of signers", e);
+        }
+        while (signers.hasRemaining()) {
+            signerCount++;
+            try {
+                ByteBuffer signer = getLengthPrefixedSlice(signers);
+                X509Certificate[] certs = verifySigner(signer, contentDigests, certFactory);
+                signerCerts.add(certs);
+            } catch (IOException | BufferUnderflowException | SecurityException e) {
+                throw new SecurityException(
+                        "Failed to parse/verify signer #" + signerCount + " block",
+                        e);
+            }
+        }
+
+        if (signerCount < 1) {
+            throw new SecurityException("No signers found");
+        }
+
+        if (contentDigests.isEmpty()) {
+            throw new SecurityException("No content digests found");
+        }
+
+        verifyIntegrity(
+                contentDigests,
+                apkFileDescriptor,
+                signatureInfo.apkSigningBlockOffset,
+                signatureInfo.centralDirOffset,
+                signatureInfo.eocdOffset,
+                signatureInfo.eocd);
+
+        return signerCerts.toArray(new X509Certificate[signerCerts.size()][]);
+!!!4797239.java!!!	verifySigner(inout signerBlock : ByteBuffer, inout contentDigests : Map<Integer, byte[]>, inout certFactory : CertificateFactory) : X509Certificate
+        ByteBuffer signedData = getLengthPrefixedSlice(signerBlock);
+        ByteBuffer signatures = getLengthPrefixedSlice(signerBlock);
+        byte[] publicKeyBytes = readLengthPrefixedByteArray(signerBlock);
+
+        int signatureCount = 0;
+        int bestSigAlgorithm = -1;
+        byte[] bestSigAlgorithmSignatureBytes = null;
+        List<Integer> signaturesSigAlgorithms = new ArrayList<>();
+        while (signatures.hasRemaining()) {
+            signatureCount++;
+            try {
+                ByteBuffer signature = getLengthPrefixedSlice(signatures);
+                if (signature.remaining() < 8) {
+                    throw new SecurityException("Signature record too short");
+                }
+                int sigAlgorithm = signature.getInt();
+                signaturesSigAlgorithms.add(sigAlgorithm);
+                if (!isSupportedSignatureAlgorithm(sigAlgorithm)) {
+                    continue;
+                }
+                if ((bestSigAlgorithm == -1)
+                        || (compareSignatureAlgorithm(sigAlgorithm, bestSigAlgorithm) > 0)) {
+                    bestSigAlgorithm = sigAlgorithm;
+                    bestSigAlgorithmSignatureBytes = readLengthPrefixedByteArray(signature);
+                }
+            } catch (IOException | BufferUnderflowException e) {
+                throw new SecurityException(
+                        "Failed to parse signature record #" + signatureCount,
+                        e);
+            }
+        }
+        if (bestSigAlgorithm == -1) {
+            if (signatureCount == 0) {
+                throw new SecurityException("No signatures found");
+            } else {
+                throw new SecurityException("No supported signatures found");
+            }
+        }
+
+        String keyAlgorithm = getSignatureAlgorithmJcaKeyAlgorithm(bestSigAlgorithm);
+        Pair<String, ? extends AlgorithmParameterSpec> signatureAlgorithmParams =
+                getSignatureAlgorithmJcaSignatureAlgorithm(bestSigAlgorithm);
+        String jcaSignatureAlgorithm = signatureAlgorithmParams.first;
+        AlgorithmParameterSpec jcaSignatureAlgorithmParams = signatureAlgorithmParams.second;
+        boolean sigVerified;
+        try {
+            PublicKey publicKey =
+                    KeyFactory.getInstance(keyAlgorithm)
+                            .generatePublic(new X509EncodedKeySpec(publicKeyBytes));
+            Signature sig = Signature.getInstance(jcaSignatureAlgorithm);
+            sig.initVerify(publicKey);
+            if (jcaSignatureAlgorithmParams != null) {
+                sig.setParameter(jcaSignatureAlgorithmParams);
+            }
+            sig.update(signedData);
+            sigVerified = sig.verify(bestSigAlgorithmSignatureBytes);
+        } catch (NoSuchAlgorithmException | InvalidKeySpecException | InvalidKeyException
+                | InvalidAlgorithmParameterException | SignatureException e) {
+            throw new SecurityException(
+                    "Failed to verify " + jcaSignatureAlgorithm + " signature", e);
+        }
+        if (!sigVerified) {
+            throw new SecurityException(jcaSignatureAlgorithm + " signature did not verify");
+        }
+
+        // Signature over signedData has verified.
+
+        byte[] contentDigest = null;
+        signedData.clear();
+        ByteBuffer digests = getLengthPrefixedSlice(signedData);
+        List<Integer> digestsSigAlgorithms = new ArrayList<>();
+        int digestCount = 0;
+        while (digests.hasRemaining()) {
+            digestCount++;
+            try {
+                ByteBuffer digest = getLengthPrefixedSlice(digests);
+                if (digest.remaining() < 8) {
+                    throw new IOException("Record too short");
+                }
+                int sigAlgorithm = digest.getInt();
+                digestsSigAlgorithms.add(sigAlgorithm);
+                if (sigAlgorithm == bestSigAlgorithm) {
+                    contentDigest = readLengthPrefixedByteArray(digest);
+                }
+            } catch (IOException | BufferUnderflowException e) {
+                throw new IOException("Failed to parse digest record #" + digestCount, e);
+            }
+        }
+
+        if (!signaturesSigAlgorithms.equals(digestsSigAlgorithms)) {
+            throw new SecurityException(
+                    "Signature algorithms don't match between digests and signatures records");
+        }
+        int digestAlgorithm = getSignatureAlgorithmContentDigestAlgorithm(bestSigAlgorithm);
+        byte[] previousSignerDigest = contentDigests.put(digestAlgorithm, contentDigest);
+        if ((previousSignerDigest != null)
+                && (!MessageDigest.isEqual(previousSignerDigest, contentDigest))) {
+            throw new SecurityException(
+                    getContentDigestAlgorithmJcaDigestAlgorithm(digestAlgorithm)
+                    + " contents digest does not match the digest specified by a preceding signer");
+        }
+
+        ByteBuffer certificates = getLengthPrefixedSlice(signedData);
+        List<X509Certificate> certs = new ArrayList<>();
+        int certificateCount = 0;
+        while (certificates.hasRemaining()) {
+            certificateCount++;
+            byte[] encodedCert = readLengthPrefixedByteArray(certificates);
+            X509Certificate certificate;
+            try {
+                certificate = (X509Certificate)
+                        certFactory.generateCertificate(new ByteArrayInputStream(encodedCert));
+            } catch (CertificateException e) {
+                throw new SecurityException("Failed to decode certificate #" + certificateCount, e);
+            }
+            certificate = new VerbatimX509Certificate(certificate, encodedCert);
+            certs.add(certificate);
+        }
+
+        if (certs.isEmpty()) {
+            throw new SecurityException("No certificates listed");
+        }
+        X509Certificate mainCertificate = certs.get(0);
+        byte[] certificatePublicKeyBytes = mainCertificate.getPublicKey().getEncoded();
+        if (!Arrays.equals(publicKeyBytes, certificatePublicKeyBytes)) {
+            throw new SecurityException(
+                    "Public key mismatch between certificate and signature record");
+        }
+
+        return certs.toArray(new X509Certificate[certs.size()]);
+!!!4797367.java!!!	verifyIntegrity(inout expectedDigests : Map<Integer, byte[]>, inout apkFileDescriptor : FileDescriptor, in apkSigningBlockOffset : long, in centralDirOffset : long, in eocdOffset : long, inout eocdBuf : ByteBuffer) : void
+
+        if (expectedDigests.isEmpty()) {
+            throw new SecurityException("No digests provided");
+        }
+
+        // We need to verify the integrity of the following three sections of the file:
+        // 1. Everything up to the start of the APK Signing Block.
+        // 2. ZIP Central Directory.
+        // 3. ZIP End of Central Directory (EoCD).
+        // Each of these sections is represented as a separate DataSource instance below.
+
+        // To handle large APKs, these sections are read in 1 MB chunks using memory-mapped I/O to
+        // avoid wasting physical memory. In most APK verification scenarios, the contents of the
+        // APK are already there in the OS's page cache and thus mmap does not use additional
+        // physical memory.
+        DataSource beforeApkSigningBlock =
+                new MemoryMappedFileDataSource(apkFileDescriptor, 0, apkSigningBlockOffset);
+        DataSource centralDir =
+                new MemoryMappedFileDataSource(
+                        apkFileDescriptor, centralDirOffset, eocdOffset - centralDirOffset);
+
+        // For the purposes of integrity verification, ZIP End of Central Directory's field Start of
+        // Central Directory must be considered to point to the offset of the APK Signing Block.
+        eocdBuf = eocdBuf.duplicate();
+        eocdBuf.order(ByteOrder.LITTLE_ENDIAN);
+        ZipUtils.setZipEocdCentralDirectoryOffset(eocdBuf, apkSigningBlockOffset);
+        DataSource eocd = new ByteBufferDataSource(eocdBuf);
+
+        int[] digestAlgorithms = new int[expectedDigests.size()];
+        int digestAlgorithmCount = 0;
+        for (int digestAlgorithm : expectedDigests.keySet()) {
+            digestAlgorithms[digestAlgorithmCount] = digestAlgorithm;
+            digestAlgorithmCount++;
+        }
+        byte[][] actualDigests;
+        try {
+            actualDigests =
+                    computeContentDigests(
+                            digestAlgorithms,
+                            new DataSource[] {beforeApkSigningBlock, centralDir, eocd});
+        } catch (DigestException e) {
+            throw new SecurityException("Failed to compute digest(s) of contents", e);
+        }
+        for (int i = 0; i < digestAlgorithms.length; i++) {
+            int digestAlgorithm = digestAlgorithms[i];
+            byte[] expectedDigest = expectedDigests.get(digestAlgorithm);
+            byte[] actualDigest = actualDigests[i];
+            if (!MessageDigest.isEqual(expectedDigest, actualDigest)) {
+                throw new SecurityException(
+                        getContentDigestAlgorithmJcaDigestAlgorithm(digestAlgorithm)
+                                + " digest of contents did not verify");
+            }
+        }
+!!!4797495.java!!!	computeContentDigests(inout digestAlgorithms : int, inout contents : ApkSignatureSchemeV2Verifier::DataSource) : byte
+        // For each digest algorithm the result is computed as follows:
+        // 1. Each segment of contents is split into consecutive chunks of 1 MB in size.
+        //    The final chunk will be shorter iff the length of segment is not a multiple of 1 MB.
+        //    No chunks are produced for empty (zero length) segments.
+        // 2. The digest of each chunk is computed over the concatenation of byte 0xa5, the chunk's
+        //    length in bytes (uint32 little-endian) and the chunk's contents.
+        // 3. The output digest is computed over the concatenation of the byte 0x5a, the number of
+        //    chunks (uint32 little-endian) and the concatenation of digests of chunks of all
+        //    segments in-order.
+
+        long totalChunkCountLong = 0;
+        for (DataSource input : contents) {
+            totalChunkCountLong += getChunkCount(input.size());
+        }
+        if (totalChunkCountLong >= Integer.MAX_VALUE / 1024) {
+            throw new DigestException("Too many chunks: " + totalChunkCountLong);
+        }
+        int totalChunkCount = (int) totalChunkCountLong;
+
+        byte[][] digestsOfChunks = new byte[digestAlgorithms.length][];
+        for (int i = 0; i < digestAlgorithms.length; i++) {
+            int digestAlgorithm = digestAlgorithms[i];
+            int digestOutputSizeBytes = getContentDigestAlgorithmOutputSizeBytes(digestAlgorithm);
+            byte[] concatenationOfChunkCountAndChunkDigests =
+                    new byte[5 + totalChunkCount * digestOutputSizeBytes];
+            concatenationOfChunkCountAndChunkDigests[0] = 0x5a;
+            setUnsignedInt32LittleEndian(
+                    totalChunkCount,
+                    concatenationOfChunkCountAndChunkDigests,
+                    1);
+            digestsOfChunks[i] = concatenationOfChunkCountAndChunkDigests;
+        }
+
+        byte[] chunkContentPrefix = new byte[5];
+        chunkContentPrefix[0] = (byte) 0xa5;
+        int chunkIndex = 0;
+        MessageDigest[] mds = new MessageDigest[digestAlgorithms.length];
+        for (int i = 0; i < digestAlgorithms.length; i++) {
+            String jcaAlgorithmName =
+                    getContentDigestAlgorithmJcaDigestAlgorithm(digestAlgorithms[i]);
+            try {
+                mds[i] = MessageDigest.getInstance(jcaAlgorithmName);
+            } catch (NoSuchAlgorithmException e) {
+                throw new RuntimeException(jcaAlgorithmName + " digest not supported", e);
+            }
+        }
+        // TODO: Compute digests of chunks in parallel when beneficial. This requires some research
+        // into how to parallelize (if at all) based on the capabilities of the hardware on which
+        // this code is running and based on the size of input.
+        int dataSourceIndex = 0;
+        for (DataSource input : contents) {
+            long inputOffset = 0;
+            long inputRemaining = input.size();
+            while (inputRemaining > 0) {
+                int chunkSize = (int) Math.min(inputRemaining, CHUNK_SIZE_BYTES);
+                setUnsignedInt32LittleEndian(chunkSize, chunkContentPrefix, 1);
+                for (int i = 0; i < mds.length; i++) {
+                    mds[i].update(chunkContentPrefix);
+                }
+                try {
+                    input.feedIntoMessageDigests(mds, inputOffset, chunkSize);
+                } catch (IOException e) {
+                    throw new DigestException(
+                            "Failed to digest chunk #" + chunkIndex + " of section #"
+                                    + dataSourceIndex,
+                            e);
+                }
+                for (int i = 0; i < digestAlgorithms.length; i++) {
+                    int digestAlgorithm = digestAlgorithms[i];
+                    byte[] concatenationOfChunkCountAndChunkDigests = digestsOfChunks[i];
+                    int expectedDigestSizeBytes =
+                            getContentDigestAlgorithmOutputSizeBytes(digestAlgorithm);
+                    MessageDigest md = mds[i];
+                    int actualDigestSizeBytes =
+                            md.digest(
+                                    concatenationOfChunkCountAndChunkDigests,
+                                    5 + chunkIndex * expectedDigestSizeBytes,
+                                    expectedDigestSizeBytes);
+                    if (actualDigestSizeBytes != expectedDigestSizeBytes) {
+                        throw new RuntimeException(
+                                "Unexpected output size of " + md.getAlgorithm() + " digest: "
+                                        + actualDigestSizeBytes);
+                    }
+                }
+                inputOffset += chunkSize;
+                inputRemaining -= chunkSize;
+                chunkIndex++;
+            }
+            dataSourceIndex++;
+        }
+
+        byte[][] result = new byte[digestAlgorithms.length][];
+        for (int i = 0; i < digestAlgorithms.length; i++) {
+            int digestAlgorithm = digestAlgorithms[i];
+            byte[] input = digestsOfChunks[i];
+            String jcaAlgorithmName = getContentDigestAlgorithmJcaDigestAlgorithm(digestAlgorithm);
+            MessageDigest md;
+            try {
+                md = MessageDigest.getInstance(jcaAlgorithmName);
+            } catch (NoSuchAlgorithmException e) {
+                throw new RuntimeException(jcaAlgorithmName + " digest not supported", e);
+            }
+            byte[] output = md.digest(input);
+            result[i] = output;
+        }
+        return result;
+!!!4797623.java!!!	getEocd(inout apk : RandomAccessFile) : Pair
+        Pair<ByteBuffer, Long> eocdAndOffsetInFile =
+                ZipUtils.findZipEndOfCentralDirectoryRecord(apk);
+        if (eocdAndOffsetInFile == null) {
+            throw new SignatureNotFoundException(
+                    "Not an APK file: ZIP End of Central Directory record not found");
+        }
+        return eocdAndOffsetInFile;
+!!!4797751.java!!!	getCentralDirOffset(inout eocd : ByteBuffer, in eocdOffset : long) : long
+        // Look up the offset of ZIP Central Directory.
+        long centralDirOffset = ZipUtils.getZipEocdCentralDirectoryOffset(eocd);
+        if (centralDirOffset >= eocdOffset) {
+            throw new SignatureNotFoundException(
+                    "ZIP Central Directory offset out of range: " + centralDirOffset
+                    + ". ZIP End of Central Directory offset: " + eocdOffset);
+        }
+        long centralDirSize = ZipUtils.getZipEocdCentralDirectorySizeBytes(eocd);
+        if (centralDirOffset + centralDirSize != eocdOffset) {
+            throw new SignatureNotFoundException(
+                    "ZIP Central Directory is not immediately followed by End of Central"
+                    + " Directory");
+        }
+        return centralDirOffset;
+!!!4797879.java!!!	getChunkCount(in inputSizeBytes : long) : long
+        return (inputSizeBytes + CHUNK_SIZE_BYTES - 1) / CHUNK_SIZE_BYTES;
+!!!4798007.java!!!	isSupportedSignatureAlgorithm(in sigAlgorithm : int) : boolean
+        switch (sigAlgorithm) {
+            case SIGNATURE_RSA_PSS_WITH_SHA256:
+            case SIGNATURE_RSA_PSS_WITH_SHA512:
+            case SIGNATURE_RSA_PKCS1_V1_5_WITH_SHA256:
+            case SIGNATURE_RSA_PKCS1_V1_5_WITH_SHA512:
+            case SIGNATURE_ECDSA_WITH_SHA256:
+            case SIGNATURE_ECDSA_WITH_SHA512:
+            case SIGNATURE_DSA_WITH_SHA256:
+                return true;
+            default:
+                return false;
+        }
+!!!4798135.java!!!	compareSignatureAlgorithm(in sigAlgorithm1 : int, in sigAlgorithm2 : int) : int
+        int digestAlgorithm1 = getSignatureAlgorithmContentDigestAlgorithm(sigAlgorithm1);
+        int digestAlgorithm2 = getSignatureAlgorithmContentDigestAlgorithm(sigAlgorithm2);
+        return compareContentDigestAlgorithm(digestAlgorithm1, digestAlgorithm2);
+!!!4798263.java!!!	compareContentDigestAlgorithm(in digestAlgorithm1 : int, in digestAlgorithm2 : int) : int
+        switch (digestAlgorithm1) {
+            case CONTENT_DIGEST_CHUNKED_SHA256:
+                switch (digestAlgorithm2) {
+                    case CONTENT_DIGEST_CHUNKED_SHA256:
+                        return 0;
+                    case CONTENT_DIGEST_CHUNKED_SHA512:
+                        return -1;
+                    default:
+                        throw new IllegalArgumentException(
+                                "Unknown digestAlgorithm2: " + digestAlgorithm2);
+                }
+            case CONTENT_DIGEST_CHUNKED_SHA512:
+                switch (digestAlgorithm2) {
+                    case CONTENT_DIGEST_CHUNKED_SHA256:
+                        return 1;
+                    case CONTENT_DIGEST_CHUNKED_SHA512:
+                        return 0;
+                    default:
+                        throw new IllegalArgumentException(
+                                "Unknown digestAlgorithm2: " + digestAlgorithm2);
+                }
+            default:
+                throw new IllegalArgumentException("Unknown digestAlgorithm1: " + digestAlgorithm1);
+        }
+!!!4798391.java!!!	getSignatureAlgorithmContentDigestAlgorithm(in sigAlgorithm : int) : int
+        switch (sigAlgorithm) {
+            case SIGNATURE_RSA_PSS_WITH_SHA256:
+            case SIGNATURE_RSA_PKCS1_V1_5_WITH_SHA256:
+            case SIGNATURE_ECDSA_WITH_SHA256:
+            case SIGNATURE_DSA_WITH_SHA256:
+                return CONTENT_DIGEST_CHUNKED_SHA256;
+            case SIGNATURE_RSA_PSS_WITH_SHA512:
+            case SIGNATURE_RSA_PKCS1_V1_5_WITH_SHA512:
+            case SIGNATURE_ECDSA_WITH_SHA512:
+                return CONTENT_DIGEST_CHUNKED_SHA512;
+            default:
+                throw new IllegalArgumentException(
+                        "Unknown signature algorithm: 0x"
+                                + Long.toHexString(sigAlgorithm & 0xffffffff));
+        }
+!!!4798519.java!!!	getContentDigestAlgorithmJcaDigestAlgorithm(in digestAlgorithm : int) : String
+        switch (digestAlgorithm) {
+            case CONTENT_DIGEST_CHUNKED_SHA256:
+                return "SHA-256";
+            case CONTENT_DIGEST_CHUNKED_SHA512:
+                return "SHA-512";
+            default:
+                throw new IllegalArgumentException(
+                        "Unknown content digest algorthm: " + digestAlgorithm);
+        }
+!!!4798647.java!!!	getContentDigestAlgorithmOutputSizeBytes(in digestAlgorithm : int) : int
+        switch (digestAlgorithm) {
+            case CONTENT_DIGEST_CHUNKED_SHA256:
+                return 256 / 8;
+            case CONTENT_DIGEST_CHUNKED_SHA512:
+                return 512 / 8;
+            default:
+                throw new IllegalArgumentException(
+                        "Unknown content digest algorthm: " + digestAlgorithm);
+        }
+!!!4798775.java!!!	getSignatureAlgorithmJcaKeyAlgorithm(in sigAlgorithm : int) : String
+        switch (sigAlgorithm) {
+            case SIGNATURE_RSA_PSS_WITH_SHA256:
+            case SIGNATURE_RSA_PSS_WITH_SHA512:
+            case SIGNATURE_RSA_PKCS1_V1_5_WITH_SHA256:
+            case SIGNATURE_RSA_PKCS1_V1_5_WITH_SHA512:
+                return "RSA";
+            case SIGNATURE_ECDSA_WITH_SHA256:
+            case SIGNATURE_ECDSA_WITH_SHA512:
+                return "EC";
+            case SIGNATURE_DSA_WITH_SHA256:
+                return "DSA";
+            default:
+                throw new IllegalArgumentException(
+                        "Unknown signature algorithm: 0x"
+                                + Long.toHexString(sigAlgorithm & 0xffffffff));
+        }
+!!!4798903.java!!!	getSignatureAlgorithmJcaSignatureAlgorithm(in sigAlgorithm : int) : Pair
+        switch (sigAlgorithm) {
+            case SIGNATURE_RSA_PSS_WITH_SHA256:
+                return Pair.create(
+                        "SHA256withRSA/PSS",
+                        new PSSParameterSpec(
+                                "SHA-256", "MGF1", MGF1ParameterSpec.SHA256, 256 / 8, 1));
+            case SIGNATURE_RSA_PSS_WITH_SHA512:
+                return Pair.create(
+                        "SHA512withRSA/PSS",
+                        new PSSParameterSpec(
+                                "SHA-512", "MGF1", MGF1ParameterSpec.SHA512, 512 / 8, 1));
+            case SIGNATURE_RSA_PKCS1_V1_5_WITH_SHA256:
+                return Pair.create("SHA256withRSA", null);
+            case SIGNATURE_RSA_PKCS1_V1_5_WITH_SHA512:
+                return Pair.create("SHA512withRSA", null);
+            case SIGNATURE_ECDSA_WITH_SHA256:
+                return Pair.create("SHA256withECDSA", null);
+            case SIGNATURE_ECDSA_WITH_SHA512:
+                return Pair.create("SHA512withECDSA", null);
+            case SIGNATURE_DSA_WITH_SHA256:
+                return Pair.create("SHA256withDSA", null);
+            default:
+                throw new IllegalArgumentException(
+                        "Unknown signature algorithm: 0x"
+                                + Long.toHexString(sigAlgorithm & 0xffffffff));
+        }
+!!!4799031.java!!!	sliceFromTo(inout source : ByteBuffer, in start : int, in end : int) : ByteBuffer
+        if (start < 0) {
+            throw new IllegalArgumentException("start: " + start);
+        }
+        if (end < start) {
+            throw new IllegalArgumentException("end < start: " + end + " < " + start);
+        }
+        int capacity = source.capacity();
+        if (end > source.capacity()) {
+            throw new IllegalArgumentException("end > capacity: " + end + " > " + capacity);
+        }
+        int originalLimit = source.limit();
+        int originalPosition = source.position();
+        try {
+            source.position(0);
+            source.limit(end);
+            source.position(start);
+            ByteBuffer result = source.slice();
+            result.order(source.order());
+            return result;
+        } finally {
+            source.position(0);
+            source.limit(originalLimit);
+            source.position(originalPosition);
+        }
+!!!4799159.java!!!	getByteBuffer(inout source : ByteBuffer, in size : int) : ByteBuffer
+        if (size < 0) {
+            throw new IllegalArgumentException("size: " + size);
+        }
+        int originalLimit = source.limit();
+        int position = source.position();
+        int limit = position + size;
+        if ((limit < position) || (limit > originalLimit)) {
+            throw new BufferUnderflowException();
+        }
+        source.limit(limit);
+        try {
+            ByteBuffer result = source.slice();
+            result.order(source.order());
+            source.position(limit);
+            return result;
+        } finally {
+            source.limit(originalLimit);
+        }
+!!!4799287.java!!!	getLengthPrefixedSlice(inout source : ByteBuffer) : ByteBuffer
+        if (source.remaining() < 4) {
+            throw new IOException(
+                    "Remaining buffer too short to contain length of length-prefixed field."
+                            + " Remaining: " + source.remaining());
+        }
+        int len = source.getInt();
+        if (len < 0) {
+            throw new IllegalArgumentException("Negative length");
+        } else if (len > source.remaining()) {
+            throw new IOException("Length-prefixed field longer than remaining buffer."
+                    + " Field length: " + len + ", remaining: " + source.remaining());
+        }
+        return getByteBuffer(source, len);
+!!!4799415.java!!!	readLengthPrefixedByteArray(inout buf : ByteBuffer) : byte
+        int len = buf.getInt();
+        if (len < 0) {
+            throw new IOException("Negative length");
+        } else if (len > buf.remaining()) {
+            throw new IOException("Underflow while reading length-prefixed value. Length: " + len
+                    + ", available: " + buf.remaining());
+        }
+        byte[] result = new byte[len];
+        buf.get(result);
+        return result;
+!!!4799543.java!!!	setUnsignedInt32LittleEndian(in value : int, inout result : byte, in offset : int) : void
+        result[offset] = (byte) (value & 0xff);
+        result[offset + 1] = (byte) ((value >>> 8) & 0xff);
+        result[offset + 2] = (byte) ((value >>> 16) & 0xff);
+        result[offset + 3] = (byte) ((value >>> 24) & 0xff);
+!!!4799671.java!!!	findApkSigningBlock(inout apk : RandomAccessFile, in centralDirOffset : long) : Pair
+        // FORMAT:
+        // OFFSET       DATA TYPE  DESCRIPTION
+        // * @+0  bytes uint64:    size in bytes (excluding this field)
+        // * @+8  bytes payload
+        // * @-24 bytes uint64:    size in bytes (same as the one above)
+        // * @-16 bytes uint128:   magic
+
+        if (centralDirOffset < APK_SIG_BLOCK_MIN_SIZE) {
+            throw new SignatureNotFoundException(
+                    "APK too small for APK Signing Block. ZIP Central Directory offset: "
+                            + centralDirOffset);
+        }
+        // Read the magic and offset in file from the footer section of the block:
+        // * uint64:   size of block
+        // * 16 bytes: magic
+        ByteBuffer footer = ByteBuffer.allocate(24);
+        footer.order(ByteOrder.LITTLE_ENDIAN);
+        apk.seek(centralDirOffset - footer.capacity());
+        apk.readFully(footer.array(), footer.arrayOffset(), footer.capacity());
+        if ((footer.getLong(8) != APK_SIG_BLOCK_MAGIC_LO)
+                || (footer.getLong(16) != APK_SIG_BLOCK_MAGIC_HI)) {
+            throw new SignatureNotFoundException(
+                    "No APK Signing Block before ZIP Central Directory");
+        }
+        // Read and compare size fields
+        long apkSigBlockSizeInFooter = footer.getLong(0);
+        if ((apkSigBlockSizeInFooter < footer.capacity())
+                || (apkSigBlockSizeInFooter > Integer.MAX_VALUE - 8)) {
+            throw new SignatureNotFoundException(
+                    "APK Signing Block size out of range: " + apkSigBlockSizeInFooter);
+        }
+        int totalSize = (int) (apkSigBlockSizeInFooter + 8);
+        long apkSigBlockOffset = centralDirOffset - totalSize;
+        if (apkSigBlockOffset < 0) {
+            throw new SignatureNotFoundException(
+                    "APK Signing Block offset out of range: " + apkSigBlockOffset);
+        }
+        ByteBuffer apkSigBlock = ByteBuffer.allocate(totalSize);
+        apkSigBlock.order(ByteOrder.LITTLE_ENDIAN);
+        apk.seek(apkSigBlockOffset);
+        apk.readFully(apkSigBlock.array(), apkSigBlock.arrayOffset(), apkSigBlock.capacity());
+        long apkSigBlockSizeInHeader = apkSigBlock.getLong(0);
+        if (apkSigBlockSizeInHeader != apkSigBlockSizeInFooter) {
+            throw new SignatureNotFoundException(
+                    "APK Signing Block sizes in header and footer do not match: "
+                            + apkSigBlockSizeInHeader + " vs " + apkSigBlockSizeInFooter);
+        }
+        return Pair.create(apkSigBlock, apkSigBlockOffset);
+!!!4799799.java!!!	findApkSignatureSchemeV2Block(inout apkSigningBlock : ByteBuffer) : ByteBuffer
+        checkByteOrderLittleEndian(apkSigningBlock);
+        // FORMAT:
+        // OFFSET       DATA TYPE  DESCRIPTION
+        // * @+0  bytes uint64:    size in bytes (excluding this field)
+        // * @+8  bytes pairs
+        // * @-24 bytes uint64:    size in bytes (same as the one above)
+        // * @-16 bytes uint128:   magic
+        ByteBuffer pairs = sliceFromTo(apkSigningBlock, 8, apkSigningBlock.capacity() - 24);
+
+        int entryCount = 0;
+        while (pairs.hasRemaining()) {
+            entryCount++;
+            if (pairs.remaining() < 8) {
+                throw new SignatureNotFoundException(
+                        "Insufficient data to read size of APK Signing Block entry #" + entryCount);
+            }
+            long lenLong = pairs.getLong();
+            if ((lenLong < 4) || (lenLong > Integer.MAX_VALUE)) {
+                throw new SignatureNotFoundException(
+                        "APK Signing Block entry #" + entryCount
+                                + " size out of range: " + lenLong);
+            }
+            int len = (int) lenLong;
+            int nextEntryPos = pairs.position() + len;
+            if (len > pairs.remaining()) {
+                throw new SignatureNotFoundException(
+                        "APK Signing Block entry #" + entryCount + " size out of range: " + len
+                                + ", available: " + pairs.remaining());
+            }
+            int id = pairs.getInt();
+            if (id == APK_SIGNATURE_SCHEME_V2_BLOCK_ID) {
+                return getByteBuffer(pairs, len - 4);
+            }
+            pairs.position(nextEntryPos);
+        }
+
+        throw new SignatureNotFoundException(
+                "No APK Signature Scheme v2 block in APK Signing Block");
+!!!4799927.java!!!	checkByteOrderLittleEndian(inout buffer : ByteBuffer) : void
+        if (buffer.order() != ByteOrder.LITTLE_ENDIAN) {
+            throw new IllegalArgumentException("ByteBuffer byte order must be little endian");
+        }

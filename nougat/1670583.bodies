@@ -1,0 +1,430 @@
+class UserUsageStatsService
+!!!34201527.java!!!	UserUsageStatsService(inout context : Context, in userId : int, inout usageStatsDir : File, inout listener : UserUsageStatsService::StatsUpdatedListener)
+        mContext = context;
+        mDailyExpiryDate = new UnixCalendar(0);
+        mDatabase = new UsageStatsDatabase(usageStatsDir);
+        mCurrentStats = new IntervalStats[UsageStatsManager.INTERVAL_COUNT];
+        mListener = listener;
+        mLogPrefix = "User[" + Integer.toString(userId) + "] ";
+        mUserId = userId;
+!!!34201655.java!!!	init(in currentTimeMillis : long) : void
+        mDatabase.init(currentTimeMillis);
+
+        int nullCount = 0;
+        for (int i = 0; i < mCurrentStats.length; i++) {
+            mCurrentStats[i] = mDatabase.getLatestUsageStats(i);
+            if (mCurrentStats[i] == null) {
+                // Find out how many intervals we don't have data for.
+                // Ideally it should be all or none.
+                nullCount++;
+            }
+        }
+
+        if (nullCount > 0) {
+            if (nullCount != mCurrentStats.length) {
+                // This is weird, but we shouldn't fail if something like this
+                // happens.
+                Slog.w(TAG, mLogPrefix + "Some stats have no latest available");
+            } else {
+                // This must be first boot.
+            }
+
+            // By calling loadActiveStats, we will
+            // generate new stats for each bucket.
+            loadActiveStats(currentTimeMillis);
+        } else {
+            // Set up the expiry date to be one day from the latest daily stat.
+            // This may actually be today and we will rollover on the first event
+            // that is reported.
+            updateRolloverDeadline();
+        }
+
+        // Now close off any events that were open at the time this was saved.
+        for (IntervalStats stat : mCurrentStats) {
+            final int pkgCount = stat.packageStats.size();
+            for (int i = 0; i < pkgCount; i++) {
+                UsageStats pkgStats = stat.packageStats.valueAt(i);
+                if (pkgStats.mLastEvent == UsageEvents.Event.MOVE_TO_FOREGROUND ||
+                        pkgStats.mLastEvent == UsageEvents.Event.CONTINUE_PREVIOUS_DAY) {
+                    stat.update(pkgStats.mPackageName, stat.lastTimeSaved,
+                            UsageEvents.Event.END_OF_DAY);
+                    notifyStatsChanged();
+                }
+            }
+
+            stat.updateConfigurationStats(null, stat.lastTimeSaved);
+        }
+
+        if (mDatabase.isNewUpdate()) {
+            notifyNewUpdate();
+        }
+!!!34201783.java!!!	onTimeChanged(in oldTime : long, in newTime : long) : void
+        persistActiveStats();
+        mDatabase.onTimeChanged(newTime - oldTime);
+        loadActiveStats(newTime);
+!!!34201911.java!!!	reportEvent(inout event : UsageEvents::Event) : void
+        if (DEBUG) {
+            Slog.d(TAG, mLogPrefix + "Got usage event for " + event.mPackage
+                    + "[" + event.mTimeStamp + "]: "
+                    + eventToString(event.mEventType));
+        }
+
+        if (event.mTimeStamp >= mDailyExpiryDate.getTimeInMillis()) {
+            // Need to rollover
+            rolloverStats(event.mTimeStamp);
+        }
+
+        final IntervalStats currentDailyStats = mCurrentStats[UsageStatsManager.INTERVAL_DAILY];
+
+        final Configuration newFullConfig = event.mConfiguration;
+        if (event.mEventType == UsageEvents.Event.CONFIGURATION_CHANGE &&
+                currentDailyStats.activeConfiguration != null) {
+            // Make the event configuration a delta.
+            event.mConfiguration = Configuration.generateDelta(
+                    currentDailyStats.activeConfiguration, newFullConfig);
+        }
+
+        // Add the event to the daily list.
+        if (currentDailyStats.events == null) {
+            currentDailyStats.events = new TimeSparseArray<>();
+        }
+        if (event.mEventType != UsageEvents.Event.SYSTEM_INTERACTION) {
+            currentDailyStats.events.put(event.mTimeStamp, event);
+        }
+
+        for (IntervalStats stats : mCurrentStats) {
+            if (event.mEventType == UsageEvents.Event.CONFIGURATION_CHANGE) {
+                stats.updateConfigurationStats(newFullConfig, event.mTimeStamp);
+            } else {
+                stats.update(event.mPackage, event.mTimeStamp, event.mEventType);
+            }
+        }
+
+        notifyStatsChanged();
+!!!34202039.java!!!	queryStats(in intervalType : int, in beginTime : long, in endTime : long, inout combiner : UsageStatsDatabase::StatCombiner) : List<T>
+        if (intervalType == UsageStatsManager.INTERVAL_BEST) {
+            intervalType = mDatabase.findBestFitBucket(beginTime, endTime);
+            if (intervalType < 0) {
+                // Nothing saved to disk yet, so every stat is just as equal (no rollover has
+                // occurred.
+                intervalType = UsageStatsManager.INTERVAL_DAILY;
+            }
+        }
+
+        if (intervalType < 0 || intervalType >= mCurrentStats.length) {
+            if (DEBUG) {
+                Slog.d(TAG, mLogPrefix + "Bad intervalType used " + intervalType);
+            }
+            return null;
+        }
+
+        final IntervalStats currentStats = mCurrentStats[intervalType];
+
+        if (DEBUG) {
+            Slog.d(TAG, mLogPrefix + "SELECT * FROM " + intervalType + " WHERE beginTime >= "
+                    + beginTime + " AND endTime < " + endTime);
+        }
+
+        if (beginTime >= currentStats.endTime) {
+            if (DEBUG) {
+                Slog.d(TAG, mLogPrefix + "Requesting stats after " + beginTime + " but latest is "
+                        + currentStats.endTime);
+            }
+            // Nothing newer available.
+            return null;
+        }
+
+        // Truncate the endTime to just before the in-memory stats. Then, we'll append the
+        // in-memory stats to the results (if necessary) so as to avoid writing to disk too
+        // often.
+        final long truncatedEndTime = Math.min(currentStats.beginTime, endTime);
+
+        // Get the stats from disk.
+        List<T> results = mDatabase.queryUsageStats(intervalType, beginTime,
+                truncatedEndTime, combiner);
+        if (DEBUG) {
+            Slog.d(TAG, "Got " + (results != null ? results.size() : 0) + " results from disk");
+            Slog.d(TAG, "Current stats beginTime=" + currentStats.beginTime +
+                    " endTime=" + currentStats.endTime);
+        }
+
+        // Now check if the in-memory stats match the range and add them if they do.
+        if (beginTime < currentStats.endTime && endTime > currentStats.beginTime) {
+            if (DEBUG) {
+                Slog.d(TAG, mLogPrefix + "Returning in-memory stats");
+            }
+
+            if (results == null) {
+                results = new ArrayList<>();
+            }
+            combiner.combine(currentStats, true, results);
+        }
+
+        if (DEBUG) {
+            Slog.d(TAG, mLogPrefix + "Results: " + (results != null ? results.size() : 0));
+        }
+        return results;
+!!!34202167.java!!!	queryUsageStats(in bucketType : int, in beginTime : long, in endTime : long) : UsageStats
+        return queryStats(bucketType, beginTime, endTime, sUsageStatsCombiner);
+!!!34202295.java!!!	queryConfigurationStats(in bucketType : int, in beginTime : long, in endTime : long) : ConfigurationStats
+        return queryStats(bucketType, beginTime, endTime, sConfigStatsCombiner);
+!!!34202423.java!!!	queryEvents(in beginTime : long, in endTime : long) : UsageEvents
+        final ArraySet<String> names = new ArraySet<>();
+        List<UsageEvents.Event> results = queryStats(UsageStatsManager.INTERVAL_DAILY,
+                beginTime, endTime, new StatCombiner<UsageEvents.Event>() {
+                    @Override
+                    public void combine(IntervalStats stats, boolean mutable,
+                            List<UsageEvents.Event> accumulatedResult) {
+                        if (stats.events == null) {
+                            return;
+                        }
+
+                        final int startIndex = stats.events.closestIndexOnOrAfter(beginTime);
+                        if (startIndex < 0) {
+                            return;
+                        }
+
+                        final int size = stats.events.size();
+                        for (int i = startIndex; i < size; i++) {
+                            if (stats.events.keyAt(i) >= endTime) {
+                                return;
+                            }
+
+                            final UsageEvents.Event event = stats.events.valueAt(i);
+                            names.add(event.mPackage);
+                            if (event.mClass != null) {
+                                names.add(event.mClass);
+                            }
+                            accumulatedResult.add(event);
+                        }
+                    }
+                });
+
+        if (results == null || results.isEmpty()) {
+            return null;
+        }
+
+        String[] table = names.toArray(new String[names.size()]);
+        Arrays.sort(table);
+        return new UsageEvents(results, table);
+!!!34202551.java!!!	persistActiveStats() : void
+        if (mStatsChanged) {
+            Slog.i(TAG, mLogPrefix + "Flushing usage stats to disk");
+            try {
+                for (int i = 0; i < mCurrentStats.length; i++) {
+                    mDatabase.putUsageStats(i, mCurrentStats[i]);
+                }
+                mStatsChanged = false;
+            } catch (IOException e) {
+                Slog.e(TAG, mLogPrefix + "Failed to persist active stats", e);
+            }
+        }
+!!!34202679.java!!!	rolloverStats(in currentTimeMillis : long) : void
+        final long startTime = SystemClock.elapsedRealtime();
+        Slog.i(TAG, mLogPrefix + "Rolling over usage stats");
+
+        // Finish any ongoing events with an END_OF_DAY event. Make a note of which components
+        // need a new CONTINUE_PREVIOUS_DAY entry.
+        final Configuration previousConfig =
+                mCurrentStats[UsageStatsManager.INTERVAL_DAILY].activeConfiguration;
+        ArraySet<String> continuePreviousDay = new ArraySet<>();
+        for (IntervalStats stat : mCurrentStats) {
+            final int pkgCount = stat.packageStats.size();
+            for (int i = 0; i < pkgCount; i++) {
+                UsageStats pkgStats = stat.packageStats.valueAt(i);
+                if (pkgStats.mLastEvent == UsageEvents.Event.MOVE_TO_FOREGROUND ||
+                        pkgStats.mLastEvent == UsageEvents.Event.CONTINUE_PREVIOUS_DAY) {
+                    continuePreviousDay.add(pkgStats.mPackageName);
+                    stat.update(pkgStats.mPackageName, mDailyExpiryDate.getTimeInMillis() - 1,
+                            UsageEvents.Event.END_OF_DAY);
+                    notifyStatsChanged();
+                }
+            }
+
+            stat.updateConfigurationStats(null, mDailyExpiryDate.getTimeInMillis() - 1);
+        }
+
+        persistActiveStats();
+        mDatabase.prune(currentTimeMillis);
+        loadActiveStats(currentTimeMillis);
+
+        final int continueCount = continuePreviousDay.size();
+        for (int i = 0; i < continueCount; i++) {
+            String name = continuePreviousDay.valueAt(i);
+            final long beginTime = mCurrentStats[UsageStatsManager.INTERVAL_DAILY].beginTime;
+            for (IntervalStats stat : mCurrentStats) {
+                stat.update(name, beginTime, UsageEvents.Event.CONTINUE_PREVIOUS_DAY);
+                stat.updateConfigurationStats(previousConfig, beginTime);
+                notifyStatsChanged();
+            }
+        }
+        persistActiveStats();
+
+        final long totalTime = SystemClock.elapsedRealtime() - startTime;
+        Slog.i(TAG, mLogPrefix + "Rolling over usage stats complete. Took " + totalTime
+                + " milliseconds");
+!!!34202807.java!!!	notifyStatsChanged() : void
+        if (!mStatsChanged) {
+            mStatsChanged = true;
+            mListener.onStatsUpdated();
+        }
+!!!34202935.java!!!	notifyNewUpdate() : void
+        mListener.onNewUpdate(mUserId);
+!!!34203063.java!!!	loadActiveStats(in currentTimeMillis : long) : void
+        for (int intervalType = 0; intervalType < mCurrentStats.length; intervalType++) {
+            final IntervalStats stats = mDatabase.getLatestUsageStats(intervalType);
+            if (stats != null && currentTimeMillis - 500 >= stats.endTime &&
+                    currentTimeMillis < stats.beginTime + INTERVAL_LENGTH[intervalType]) {
+                if (DEBUG) {
+                    Slog.d(TAG, mLogPrefix + "Loading existing stats @ " +
+                            sDateFormat.format(stats.beginTime) + "(" + stats.beginTime +
+                            ") for interval " + intervalType);
+                }
+                mCurrentStats[intervalType] = stats;
+            } else {
+                // No good fit remains.
+                if (DEBUG) {
+                    Slog.d(TAG, "Creating new stats @ " +
+                            sDateFormat.format(currentTimeMillis) + "(" +
+                            currentTimeMillis + ") for interval " + intervalType);
+                }
+
+                mCurrentStats[intervalType] = new IntervalStats();
+                mCurrentStats[intervalType].beginTime = currentTimeMillis;
+                mCurrentStats[intervalType].endTime = currentTimeMillis + 1;
+            }
+        }
+
+        mStatsChanged = false;
+        updateRolloverDeadline();
+
+        // Tell the listener that the stats reloaded, which may have changed idle states.
+        mListener.onStatsReloaded();
+!!!34203191.java!!!	updateRolloverDeadline() : void
+        mDailyExpiryDate.setTimeInMillis(
+                mCurrentStats[UsageStatsManager.INTERVAL_DAILY].beginTime);
+        mDailyExpiryDate.addDays(1);
+        Slog.i(TAG, mLogPrefix + "Rollover scheduled @ " +
+                sDateFormat.format(mDailyExpiryDate.getTimeInMillis()) + "(" +
+                mDailyExpiryDate.getTimeInMillis() + ")");
+!!!34203319.java!!!	checkin(in pw : IndentingPrintWriter) : void
+        mDatabase.checkinDailyFiles(new UsageStatsDatabase.CheckinAction() {
+            @Override
+            public boolean checkin(IntervalStats stats) {
+                printIntervalStats(pw, stats, false);
+                return true;
+            }
+        });
+!!!34203447.java!!!	dump(inout pw : IndentingPrintWriter) : void
+        // This is not a check-in, only dump in-memory stats.
+        for (int interval = 0; interval < mCurrentStats.length; interval++) {
+            pw.print("In-memory ");
+            pw.print(intervalToString(interval));
+            pw.println(" stats");
+            printIntervalStats(pw, mCurrentStats[interval], true);
+        }
+!!!34203575.java!!!	formatDateTime(in dateTime : long, inout pretty : boolean) : String
+        if (pretty) {
+            return "\"" + DateUtils.formatDateTime(mContext, dateTime, sDateFormatFlags) + "\"";
+        }
+        return Long.toString(dateTime);
+!!!34203703.java!!!	formatElapsedTime(in elapsedTime : long, inout pretty : boolean) : String
+        if (pretty) {
+            return "\"" + DateUtils.formatElapsedTime(elapsedTime / 1000) + "\"";
+        }
+        return Long.toString(elapsedTime);
+!!!34203831.java!!!	printIntervalStats(inout pw : IndentingPrintWriter, inout stats : IntervalStats, inout prettyDates : boolean) : void
+        if (prettyDates) {
+            pw.printPair("timeRange", "\"" + DateUtils.formatDateRange(mContext,
+                    stats.beginTime, stats.endTime, sDateFormatFlags) + "\"");
+        } else {
+            pw.printPair("beginTime", stats.beginTime);
+            pw.printPair("endTime", stats.endTime);
+        }
+        pw.println();
+        pw.increaseIndent();
+        pw.println("packages");
+        pw.increaseIndent();
+        final ArrayMap<String, UsageStats> pkgStats = stats.packageStats;
+        final int pkgCount = pkgStats.size();
+        for (int i = 0; i < pkgCount; i++) {
+            final UsageStats usageStats = pkgStats.valueAt(i);
+            pw.printPair("package", usageStats.mPackageName);
+            pw.printPair("totalTime",
+                    formatElapsedTime(usageStats.mTotalTimeInForeground, prettyDates));
+            pw.printPair("lastTime", formatDateTime(usageStats.mLastTimeUsed, prettyDates));
+            pw.println();
+        }
+        pw.decreaseIndent();
+
+        pw.println("configurations");
+        pw.increaseIndent();
+        final ArrayMap<Configuration, ConfigurationStats> configStats = stats.configurations;
+        final int configCount = configStats.size();
+        for (int i = 0; i < configCount; i++) {
+            final ConfigurationStats config = configStats.valueAt(i);
+            pw.printPair("config", Configuration.resourceQualifierString(config.mConfiguration));
+            pw.printPair("totalTime", formatElapsedTime(config.mTotalTimeActive, prettyDates));
+            pw.printPair("lastTime", formatDateTime(config.mLastTimeActive, prettyDates));
+            pw.printPair("count", config.mActivationCount);
+            pw.println();
+        }
+        pw.decreaseIndent();
+
+        pw.println("events");
+        pw.increaseIndent();
+        final TimeSparseArray<UsageEvents.Event> events = stats.events;
+        final int eventCount = events != null ? events.size() : 0;
+        for (int i = 0; i < eventCount; i++) {
+            final UsageEvents.Event event = events.valueAt(i);
+            pw.printPair("time", formatDateTime(event.mTimeStamp, prettyDates));
+            pw.printPair("type", eventToString(event.mEventType));
+            pw.printPair("package", event.mPackage);
+            if (event.mClass != null) {
+                pw.printPair("class", event.mClass);
+            }
+            if (event.mConfiguration != null) {
+                pw.printPair("config", Configuration.resourceQualifierString(event.mConfiguration));
+            }
+            pw.println();
+        }
+        pw.decreaseIndent();
+        pw.decreaseIndent();
+!!!34203959.java!!!	intervalToString(in interval : int) : String
+        switch (interval) {
+            case UsageStatsManager.INTERVAL_DAILY:
+                return "daily";
+            case UsageStatsManager.INTERVAL_WEEKLY:
+                return "weekly";
+            case UsageStatsManager.INTERVAL_MONTHLY:
+                return "monthly";
+            case UsageStatsManager.INTERVAL_YEARLY:
+                return "yearly";
+            default:
+                return "?";
+        }
+!!!34204087.java!!!	eventToString(in eventType : int) : String
+        switch (eventType) {
+            case UsageEvents.Event.NONE:
+                return "NONE";
+            case UsageEvents.Event.MOVE_TO_BACKGROUND:
+                return "MOVE_TO_BACKGROUND";
+            case UsageEvents.Event.MOVE_TO_FOREGROUND:
+                return "MOVE_TO_FOREGROUND";
+            case UsageEvents.Event.END_OF_DAY:
+                return "END_OF_DAY";
+            case UsageEvents.Event.CONTINUE_PREVIOUS_DAY:
+                return "CONTINUE_PREVIOUS_DAY";
+            case UsageEvents.Event.CONFIGURATION_CHANGE:
+                return "CONFIGURATION_CHANGE";
+            case UsageEvents.Event.SYSTEM_INTERACTION:
+                return "SYSTEM_INTERACTION";
+            case UsageEvents.Event.USER_INTERACTION:
+                return "USER_INTERACTION";
+            default:
+                return "UNKNOWN";
+        }
+!!!34204215.java!!!	getBackupPayload(inout key : String) : byte
+        return mDatabase.getBackupPayload(key);
+!!!34204343.java!!!	applyRestoredPayload(inout key : String, inout payload : byte) : void
+        mDatabase.applyRestoredPayload(key, payload);

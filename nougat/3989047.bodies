@@ -1,0 +1,308 @@
+class TvInputHardwareImpl
+!!!42945591.java!!!	TvInputHardwareImpl(inout info : TvInputHardwareInfo)
+            mInfo = info;
+            mAudioManager.registerAudioPortUpdateListener(mAudioListener);
+            if (mInfo.getAudioType() != AudioManager.DEVICE_NONE) {
+                mAudioSource = findAudioDevicePort(mInfo.getAudioType(), mInfo.getAudioAddress());
+                findAudioSinkFromAudioPolicy(mAudioSink);
+            }
+!!!42945719.java!!!	findAudioSinkFromAudioPolicy(inout sinks : List<AudioDevicePort>) : void
+            sinks.clear();
+            ArrayList<AudioDevicePort> devicePorts = new ArrayList<>();
+            if (mAudioManager.listAudioDevicePorts(devicePorts) != AudioManager.SUCCESS) {
+                return;
+            }
+            int sinkDevice = mAudioManager.getDevicesForStream(AudioManager.STREAM_MUSIC);
+            for (AudioDevicePort port : devicePorts) {
+                if ((port.type() & sinkDevice) != 0 &&
+                    (port.type() & AudioSystem.DEVICE_BIT_IN) == 0) {
+                    sinks.add(port);
+                }
+            }
+!!!42945847.java!!!	findAudioDevicePort(in type : int, inout address : String) : AudioDevicePort
+            if (type == AudioManager.DEVICE_NONE) {
+                return null;
+            }
+            ArrayList<AudioDevicePort> devicePorts = new ArrayList<>();
+            if (mAudioManager.listAudioDevicePorts(devicePorts) != AudioManager.SUCCESS) {
+                return null;
+            }
+            for (AudioDevicePort port : devicePorts) {
+                if (port.type() == type && port.address().equals(address)) {
+                    return port;
+                }
+            }
+            return null;
+!!!42945975.java!!!	release() : void
+            synchronized (mImplLock) {
+                mAudioManager.unregisterAudioPortUpdateListener(mAudioListener);
+                if (mAudioPatch != null) {
+                    mAudioManager.releaseAudioPatch(mAudioPatch);
+                    mAudioPatch = null;
+                }
+                mReleased = true;
+            }
+!!!42946103.java!!!	setSurface(inout surface : Surface, inout config : TvStreamConfig) : boolean
+            synchronized (mImplLock) {
+                if (mReleased) {
+                    throw new IllegalStateException("Device already released.");
+                }
+
+                int result = TvInputHal.SUCCESS;
+                if (surface == null) {
+                    // The value of config is ignored when surface == null.
+                    if (mActiveConfig != null) {
+                        result = mHal.removeStream(mInfo.getDeviceId(), mActiveConfig);
+                        mActiveConfig = null;
+                    } else {
+                        // We already have no active stream.
+                        return true;
+                    }
+                } else {
+                    // It's impossible to set a non-null surface with a null config.
+                    if (config == null) {
+                        return false;
+                    }
+                    // Remove stream only if we have an existing active configuration.
+                    if (mActiveConfig != null && !config.equals(mActiveConfig)) {
+                        result = mHal.removeStream(mInfo.getDeviceId(), mActiveConfig);
+                        if (result != TvInputHal.SUCCESS) {
+                            mActiveConfig = null;
+                        }
+                    }
+                    // Proceed only if all previous operations succeeded.
+                    if (result == TvInputHal.SUCCESS) {
+                        result = mHal.addOrUpdateStream(mInfo.getDeviceId(), surface, config);
+                        if (result == TvInputHal.SUCCESS) {
+                            mActiveConfig = config;
+                        }
+                    }
+                }
+                updateAudioConfigLocked();
+                return result == TvInputHal.SUCCESS;
+            }
+!!!42946231.java!!!	updateAudioConfigLocked() : void
+            boolean sinkUpdated = updateAudioSinkLocked();
+            boolean sourceUpdated = updateAudioSourceLocked();
+            // We can't do updated = updateAudioSinkLocked() || updateAudioSourceLocked() here
+            // because Java won't evaluate the latter if the former is true.
+
+            if (mAudioSource == null || mAudioSink.isEmpty() || mActiveConfig == null) {
+                if (mAudioPatch != null) {
+                    mAudioManager.releaseAudioPatch(mAudioPatch);
+                    mAudioPatch = null;
+                }
+                return;
+            }
+
+            updateVolume();
+            float volume = mSourceVolume * getMediaStreamVolume();
+            AudioGainConfig sourceGainConfig = null;
+            if (mAudioSource.gains().length > 0 && volume != mCommittedVolume) {
+                AudioGain sourceGain = null;
+                for (AudioGain gain : mAudioSource.gains()) {
+                    if ((gain.mode() & AudioGain.MODE_JOINT) != 0) {
+                        sourceGain = gain;
+                        break;
+                    }
+                }
+                // NOTE: we only change the source gain in MODE_JOINT here.
+                if (sourceGain != null) {
+                    int steps = (sourceGain.maxValue() - sourceGain.minValue())
+                            / sourceGain.stepValue();
+                    int gainValue = sourceGain.minValue();
+                    if (volume < 1.0f) {
+                        gainValue += sourceGain.stepValue() * (int) (volume * steps + 0.5);
+                    } else {
+                        gainValue = sourceGain.maxValue();
+                    }
+                    // size of gain values is 1 in MODE_JOINT
+                    int[] gainValues = new int[] { gainValue };
+                    sourceGainConfig = sourceGain.buildConfig(AudioGain.MODE_JOINT,
+                            sourceGain.channelMask(), gainValues, 0);
+                } else {
+                    Slog.w(TAG, "No audio source gain with MODE_JOINT support exists.");
+                }
+            }
+
+            AudioPortConfig sourceConfig = mAudioSource.activeConfig();
+            List<AudioPortConfig> sinkConfigs = new ArrayList<>();
+            AudioPatch[] audioPatchArray = new AudioPatch[] { mAudioPatch };
+            boolean shouldRecreateAudioPatch = sourceUpdated || sinkUpdated;
+
+            for (AudioDevicePort audioSink : mAudioSink) {
+                AudioPortConfig sinkConfig = audioSink.activeConfig();
+                int sinkSamplingRate = mDesiredSamplingRate;
+                int sinkChannelMask = mDesiredChannelMask;
+                int sinkFormat = mDesiredFormat;
+                // If sinkConfig != null and values are set to default,
+                // fill in the sinkConfig values.
+                if (sinkConfig != null) {
+                    if (sinkSamplingRate == 0) {
+                        sinkSamplingRate = sinkConfig.samplingRate();
+                    }
+                    if (sinkChannelMask == AudioFormat.CHANNEL_OUT_DEFAULT) {
+                        sinkChannelMask = sinkConfig.channelMask();
+                    }
+                    if (sinkFormat == AudioFormat.ENCODING_DEFAULT) {
+                        sinkChannelMask = sinkConfig.format();
+                    }
+                }
+
+                if (sinkConfig == null
+                        || sinkConfig.samplingRate() != sinkSamplingRate
+                        || sinkConfig.channelMask() != sinkChannelMask
+                        || sinkConfig.format() != sinkFormat) {
+                    // Check for compatibility and reset to default if necessary.
+                    if (!intArrayContains(audioSink.samplingRates(), sinkSamplingRate)
+                            && audioSink.samplingRates().length > 0) {
+                        sinkSamplingRate = audioSink.samplingRates()[0];
+                    }
+                    if (!intArrayContains(audioSink.channelMasks(), sinkChannelMask)) {
+                        sinkChannelMask = AudioFormat.CHANNEL_OUT_DEFAULT;
+                    }
+                    if (!intArrayContains(audioSink.formats(), sinkFormat)) {
+                        sinkFormat = AudioFormat.ENCODING_DEFAULT;
+                    }
+                    sinkConfig = audioSink.buildConfig(sinkSamplingRate, sinkChannelMask,
+                            sinkFormat, null);
+                    shouldRecreateAudioPatch = true;
+                }
+                sinkConfigs.add(sinkConfig);
+            }
+            // sinkConfigs.size() == mAudioSink.size(), and mAudioSink is guaranteed to be
+            // non-empty at the beginning of this method.
+            AudioPortConfig sinkConfig = sinkConfigs.get(0);
+            if (sourceConfig == null || sourceGainConfig != null) {
+                int sourceSamplingRate = 0;
+                if (intArrayContains(mAudioSource.samplingRates(), sinkConfig.samplingRate())) {
+                    sourceSamplingRate = sinkConfig.samplingRate();
+                } else if (mAudioSource.samplingRates().length > 0) {
+                    // Use any sampling rate and hope audio patch can handle resampling...
+                    sourceSamplingRate = mAudioSource.samplingRates()[0];
+                }
+                int sourceChannelMask = AudioFormat.CHANNEL_IN_DEFAULT;
+                for (int inChannelMask : mAudioSource.channelMasks()) {
+                    if (AudioFormat.channelCountFromOutChannelMask(sinkConfig.channelMask())
+                            == AudioFormat.channelCountFromInChannelMask(inChannelMask)) {
+                        sourceChannelMask = inChannelMask;
+                        break;
+                    }
+                }
+                int sourceFormat = AudioFormat.ENCODING_DEFAULT;
+                if (intArrayContains(mAudioSource.formats(), sinkConfig.format())) {
+                    sourceFormat = sinkConfig.format();
+                }
+                sourceConfig = mAudioSource.buildConfig(sourceSamplingRate, sourceChannelMask,
+                        sourceFormat, sourceGainConfig);
+                shouldRecreateAudioPatch = true;
+            }
+            if (shouldRecreateAudioPatch) {
+                mCommittedVolume = volume;
+                if (mAudioPatch != null) {
+                    mAudioManager.releaseAudioPatch(mAudioPatch);
+                }
+                mAudioManager.createAudioPatch(
+                        audioPatchArray,
+                        new AudioPortConfig[] { sourceConfig },
+                        sinkConfigs.toArray(new AudioPortConfig[sinkConfigs.size()]));
+                mAudioPatch = audioPatchArray[0];
+                if (sourceGainConfig != null) {
+                    mAudioManager.setAudioPortGain(mAudioSource, sourceGainConfig);
+                }
+            }
+!!!42946359.java!!!	setStreamVolume(in volume : float) : void
+            synchronized (mImplLock) {
+                if (mReleased) {
+                    throw new IllegalStateException("Device already released.");
+                }
+                mSourceVolume = volume;
+                updateAudioConfigLocked();
+            }
+!!!42946487.java!!!	dispatchKeyEventToHdmi(inout event : KeyEvent) : boolean
+            synchronized (mImplLock) {
+                if (mReleased) {
+                    throw new IllegalStateException("Device already released.");
+                }
+            }
+            if (mInfo.getType() != TvInputHardwareInfo.TV_INPUT_TYPE_HDMI) {
+                return false;
+            }
+            // TODO(hdmi): mHdmiClient.sendKeyEvent(event);
+            return false;
+!!!42946615.java!!!	startCapture(inout surface : Surface, inout config : TvStreamConfig) : boolean
+            synchronized (mImplLock) {
+                if (mReleased) {
+                    return false;
+                }
+                if (surface == null || config == null) {
+                    return false;
+                }
+                if (config.getType() != TvStreamConfig.STREAM_TYPE_BUFFER_PRODUCER) {
+                    return false;
+                }
+
+                int result = mHal.addOrUpdateStream(mInfo.getDeviceId(), surface, config);
+                return result == TvInputHal.SUCCESS;
+            }
+!!!42946743.java!!!	stopCapture(inout config : TvStreamConfig) : boolean
+            synchronized (mImplLock) {
+                if (mReleased) {
+                    return false;
+                }
+                if (config == null) {
+                    return false;
+                }
+
+                int result = mHal.removeStream(mInfo.getDeviceId(), config);
+                return result == TvInputHal.SUCCESS;
+            }
+!!!42946871.java!!!	updateAudioSourceLocked() : boolean
+            if (mInfo.getAudioType() == AudioManager.DEVICE_NONE) {
+                return false;
+            }
+            AudioDevicePort previousSource = mAudioSource;
+            mAudioSource = findAudioDevicePort(mInfo.getAudioType(), mInfo.getAudioAddress());
+            return mAudioSource == null ? (previousSource != null)
+                    : !mAudioSource.equals(previousSource);
+!!!42946999.java!!!	updateAudioSinkLocked() : boolean
+            if (mInfo.getAudioType() == AudioManager.DEVICE_NONE) {
+                return false;
+            }
+            List<AudioDevicePort> previousSink = mAudioSink;
+            mAudioSink = new ArrayList<>();
+            if (mOverrideAudioType == AudioManager.DEVICE_NONE) {
+                findAudioSinkFromAudioPolicy(mAudioSink);
+            } else {
+                AudioDevicePort audioSink =
+                        findAudioDevicePort(mOverrideAudioType, mOverrideAudioAddress);
+                if (audioSink != null) {
+                    mAudioSink.add(audioSink);
+                }
+            }
+
+            // Returns true if mAudioSink and previousSink differs.
+            if (mAudioSink.size() != previousSink.size()) {
+                return true;
+            }
+            previousSink.removeAll(mAudioSink);
+            return !previousSink.isEmpty();
+!!!42947127.java!!!	handleAudioSinkUpdated() : void
+            synchronized (mImplLock) {
+                updateAudioConfigLocked();
+            }
+!!!42947255.java!!!	overrideAudioSink(in audioType : int, inout audioAddress : String, in samplingRate : int, in channelMask : int, in format : int) : void
+            synchronized (mImplLock) {
+                mOverrideAudioType = audioType;
+                mOverrideAudioAddress = audioAddress;
+
+                mDesiredSamplingRate = samplingRate;
+                mDesiredChannelMask = channelMask;
+                mDesiredFormat = format;
+
+                updateAudioConfigLocked();
+            }
+!!!42947383.java!!!	onMediaStreamVolumeChanged() : void
+            synchronized (mImplLock) {
+                updateAudioConfigLocked();
+            }

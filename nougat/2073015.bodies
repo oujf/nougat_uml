@@ -1,0 +1,114 @@
+class ObtainingIpState
+!!!36955703.java!!!	enter() : void
+            if (DBG) {
+                String key = "";
+                if (getCurrentWifiConfiguration() != null) {
+                    key = getCurrentWifiConfiguration().configKey();
+                }
+                log("enter ObtainingIpState netId=" + Integer.toString(mLastNetworkId)
+                        + " " + key + " "
+                        + " roam=" + mAutoRoaming
+                        + " static=" + mWifiConfigManager.isUsingStaticIp(mLastNetworkId)
+                        + " watchdog= " + obtainingIpWatchdogCount);
+            }
+
+            // Reset link Debouncing, indicating we have successfully re-connected to the AP
+            // We might still be roaming
+            linkDebouncing = false;
+
+            // Send event to CM & network change broadcast
+            setNetworkDetailedState(DetailedState.OBTAINING_IPADDR);
+
+            // We must clear the config BSSID, as the wifi chipset may decide to roam
+            // from this point on and having the BSSID specified in the network block would
+            // cause the roam to fail and the device to disconnect.
+            clearCurrentConfigBSSID("ObtainingIpAddress");
+
+            // Stop IpManager in case we're switching from DHCP to static
+            // configuration or vice versa.
+            //
+            // TODO: Only ever enter this state the first time we connect to a
+            // network, never on switching between static configuration and
+            // DHCP. When we transition from static configuration to DHCP in
+            // particular, we must tell ConnectivityService that we're
+            // disconnected, because DHCP might take a long time during which
+            // connectivity APIs such as getActiveNetworkInfo should not return
+            // CONNECTED.
+            stopIpManager();
+
+            mIpManager.setHttpProxy(mWifiConfigManager.getProxyProperties(mLastNetworkId));
+            if (!TextUtils.isEmpty(mTcpBufferSizes)) {
+                mIpManager.setTcpBufferSizes(mTcpBufferSizes);
+            }
+
+            if (!mWifiConfigManager.isUsingStaticIp(mLastNetworkId)) {
+                final IpManager.ProvisioningConfiguration prov =
+                        mIpManager.buildProvisioningConfiguration()
+                            .withPreDhcpAction()
+                            .withApfCapabilities(mWifiNative.getApfCapabilities())
+                            .build();
+                mIpManager.startProvisioning(prov);
+                obtainingIpWatchdogCount++;
+                logd("Start Dhcp Watchdog " + obtainingIpWatchdogCount);
+                // Get Link layer stats so as we get fresh tx packet counters
+                getWifiLinkLayerStats(true);
+                sendMessageDelayed(obtainMessage(CMD_OBTAINING_IP_ADDRESS_WATCHDOG_TIMER,
+                        obtainingIpWatchdogCount, 0), OBTAINING_IP_ADDRESS_GUARD_TIMER_MSEC);
+            } else {
+                StaticIpConfiguration config = mWifiConfigManager.getStaticIpConfiguration(
+                        mLastNetworkId);
+                if (config.ipAddress == null) {
+                    logd("Static IP lacks address");
+                    sendMessage(CMD_IPV4_PROVISIONING_FAILURE);
+                } else {
+                    final IpManager.ProvisioningConfiguration prov =
+                            mIpManager.buildProvisioningConfiguration()
+                                .withStaticConfiguration(config)
+                                .withApfCapabilities(mWifiNative.getApfCapabilities())
+                                .build();
+                    mIpManager.startProvisioning(prov);
+                }
+            }
+!!!36955831.java!!!	processMessage(inout message : Message) : boolean
+            logStateAndMessage(message, this);
+
+            switch(message.what) {
+                case CMD_AUTO_CONNECT:
+                case CMD_AUTO_ROAM:
+                    messageHandlingStatus = MESSAGE_HANDLING_STATUS_DISCARD;
+                    break;
+                case WifiManager.SAVE_NETWORK:
+                case WifiStateMachine.CMD_AUTO_SAVE_NETWORK:
+                    messageHandlingStatus = MESSAGE_HANDLING_STATUS_DEFERRED;
+                    deferMessage(message);
+                    break;
+                    /* Defer any power mode changes since we must keep active power mode at DHCP */
+
+                case WifiMonitor.NETWORK_DISCONNECTION_EVENT:
+                    reportConnectionAttemptEnd(
+                            WifiMetrics.ConnectionEvent.FAILURE_NETWORK_DISCONNECTION,
+                            WifiMetricsProto.ConnectionEvent.HLF_NONE);
+                    return NOT_HANDLED;
+                case CMD_SET_HIGH_PERF_MODE:
+                    messageHandlingStatus = MESSAGE_HANDLING_STATUS_DEFERRED;
+                    deferMessage(message);
+                    break;
+                    /* Defer scan request since we should not switch to other channels at DHCP */
+                case CMD_START_SCAN:
+                    messageHandlingStatus = MESSAGE_HANDLING_STATUS_DEFERRED;
+                    deferMessage(message);
+                    break;
+                case CMD_OBTAINING_IP_ADDRESS_WATCHDOG_TIMER:
+                    if (message.arg1 == obtainingIpWatchdogCount) {
+                        logd("ObtainingIpAddress: Watchdog Triggered, count="
+                                + obtainingIpWatchdogCount);
+                        handleIpConfigurationLost();
+                        transitionTo(mDisconnectingState);
+                        break;
+                    }
+                    messageHandlingStatus = MESSAGE_HANDLING_STATUS_DISCARD;
+                    break;
+                default:
+                    return NOT_HANDLED;
+            }
+            return HANDLED;

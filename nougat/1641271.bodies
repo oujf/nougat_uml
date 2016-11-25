@@ -1,0 +1,736 @@
+class DhcpPacket
+!!!33940023.java!!!	DhcpPacket(in transId : int, in secs : short, inout clientIp : Inet4Address, inout yourIp : Inet4Address, inout nextIp : Inet4Address, inout relayIp : Inet4Address, inout clientMac : byte, inout broadcast : boolean)
+        mTransId = transId;
+        mSecs = secs;
+        mClientIp = clientIp;
+        mYourIp = yourIp;
+        mNextIp = nextIp;
+        mRelayIp = relayIp;
+        mClientMac = clientMac;
+        mBroadcast = broadcast;
+!!!33940151.java!!!	getTransactionId() : int
+        return mTransId;
+!!!33940279.java!!!	getClientMac() : byte
+        return mClientMac;
+!!!33940407.java!!!	getClientId() : byte
+        byte[] clientId = new byte[mClientMac.length + 1];
+        clientId[0] = CLIENT_ID_ETHER;
+        System.arraycopy(mClientMac, 0, clientId, 1, mClientMac.length);
+        return clientId;
+!!!33940535.java!!!	fillInPacket(in encap : int, inout destIp : Inet4Address, inout srcIp : Inet4Address, in destUdp : short, in srcUdp : short, inout buf : ByteBuffer, in requestCode : byte, inout broadcast : boolean) : void
+        byte[] destIpArray = destIp.getAddress();
+        byte[] srcIpArray = srcIp.getAddress();
+        int ipHeaderOffset = 0;
+        int ipLengthOffset = 0;
+        int ipChecksumOffset = 0;
+        int endIpHeader = 0;
+        int udpHeaderOffset = 0;
+        int udpLengthOffset = 0;
+        int udpChecksumOffset = 0;
+
+        buf.clear();
+        buf.order(ByteOrder.BIG_ENDIAN);
+
+        if (encap == ENCAP_L2) {
+            buf.put(ETHER_BROADCAST);
+            buf.put(mClientMac);
+            buf.putShort((short) OsConstants.ETH_P_IP);
+        }
+
+        // if a full IP packet needs to be generated, put the IP & UDP
+        // headers in place, and pre-populate with artificial values
+        // needed to seed the IP checksum.
+        if (encap <= ENCAP_L3) {
+            ipHeaderOffset = buf.position();
+            buf.put(IP_VERSION_HEADER_LEN);
+            buf.put(IP_TOS_LOWDELAY);    // tos: IPTOS_LOWDELAY
+            ipLengthOffset = buf.position();
+            buf.putShort((short)0);  // length
+            buf.putShort((short)0);  // id
+            buf.putShort(IP_FLAGS_OFFSET); // ip offset: don't fragment
+            buf.put(IP_TTL);    // TTL: use default 64 from RFC1340
+            buf.put(IP_TYPE_UDP);
+            ipChecksumOffset = buf.position();
+            buf.putShort((short) 0); // checksum
+
+            buf.put(srcIpArray);
+            buf.put(destIpArray);
+            endIpHeader = buf.position();
+
+            // UDP header
+            udpHeaderOffset = buf.position();
+            buf.putShort(srcUdp);
+            buf.putShort(destUdp);
+            udpLengthOffset = buf.position();
+            buf.putShort((short) 0); // length
+            udpChecksumOffset = buf.position();
+            buf.putShort((short) 0); // UDP checksum -- initially zero
+        }
+
+        // DHCP payload
+        buf.put(requestCode);
+        buf.put((byte) 1); // Hardware Type: Ethernet
+        buf.put((byte) mClientMac.length); // Hardware Address Length
+        buf.put((byte) 0); // Hop Count
+        buf.putInt(mTransId);  // Transaction ID
+        buf.putShort(mSecs); // Elapsed Seconds
+
+        if (broadcast) {
+            buf.putShort((short) 0x8000); // Flags
+        } else {
+            buf.putShort((short) 0x0000); // Flags
+        }
+
+        buf.put(mClientIp.getAddress());
+        buf.put(mYourIp.getAddress());
+        buf.put(mNextIp.getAddress());
+        buf.put(mRelayIp.getAddress());
+        buf.put(mClientMac);
+        buf.position(buf.position() +
+                     (HWADDR_LEN - mClientMac.length) // pad addr to 16 bytes
+                     + 64     // empty server host name (64 bytes)
+                     + 128);  // empty boot file name (128 bytes)
+        buf.putInt(DHCP_MAGIC_COOKIE); // magic number
+        finishPacket(buf);
+
+        // round up to an even number of octets
+        if ((buf.position() & 1) == 1) {
+            buf.put((byte) 0);
+        }
+
+        // If an IP packet is being built, the IP & UDP checksums must be
+        // computed.
+        if (encap <= ENCAP_L3) {
+            // fix UDP header: insert length
+            short udpLen = (short)(buf.position() - udpHeaderOffset);
+            buf.putShort(udpLengthOffset, udpLen);
+            // fix UDP header: checksum
+            // checksum for UDP at udpChecksumOffset
+            int udpSeed = 0;
+
+            // apply IPv4 pseudo-header.  Read IP address src and destination
+            // values from the IP header and accumulate checksum.
+            udpSeed += intAbs(buf.getShort(ipChecksumOffset + 2));
+            udpSeed += intAbs(buf.getShort(ipChecksumOffset + 4));
+            udpSeed += intAbs(buf.getShort(ipChecksumOffset + 6));
+            udpSeed += intAbs(buf.getShort(ipChecksumOffset + 8));
+
+            // accumulate extra data for the pseudo-header
+            udpSeed += IP_TYPE_UDP;
+            udpSeed += udpLen;
+            // and compute UDP checksum
+            buf.putShort(udpChecksumOffset, (short) checksum(buf, udpSeed,
+                                                             udpHeaderOffset,
+                                                             buf.position()));
+            // fix IP header: insert length
+            buf.putShort(ipLengthOffset, (short)(buf.position() - ipHeaderOffset));
+            // fixup IP-header checksum
+            buf.putShort(ipChecksumOffset,
+                         (short) checksum(buf, 0, ipHeaderOffset, endIpHeader));
+        }
+!!!33940663.java!!!	intAbs(in v : short) : int
+        return v & 0xFFFF;
+!!!33940791.java!!!	checksum(inout buf : ByteBuffer, in seed : int, in start : int, in end : int) : int
+        int sum = seed;
+        int bufPosition = buf.position();
+
+        // set position of original ByteBuffer, so that the ShortBuffer
+        // will be correctly initialized
+        buf.position(start);
+        ShortBuffer shortBuf = buf.asShortBuffer();
+
+        // re-set ByteBuffer position
+        buf.position(bufPosition);
+
+        short[] shortArray = new short[(end - start) / 2];
+        shortBuf.get(shortArray);
+
+        for (short s : shortArray) {
+            sum += intAbs(s);
+        }
+
+        start += shortArray.length * 2;
+
+        // see if a singleton byte remains
+        if (end != start) {
+            short b = buf.get(start);
+
+            // make it unsigned
+            if (b < 0) {
+                b += 256;
+            }
+
+            sum += b * 256;
+        }
+
+        sum = ((sum >> 16) & 0xFFFF) + (sum & 0xFFFF);
+        sum = ((sum + ((sum >> 16) & 0xFFFF)) & 0xFFFF);
+        int negated = ~sum;
+        return intAbs((short) negated);
+!!!33940919.java!!!	addTlv(inout buf : ByteBuffer, in type : byte, in value : byte) : void
+        buf.put(type);
+        buf.put((byte) 1);
+        buf.put(value);
+!!!33941047.java!!!	addTlv(inout buf : ByteBuffer, in type : byte, inout payload : byte) : void
+        if (payload != null) {
+            if (payload.length > MAX_OPTION_LEN) {
+                throw new IllegalArgumentException("DHCP option too long: "
+                        + payload.length + " vs. " + MAX_OPTION_LEN);
+            }
+            buf.put(type);
+            buf.put((byte) payload.length);
+            buf.put(payload);
+        }
+!!!33941175.java!!!	addTlv(inout buf : ByteBuffer, in type : byte, inout addr : Inet4Address) : void
+        if (addr != null) {
+            addTlv(buf, type, addr.getAddress());
+        }
+!!!33941303.java!!!	addTlv(inout buf : ByteBuffer, in type : byte, inout addrs : List<Inet4Address>) : void
+        if (addrs == null || addrs.size() == 0) return;
+
+        int optionLen = 4 * addrs.size();
+        if (optionLen > MAX_OPTION_LEN) {
+            throw new IllegalArgumentException("DHCP option too long: "
+                    + optionLen + " vs. " + MAX_OPTION_LEN);
+        }
+
+        buf.put(type);
+        buf.put((byte)(optionLen));
+
+        for (Inet4Address addr : addrs) {
+            buf.put(addr.getAddress());
+        }
+!!!33941431.java!!!	addTlv(inout buf : ByteBuffer, in type : byte, inout value : Short) : void
+        if (value != null) {
+            buf.put(type);
+            buf.put((byte) 2);
+            buf.putShort(value.shortValue());
+        }
+!!!33941559.java!!!	addTlv(inout buf : ByteBuffer, in type : byte, inout value : Integer) : void
+        if (value != null) {
+            buf.put(type);
+            buf.put((byte) 4);
+            buf.putInt(value.intValue());
+        }
+!!!33941687.java!!!	addTlv(inout buf : ByteBuffer, in type : byte, inout str : String) : void
+        try {
+            addTlv(buf, type, str.getBytes("US-ASCII"));
+        } catch (UnsupportedEncodingException e) {
+           throw new IllegalArgumentException("String is not US-ASCII: " + str);
+        }
+!!!33941815.java!!!	addTlvEnd(inout buf : ByteBuffer) : void
+        buf.put((byte) 0xFF);
+!!!33941943.java!!!	getVendorId() : String
+        if (testOverrideVendorId != null) return testOverrideVendorId;
+        return "android-dhcp-" + Build.VERSION.RELEASE;
+!!!33942071.java!!!	getHostname() : String
+        if (testOverrideHostname != null) return testOverrideHostname;
+        return SystemProperties.get("net.hostname");
+!!!33942199.java!!!	addCommonClientTlvs(inout buf : ByteBuffer) : void
+        addTlv(buf, DHCP_MAX_MESSAGE_SIZE, (short) MAX_LENGTH);
+        addTlv(buf, DHCP_VENDOR_CLASS_ID, getVendorId());
+        addTlv(buf, DHCP_HOST_NAME, getHostname());
+!!!33942327.java!!!	macToString(inout mac : byte) : String
+        String macAddr = "";
+
+        for (int i = 0; i < mac.length; i++) {
+            String hexString = "0" + Integer.toHexString(mac[i]);
+
+            // substring operation grabs the last 2 digits: this
+            // allows signed bytes to be converted correctly.
+            macAddr += hexString.substring(hexString.length() - 2);
+
+            if (i != (mac.length - 1)) {
+                macAddr += ":";
+            }
+        }
+
+        return macAddr;
+!!!33942455.java!!!	toString() : String
+        String macAddr = macToString(mClientMac);
+
+        return macAddr;
+!!!33942583.java!!!	readIpAddress(inout packet : ByteBuffer) : Inet4Address
+        Inet4Address result = null;
+        byte[] ipAddr = new byte[4];
+        packet.get(ipAddr);
+
+        try {
+            result = (Inet4Address) Inet4Address.getByAddress(ipAddr);
+        } catch (UnknownHostException ex) {
+            // ipAddr is numeric, so this should not be
+            // triggered.  However, if it is, just nullify
+            result = null;
+        }
+
+        return result;
+!!!33942711.java!!!	readAsciiString(inout buf : ByteBuffer, in byteCount : int, inout nullOk : boolean) : String
+        byte[] bytes = new byte[byteCount];
+        buf.get(bytes);
+        int length = bytes.length;
+        if (!nullOk) {
+            // Stop at the first null byte. This is because some DHCP options (e.g., the domain
+            // name) are passed to netd via FrameworkListener, which refuses arguments containing
+            // null bytes. We don't do this by default because vendorInfo is an opaque string which
+            // could in theory contain null bytes.
+            for (length = 0; length < bytes.length; length++) {
+                if (bytes[length] == 0) {
+                    break;
+                }
+            }
+        }
+        return new String(bytes, 0, length, StandardCharsets.US_ASCII);
+!!!33942839.java!!!	isPacketToOrFromClient(in udpSrcPort : short, in udpDstPort : short) : boolean
+        return (udpSrcPort == DHCP_CLIENT) || (udpDstPort == DHCP_CLIENT);
+!!!33942967.java!!!	isPacketServerToServer(in udpSrcPort : short, in udpDstPort : short) : boolean
+        return (udpSrcPort == DHCP_SERVER) && (udpDstPort == DHCP_SERVER);
+!!!33943223.java!!!	decodeFullPacket(inout packet : ByteBuffer, in pktType : int) : DhcpPacket
+        // bootp parameters
+        int transactionId;
+        short secs;
+        Inet4Address clientIp;
+        Inet4Address yourIp;
+        Inet4Address nextIp;
+        Inet4Address relayIp;
+        byte[] clientMac;
+        List<Inet4Address> dnsServers = new ArrayList<>();
+        List<Inet4Address> gateways = new ArrayList<>();  // aka router
+        Inet4Address serverIdentifier = null;
+        Inet4Address netMask = null;
+        String message = null;
+        String vendorId = null;
+        String vendorInfo = null;
+        byte[] expectedParams = null;
+        String hostName = null;
+        String domainName = null;
+        Inet4Address ipSrc = null;
+        Inet4Address ipDst = null;
+        Inet4Address bcAddr = null;
+        Inet4Address requestedIp = null;
+
+        // The following are all unsigned integers. Internally we store them as signed integers of
+        // the same length because that way we're guaranteed that they can't be out of the range of
+        // the unsigned field in the packet. Callers wanting to pass in an unsigned value will need
+        // to cast it.
+        Short mtu = null;
+        Short maxMessageSize = null;
+        Integer leaseTime = null;
+        Integer T1 = null;
+        Integer T2 = null;
+
+        // dhcp options
+        byte dhcpType = (byte) 0xFF;
+
+        packet.order(ByteOrder.BIG_ENDIAN);
+
+        // check to see if we need to parse L2, IP, and UDP encaps
+        if (pktType == ENCAP_L2) {
+            if (packet.remaining() < MIN_PACKET_LENGTH_L2) {
+                throw new ParseException(DhcpErrorEvent.L2_TOO_SHORT,
+                        "L2 packet too short, %d < %d", packet.remaining(), MIN_PACKET_LENGTH_L2);
+            }
+
+            byte[] l2dst = new byte[6];
+            byte[] l2src = new byte[6];
+
+            packet.get(l2dst);
+            packet.get(l2src);
+
+            short l2type = packet.getShort();
+
+            if (l2type != OsConstants.ETH_P_IP) {
+                throw new ParseException(DhcpErrorEvent.L2_WRONG_ETH_TYPE,
+                        "Unexpected L2 type 0x%04x, expected 0x%04x", l2type, OsConstants.ETH_P_IP);
+            }
+        }
+
+        if (pktType <= ENCAP_L3) {
+            if (packet.remaining() < MIN_PACKET_LENGTH_L3) {
+                throw new ParseException(DhcpErrorEvent.L3_TOO_SHORT,
+                        "L3 packet too short, %d < %d", packet.remaining(), MIN_PACKET_LENGTH_L3);
+            }
+
+            byte ipTypeAndLength = packet.get();
+            int ipVersion = (ipTypeAndLength & 0xf0) >> 4;
+            if (ipVersion != 4) {
+                throw new ParseException(
+                        DhcpErrorEvent.L3_NOT_IPV4, "Invalid IP version %d", ipVersion);
+            }
+
+            // System.out.println("ipType is " + ipType);
+            byte ipDiffServicesField = packet.get();
+            short ipTotalLength = packet.getShort();
+            short ipIdentification = packet.getShort();
+            byte ipFlags = packet.get();
+            byte ipFragOffset = packet.get();
+            byte ipTTL = packet.get();
+            byte ipProto = packet.get();
+            short ipChksm = packet.getShort();
+
+            ipSrc = readIpAddress(packet);
+            ipDst = readIpAddress(packet);
+
+            if (ipProto != IP_TYPE_UDP) {
+                throw new ParseException(
+                        DhcpErrorEvent.L4_NOT_UDP, "Protocol not UDP: %d", ipProto);
+            }
+
+            // Skip options. This cannot cause us to read beyond the end of the buffer because the
+            // IPv4 header cannot be more than (0x0f * 4) = 60 bytes long, and that is less than
+            // MIN_PACKET_LENGTH_L3.
+            int optionWords = ((ipTypeAndLength & 0x0f) - 5);
+            for (int i = 0; i < optionWords; i++) {
+                packet.getInt();
+            }
+
+            // assume UDP
+            short udpSrcPort = packet.getShort();
+            short udpDstPort = packet.getShort();
+            short udpLen = packet.getShort();
+            short udpChkSum = packet.getShort();
+
+            // Only accept packets to or from the well-known client port (expressly permitting
+            // packets from ports other than the well-known server port; http://b/24687559), and
+            // server-to-server packets, e.g. for relays.
+            if (!isPacketToOrFromClient(udpSrcPort, udpDstPort) &&
+                !isPacketServerToServer(udpSrcPort, udpDstPort)) {
+                // This should almost never happen because we use SO_ATTACH_FILTER on the packet
+                // socket to drop packets that don't have the right source ports. However, it's
+                // possible that a packet arrives between when the socket is bound and when the
+                // filter is set. http://b/26696823 .
+                throw new ParseException(DhcpErrorEvent.L4_WRONG_PORT,
+                        "Unexpected UDP ports %d->%d", udpSrcPort, udpDstPort);
+            }
+        }
+
+        // We need to check the length even for ENCAP_L3 because the IPv4 header is variable-length.
+        if (pktType > ENCAP_BOOTP || packet.remaining() < MIN_PACKET_LENGTH_BOOTP) {
+            throw new ParseException(DhcpErrorEvent.BOOTP_TOO_SHORT,
+                        "Invalid type or BOOTP packet too short, %d < %d",
+                        packet.remaining(), MIN_PACKET_LENGTH_BOOTP);
+        }
+
+        byte type = packet.get();
+        byte hwType = packet.get();
+        int addrLen = packet.get() & 0xff;
+        byte hops = packet.get();
+        transactionId = packet.getInt();
+        secs = packet.getShort();
+        short bootpFlags = packet.getShort();
+        boolean broadcast = (bootpFlags & 0x8000) != 0;
+        byte[] ipv4addr = new byte[4];
+
+        try {
+            packet.get(ipv4addr);
+            clientIp = (Inet4Address) Inet4Address.getByAddress(ipv4addr);
+            packet.get(ipv4addr);
+            yourIp = (Inet4Address) Inet4Address.getByAddress(ipv4addr);
+            packet.get(ipv4addr);
+            nextIp = (Inet4Address) Inet4Address.getByAddress(ipv4addr);
+            packet.get(ipv4addr);
+            relayIp = (Inet4Address) Inet4Address.getByAddress(ipv4addr);
+        } catch (UnknownHostException ex) {
+            throw new ParseException(DhcpErrorEvent.L3_INVALID_IP,
+                    "Invalid IPv4 address: %s", Arrays.toString(ipv4addr));
+        }
+
+        // Some DHCP servers have been known to announce invalid client hardware address values such
+        // as 0xff. The legacy DHCP client accepted these becuause it does not check the length at
+        // all but only checks that the interface MAC address matches the first bytes of the address
+        // in the packets. We're a bit stricter: if the length is obviously invalid (i.e., bigger
+        // than the size of the field), we fudge it to 6 (Ethernet). http://b/23725795
+        // TODO: evaluate whether to make this test more liberal.
+        if (addrLen > HWADDR_LEN) {
+            addrLen = ETHER_BROADCAST.length;
+        }
+
+        clientMac = new byte[addrLen];
+        packet.get(clientMac);
+
+        // skip over address padding (16 octets allocated)
+        packet.position(packet.position() + (16 - addrLen)
+                        + 64    // skip server host name (64 chars)
+                        + 128); // skip boot file name (128 chars)
+
+        int dhcpMagicCookie = packet.getInt();
+
+        if (dhcpMagicCookie != DHCP_MAGIC_COOKIE) {
+            throw new ParseException(DhcpErrorEvent.DHCP_BAD_MAGIC_COOKIE,
+                    "Bad magic cookie 0x%08x, should be 0x%08x",
+                    dhcpMagicCookie, DHCP_MAGIC_COOKIE);
+        }
+
+        // parse options
+        boolean notFinishedOptions = true;
+
+        while ((packet.position() < packet.limit()) && notFinishedOptions) {
+            final byte optionType = packet.get(); // cannot underflow because position < limit
+            try {
+                if (optionType == DHCP_OPTION_END) {
+                    notFinishedOptions = false;
+                } else if (optionType == DHCP_OPTION_PAD) {
+                    // The pad option doesn't have a length field. Nothing to do.
+                } else {
+                    int optionLen = packet.get() & 0xFF;
+                    int expectedLen = 0;
+
+                    switch(optionType) {
+                        case DHCP_SUBNET_MASK:
+                            netMask = readIpAddress(packet);
+                            expectedLen = 4;
+                            break;
+                        case DHCP_ROUTER:
+                            for (expectedLen = 0; expectedLen < optionLen; expectedLen += 4) {
+                                gateways.add(readIpAddress(packet));
+                            }
+                            break;
+                        case DHCP_DNS_SERVER:
+                            for (expectedLen = 0; expectedLen < optionLen; expectedLen += 4) {
+                                dnsServers.add(readIpAddress(packet));
+                            }
+                            break;
+                        case DHCP_HOST_NAME:
+                            expectedLen = optionLen;
+                            hostName = readAsciiString(packet, optionLen, false);
+                            break;
+                        case DHCP_MTU:
+                            expectedLen = 2;
+                            mtu = packet.getShort();
+                            break;
+                        case DHCP_DOMAIN_NAME:
+                            expectedLen = optionLen;
+                            domainName = readAsciiString(packet, optionLen, false);
+                            break;
+                        case DHCP_BROADCAST_ADDRESS:
+                            bcAddr = readIpAddress(packet);
+                            expectedLen = 4;
+                            break;
+                        case DHCP_REQUESTED_IP:
+                            requestedIp = readIpAddress(packet);
+                            expectedLen = 4;
+                            break;
+                        case DHCP_LEASE_TIME:
+                            leaseTime = Integer.valueOf(packet.getInt());
+                            expectedLen = 4;
+                            break;
+                        case DHCP_MESSAGE_TYPE:
+                            dhcpType = packet.get();
+                            expectedLen = 1;
+                            break;
+                        case DHCP_SERVER_IDENTIFIER:
+                            serverIdentifier = readIpAddress(packet);
+                            expectedLen = 4;
+                            break;
+                        case DHCP_PARAMETER_LIST:
+                            expectedParams = new byte[optionLen];
+                            packet.get(expectedParams);
+                            expectedLen = optionLen;
+                            break;
+                        case DHCP_MESSAGE:
+                            expectedLen = optionLen;
+                            message = readAsciiString(packet, optionLen, false);
+                            break;
+                        case DHCP_MAX_MESSAGE_SIZE:
+                            expectedLen = 2;
+                            maxMessageSize = Short.valueOf(packet.getShort());
+                            break;
+                        case DHCP_RENEWAL_TIME:
+                            expectedLen = 4;
+                            T1 = Integer.valueOf(packet.getInt());
+                            break;
+                        case DHCP_REBINDING_TIME:
+                            expectedLen = 4;
+                            T2 = Integer.valueOf(packet.getInt());
+                            break;
+                        case DHCP_VENDOR_CLASS_ID:
+                            expectedLen = optionLen;
+                            // Embedded nulls are safe as this does not get passed to netd.
+                            vendorId = readAsciiString(packet, optionLen, true);
+                            break;
+                        case DHCP_CLIENT_IDENTIFIER: { // Client identifier
+                            byte[] id = new byte[optionLen];
+                            packet.get(id);
+                            expectedLen = optionLen;
+                        } break;
+                        case DHCP_VENDOR_INFO:
+                            expectedLen = optionLen;
+                            // Embedded nulls are safe as this does not get passed to netd.
+                            vendorInfo = readAsciiString(packet, optionLen, true);
+                            break;
+                        default:
+                            // ignore any other parameters
+                            for (int i = 0; i < optionLen; i++) {
+                                expectedLen++;
+                                byte throwaway = packet.get();
+                            }
+                    }
+
+                    if (expectedLen != optionLen) {
+                        final int errorCode = DhcpErrorEvent.errorCodeWithOption(
+                                DhcpErrorEvent.DHCP_INVALID_OPTION_LENGTH, optionType);
+                        throw new ParseException(errorCode,
+                                "Invalid length %d for option %d, expected %d",
+                                optionLen, optionType, expectedLen);
+                    }
+                }
+            } catch (BufferUnderflowException e) {
+                final int errorCode = DhcpErrorEvent.errorCodeWithOption(
+                        DhcpErrorEvent.BUFFER_UNDERFLOW, optionType);
+                throw new ParseException(errorCode, "BufferUnderflowException");
+            }
+        }
+
+        DhcpPacket newPacket;
+
+        switch(dhcpType) {
+            case (byte) 0xFF:
+                throw new ParseException(DhcpErrorEvent.DHCP_NO_MSG_TYPE,
+                        "No DHCP message type option");
+            case DHCP_MESSAGE_TYPE_DISCOVER:
+                newPacket = new DhcpDiscoverPacket(
+                    transactionId, secs, clientMac, broadcast);
+                break;
+            case DHCP_MESSAGE_TYPE_OFFER:
+                newPacket = new DhcpOfferPacket(
+                    transactionId, secs, broadcast, ipSrc, clientIp, yourIp, clientMac);
+                break;
+            case DHCP_MESSAGE_TYPE_REQUEST:
+                newPacket = new DhcpRequestPacket(
+                    transactionId, secs, clientIp, clientMac, broadcast);
+                break;
+            case DHCP_MESSAGE_TYPE_DECLINE:
+                newPacket = new DhcpDeclinePacket(
+                    transactionId, secs, clientIp, yourIp, nextIp, relayIp,
+                    clientMac);
+                break;
+            case DHCP_MESSAGE_TYPE_ACK:
+                newPacket = new DhcpAckPacket(
+                    transactionId, secs, broadcast, ipSrc, clientIp, yourIp, clientMac);
+                break;
+            case DHCP_MESSAGE_TYPE_NAK:
+                newPacket = new DhcpNakPacket(
+                    transactionId, secs, clientIp, yourIp, nextIp, relayIp,
+                    clientMac);
+                break;
+            case DHCP_MESSAGE_TYPE_INFORM:
+                newPacket = new DhcpInformPacket(
+                    transactionId, secs, clientIp, yourIp, nextIp, relayIp,
+                    clientMac);
+                break;
+            default:
+                throw new ParseException(DhcpErrorEvent.DHCP_UNKNOWN_MSG_TYPE,
+                        "Unimplemented DHCP type %d", dhcpType);
+        }
+
+        newPacket.mBroadcastAddress = bcAddr;
+        newPacket.mDnsServers = dnsServers;
+        newPacket.mDomainName = domainName;
+        newPacket.mGateways = gateways;
+        newPacket.mHostName = hostName;
+        newPacket.mLeaseTime = leaseTime;
+        newPacket.mMessage = message;
+        newPacket.mMtu = mtu;
+        newPacket.mRequestedIp = requestedIp;
+        newPacket.mRequestedParams = expectedParams;
+        newPacket.mServerIdentifier = serverIdentifier;
+        newPacket.mSubnetMask = netMask;
+        newPacket.mMaxMessageSize = maxMessageSize;
+        newPacket.mT1 = T1;
+        newPacket.mT2 = T2;
+        newPacket.mVendorId = vendorId;
+        newPacket.mVendorInfo = vendorInfo;
+        return newPacket;
+!!!33943351.java!!!	decodeFullPacket(inout packet : byte, in length : int, in pktType : int) : DhcpPacket
+        ByteBuffer buffer = ByteBuffer.wrap(packet, 0, length).order(ByteOrder.BIG_ENDIAN);
+        return decodeFullPacket(buffer, pktType);
+!!!33943479.java!!!	toDhcpResults() : DhcpResults
+        Inet4Address ipAddress = mYourIp;
+        if (ipAddress.equals(Inet4Address.ANY)) {
+            ipAddress = mClientIp;
+            if (ipAddress.equals(Inet4Address.ANY)) {
+                return null;
+            }
+        }
+
+        int prefixLength;
+        if (mSubnetMask != null) {
+            try {
+                prefixLength = NetworkUtils.netmaskToPrefixLength(mSubnetMask);
+            } catch (IllegalArgumentException e) {
+                // Non-contiguous netmask.
+                return null;
+            }
+        } else {
+            prefixLength = NetworkUtils.getImplicitNetmask(ipAddress);
+        }
+
+        DhcpResults results = new DhcpResults();
+        try {
+            results.ipAddress = new LinkAddress(ipAddress, prefixLength);
+        } catch (IllegalArgumentException e) {
+            return null;
+        }
+
+        if (mGateways.size() > 0) {
+            results.gateway = mGateways.get(0);
+        }
+
+        results.dnsServers.addAll(mDnsServers);
+        results.domains = mDomainName;
+        results.serverAddress = mServerIdentifier;
+        results.vendorInfo = mVendorInfo;
+        results.leaseDuration = (mLeaseTime != null) ? mLeaseTime : INFINITE_LEASE;
+        results.mtu = (mMtu != null && MIN_MTU <= mMtu && mMtu <= MAX_MTU) ? mMtu : 0;
+
+        return results;
+!!!33943607.java!!!	getLeaseTimeMillis() : long
+        // dhcpcd treats the lack of a lease time option as an infinite lease.
+        if (mLeaseTime == null || mLeaseTime == INFINITE_LEASE) {
+            return 0;
+        } else if (0 <= mLeaseTime && mLeaseTime < MINIMUM_LEASE) {
+            return MINIMUM_LEASE * 1000;
+        } else {
+            return (mLeaseTime & 0xffffffffL) * 1000;
+        }
+!!!33943735.java!!!	buildDiscoverPacket(in encap : int, in transactionId : int, in secs : short, inout clientMac : byte, inout broadcast : boolean, inout expectedParams : byte) : ByteBuffer
+        DhcpPacket pkt = new DhcpDiscoverPacket(
+            transactionId, secs, clientMac, broadcast);
+        pkt.mRequestedParams = expectedParams;
+        return pkt.buildPacket(encap, DHCP_SERVER, DHCP_CLIENT);
+!!!33943863.java!!!	buildOfferPacket(in encap : int, in transactionId : int, inout broadcast : boolean, inout serverIpAddr : Inet4Address, inout clientIpAddr : Inet4Address, inout mac : byte, inout timeout : Integer, inout netMask : Inet4Address, inout bcAddr : Inet4Address, inout gateways : List<Inet4Address>, inout dnsServers : List<Inet4Address>, inout dhcpServerIdentifier : Inet4Address, inout domainName : String) : ByteBuffer
+        DhcpPacket pkt = new DhcpOfferPacket(
+            transactionId, (short) 0, broadcast, serverIpAddr, INADDR_ANY, clientIpAddr, mac);
+        pkt.mGateways = gateways;
+        pkt.mDnsServers = dnsServers;
+        pkt.mLeaseTime = timeout;
+        pkt.mDomainName = domainName;
+        pkt.mServerIdentifier = dhcpServerIdentifier;
+        pkt.mSubnetMask = netMask;
+        pkt.mBroadcastAddress = bcAddr;
+        return pkt.buildPacket(encap, DHCP_CLIENT, DHCP_SERVER);
+!!!33943991.java!!!	buildAckPacket(in encap : int, in transactionId : int, inout broadcast : boolean, inout serverIpAddr : Inet4Address, inout clientIpAddr : Inet4Address, inout mac : byte, inout timeout : Integer, inout netMask : Inet4Address, inout bcAddr : Inet4Address, inout gateways : List<Inet4Address>, inout dnsServers : List<Inet4Address>, inout dhcpServerIdentifier : Inet4Address, inout domainName : String) : ByteBuffer
+        DhcpPacket pkt = new DhcpAckPacket(
+            transactionId, (short) 0, broadcast, serverIpAddr, INADDR_ANY, clientIpAddr, mac);
+        pkt.mGateways = gateways;
+        pkt.mDnsServers = dnsServers;
+        pkt.mLeaseTime = timeout;
+        pkt.mDomainName = domainName;
+        pkt.mSubnetMask = netMask;
+        pkt.mServerIdentifier = dhcpServerIdentifier;
+        pkt.mBroadcastAddress = bcAddr;
+        return pkt.buildPacket(encap, DHCP_CLIENT, DHCP_SERVER);
+!!!33944119.java!!!	buildNakPacket(in encap : int, in transactionId : int, inout serverIpAddr : Inet4Address, inout clientIpAddr : Inet4Address, inout mac : byte) : ByteBuffer
+        DhcpPacket pkt = new DhcpNakPacket(transactionId, (short) 0, clientIpAddr,
+            serverIpAddr, serverIpAddr, serverIpAddr, mac);
+        pkt.mMessage = "requested address not available";
+        pkt.mRequestedIp = clientIpAddr;
+        return pkt.buildPacket(encap, DHCP_CLIENT, DHCP_SERVER);
+!!!33944247.java!!!	buildRequestPacket(in encap : int, in transactionId : int, in secs : short, inout clientIp : Inet4Address, inout broadcast : boolean, inout clientMac : byte, inout requestedIpAddress : Inet4Address, inout serverIdentifier : Inet4Address, inout requestedParams : byte, inout hostName : String) : ByteBuffer
+        DhcpPacket pkt = new DhcpRequestPacket(transactionId, secs, clientIp,
+            clientMac, broadcast);
+        pkt.mRequestedIp = requestedIpAddress;
+        pkt.mServerIdentifier = serverIdentifier;
+        pkt.mHostName = hostName;
+        pkt.mRequestedParams = requestedParams;
+        ByteBuffer result = pkt.buildPacket(encap, DHCP_SERVER, DHCP_CLIENT);
+        return result;

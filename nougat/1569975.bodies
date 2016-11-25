@@ -1,0 +1,304 @@
+class MediaSessionService
+!!!33060279.java!!!	MediaSessionService(inout context : Context)
+        super(context);
+        mSessionManagerImpl = new SessionManagerImpl();
+        mPriorityStack = new MediaSessionStack();
+        PowerManager pm = (PowerManager) context.getSystemService(Context.POWER_SERVICE);
+        mMediaEventWakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "handleMediaEvent");
+!!!33060407.java!!!	onStart() : void
+        publishBinderService(Context.MEDIA_SESSION_SERVICE, mSessionManagerImpl);
+        Watchdog.getInstance().addMonitor(this);
+        mKeyguardManager =
+                (KeyguardManager) getContext().getSystemService(Context.KEYGUARD_SERVICE);
+        mAudioService = getAudioService();
+        mAudioManagerInternal = LocalServices.getService(AudioManagerInternal.class);
+        mContentResolver = getContext().getContentResolver();
+        mSettingsObserver = new SettingsObserver();
+        mSettingsObserver.observe();
+
+        updateUser();
+!!!33060535.java!!!	getAudioService() : IAudioService
+        IBinder b = ServiceManager.getService(Context.AUDIO_SERVICE);
+        return IAudioService.Stub.asInterface(b);
+!!!33060663.java!!!	updateSession(inout record : MediaSessionRecord) : void
+        synchronized (mLock) {
+            if (!mAllSessions.contains(record)) {
+                Log.d(TAG, "Unknown session updated. Ignoring.");
+                return;
+            }
+            mPriorityStack.onSessionStateChange(record);
+        }
+        mHandler.post(MessageHandler.MSG_SESSIONS_CHANGED, record.getUserId(), 0);
+!!!33060791.java!!!	notifyRemoteVolumeChanged(in flags : int, inout session : MediaSessionRecord) : void
+        if (mRvc == null) {
+            return;
+        }
+        try {
+            mRvc.remoteVolumeChanged(session.getControllerBinder(), flags);
+        } catch (Exception e) {
+            Log.wtf(TAG, "Error sending volume change to system UI.", e);
+        }
+!!!33060919.java!!!	onSessionPlaystateChange(inout record : MediaSessionRecord, in oldState : int, in newState : int) : void
+        boolean updateSessions = false;
+        synchronized (mLock) {
+            if (!mAllSessions.contains(record)) {
+                Log.d(TAG, "Unknown session changed playback state. Ignoring.");
+                return;
+            }
+            updateSessions = mPriorityStack.onPlaystateChange(record, oldState, newState);
+        }
+        if (updateSessions) {
+            mHandler.post(MessageHandler.MSG_SESSIONS_CHANGED, record.getUserId(), 0);
+        }
+!!!33061047.java!!!	onSessionPlaybackTypeChanged(inout record : MediaSessionRecord) : void
+        synchronized (mLock) {
+            if (!mAllSessions.contains(record)) {
+                Log.d(TAG, "Unknown session changed playback type. Ignoring.");
+                return;
+            }
+            pushRemoteVolumeUpdateLocked(record.getUserId());
+        }
+!!!33061175.java!!!	onStartUser(in userHandle : int) : void
+        updateUser();
+!!!33061303.java!!!	onSwitchUser(in userHandle : int) : void
+        updateUser();
+!!!33061431.java!!!	onStopUser(in userHandle : int) : void
+        synchronized (mLock) {
+            UserRecord user = mUserRecords.get(userHandle);
+            if (user != null) {
+                destroyUserLocked(user);
+            }
+        }
+!!!33061559.java!!!	monitor() : void
+        synchronized (mLock) {
+            // Check for deadlock
+        }
+!!!33061687.java!!!	enforcePhoneStatePermission(in pid : int, in uid : int) : void
+        if (getContext().checkPermission(android.Manifest.permission.MODIFY_PHONE_STATE, pid, uid)
+                != PackageManager.PERMISSION_GRANTED) {
+            throw new SecurityException("Must hold the MODIFY_PHONE_STATE permission.");
+        }
+!!!33061815.java!!!	sessionDied(inout session : MediaSessionRecord) : void
+        synchronized (mLock) {
+            destroySessionLocked(session);
+        }
+!!!33061943.java!!!	destroySession(inout session : MediaSessionRecord) : void
+        synchronized (mLock) {
+            destroySessionLocked(session);
+        }
+!!!33062071.java!!!	updateUser() : void
+        synchronized (mLock) {
+            int userId = ActivityManager.getCurrentUser();
+            if (mCurrentUserId != userId) {
+                final int oldUserId = mCurrentUserId;
+                mCurrentUserId = userId; // do this first
+
+                UserRecord oldUser = mUserRecords.get(oldUserId);
+                if (oldUser != null) {
+                    oldUser.stopLocked();
+                }
+
+                UserRecord newUser = getOrCreateUser(userId);
+                newUser.startLocked();
+            }
+        }
+!!!33062199.java!!!	updateActiveSessionListeners() : void
+        synchronized (mLock) {
+            for (int i = mSessionsListeners.size() - 1; i >= 0; i--) {
+                SessionsListenerRecord listener = mSessionsListeners.get(i);
+                try {
+                    enforceMediaPermissions(listener.mComponentName, listener.mPid, listener.mUid,
+                            listener.mUserId);
+                } catch (SecurityException e) {
+                    Log.i(TAG, "ActiveSessionsListener " + listener.mComponentName
+                            + " is no longer authorized. Disconnecting.");
+                    mSessionsListeners.remove(i);
+                    try {
+                        listener.mListener
+                                .onActiveSessionsChanged(new ArrayList<MediaSession.Token>());
+                    } catch (Exception e1) {
+                        // ignore
+                    }
+                }
+            }
+        }
+!!!33062327.java!!!	destroyUserLocked(inout user : MediaSessionService::UserRecord) : void
+        user.stopLocked();
+        user.destroyLocked();
+        mUserRecords.remove(user.mUserId);
+!!!33062455.java!!!	destroySessionLocked(inout session : MediaSessionRecord) : void
+        if (DEBUG) {
+            Log.d(TAG, "Destroying session : " + session.toString());
+        }
+        int userId = session.getUserId();
+        UserRecord user = mUserRecords.get(userId);
+        if (user != null) {
+            user.removeSessionLocked(session);
+        }
+
+        mPriorityStack.removeSession(session);
+        mAllSessions.remove(session);
+
+        try {
+            session.getCallback().asBinder().unlinkToDeath(session, 0);
+        } catch (Exception e) {
+            // ignore exceptions while destroying a session.
+        }
+        session.onDestroy();
+
+        mHandler.post(MessageHandler.MSG_SESSIONS_CHANGED, session.getUserId(), 0);
+!!!33062583.java!!!	enforcePackageName(inout packageName : String, in uid : int) : void
+        if (TextUtils.isEmpty(packageName)) {
+            throw new IllegalArgumentException("packageName may not be empty");
+        }
+        String[] packages = getContext().getPackageManager().getPackagesForUid(uid);
+        final int packageCount = packages.length;
+        for (int i = 0; i < packageCount; i++) {
+            if (packageName.equals(packages[i])) {
+                return;
+            }
+        }
+        throw new IllegalArgumentException("packageName is not owned by the calling process");
+!!!33062711.java!!!	enforceMediaPermissions(inout compName : ComponentName, in pid : int, in uid : int, in resolvedUserId : int) : void
+        if (isCurrentVolumeController(uid)) return;
+        if (getContext()
+                .checkPermission(android.Manifest.permission.MEDIA_CONTENT_CONTROL, pid, uid)
+                    != PackageManager.PERMISSION_GRANTED
+                && !isEnabledNotificationListener(compName, UserHandle.getUserId(uid),
+                        resolvedUserId)) {
+            throw new SecurityException("Missing permission to control media.");
+        }
+!!!33062839.java!!!	isCurrentVolumeController(in uid : int) : boolean
+        if (mAudioManagerInternal != null) {
+            final int vcuid = mAudioManagerInternal.getVolumeControllerUid();
+            if (vcuid > 0 && uid == vcuid) {
+                return true;
+            }
+        }
+        return false;
+!!!33062967.java!!!	enforceSystemUiPermission(inout action : String, in pid : int, in uid : int) : void
+        if (isCurrentVolumeController(uid)) return;
+        if (getContext().checkPermission(android.Manifest.permission.STATUS_BAR_SERVICE,
+                pid, uid) != PackageManager.PERMISSION_GRANTED) {
+            throw new SecurityException("Only system ui may " + action);
+        }
+!!!33063095.java!!!	isEnabledNotificationListener(inout compName : ComponentName, in userId : int, in forUserId : int) : boolean
+        if (userId != forUserId) {
+            // You may not access another user's content as an enabled listener.
+            return false;
+        }
+        if (DEBUG) {
+            Log.d(TAG, "Checking if enabled notification listener " + compName);
+        }
+        if (compName != null) {
+            final String enabledNotifListeners = Settings.Secure.getStringForUser(mContentResolver,
+                    Settings.Secure.ENABLED_NOTIFICATION_LISTENERS,
+                    userId);
+            if (enabledNotifListeners != null) {
+                final String[] components = enabledNotifListeners.split(":");
+                for (int i = 0; i < components.length; i++) {
+                    final ComponentName component =
+                            ComponentName.unflattenFromString(components[i]);
+                    if (component != null) {
+                        if (compName.equals(component)) {
+                            if (DEBUG) {
+                                Log.d(TAG, "ok to get sessions: " + component +
+                                        " is authorized notification listener");
+                            }
+                            return true;
+                        }
+                    }
+                }
+            }
+            if (DEBUG) {
+                Log.d(TAG, "not ok to get sessions, " + compName +
+                        " is not in list of ENABLED_NOTIFICATION_LISTENERS for user " + userId);
+            }
+        }
+        return false;
+!!!33063223.java!!!	createSessionInternal(in callerPid : int, in callerUid : int, in userId : int, inout callerPackageName : String, inout cb : ISessionCallback, inout tag : String) : MediaSessionRecord
+        synchronized (mLock) {
+            return createSessionLocked(callerPid, callerUid, userId, callerPackageName, cb, tag);
+        }
+!!!33063351.java!!!	createSessionLocked(in callerPid : int, in callerUid : int, in userId : int, inout callerPackageName : String, inout cb : ISessionCallback, inout tag : String) : MediaSessionRecord
+
+        final MediaSessionRecord session = new MediaSessionRecord(callerPid, callerUid, userId,
+                callerPackageName, cb, tag, this, mHandler);
+        try {
+            cb.asBinder().linkToDeath(session, 0);
+        } catch (RemoteException e) {
+            throw new RuntimeException("Media Session owner died prematurely.", e);
+        }
+
+        mAllSessions.add(session);
+        mPriorityStack.addSession(session);
+
+        UserRecord user = getOrCreateUser(userId);
+        user.addSessionLocked(session);
+
+        mHandler.post(MessageHandler.MSG_SESSIONS_CHANGED, userId, 0);
+
+        if (DEBUG) {
+            Log.d(TAG, "Created session for package " + callerPackageName + " with tag " + tag);
+        }
+        return session;
+!!!33063479.java!!!	getOrCreateUser(in userId : int) : MediaSessionService::UserRecord
+        UserRecord user = mUserRecords.get(userId);
+        if (user == null) {
+            user = new UserRecord(getContext(), userId);
+            mUserRecords.put(userId, user);
+        }
+        return user;
+!!!33063607.java!!!	findIndexOfSessionsListenerLocked(inout listener : IActiveSessionsListener) : int
+        for (int i = mSessionsListeners.size() - 1; i >= 0; i--) {
+            if (mSessionsListeners.get(i).mListener.asBinder() == listener.asBinder()) {
+                return i;
+            }
+        }
+        return -1;
+!!!33063735.java!!!	pushSessionsChanged(in userId : int) : void
+        synchronized (mLock) {
+            List<MediaSessionRecord> records = mPriorityStack.getActiveSessions(userId);
+            int size = records.size();
+            if (size > 0 && records.get(0).isPlaybackActive(false)) {
+                rememberMediaButtonReceiverLocked(records.get(0));
+            }
+            ArrayList<MediaSession.Token> tokens = new ArrayList<MediaSession.Token>();
+            for (int i = 0; i < size; i++) {
+                tokens.add(new MediaSession.Token(records.get(i).getControllerBinder()));
+            }
+            pushRemoteVolumeUpdateLocked(userId);
+            for (int i = mSessionsListeners.size() - 1; i >= 0; i--) {
+                SessionsListenerRecord record = mSessionsListeners.get(i);
+                if (record.mUserId == UserHandle.USER_ALL || record.mUserId == userId) {
+                    try {
+                        record.mListener.onActiveSessionsChanged(tokens);
+                    } catch (RemoteException e) {
+                        Log.w(TAG, "Dead ActiveSessionsListener in pushSessionsChanged, removing",
+                                e);
+                        mSessionsListeners.remove(i);
+                    }
+                }
+            }
+        }
+!!!33063863.java!!!	pushRemoteVolumeUpdateLocked(in userId : int) : void
+        if (mRvc != null) {
+            try {
+                MediaSessionRecord record = mPriorityStack.getDefaultRemoteSession(userId);
+                mRvc.updateRemoteController(record == null ? null : record.getControllerBinder());
+            } catch (RemoteException e) {
+                Log.wtf(TAG, "Error sending default remote volume to sys ui.", e);
+            }
+        }
+!!!33063991.java!!!	rememberMediaButtonReceiverLocked(inout record : MediaSessionRecord) : void
+        PendingIntent receiver = record.getMediaButtonReceiver();
+        UserRecord user = mUserRecords.get(record.getUserId());
+        if (receiver != null && user != null) {
+            user.mLastMediaButtonReceiver = receiver;
+            ComponentName component = receiver.getIntent().getComponent();
+            if (component != null && record.getPackageName().equals(component.getPackageName())) {
+                Settings.Secure.putStringForUser(mContentResolver,
+                        Settings.System.MEDIA_BUTTON_RECEIVER, component.flattenToString(),
+                        record.getUserId());
+            }
+        }

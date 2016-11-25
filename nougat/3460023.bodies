@@ -1,0 +1,213 @@
+class NuPlayer::StreamingSource
+!!!39843127.cpp!!!	prepareAsync() : void
+    if (mLooper == NULL) {
+        mLooper = new ALooper;
+        mLooper->setName("streaming");
+        mLooper->start();
+
+        mLooper->registerHandler(this);
+    }
+
+    notifyVideoSizeChanged();
+    notifyFlagsChanged(0);
+    notifyPrepared();
+!!!39843255.cpp!!!	start() : void
+    mStreamListener = new NuPlayerStreamListener(mSource, NULL);
+
+    uint32_t sourceFlags = mSource->flags();
+
+    uint32_t parserFlags = ATSParser::TS_TIMESTAMPS_ARE_ABSOLUTE;
+    if (sourceFlags & IStreamSource::kFlagAlignedVideoData) {
+        parserFlags |= ATSParser::ALIGNED_VIDEO_DATA;
+    }
+
+    mTSParser = new ATSParser(parserFlags);
+
+    mStreamListener->start();
+
+    postReadBuffer();
+!!!39843383.cpp!!!	feedMoreTSData() : status_t
+    return postReadBuffer();
+!!!39843511.cpp!!!	dequeueAccessUnit(in audio : bool, inout accessUnit : sp<ABuffer>) : status_t
+    sp<AnotherPacketSource> source = getSource(audio);
+
+    if (source == NULL) {
+        return -EWOULDBLOCK;
+    }
+
+    if (!haveSufficientDataOnAllTracks()) {
+        postReadBuffer();
+    }
+
+    status_t finalResult;
+    if (!source->hasBufferAvailable(&finalResult)) {
+        return finalResult == OK ? -EWOULDBLOCK : finalResult;
+    }
+
+    status_t err = source->dequeueAccessUnit(accessUnit);
+
+#if !defined(LOG_NDEBUG) || LOG_NDEBUG == 0
+    if (err == OK) {
+        int64_t timeUs;
+        CHECK((*accessUnit)->meta()->findInt64("timeUs", &timeUs));
+        ALOGV("dequeueAccessUnit timeUs=%lld us", timeUs);
+    }
+#endif
+
+    return err;
+!!!39843639.cpp!!!	isRealTime() : bool
+    return mSource->flags() & IStreamSource::kFlagIsRealTimeData;
+!!!39843767.cpp!!!	onMessageReceived(in msg : sp<AMessage>) : void
+    switch (msg->what()) {
+        case kWhatReadBuffer:
+        {
+            onReadBuffer();
+
+            {
+                Mutex::Autolock _l(mBufferingLock);
+                mBuffering = false;
+            }
+            break;
+        }
+        default:
+        {
+            TRESPASS();
+        }
+    }
+!!!39843895.cpp!!!	getFormat(in audio : bool) : sp<AMessage>
+    sp<AnotherPacketSource> source = getSource(audio);
+
+    sp<AMessage> format = new AMessage;
+    if (source == NULL) {
+        format->setInt32("err", -EWOULDBLOCK);
+        return format;
+    }
+
+    sp<MetaData> meta = source->getFormat();
+    status_t err = convertMetaDataToMessage(meta, &format);
+    if (err != OK) {
+        format->setInt32("err", err);
+    }
+    return format;
+!!!39844023.cpp!!!	setError(in err : status_t) : void
+    Mutex::Autolock _l(mBufferingLock);
+    mFinalResult = err;
+!!!39844151.cpp!!!	getSource(in audio : bool) : sp<AnotherPacketSource>
+    if (mTSParser == NULL) {
+        return NULL;
+    }
+
+    sp<MediaSource> source = mTSParser->getSource(
+            audio ? ATSParser::AUDIO : ATSParser::VIDEO);
+
+    return static_cast<AnotherPacketSource *>(source.get());
+!!!39844279.cpp!!!	haveSufficientDataOnAllTracks() : bool
+    // We're going to buffer at least 2 secs worth data on all tracks before
+    // starting playback (both at startup and after a seek).
+
+    static const int64_t kMinDurationUs = 2000000ll;
+
+    sp<AnotherPacketSource> audioTrack = getSource(true /*audio*/);
+    sp<AnotherPacketSource> videoTrack = getSource(false /*audio*/);
+
+    status_t err;
+    int64_t durationUs;
+    if (audioTrack != NULL
+            && (durationUs = audioTrack->getBufferedDurationUs(&err))
+                    < kMinDurationUs
+            && err == OK) {
+        ALOGV("audio track doesn't have enough data yet. (%.2f secs buffered)",
+              durationUs / 1E6);
+        return false;
+    }
+
+    if (videoTrack != NULL
+            && (durationUs = videoTrack->getBufferedDurationUs(&err))
+                    < kMinDurationUs
+            && err == OK) {
+        ALOGV("video track doesn't have enough data yet. (%.2f secs buffered)",
+              durationUs / 1E6);
+        return false;
+    }
+
+    return true;
+!!!39844407.cpp!!!	postReadBuffer() : status_t
+    {
+        Mutex::Autolock _l(mBufferingLock);
+        if (mFinalResult != OK) {
+            return mFinalResult;
+        }
+        if (mBuffering) {
+            return OK;
+        }
+        mBuffering = true;
+    }
+
+    (new AMessage(kWhatReadBuffer, this))->post();
+    return OK;
+!!!39844535.cpp!!!	onReadBuffer() : void
+    for (int32_t i = 0; i < kNumListenerQueuePackets; ++i) {
+        char buffer[188];
+        sp<AMessage> extra;
+        ssize_t n = mStreamListener->read(buffer, sizeof(buffer), &extra);
+
+        if (n == 0) {
+            ALOGI("input data EOS reached.");
+            mTSParser->signalEOS(ERROR_END_OF_STREAM);
+            setError(ERROR_END_OF_STREAM);
+            break;
+        } else if (n == INFO_DISCONTINUITY) {
+            int32_t type = ATSParser::DISCONTINUITY_TIME;
+
+            int32_t mask;
+            if (extra != NULL
+                    && extra->findInt32(
+                        IStreamListener::kKeyDiscontinuityMask, &mask)) {
+                if (mask == 0) {
+                    ALOGE("Client specified an illegal discontinuity type.");
+                    setError(ERROR_UNSUPPORTED);
+                    break;
+                }
+
+                type = mask;
+            }
+
+            mTSParser->signalDiscontinuity(
+                    (ATSParser::DiscontinuityType)type, extra);
+        } else if (n < 0) {
+            break;
+        } else {
+            if (buffer[0] == 0x00) {
+                // XXX legacy
+
+                if (extra == NULL) {
+                    extra = new AMessage;
+                }
+
+                uint8_t type = buffer[1];
+
+                if (type & 2) {
+                    int64_t mediaTimeUs;
+                    memcpy(&mediaTimeUs, &buffer[2], sizeof(mediaTimeUs));
+
+                    extra->setInt64(IStreamListener::kKeyMediaTimeUs, mediaTimeUs);
+                }
+
+                mTSParser->signalDiscontinuity(
+                        ((type & 1) == 0)
+                            ? ATSParser::DISCONTINUITY_TIME
+                            : ATSParser::DISCONTINUITY_FORMATCHANGE,
+                        extra);
+            } else {
+                status_t err = mTSParser->feedTSPacket(buffer, sizeof(buffer));
+
+                if (err != OK) {
+                    ALOGE("TS Parser returned error %d", err);
+
+                    mTSParser->signalEOS(err);
+                    setError(err);
+                    break;
+                }
+            }
+        }
+    }

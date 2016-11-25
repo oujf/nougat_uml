@@ -1,0 +1,224 @@
+class DeliveryTracker
+!!!41375159.java!!!	removeLocked(inout pi : PendingIntent, inout intent : Intent) : AlarmManagerService::InFlight
+            for (int i = 0; i < mInFlight.size(); i++) {
+                if (mInFlight.get(i).mPendingIntent == pi) {
+                    return mInFlight.remove(i);
+                }
+            }
+            mLog.w("No in-flight alarm for " + pi + " " + intent);
+            return null;
+!!!41375287.java!!!	removeLocked(inout listener : IBinder) : AlarmManagerService::InFlight
+            for (int i = 0; i < mInFlight.size(); i++) {
+                if (mInFlight.get(i).mListener == listener) {
+                    return mInFlight.remove(i);
+                }
+            }
+            mLog.w("No in-flight alarm for listener " + listener);
+            return null;
+!!!41375415.java!!!	updateStatsLocked(inout inflight : AlarmManagerService::InFlight) : void
+            final long nowELAPSED = SystemClock.elapsedRealtime();
+            BroadcastStats bs = inflight.mBroadcastStats;
+            bs.nesting--;
+            if (bs.nesting <= 0) {
+                bs.nesting = 0;
+                bs.aggregateTime += nowELAPSED - bs.startTime;
+            }
+            FilterStats fs = inflight.mFilterStats;
+            fs.nesting--;
+            if (fs.nesting <= 0) {
+                fs.nesting = 0;
+                fs.aggregateTime += nowELAPSED - fs.startTime;
+            }
+            if (RECORD_ALARMS_IN_HISTORY) {
+                if (inflight.mWorkSource != null && inflight.mWorkSource.size() > 0) {
+                    for (int wi=0; wi<inflight.mWorkSource.size(); wi++) {
+                        ActivityManagerNative.noteAlarmFinish(
+                                inflight.mPendingIntent, inflight.mWorkSource.get(wi), inflight.mTag);
+                    }
+                } else {
+                    ActivityManagerNative.noteAlarmFinish(
+                            inflight.mPendingIntent, inflight.mUid, inflight.mTag);
+                }
+            }
+!!!41375543.java!!!	updateTrackingLocked(inout inflight : AlarmManagerService::InFlight) : void
+            if (inflight != null) {
+                updateStatsLocked(inflight);
+            }
+            mBroadcastRefCount--;
+            if (mBroadcastRefCount == 0) {
+                mHandler.obtainMessage(AlarmHandler.REPORT_ALARMS_ACTIVE, 0).sendToTarget();
+                mWakeLock.release();
+                if (mInFlight.size() > 0) {
+                    mLog.w("Finished all dispatches with " + mInFlight.size()
+                            + " remaining inflights");
+                    for (int i=0; i<mInFlight.size(); i++) {
+                        mLog.w("  Remaining #" + i + ": " + mInFlight.get(i));
+                    }
+                    mInFlight.clear();
+                }
+            } else {
+                // the next of our alarms is now in flight.  reattribute the wakelock.
+                if (mInFlight.size() > 0) {
+                    InFlight inFlight = mInFlight.get(0);
+                    setWakelockWorkSource(inFlight.mPendingIntent, inFlight.mWorkSource,
+                            inFlight.mAlarmType, inFlight.mTag, -1, false);
+                } else {
+                    // should never happen
+                    mLog.w("Alarm wakelock still held but sent queue empty");
+                    mWakeLock.setWorkSource(null);
+                }
+            }
+!!!41375671.java!!!	alarmComplete(inout who : IBinder) : void
+            if (who == null) {
+                Slog.w(TAG, "Invalid alarmComplete: uid=" + Binder.getCallingUid()
+                        + " pid=" + Binder.getCallingPid());
+                return;
+            }
+
+            final long ident = Binder.clearCallingIdentity();
+            try {
+                synchronized (mLock) {
+                    mHandler.removeMessages(AlarmHandler.LISTENER_TIMEOUT, who);
+                    InFlight inflight = removeLocked(who);
+                    if (inflight != null) {
+                        if (DEBUG_LISTENER_CALLBACK) {
+                            Slog.i(TAG, "alarmComplete() from " + who);
+                        }
+                        updateTrackingLocked(inflight);
+                    } else {
+                        // Delivery timed out, and the timeout handling already took care of
+                        // updating our tracking here, so we needn't do anything further.
+                        if (DEBUG_LISTENER_CALLBACK) {
+                            Slog.i(TAG, "Late alarmComplete() from " + who);
+                        }
+                    }
+                }
+            } finally {
+                Binder.restoreCallingIdentity(ident);
+            }
+!!!41375799.java!!!	onSendFinished(inout pi : PendingIntent, inout intent : Intent, in resultCode : int, in resultData : String, inout resultExtras : Bundle) : void
+            synchronized (mLock) {
+                updateTrackingLocked(removeLocked(pi, intent));
+            }
+!!!41375927.java!!!	alarmTimedOut(inout who : IBinder) : void
+            synchronized (mLock) {
+                InFlight inflight = removeLocked(who);
+                if (inflight != null) {
+                    // TODO: implement ANR policy for the target
+                    if (DEBUG_LISTENER_CALLBACK) {
+                        Slog.i(TAG, "Alarm listener " + who + " timed out in delivery");
+                    }
+                    updateTrackingLocked(inflight);
+                } else {
+                    if (DEBUG_LISTENER_CALLBACK) {
+                        Slog.i(TAG, "Spurious timeout of listener " + who);
+                    }
+                }
+            }
+!!!41376055.java!!!	deliverLocked(inout alarm : AlarmManagerService::Alarm, in nowELAPSED : long, inout allowWhileIdle : boolean) : void
+            if (alarm.operation != null) {
+                // PendingIntent alarm
+                try {
+                    alarm.operation.send(getContext(), 0,
+                            mBackgroundIntent.putExtra(
+                                    Intent.EXTRA_ALARM_COUNT, alarm.count),
+                                    mDeliveryTracker, mHandler, null,
+                                    allowWhileIdle ? mIdleOptions : null);
+                } catch (PendingIntent.CanceledException e) {
+                    if (alarm.repeatInterval > 0) {
+                        // This IntentSender is no longer valid, but this
+                        // is a repeating alarm, so toss it
+                        removeImpl(alarm.operation);
+                    }
+                    // No actual delivery was possible, so the delivery tracker's
+                    // 'finished' callback won't be invoked.  We also don't need
+                    // to do any wakelock or stats tracking, so we have nothing
+                    // left to do here but go on to the next thing.
+                    return;
+                }
+            } else {
+                // Direct listener callback alarm
+                try {
+                    if (DEBUG_LISTENER_CALLBACK) {
+                        Slog.v(TAG, "Alarm to uid=" + alarm.uid
+                                + " listener=" + alarm.listener.asBinder());
+                    }
+                    alarm.listener.doAlarm(this);
+                    mHandler.sendMessageDelayed(
+                            mHandler.obtainMessage(AlarmHandler.LISTENER_TIMEOUT,
+                                    alarm.listener.asBinder()),
+                            mConstants.LISTENER_TIMEOUT);
+                } catch (Exception e) {
+                    if (DEBUG_LISTENER_CALLBACK) {
+                        Slog.i(TAG, "Alarm undeliverable to listener "
+                                + alarm.listener.asBinder(), e);
+                    }
+                    // As in the PendingIntent.CanceledException case, delivery of the
+                    // alarm was not possible, so we have no wakelock or timeout or
+                    // stats management to do.  It threw before we posted the delayed
+                    // timeout message, so we're done here.
+                    return;
+                }
+            }
+
+            // The alarm is now in flight; now arrange wakelock and stats tracking
+            if (mBroadcastRefCount == 0) {
+                setWakelockWorkSource(alarm.operation, alarm.workSource,
+                        alarm.type, alarm.statsTag, (alarm.operation == null) ? alarm.uid : -1,
+                        true);
+                mWakeLock.acquire();
+                mHandler.obtainMessage(AlarmHandler.REPORT_ALARMS_ACTIVE, 1).sendToTarget();
+            }
+            final InFlight inflight = new InFlight(AlarmManagerService.this,
+                    alarm.operation, alarm.listener, alarm.workSource, alarm.uid,
+                    alarm.packageName, alarm.type, alarm.statsTag, nowELAPSED);
+            mInFlight.add(inflight);
+            mBroadcastRefCount++;
+
+            if (allowWhileIdle) {
+                // Record the last time this uid handled an ALLOW_WHILE_IDLE alarm.
+                mLastAllowWhileIdleDispatch.put(alarm.uid, nowELAPSED);
+                if (RECORD_DEVICE_IDLE_ALARMS) {
+                    IdleDispatchEntry ent = new IdleDispatchEntry();
+                    ent.uid = alarm.uid;
+                    ent.pkg = alarm.packageName;
+                    ent.tag = alarm.statsTag;
+                    ent.op = "DELIVER";
+                    ent.elapsedRealtime = nowELAPSED;
+                    mAllowWhileIdleDispatches.add(ent);
+                }
+            }
+
+            final BroadcastStats bs = inflight.mBroadcastStats;
+            bs.count++;
+            if (bs.nesting == 0) {
+                bs.nesting = 1;
+                bs.startTime = nowELAPSED;
+            } else {
+                bs.nesting++;
+            }
+            final FilterStats fs = inflight.mFilterStats;
+            fs.count++;
+            if (fs.nesting == 0) {
+                fs.nesting = 1;
+                fs.startTime = nowELAPSED;
+            } else {
+                fs.nesting++;
+            }
+            if (alarm.type == ELAPSED_REALTIME_WAKEUP
+                    || alarm.type == RTC_WAKEUP) {
+                bs.numWakeup++;
+                fs.numWakeup++;
+                if (alarm.workSource != null && alarm.workSource.size() > 0) {
+                    for (int wi=0; wi<alarm.workSource.size(); wi++) {
+                        final String wsName = alarm.workSource.getName(wi);
+                        ActivityManagerNative.noteWakeupAlarm(
+                                alarm.operation, alarm.workSource.get(wi),
+                                (wsName != null) ? wsName : alarm.packageName,
+                                alarm.statsTag);
+                    }
+                } else {
+                    ActivityManagerNative.noteWakeupAlarm(
+                            alarm.operation, alarm.uid, alarm.packageName, alarm.statsTag);
+                }
+            }

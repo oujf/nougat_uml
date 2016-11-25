@@ -1,0 +1,590 @@
+class TextServicesManagerService
+!!!32255543.java!!!	systemRunning() : void
+        synchronized (mSpellCheckerMap) {
+            if (!mSystemReady) {
+                mSystemReady = true;
+                resetInternalState(mSettings.getCurrentUserId());
+            }
+        }
+!!!32255671.java!!!	onSwitchUser(in userId : int) : void
+        synchronized (mSpellCheckerMap) {
+            resetInternalState(userId);
+        }
+!!!32255799.java!!!	onUnlockUser(in userId : int) : void
+        synchronized(mSpellCheckerMap) {
+            final int currentUserId = mSettings.getCurrentUserId();
+            if (userId != currentUserId) {
+                return;
+            }
+            resetInternalState(currentUserId);
+        }
+!!!32255927.java!!!	TextServicesManagerService(inout context : Context)
+        mSystemReady = false;
+        mContext = context;
+
+        mUserManager = mContext.getSystemService(UserManager.class);
+
+        final IntentFilter broadcastFilter = new IntentFilter();
+        broadcastFilter.addAction(Intent.ACTION_USER_ADDED);
+        broadcastFilter.addAction(Intent.ACTION_USER_REMOVED);
+        mContext.registerReceiver(new TextServicesBroadcastReceiver(), broadcastFilter);
+
+        int userId = UserHandle.USER_SYSTEM;
+        try {
+            userId = ActivityManagerNative.getDefault().getCurrentUser().id;
+        } catch (RemoteException e) {
+            Slog.w(TAG, "Couldn't get current user ID; guessing it's 0", e);
+        }
+        mMonitor = new TextServicesMonitor();
+        mMonitor.register(context, null, true);
+        final boolean useCopyOnWriteSettings =
+                !mSystemReady || !mUserManager.isUserUnlockingOrUnlocked(userId);
+        mSettings = new TextServicesSettings(context.getContentResolver(), userId,
+                useCopyOnWriteSettings);
+
+        // "resetInternalState" initializes the states for the foreground user
+        resetInternalState(userId);
+!!!32256055.java!!!	resetInternalState(in userId : int) : void
+        final boolean useCopyOnWriteSettings =
+                !mSystemReady || !mUserManager.isUserUnlockingOrUnlocked(userId);
+        mSettings.switchCurrentUser(userId, useCopyOnWriteSettings);
+        updateCurrentProfileIds();
+        unbindServiceLocked();
+        buildSpellCheckerMapLocked(mContext, mSpellCheckerList, mSpellCheckerMap, mSettings);
+        SpellCheckerInfo sci = getCurrentSpellChecker(null);
+        if (sci == null) {
+            sci = findAvailSpellCheckerLocked(null);
+            if (sci != null) {
+                // Set the current spell checker if there is one or more spell checkers
+                // available. In this case, "sci" is the first one in the available spell
+                // checkers.
+                setCurrentSpellCheckerLocked(sci.getId());
+            }
+        }
+!!!32256183.java!!!	updateCurrentProfileIds() : void
+        mSettings.setCurrentProfileIds(
+                mUserManager.getProfileIdsWithDisabled(mSettings.getCurrentUserId()));
+!!!32256695.java!!!	buildSpellCheckerMapLocked(inout context : Context, inout list : ArrayList<SpellCheckerInfo>, inout map : HashMap<String, SpellCheckerInfo>, inout settings : TextServicesManagerService::TextServicesSettings) : void
+        list.clear();
+        map.clear();
+        final PackageManager pm = context.getPackageManager();
+        // Note: We do not specify PackageManager.MATCH_ENCRYPTION_* flags here because the default
+        // behavior of PackageManager is exactly what we want.  It by default picks up appropriate
+        // services depending on the unlock state for the specified user.
+        final List<ResolveInfo> services = pm.queryIntentServicesAsUser(
+                new Intent(SpellCheckerService.SERVICE_INTERFACE), PackageManager.GET_META_DATA,
+                settings.getCurrentUserId());
+        final int N = services.size();
+        for (int i = 0; i < N; ++i) {
+            final ResolveInfo ri = services.get(i);
+            final ServiceInfo si = ri.serviceInfo;
+            final ComponentName compName = new ComponentName(si.packageName, si.name);
+            if (!android.Manifest.permission.BIND_TEXT_SERVICE.equals(si.permission)) {
+                Slog.w(TAG, "Skipping text service " + compName
+                        + ": it does not require the permission "
+                        + android.Manifest.permission.BIND_TEXT_SERVICE);
+                continue;
+            }
+            if (DBG) Slog.d(TAG, "Add: " + compName);
+            try {
+                final SpellCheckerInfo sci = new SpellCheckerInfo(context, ri);
+                if (sci.getSubtypeCount() <= 0) {
+                    Slog.w(TAG, "Skipping text service " + compName
+                            + ": it does not contain subtypes.");
+                    continue;
+                }
+                list.add(sci);
+                map.put(sci.getId(), sci);
+            } catch (XmlPullParserException e) {
+                Slog.w(TAG, "Unable to load the spell checker " + compName, e);
+            } catch (IOException e) {
+                Slog.w(TAG, "Unable to load the spell checker " + compName, e);
+            }
+        }
+        if (DBG) {
+            Slog.d(TAG, "buildSpellCheckerMapLocked: " + list.size() + "," + map.size());
+        }
+!!!32256823.java!!!	calledFromValidUser() : boolean
+        final int uid = Binder.getCallingUid();
+        final int userId = UserHandle.getUserId(uid);
+        if (DBG) {
+            Slog.d(TAG, "--- calledFromForegroundUserOrSystemProcess ? "
+                    + "calling uid = " + uid + " system uid = " + Process.SYSTEM_UID
+                    + " calling userId = " + userId + ", foreground user id = "
+                    + mSettings.getCurrentUserId() + ", calling pid = " + Binder.getCallingPid());
+            try {
+                final String[] packageNames = AppGlobals.getPackageManager().getPackagesForUid(uid);
+                for (int i = 0; i < packageNames.length; ++i) {
+                    if (DBG) {
+                        Slog.d(TAG, "--- process name for "+ uid + " = " + packageNames[i]);
+                    }
+                }
+            } catch (RemoteException e) {
+            }
+        }
+
+        if (uid == Process.SYSTEM_UID || userId == mSettings.getCurrentUserId()) {
+            return true;
+        }
+
+        // Permits current profile to use TSFM as long as the current text service is the system's
+        // one. This is a tentative solution and should be replaced with fully functional multiuser
+        // support.
+        // TODO: Implement multiuser support in TSMS.
+        final boolean isCurrentProfile = mSettings.isCurrentProfile(userId);
+        if (DBG) {
+            Slog.d(TAG, "--- userId = "+ userId + " isCurrentProfile = " + isCurrentProfile);
+        }
+        if (mSettings.isCurrentProfile(userId)) {
+            final SpellCheckerInfo spellCheckerInfo = getCurrentSpellCheckerWithoutVerification();
+            if (spellCheckerInfo != null) {
+                final ServiceInfo serviceInfo = spellCheckerInfo.getServiceInfo();
+                final boolean isSystemSpellChecker =
+                        (serviceInfo.applicationInfo.flags & ApplicationInfo.FLAG_SYSTEM) != 0;
+                if (DBG) {
+                    Slog.d(TAG, "--- current spell checker = "+ spellCheckerInfo.getPackageName()
+                            + " isSystem = " + isSystemSpellChecker);
+                }
+                if (isSystemSpellChecker) {
+                    return true;
+                }
+            }
+        }
+
+        // Unlike InputMethodManagerService#calledFromValidUser, INTERACT_ACROSS_USERS_FULL isn't
+        // taken into account here.  Anyway this method is supposed to be removed once multiuser
+        // support is implemented.
+        if (DBG) {
+            Slog.d(TAG, "--- IPC from userId:" + userId + " is being ignored. \n"
+                    + getStackTrace());
+        }
+        return false;
+!!!32256951.java!!!	bindCurrentSpellCheckerService(inout service : Intent, inout conn : ServiceConnection, in flags : int) : boolean
+        if (service == null || conn == null) {
+            Slog.e(TAG, "--- bind failed: service = " + service + ", conn = " + conn);
+            return false;
+        }
+        return mContext.bindServiceAsUser(service, conn, flags,
+                new UserHandle(mSettings.getCurrentUserId()));
+!!!32257079.java!!!	unbindServiceLocked() : void
+        for (SpellCheckerBindGroup scbg : mSpellCheckerBindGroups.values()) {
+            scbg.removeAll();
+        }
+        mSpellCheckerBindGroups.clear();
+!!!32257207.java!!!	findAvailSpellCheckerLocked(inout prefPackage : String) : SpellCheckerInfo
+        final int spellCheckersCount = mSpellCheckerList.size();
+        if (spellCheckersCount == 0) {
+            Slog.w(TAG, "no available spell checker services found");
+            return null;
+        }
+        if (prefPackage != null) {
+            for (int i = 0; i < spellCheckersCount; ++i) {
+                final SpellCheckerInfo sci = mSpellCheckerList.get(i);
+                if (prefPackage.equals(sci.getPackageName())) {
+                    if (DBG) {
+                        Slog.d(TAG, "findAvailSpellCheckerLocked: " + sci.getPackageName());
+                    }
+                    return sci;
+                }
+            }
+        }
+
+        // Look up a spell checker based on the system locale.
+        // TODO: Still there is a room to improve in the following logic: e.g., check if the package
+        // is pre-installed or not.
+        final Locale systemLocal = mContext.getResources().getConfiguration().locale;
+        final ArrayList<Locale> suitableLocales =
+                InputMethodUtils.getSuitableLocalesForSpellChecker(systemLocal);
+        if (DBG) {
+            Slog.w(TAG, "findAvailSpellCheckerLocked suitableLocales="
+                    + Arrays.toString(suitableLocales.toArray(new Locale[suitableLocales.size()])));
+        }
+        final int localeCount = suitableLocales.size();
+        for (int localeIndex = 0; localeIndex < localeCount; ++localeIndex) {
+            final Locale locale = suitableLocales.get(localeIndex);
+            for (int spellCheckersIndex = 0; spellCheckersIndex < spellCheckersCount;
+                    ++spellCheckersIndex) {
+                final SpellCheckerInfo info = mSpellCheckerList.get(spellCheckersIndex);
+                final int subtypeCount = info.getSubtypeCount();
+                for (int subtypeIndex = 0; subtypeIndex < subtypeCount; ++subtypeIndex) {
+                    final SpellCheckerSubtype subtype = info.getSubtypeAt(subtypeIndex);
+                    final Locale subtypeLocale = InputMethodUtils.constructLocaleFromString(
+                            subtype.getLocale());
+                    if (locale.equals(subtypeLocale)) {
+                        // TODO: We may have more spell checkers that fall into this category.
+                        // Ideally we should pick up the most suitable one instead of simply
+                        // returning the first found one.
+                        return info;
+                    }
+                }
+            }
+        }
+
+        if (spellCheckersCount > 1) {
+            Slog.w(TAG, "more than one spell checker service found, picking first");
+        }
+        return mSpellCheckerList.get(0);
+!!!32257335.java!!!	getCurrentSpellChecker(inout locale : String) : SpellCheckerInfo
+        // TODO: Make this work even for non-current users?
+        if (!calledFromValidUser()) {
+            return null;
+        }
+        return getCurrentSpellCheckerWithoutVerification();
+!!!32257463.java!!!	getCurrentSpellCheckerWithoutVerification() : SpellCheckerInfo
+        synchronized (mSpellCheckerMap) {
+            final String curSpellCheckerId = mSettings.getSelectedSpellChecker();
+            if (DBG) {
+                Slog.w(TAG, "getCurrentSpellChecker: " + curSpellCheckerId);
+            }
+            if (TextUtils.isEmpty(curSpellCheckerId)) {
+                return null;
+            }
+            return mSpellCheckerMap.get(curSpellCheckerId);
+        }
+!!!32257591.java!!!	getCurrentSpellCheckerSubtype(inout locale : String, inout allowImplicitlySelectedSubtype : boolean) : SpellCheckerSubtype
+        // TODO: Make this work even for non-current users?
+        if (!calledFromValidUser()) {
+            return null;
+        }
+        synchronized (mSpellCheckerMap) {
+            final int subtypeHashCode =
+                    mSettings.getSelectedSpellCheckerSubtype(SpellCheckerSubtype.SUBTYPE_ID_NONE);
+            if (DBG) {
+                Slog.w(TAG, "getCurrentSpellCheckerSubtype: " + subtypeHashCode);
+            }
+            final SpellCheckerInfo sci = getCurrentSpellChecker(null);
+            if (sci == null || sci.getSubtypeCount() == 0) {
+                if (DBG) {
+                    Slog.w(TAG, "Subtype not found.");
+                }
+                return null;
+            }
+            if (subtypeHashCode == SpellCheckerSubtype.SUBTYPE_ID_NONE
+                    && !allowImplicitlySelectedSubtype) {
+                return null;
+            }
+            String candidateLocale = null;
+            if (subtypeHashCode == 0) {
+                // Spell checker language settings == "auto"
+                final InputMethodManager imm = mContext.getSystemService(InputMethodManager.class);
+                if (imm != null) {
+                    final InputMethodSubtype currentInputMethodSubtype =
+                            imm.getCurrentInputMethodSubtype();
+                    if (currentInputMethodSubtype != null) {
+                        final String localeString = currentInputMethodSubtype.getLocale();
+                        if (!TextUtils.isEmpty(localeString)) {
+                            // 1. Use keyboard locale if available in the spell checker
+                            candidateLocale = localeString;
+                        }
+                    }
+                }
+                if (candidateLocale == null) {
+                    // 2. Use System locale if available in the spell checker
+                    candidateLocale = mContext.getResources().getConfiguration().locale.toString();
+                }
+            }
+            SpellCheckerSubtype candidate = null;
+            for (int i = 0; i < sci.getSubtypeCount(); ++i) {
+                final SpellCheckerSubtype scs = sci.getSubtypeAt(i);
+                if (subtypeHashCode == 0) {
+                    final String scsLocale = scs.getLocale();
+                    if (candidateLocale.equals(scsLocale)) {
+                        return scs;
+                    } else if (candidate == null) {
+                        if (candidateLocale.length() >= 2 && scsLocale.length() >= 2
+                                && candidateLocale.startsWith(scsLocale)) {
+                            // Fall back to the applicable language
+                            candidate = scs;
+                        }
+                    }
+                } else if (scs.hashCode() == subtypeHashCode) {
+                    if (DBG) {
+                        Slog.w(TAG, "Return subtype " + scs.hashCode() + ", input= " + locale
+                                + ", " + scs.getLocale());
+                    }
+                    // 3. Use the user specified spell check language
+                    return scs;
+                }
+            }
+            // 4. Fall back to the applicable language and return it if not null
+            // 5. Simply just return it even if it's null which means we could find no suitable
+            // spell check languages
+            return candidate;
+        }
+!!!32257719.java!!!	getSpellCheckerService(inout sciId : String, inout locale : String, inout tsListener : ITextServicesSessionListener, inout scListener : ISpellCheckerSessionListener, inout bundle : Bundle) : void
+        if (!calledFromValidUser()) {
+            return;
+        }
+        if (!mSystemReady) {
+            return;
+        }
+        if (TextUtils.isEmpty(sciId) || tsListener == null || scListener == null) {
+            Slog.e(TAG, "getSpellCheckerService: Invalid input.");
+            return;
+        }
+        synchronized(mSpellCheckerMap) {
+            if (!mSpellCheckerMap.containsKey(sciId)) {
+                return;
+            }
+            final SpellCheckerInfo sci = mSpellCheckerMap.get(sciId);
+            final int uid = Binder.getCallingUid();
+            if (mSpellCheckerBindGroups.containsKey(sciId)) {
+                final SpellCheckerBindGroup bindGroup = mSpellCheckerBindGroups.get(sciId);
+                if (bindGroup != null) {
+                    final InternalDeathRecipient recipient =
+                            mSpellCheckerBindGroups.get(sciId).addListener(
+                                    tsListener, locale, scListener, uid, bundle);
+                    if (recipient == null) {
+                        if (DBG) {
+                            Slog.w(TAG, "Didn't create a death recipient.");
+                        }
+                        return;
+                    }
+                    if (bindGroup.mSpellChecker == null & bindGroup.mConnected) {
+                        Slog.e(TAG, "The state of the spell checker bind group is illegal.");
+                        bindGroup.removeAll();
+                    } else if (bindGroup.mSpellChecker != null) {
+                        if (DBG) {
+                            Slog.w(TAG, "Existing bind found. Return a spell checker session now. "
+                                    + "Listeners count = " + bindGroup.mListeners.size());
+                        }
+                        try {
+                            final ISpellCheckerSession session =
+                                    bindGroup.mSpellChecker.getISpellCheckerSession(
+                                            recipient.mScLocale, recipient.mScListener, bundle);
+                            if (session != null) {
+                                tsListener.onServiceConnected(session);
+                                return;
+                            } else {
+                                if (DBG) {
+                                    Slog.w(TAG, "Existing bind already expired. ");
+                                }
+                                bindGroup.removeAll();
+                            }
+                        } catch (RemoteException e) {
+                            Slog.e(TAG, "Exception in getting spell checker session: " + e);
+                            bindGroup.removeAll();
+                        }
+                    }
+                }
+            }
+            final long ident = Binder.clearCallingIdentity();
+            try {
+                startSpellCheckerServiceInnerLocked(
+                        sci, locale, tsListener, scListener, uid, bundle);
+            } finally {
+                Binder.restoreCallingIdentity(ident);
+            }
+        }
+        return;
+!!!32257847.java!!!	isSpellCheckerEnabled() : boolean
+        if (!calledFromValidUser()) {
+            return false;
+        }
+        synchronized(mSpellCheckerMap) {
+            return isSpellCheckerEnabledLocked();
+        }
+!!!32257975.java!!!	startSpellCheckerServiceInnerLocked(inout info : SpellCheckerInfo, inout locale : String, inout tsListener : ITextServicesSessionListener, inout scListener : ISpellCheckerSessionListener, in uid : int, inout bundle : Bundle) : void
+        if (DBG) {
+            Slog.w(TAG, "Start spell checker session inner locked.");
+        }
+        final String sciId = info.getId();
+        final InternalServiceConnection connection = new InternalServiceConnection(
+                sciId, locale, bundle);
+        final Intent serviceIntent = new Intent(SpellCheckerService.SERVICE_INTERFACE);
+        serviceIntent.setComponent(info.getComponent());
+        if (DBG) {
+            Slog.w(TAG, "bind service: " + info.getId());
+        }
+        if (!bindCurrentSpellCheckerService(serviceIntent, connection,
+                Context.BIND_AUTO_CREATE | Context.BIND_FOREGROUND_SERVICE_WHILE_AWAKE)) {
+            Slog.e(TAG, "Failed to get a spell checker service.");
+            return;
+        }
+        final SpellCheckerBindGroup group = new SpellCheckerBindGroup(
+                connection, tsListener, locale, scListener, uid, bundle);
+        mSpellCheckerBindGroups.put(sciId, group);
+!!!32258103.java!!!	getEnabledSpellCheckers() : SpellCheckerInfo
+        // TODO: Make this work even for non-current users?
+        if (!calledFromValidUser()) {
+            return null;
+        }
+        if (DBG) {
+            Slog.d(TAG, "getEnabledSpellCheckers: " + mSpellCheckerList.size());
+            for (int i = 0; i < mSpellCheckerList.size(); ++i) {
+                Slog.d(TAG, "EnabledSpellCheckers: " + mSpellCheckerList.get(i).getPackageName());
+            }
+        }
+        return mSpellCheckerList.toArray(new SpellCheckerInfo[mSpellCheckerList.size()]);
+!!!32258231.java!!!	finishSpellCheckerService(inout listener : ISpellCheckerSessionListener) : void
+        if (!calledFromValidUser()) {
+            return;
+        }
+        if (DBG) {
+            Slog.d(TAG, "FinishSpellCheckerService");
+        }
+        synchronized(mSpellCheckerMap) {
+            final ArrayList<SpellCheckerBindGroup> removeList = new ArrayList<>();
+            for (SpellCheckerBindGroup group : mSpellCheckerBindGroups.values()) {
+                if (group == null) continue;
+                // Use removeList to avoid modifying mSpellCheckerBindGroups in this loop.
+                removeList.add(group);
+            }
+            final int removeSize = removeList.size();
+            for (int i = 0; i < removeSize; ++i) {
+                removeList.get(i).removeListener(listener);
+            }
+        }
+!!!32258359.java!!!	setCurrentSpellChecker(inout locale : String, inout sciId : String) : void
+        if (!calledFromValidUser()) {
+            return;
+        }
+        synchronized(mSpellCheckerMap) {
+            if (mContext.checkCallingOrSelfPermission(
+                    android.Manifest.permission.WRITE_SECURE_SETTINGS)
+                    != PackageManager.PERMISSION_GRANTED) {
+                throw new SecurityException(
+                        "Requires permission "
+                        + android.Manifest.permission.WRITE_SECURE_SETTINGS);
+            }
+            setCurrentSpellCheckerLocked(sciId);
+        }
+!!!32258487.java!!!	setCurrentSpellCheckerSubtype(inout locale : String, in hashCode : int) : void
+        if (!calledFromValidUser()) {
+            return;
+        }
+        synchronized(mSpellCheckerMap) {
+            if (mContext.checkCallingOrSelfPermission(
+                    android.Manifest.permission.WRITE_SECURE_SETTINGS)
+                    != PackageManager.PERMISSION_GRANTED) {
+                throw new SecurityException(
+                        "Requires permission "
+                        + android.Manifest.permission.WRITE_SECURE_SETTINGS);
+            }
+            setCurrentSpellCheckerSubtypeLocked(hashCode);
+        }
+!!!32258615.java!!!	setSpellCheckerEnabled(inout enabled : boolean) : void
+        if (!calledFromValidUser()) {
+            return;
+        }
+        synchronized(mSpellCheckerMap) {
+            if (mContext.checkCallingOrSelfPermission(
+                    android.Manifest.permission.WRITE_SECURE_SETTINGS)
+                    != PackageManager.PERMISSION_GRANTED) {
+                throw new SecurityException(
+                        "Requires permission "
+                        + android.Manifest.permission.WRITE_SECURE_SETTINGS);
+            }
+            setSpellCheckerEnabledLocked(enabled);
+        }
+!!!32258743.java!!!	setCurrentSpellCheckerLocked(inout sciId : String) : void
+        if (DBG) {
+            Slog.w(TAG, "setCurrentSpellChecker: " + sciId);
+        }
+        if (TextUtils.isEmpty(sciId) || !mSpellCheckerMap.containsKey(sciId)) return;
+        final SpellCheckerInfo currentSci = getCurrentSpellChecker(null);
+        if (currentSci != null && currentSci.getId().equals(sciId)) {
+            // Do nothing if the current spell checker is same as new spell checker.
+            return;
+        }
+        final long ident = Binder.clearCallingIdentity();
+        try {
+            mSettings.putSelectedSpellChecker(sciId);
+            setCurrentSpellCheckerSubtypeLocked(0);
+        } finally {
+            Binder.restoreCallingIdentity(ident);
+        }
+!!!32258871.java!!!	setCurrentSpellCheckerSubtypeLocked(in hashCode : int) : void
+        if (DBG) {
+            Slog.w(TAG, "setCurrentSpellCheckerSubtype: " + hashCode);
+        }
+        final SpellCheckerInfo sci = getCurrentSpellChecker(null);
+        int tempHashCode = 0;
+        for (int i = 0; sci != null && i < sci.getSubtypeCount(); ++i) {
+            if(sci.getSubtypeAt(i).hashCode() == hashCode) {
+                tempHashCode = hashCode;
+                break;
+            }
+        }
+        final long ident = Binder.clearCallingIdentity();
+        try {
+            mSettings.putSelectedSpellCheckerSubtype(tempHashCode);
+        } finally {
+            Binder.restoreCallingIdentity(ident);
+        }
+!!!32258999.java!!!	setSpellCheckerEnabledLocked(inout enabled : boolean) : void
+        if (DBG) {
+            Slog.w(TAG, "setSpellCheckerEnabled: " + enabled);
+        }
+        final long ident = Binder.clearCallingIdentity();
+        try {
+            mSettings.setSpellCheckerEnabled(enabled);
+        } finally {
+            Binder.restoreCallingIdentity(ident);
+        }
+!!!32259127.java!!!	isSpellCheckerEnabledLocked() : boolean
+        final long ident = Binder.clearCallingIdentity();
+        try {
+            final boolean retval = mSettings.isSpellCheckerEnabled();
+            if (DBG) {
+                Slog.w(TAG, "getSpellCheckerEnabled: " + retval);
+            }
+            return retval;
+        } finally {
+            Binder.restoreCallingIdentity(ident);
+        }
+!!!32259255.java!!!	dump(inout fd : FileDescriptor, inout pw : PrintWriter, inout args : String) : void
+        if (mContext.checkCallingOrSelfPermission(android.Manifest.permission.DUMP)
+                != PackageManager.PERMISSION_GRANTED) {
+
+            pw.println("Permission Denial: can't dump TextServicesManagerService from from pid="
+                    + Binder.getCallingPid()
+                    + ", uid=" + Binder.getCallingUid());
+            return;
+        }
+
+        synchronized(mSpellCheckerMap) {
+            pw.println("Current Text Services Manager state:");
+            pw.println("  Spell Checkers:");
+            int spellCheckerIndex = 0;
+            for (final SpellCheckerInfo info : mSpellCheckerMap.values()) {
+                pw.println("  Spell Checker #" + spellCheckerIndex);
+                info.dump(pw, "    ");
+                ++spellCheckerIndex;
+            }
+            pw.println("");
+            pw.println("  Spell Checker Bind Groups:");
+            for (final Map.Entry<String, SpellCheckerBindGroup> ent
+                    : mSpellCheckerBindGroups.entrySet()) {
+                final SpellCheckerBindGroup grp = ent.getValue();
+                pw.println("    " + ent.getKey() + " " + grp + ":");
+                pw.println("      " + "mInternalConnection=" + grp.mInternalConnection);
+                pw.println("      " + "mSpellChecker=" + grp.mSpellChecker);
+                pw.println("      " + "mBound=" + grp.mBound + " mConnected=" + grp.mConnected);
+                final int N = grp.mListeners.size();
+                for (int i = 0; i < N; i++) {
+                    final InternalDeathRecipient listener = grp.mListeners.get(i);
+                    pw.println("      " + "Listener #" + i + ":");
+                    pw.println("        " + "mTsListener=" + listener.mTsListener);
+                    pw.println("        " + "mScListener=" + listener.mScListener);
+                    pw.println("        " + "mGroup=" + listener.mGroup);
+                    pw.println("        " + "mScLocale=" + listener.mScLocale
+                            + " mUid=" + listener.mUid);
+                }
+            }
+            pw.println("");
+            pw.println("  mSettings:");
+            mSettings.dumpLocked(pw, "    ");
+        }
+!!!32263351.java!!!	getStackTrace() : String
+        final StringBuilder sb = new StringBuilder();
+        try {
+            throw new RuntimeException();
+        } catch (RuntimeException e) {
+            final StackTraceElement[] frames = e.getStackTrace();
+            // Start at 1 because the first frame is here and we don't care about it
+            for (int j = 1; j < frames.length; ++j) {
+                sb.append(frames[j].toString() + "\n");
+            }
+        }
+        return sb.toString();

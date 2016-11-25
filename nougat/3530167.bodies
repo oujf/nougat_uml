@@ -1,0 +1,383 @@
+class SoftOpus
+!!!39874871.cpp!!!	SoftOpus(in name : char, in callbacks : OMX_CALLBACKTYPE, in appData : OMX_PTR, inout component : OMX_COMPONENTTYPE)
+    initPorts();
+    CHECK_EQ(initDecoder(), (status_t)OK);
+!!!39874999.cpp!!!	~SoftOpus()
+    if (mDecoder != NULL) {
+        opus_multistream_decoder_destroy(mDecoder);
+        mDecoder = NULL;
+    }
+    if (mHeader != NULL) {
+        delete mHeader;
+        mHeader = NULL;
+    }
+!!!39875127.cpp!!!	internalGetParameter(in index : OMX_INDEXTYPE, in params : OMX_PTR) : OMX_ERRORTYPE
+    switch ((int)index) {
+        case OMX_IndexParamAudioAndroidOpus:
+        {
+            OMX_AUDIO_PARAM_ANDROID_OPUSTYPE *opusParams =
+                (OMX_AUDIO_PARAM_ANDROID_OPUSTYPE *)params;
+
+            if (!isValidOMXParam(opusParams)) {
+                return OMX_ErrorBadParameter;
+            }
+
+            if (opusParams->nPortIndex != 0) {
+                return OMX_ErrorUndefined;
+            }
+
+            opusParams->nAudioBandWidth = 0;
+            opusParams->nSampleRate = kRate;
+            opusParams->nBitRate = 0;
+
+            if (!isConfigured()) {
+                opusParams->nChannels = 1;
+            } else {
+                opusParams->nChannels = mHeader->channels;
+            }
+
+            return OMX_ErrorNone;
+        }
+
+        case OMX_IndexParamAudioPcm:
+        {
+            OMX_AUDIO_PARAM_PCMMODETYPE *pcmParams =
+                (OMX_AUDIO_PARAM_PCMMODETYPE *)params;
+
+            if (!isValidOMXParam(pcmParams)) {
+                return OMX_ErrorBadParameter;
+            }
+
+            if (pcmParams->nPortIndex != 1) {
+                return OMX_ErrorUndefined;
+            }
+
+            pcmParams->eNumData = OMX_NumericalDataSigned;
+            pcmParams->eEndian = OMX_EndianBig;
+            pcmParams->bInterleaved = OMX_TRUE;
+            pcmParams->nBitPerSample = 16;
+            pcmParams->ePCMMode = OMX_AUDIO_PCMModeLinear;
+            pcmParams->eChannelMapping[0] = OMX_AUDIO_ChannelLF;
+            pcmParams->eChannelMapping[1] = OMX_AUDIO_ChannelRF;
+            pcmParams->nSamplingRate = kRate;
+
+            if (!isConfigured()) {
+                pcmParams->nChannels = 1;
+            } else {
+                pcmParams->nChannels = mHeader->channels;
+            }
+
+            return OMX_ErrorNone;
+        }
+
+        default:
+            return SimpleSoftOMXComponent::internalGetParameter(index, params);
+    }
+!!!39875255.cpp!!!	internalSetParameter(in index : OMX_INDEXTYPE, in params : OMX_PTR) : OMX_ERRORTYPE
+    switch ((int)index) {
+        case OMX_IndexParamStandardComponentRole:
+        {
+            const OMX_PARAM_COMPONENTROLETYPE *roleParams =
+                (const OMX_PARAM_COMPONENTROLETYPE *)params;
+
+            if (!isValidOMXParam(roleParams)) {
+                return OMX_ErrorBadParameter;
+            }
+
+            if (strncmp((const char *)roleParams->cRole,
+                        "audio_decoder.opus",
+                        OMX_MAX_STRINGNAME_SIZE - 1)) {
+                return OMX_ErrorUndefined;
+            }
+
+            return OMX_ErrorNone;
+        }
+
+        case OMX_IndexParamAudioAndroidOpus:
+        {
+            const OMX_AUDIO_PARAM_ANDROID_OPUSTYPE *opusParams =
+                (const OMX_AUDIO_PARAM_ANDROID_OPUSTYPE *)params;
+
+            if (!isValidOMXParam(opusParams)) {
+                return OMX_ErrorBadParameter;
+            }
+
+            if (opusParams->nPortIndex != 0) {
+                return OMX_ErrorUndefined;
+            }
+
+            return OMX_ErrorNone;
+        }
+
+        default:
+            return SimpleSoftOMXComponent::internalSetParameter(index, params);
+    }
+!!!39875383.cpp!!!	onQueueFilled(in portIndex : OMX_U32) : void
+    List<BufferInfo *> &inQueue = getPortQueue(0);
+    List<BufferInfo *> &outQueue = getPortQueue(1);
+
+    if (mOutputPortSettingsChange != NONE) {
+        return;
+    }
+
+    if (portIndex == 0 && mInputBufferCount < 3) {
+        BufferInfo *info = *inQueue.begin();
+        OMX_BUFFERHEADERTYPE *header = info->mHeader;
+
+        const uint8_t *data = header->pBuffer + header->nOffset;
+        size_t size = header->nFilledLen;
+
+        if (mInputBufferCount == 0) {
+            CHECK(mHeader == NULL);
+            mHeader = new OpusHeader();
+            memset(mHeader, 0, sizeof(*mHeader));
+            if (!ParseOpusHeader(data, size, mHeader)) {
+                ALOGV("Parsing Opus Header failed.");
+                notify(OMX_EventError, OMX_ErrorUndefined, 0, NULL);
+                return;
+            }
+
+            uint8_t channel_mapping[kMaxChannels] = {0};
+            if (mHeader->channels <= kMaxChannelsWithDefaultLayout) {
+                memcpy(&channel_mapping,
+                       kDefaultOpusChannelLayout,
+                       kMaxChannelsWithDefaultLayout);
+            } else {
+                memcpy(&channel_mapping,
+                       mHeader->stream_map,
+                       mHeader->channels);
+            }
+
+            int status = OPUS_INVALID_STATE;
+            mDecoder = opus_multistream_decoder_create(kRate,
+                                                       mHeader->channels,
+                                                       mHeader->num_streams,
+                                                       mHeader->num_coupled,
+                                                       channel_mapping,
+                                                       &status);
+            if (!mDecoder || status != OPUS_OK) {
+                ALOGV("opus_multistream_decoder_create failed status=%s",
+                      opus_strerror(status));
+                notify(OMX_EventError, OMX_ErrorUndefined, 0, NULL);
+                return;
+            }
+            status =
+                opus_multistream_decoder_ctl(mDecoder,
+                                             OPUS_SET_GAIN(mHeader->gain_db));
+            if (status != OPUS_OK) {
+                ALOGV("Failed to set OPUS header gain; status=%s",
+                      opus_strerror(status));
+                notify(OMX_EventError, OMX_ErrorUndefined, 0, NULL);
+                return;
+            }
+        } else if (mInputBufferCount == 1) {
+            mCodecDelay = ns_to_samples(
+                              *(reinterpret_cast<int64_t*>(header->pBuffer +
+                                                           header->nOffset)),
+                              kRate);
+            mSamplesToDiscard = mCodecDelay;
+        } else {
+            mSeekPreRoll = ns_to_samples(
+                               *(reinterpret_cast<int64_t*>(header->pBuffer +
+                                                            header->nOffset)),
+                               kRate);
+            notify(OMX_EventPortSettingsChanged, 1, 0, NULL);
+            mOutputPortSettingsChange = AWAITING_DISABLED;
+        }
+
+        inQueue.erase(inQueue.begin());
+        info->mOwnedByUs = false;
+        notifyEmptyBufferDone(header);
+        ++mInputBufferCount;
+        return;
+    }
+
+    while (!inQueue.empty() && !outQueue.empty()) {
+        BufferInfo *inInfo = *inQueue.begin();
+        OMX_BUFFERHEADERTYPE *inHeader = inInfo->mHeader;
+
+        // Ignore CSD re-submissions.
+        if (inHeader->nFlags & OMX_BUFFERFLAG_CODECCONFIG) {
+            inQueue.erase(inQueue.begin());
+            inInfo->mOwnedByUs = false;
+            notifyEmptyBufferDone(inHeader);
+            return;
+        }
+
+        BufferInfo *outInfo = *outQueue.begin();
+        OMX_BUFFERHEADERTYPE *outHeader = outInfo->mHeader;
+
+        if (inHeader->nFlags & OMX_BUFFERFLAG_EOS) {
+            inQueue.erase(inQueue.begin());
+            inInfo->mOwnedByUs = false;
+            notifyEmptyBufferDone(inHeader);
+
+            outHeader->nFilledLen = 0;
+            outHeader->nFlags = OMX_BUFFERFLAG_EOS;
+
+            outQueue.erase(outQueue.begin());
+            outInfo->mOwnedByUs = false;
+            notifyFillBufferDone(outHeader);
+            return;
+        }
+
+        if (inHeader->nOffset == 0) {
+            mAnchorTimeUs = inHeader->nTimeStamp;
+            mNumFramesOutput = 0;
+        }
+
+        // When seeking to zero, |mCodecDelay| samples has to be discarded
+        // instead of |mSeekPreRoll| samples (as we would when seeking to any
+        // other timestamp).
+        if (inHeader->nTimeStamp == 0) {
+            mSamplesToDiscard = mCodecDelay;
+        }
+
+        const uint8_t *data = inHeader->pBuffer + inHeader->nOffset;
+        const uint32_t size = inHeader->nFilledLen;
+        size_t frameSize = kMaxOpusOutputPacketSizeSamples;
+        if (frameSize > outHeader->nAllocLen / sizeof(int16_t) / mHeader->channels) {
+            frameSize = outHeader->nAllocLen / sizeof(int16_t) / mHeader->channels;
+            android_errorWriteLog(0x534e4554, "27833616");
+        }
+
+        int numFrames = opus_multistream_decode(mDecoder,
+                                                data,
+                                                size,
+                                                (int16_t *)outHeader->pBuffer,
+                                                frameSize,
+                                                0);
+        if (numFrames < 0) {
+            ALOGE("opus_multistream_decode returned %d", numFrames);
+            notify(OMX_EventError, OMX_ErrorUndefined, 0, NULL);
+            return;
+        }
+
+        outHeader->nOffset = 0;
+        if (mSamplesToDiscard > 0) {
+            if (mSamplesToDiscard > numFrames) {
+                mSamplesToDiscard -= numFrames;
+                numFrames = 0;
+            } else {
+                numFrames -= mSamplesToDiscard;
+                outHeader->nOffset = mSamplesToDiscard * sizeof(int16_t) *
+                                     mHeader->channels;
+                mSamplesToDiscard = 0;
+            }
+        }
+
+        outHeader->nFilledLen = numFrames * sizeof(int16_t) * mHeader->channels;
+        outHeader->nFlags = 0;
+
+        outHeader->nTimeStamp = mAnchorTimeUs +
+                                (mNumFramesOutput * 1000000ll) /
+                                kRate;
+
+        mNumFramesOutput += numFrames;
+
+        inInfo->mOwnedByUs = false;
+        inQueue.erase(inQueue.begin());
+        inInfo = NULL;
+        notifyEmptyBufferDone(inHeader);
+        inHeader = NULL;
+
+        outInfo->mOwnedByUs = false;
+        outQueue.erase(outQueue.begin());
+        outInfo = NULL;
+        notifyFillBufferDone(outHeader);
+        outHeader = NULL;
+
+        ++mInputBufferCount;
+    }
+!!!39875511.cpp!!!	onPortFlushCompleted(in portIndex : OMX_U32) : void
+    if (portIndex == 0 && mDecoder != NULL) {
+        // Make sure that the next buffer output does not still
+        // depend on fragments from the last one decoded.
+        mNumFramesOutput = 0;
+        opus_multistream_decoder_ctl(mDecoder, OPUS_RESET_STATE);
+        mAnchorTimeUs = 0;
+        mSamplesToDiscard = mSeekPreRoll;
+    }
+!!!39875639.cpp!!!	onPortEnableCompleted(in portIndex : OMX_U32, in enabled : bool) : void
+    if (portIndex != 1) {
+        return;
+    }
+
+    switch (mOutputPortSettingsChange) {
+        case NONE:
+            break;
+
+        case AWAITING_DISABLED:
+        {
+            CHECK(!enabled);
+            mOutputPortSettingsChange = AWAITING_ENABLED;
+            break;
+        }
+
+        default:
+        {
+            CHECK_EQ((int)mOutputPortSettingsChange, (int)AWAITING_ENABLED);
+            CHECK(enabled);
+            mOutputPortSettingsChange = NONE;
+            break;
+        }
+    }
+!!!39875767.cpp!!!	onReset() : void
+    mInputBufferCount = 0;
+    mNumFramesOutput = 0;
+    if (mDecoder != NULL) {
+        opus_multistream_decoder_destroy(mDecoder);
+        mDecoder = NULL;
+    }
+    if (mHeader != NULL) {
+        delete mHeader;
+        mHeader = NULL;
+    }
+
+    mOutputPortSettingsChange = NONE;
+!!!39875895.cpp!!!	initPorts() : void
+    OMX_PARAM_PORTDEFINITIONTYPE def;
+    InitOMXParams(&def);
+
+    def.nPortIndex = 0;
+    def.eDir = OMX_DirInput;
+    def.nBufferCountMin = kNumBuffers;
+    def.nBufferCountActual = def.nBufferCountMin;
+    def.nBufferSize = 960 * 6;
+    def.bEnabled = OMX_TRUE;
+    def.bPopulated = OMX_FALSE;
+    def.eDomain = OMX_PortDomainAudio;
+    def.bBuffersContiguous = OMX_FALSE;
+    def.nBufferAlignment = 1;
+
+    def.format.audio.cMIMEType =
+        const_cast<char *>(MEDIA_MIMETYPE_AUDIO_OPUS);
+
+    def.format.audio.pNativeRender = NULL;
+    def.format.audio.bFlagErrorConcealment = OMX_FALSE;
+    def.format.audio.eEncoding =
+        (OMX_AUDIO_CODINGTYPE)OMX_AUDIO_CodingAndroidOPUS;
+
+    addPort(def);
+
+    def.nPortIndex = 1;
+    def.eDir = OMX_DirOutput;
+    def.nBufferCountMin = kNumBuffers;
+    def.nBufferCountActual = def.nBufferCountMin;
+    def.nBufferSize = kMaxNumSamplesPerBuffer * sizeof(int16_t) * kMaxChannels;
+    def.bEnabled = OMX_TRUE;
+    def.bPopulated = OMX_FALSE;
+    def.eDomain = OMX_PortDomainAudio;
+    def.bBuffersContiguous = OMX_FALSE;
+    def.nBufferAlignment = 2;
+
+    def.format.audio.cMIMEType = const_cast<char *>("audio/raw");
+    def.format.audio.pNativeRender = NULL;
+    def.format.audio.bFlagErrorConcealment = OMX_FALSE;
+    def.format.audio.eEncoding = OMX_AUDIO_CodingPCM;
+
+    addPort(def);
+!!!39876023.cpp!!!	initDecoder() : status_t
+    return OK;
+!!!39876151.cpp!!!	isConfigured() : bool
+    return mInputBufferCount >= 1;

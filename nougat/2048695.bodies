@@ -1,0 +1,192 @@
+class SipWakeupTimer
+!!!36771255.java!!!	SipWakeupTimer(inout context : Context, inout executor : Executor)
+        mContext = context;
+        mAlarmManager = (AlarmManager)
+                context.getSystemService(Context.ALARM_SERVICE);
+
+        IntentFilter filter = new IntentFilter(getAction());
+        context.registerReceiver(this, filter);
+        mExecutor = executor;
+!!!36771383.java!!!	stop() : void
+        mContext.unregisterReceiver(this);
+        if (mPendingIntent != null) {
+            mAlarmManager.cancel(mPendingIntent);
+            mPendingIntent = null;
+        }
+        mEventQueue.clear();
+        mEventQueue = null;
+!!!36771511.java!!!	stopped() : boolean
+        if (mEventQueue == null) {
+            if (DBG) log("Timer stopped");
+            return true;
+        } else {
+            return false;
+        }
+!!!36771639.java!!!	cancelAlarm() : void
+        mAlarmManager.cancel(mPendingIntent);
+        mPendingIntent = null;
+!!!36771767.java!!!	recalculatePeriods() : void
+        if (mEventQueue.isEmpty()) return;
+
+        MyEvent firstEvent = mEventQueue.first();
+        int minPeriod = firstEvent.mMaxPeriod;
+        long minTriggerTime = firstEvent.mTriggerTime;
+        for (MyEvent e : mEventQueue) {
+            e.mPeriod = e.mMaxPeriod / minPeriod * minPeriod;
+            int interval = (int) (e.mLastTriggerTime + e.mMaxPeriod
+                    - minTriggerTime);
+            interval = interval / minPeriod * minPeriod;
+            e.mTriggerTime = minTriggerTime + interval;
+        }
+        TreeSet<MyEvent> newQueue = new TreeSet<MyEvent>(
+                mEventQueue.comparator());
+        newQueue.addAll(mEventQueue);
+        mEventQueue.clear();
+        mEventQueue = newQueue;
+        if (DBG) {
+            log("queue re-calculated");
+            printQueue();
+        }
+!!!36771895.java!!!	insertEvent(inout event : SipWakeupTimer::MyEvent) : void
+        long now = SystemClock.elapsedRealtime();
+        if (mEventQueue.isEmpty()) {
+            event.mTriggerTime = now + event.mPeriod;
+            mEventQueue.add(event);
+            return;
+        }
+        MyEvent firstEvent = mEventQueue.first();
+        int minPeriod = firstEvent.mPeriod;
+        if (minPeriod <= event.mMaxPeriod) {
+            event.mPeriod = event.mMaxPeriod / minPeriod * minPeriod;
+            int interval = event.mMaxPeriod;
+            interval -= (int) (firstEvent.mTriggerTime - now);
+            interval = interval / minPeriod * minPeriod;
+            event.mTriggerTime = firstEvent.mTriggerTime + interval;
+            mEventQueue.add(event);
+        } else {
+            long triggerTime = now + event.mPeriod;
+            if (firstEvent.mTriggerTime < triggerTime) {
+                event.mTriggerTime = firstEvent.mTriggerTime;
+                event.mLastTriggerTime -= event.mPeriod;
+            } else {
+                event.mTriggerTime = triggerTime;
+            }
+            mEventQueue.add(event);
+            recalculatePeriods();
+        }
+!!!36772023.java!!!	set(in period : int, inout callback : Runnable) : void
+        if (stopped()) return;
+
+        long now = SystemClock.elapsedRealtime();
+        MyEvent event = new MyEvent(period, callback, now);
+        insertEvent(event);
+
+        if (mEventQueue.first() == event) {
+            if (mEventQueue.size() > 1) cancelAlarm();
+            scheduleNext();
+        }
+
+        long triggerTime = event.mTriggerTime;
+        if (DBG) {
+            log("set: add event " + event + " scheduled on "
+                    + showTime(triggerTime) + " at " + showTime(now)
+                    + ", #events=" + mEventQueue.size());
+            printQueue();
+        }
+!!!36772151.java!!!	cancel(inout callback : Runnable) : void
+        if (stopped() || mEventQueue.isEmpty()) return;
+        if (DBG) log("cancel:" + callback);
+
+        MyEvent firstEvent = mEventQueue.first();
+        for (Iterator<MyEvent> iter = mEventQueue.iterator();
+                iter.hasNext();) {
+            MyEvent event = iter.next();
+            if (event.mCallback == callback) {
+                iter.remove();
+                if (DBG) log("    cancel found:" + event);
+            }
+        }
+        if (mEventQueue.isEmpty()) {
+            cancelAlarm();
+        } else if (mEventQueue.first() != firstEvent) {
+            cancelAlarm();
+            firstEvent = mEventQueue.first();
+            firstEvent.mPeriod = firstEvent.mMaxPeriod;
+            firstEvent.mTriggerTime = firstEvent.mLastTriggerTime
+                    + firstEvent.mPeriod;
+            recalculatePeriods();
+            scheduleNext();
+        }
+        if (DBG) {
+            log("cancel: X");
+            printQueue();
+        }
+!!!36772279.java!!!	scheduleNext() : void
+        if (stopped() || mEventQueue.isEmpty()) return;
+
+        if (mPendingIntent != null) {
+            throw new RuntimeException("pendingIntent is not null!");
+        }
+
+        MyEvent event = mEventQueue.first();
+        Intent intent = new Intent(getAction());
+        intent.putExtra(TRIGGER_TIME, event.mTriggerTime);
+        PendingIntent pendingIntent = mPendingIntent =
+                PendingIntent.getBroadcast(mContext, 0, intent,
+                        PendingIntent.FLAG_UPDATE_CURRENT);
+        mAlarmManager.set(AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                event.mTriggerTime, pendingIntent);
+!!!36772407.java!!!	onReceive(inout context : Context, inout intent : Intent) : void
+        // This callback is already protected by AlarmManager's wake lock.
+        String action = intent.getAction();
+        if (getAction().equals(action)
+                && intent.getExtras().containsKey(TRIGGER_TIME)) {
+            mPendingIntent = null;
+            long triggerTime = intent.getLongExtra(TRIGGER_TIME, -1L);
+            execute(triggerTime);
+        } else {
+            log("onReceive: unrecognized intent: " + intent);
+        }
+!!!36772535.java!!!	printQueue() : void
+        int count = 0;
+        for (MyEvent event : mEventQueue) {
+            log("     " + event + ": scheduled at "
+                    + showTime(event.mTriggerTime) + ": last at "
+                    + showTime(event.mLastTriggerTime));
+            if (++count >= 5) break;
+        }
+        if (mEventQueue.size() > count) {
+            log("     .....");
+        } else if (count == 0) {
+            log("     <empty>");
+        }
+!!!36772663.java!!!	execute(in triggerTime : long) : void
+        if (DBG) log("time's up, triggerTime = "
+                + showTime(triggerTime) + ": " + mEventQueue.size());
+        if (stopped() || mEventQueue.isEmpty()) return;
+
+        for (MyEvent event : mEventQueue) {
+            if (event.mTriggerTime != triggerTime) continue;
+            if (DBG) log("execute " + event);
+
+            event.mLastTriggerTime = triggerTime;
+            event.mTriggerTime += event.mPeriod;
+
+            // run the callback in the handler thread to prevent deadlock
+            mExecutor.execute(event.mCallback);
+        }
+        if (DBG) {
+            log("after timeout execution");
+            printQueue();
+        }
+        scheduleNext();
+!!!36772791.java!!!	getAction() : String
+        return toString();
+!!!36772919.java!!!	showTime(in time : long) : String
+        int ms = (int) (time % 1000);
+        int s = (int) (time / 1000);
+        int m = s / 60;
+        s %= 60;
+        return String.format("%d.%d.%d", m, s, ms);
+!!!36773687.java!!!	log(inout s : String) : void
+        Rlog.d(TAG, s);

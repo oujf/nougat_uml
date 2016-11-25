@@ -1,0 +1,107 @@
+class CallbackThread
+!!!41191991.cpp!!!	~CallbackThread()
+    mEventQueue.clear();
+!!!41192119.cpp!!!	threadLoop() : bool
+    while (!exitPending()) {
+        sp<IMemory> eventMemory;
+        sp<ModuleClient> moduleClient;
+        {
+            Mutex::Autolock _l(mCallbackLock);
+            while (mEventQueue.isEmpty() && !exitPending()) {
+                ALOGV("CallbackThread::threadLoop() sleep");
+                mCallbackCond.wait(mCallbackLock);
+                ALOGV("CallbackThread::threadLoop() wake up");
+            }
+            if (exitPending()) {
+                break;
+            }
+            eventMemory = mEventQueue[0];
+            mEventQueue.removeAt(0);
+            moduleClient = mModuleClient.promote();
+        }
+        if (moduleClient != 0) {
+            moduleClient->onCallbackEvent(eventMemory);
+            eventMemory.clear();
+        }
+    }
+    return false;
+!!!41192247.cpp!!!	onFirstRef() : void
+    run("RadioService cbk", ANDROID_PRIORITY_URGENT_AUDIO);
+!!!41192375.cpp!!!	exit() : void
+    Mutex::Autolock _l(mCallbackLock);
+    requestExit();
+    mCallbackCond.broadcast();
+!!!41192503.cpp!!!	sendEvent(inout event : radio_hal_event_t) : void
+     sp<IMemory> eventMemory = prepareEvent(event);
+     if (eventMemory == 0) {
+         return;
+     }
+
+     AutoMutex lock(mCallbackLock);
+     mEventQueue.add(eventMemory);
+     mCallbackCond.signal();
+     ALOGV("%s DONE", __FUNCTION__);
+!!!41192631.cpp!!!	prepareEvent(inout halEvent : radio_hal_event_t) : sp<IMemory>
+    sp<IMemory> eventMemory;
+
+    size_t headerSize =
+            (sizeof(struct radio_event) + sizeof(unsigned int) - 1) /sizeof(unsigned int);
+    size_t metadataSize = 0;
+    switch (halEvent->type) {
+    case RADIO_EVENT_TUNED:
+    case RADIO_EVENT_AF_SWITCH:
+        if (radio_metadata_check(halEvent->info.metadata) == 0) {
+            metadataSize = radio_metadata_get_size(halEvent->info.metadata);
+        }
+        break;
+    case RADIO_EVENT_METADATA:
+        if (radio_metadata_check(halEvent->metadata) != 0) {
+            return eventMemory;
+        }
+        metadataSize = radio_metadata_get_size(halEvent->metadata);
+        break;
+    default:
+        break;
+    }
+    size_t size = headerSize + metadataSize;
+    eventMemory = mMemoryDealer->allocate(size);
+    if (eventMemory == 0 || eventMemory->pointer() == NULL) {
+        eventMemory.clear();
+        return eventMemory;
+    }
+    struct radio_event *event = (struct radio_event *)eventMemory->pointer();
+    event->type = halEvent->type;
+    event->status = halEvent->status;
+
+    switch (event->type) {
+    case RADIO_EVENT_CONFIG:
+        event->config.band = halEvent->config;
+        break;
+    case RADIO_EVENT_TUNED:
+    case RADIO_EVENT_AF_SWITCH:
+        event->info = halEvent->info;
+        if (metadataSize != 0) {
+            memcpy((char *)event + headerSize, halEvent->info.metadata, metadataSize);
+            // replace meta data pointer by offset while in shared memory so that receiving side
+            // can restore the pointer in destination process.
+            event->info.metadata = (radio_metadata_t *)headerSize;
+        }
+        break;
+    case RADIO_EVENT_TA:
+    case RADIO_EVENT_EA:
+    case RADIO_EVENT_ANTENNA:
+    case RADIO_EVENT_CONTROL:
+        event->on = halEvent->on;
+        break;
+    case RADIO_EVENT_METADATA:
+        memcpy((char *)event + headerSize, halEvent->metadata, metadataSize);
+        // replace meta data pointer by offset while in shared memory so that receiving side
+        // can restore the pointer in destination process.
+        event->metadata = (radio_metadata_t *)headerSize;
+        break;
+    case RADIO_EVENT_HW_FAILURE:
+    default:
+        break;
+    }
+
+    return eventMemory;

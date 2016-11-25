@@ -1,0 +1,138 @@
+class RadioService
+!!!41189687.cpp!!!	RadioService()
+    ALOGI("%s", __FUNCTION__);
+!!!41189815.cpp!!!	~RadioService()
+    for (size_t i = 0; i < mModules.size(); i++) {
+        radio_hw_device_close(mModules.valueAt(i)->hwDevice());
+    }
+!!!41189943.cpp!!!	listModules(inout properties : radio_properties, inout numModules : uint32_t) : status_t
+    ALOGV("listModules");
+
+    AutoMutex lock(mServiceLock);
+    if (numModules == NULL || (*numModules != 0 && properties == NULL)) {
+        return BAD_VALUE;
+    }
+    size_t maxModules = *numModules;
+    *numModules = mModules.size();
+    for (size_t i = 0; i < mModules.size() && i < maxModules; i++) {
+        properties[i] = mModules.valueAt(i)->properties();
+    }
+    return NO_ERROR;
+!!!41190071.cpp!!!	attach(in handle : radio_handle_t, in client : sp<IRadioClient>, in config : radio_band_config, in withAudio : bool, inout radio : sp<IRadio>) : status_t
+    ALOGV("%s %d config %p withAudio %d", __FUNCTION__, handle, config, withAudio);
+
+    AutoMutex lock(mServiceLock);
+    radio.clear();
+    if (client == 0) {
+        return BAD_VALUE;
+    }
+    ssize_t index = mModules.indexOfKey(handle);
+    if (index < 0) {
+        return BAD_VALUE;
+    }
+    sp<Module> module = mModules.valueAt(index);
+
+    if (config == NULL) {
+        config = module->getDefaultConfig();
+        if (config == NULL) {
+            return INVALID_OPERATION;
+        }
+    }
+    ALOGV("%s region %d type %d", __FUNCTION__, config->region, config->band.type);
+
+    radio = module->addClient(client, config, withAudio);
+
+    if (radio == 0) {
+        return NO_INIT;
+    }
+    return NO_ERROR;
+!!!41190199.cpp!!!	onTransact(in code : uint32_t, in data : Parcel, inout reply : Parcel, in flags : uint32_t) : status_t
+    return BnRadioService::onTransact(code, data, reply, flags);
+!!!41195831.cpp!!!	callback(inout halEvent : radio_hal_event_t, inout cookie : void) : void
+    CallbackThread *callbackThread = (CallbackThread *)cookie;
+    if (callbackThread == NULL) {
+        return;
+    }
+    callbackThread->sendEvent(halEvent);
+!!!41195959.cpp!!!	onFirstRef() : void
+    const hw_module_t *mod;
+    int rc;
+    struct radio_hw_device *dev;
+
+    ALOGI("%s", __FUNCTION__);
+
+    rc = hw_get_module_by_class(RADIO_HARDWARE_MODULE_ID, RADIO_HARDWARE_MODULE_ID_FM, &mod);
+    if (rc != 0) {
+        ALOGE("couldn't load radio module %s.%s (%s)",
+              RADIO_HARDWARE_MODULE_ID, "primary", strerror(-rc));
+        return;
+    }
+    rc = radio_hw_device_open(mod, &dev);
+    if (rc != 0) {
+        ALOGE("couldn't open radio hw device in %s.%s (%s)",
+              RADIO_HARDWARE_MODULE_ID, "primary", strerror(-rc));
+        return;
+    }
+    if (dev->common.version != RADIO_DEVICE_API_VERSION_CURRENT) {
+        ALOGE("wrong radio hw device version %04x", dev->common.version);
+        return;
+    }
+
+    struct radio_hal_properties halProperties;
+    rc = dev->get_properties(dev, &halProperties);
+    if (rc != 0) {
+        ALOGE("could not read implementation properties");
+        return;
+    }
+
+    radio_properties_t properties;
+    properties.handle =
+            (radio_handle_t)android_atomic_inc(&mNextUniqueId);
+
+    ALOGI("loaded default module %s, handle %d", properties.product, properties.handle);
+
+    convertProperties(&properties, &halProperties);
+    sp<Module> module = new Module(dev, properties);
+    mModules.add(properties.handle, module);
+!!!41196087.cpp!!!	convertProperties(inout properties : radio_properties_t, in halProperties : radio_hal_properties_t) : void
+    memset(properties, 0, sizeof(struct radio_properties));
+    properties->class_id = halProperties->class_id;
+    strlcpy(properties->implementor, halProperties->implementor,
+            RADIO_STRING_LEN_MAX);
+    strlcpy(properties->product, halProperties->product,
+            RADIO_STRING_LEN_MAX);
+    strlcpy(properties->version, halProperties->version,
+            RADIO_STRING_LEN_MAX);
+    strlcpy(properties->serial, halProperties->serial,
+            RADIO_STRING_LEN_MAX);
+    properties->num_tuners = halProperties->num_tuners;
+    properties->num_audio_sources = halProperties->num_audio_sources;
+    properties->supports_capture = halProperties->supports_capture;
+
+    for (size_t i = 0; i < ARRAY_SIZE(sKnownRegionConfigs); i++) {
+        const radio_hal_band_config_t *band = &sKnownRegionConfigs[i].band;
+        size_t j;
+        for (j = 0; j < halProperties->num_bands; j++) {
+            const radio_hal_band_config_t *halBand = &halProperties->bands[j];
+            size_t k;
+            if (band->type != halBand->type) continue;
+            if (band->lower_limit < halBand->lower_limit) continue;
+            if (band->upper_limit > halBand->upper_limit) continue;
+            for (k = 0; k < halBand->num_spacings; k++) {
+                if (band->spacings[0] == halBand->spacings[k]) break;
+            }
+            if (k == halBand->num_spacings) continue;
+            if (band->type == RADIO_BAND_AM) break;
+            if ((band->fm.deemphasis & halBand->fm.deemphasis) == 0) continue;
+            if (halBand->fm.rds == 0) break;
+            if ((band->fm.rds & halBand->fm.rds) != 0) break;
+        }
+        if (j == halProperties->num_bands) continue;
+
+        ALOGI("convertProperties() Adding band type %d region %d",
+              sKnownRegionConfigs[i].band.type , sKnownRegionConfigs[i].region);
+
+        memcpy(&properties->bands[properties->num_bands++],
+               &sKnownRegionConfigs[i],
+               sizeof(radio_band_config_t));
+    }

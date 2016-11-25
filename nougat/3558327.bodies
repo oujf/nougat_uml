@@ -1,0 +1,135 @@
+class WebmFrameMediaSourceThread
+!!!40037431.cpp!!!	WebmFrameMediaSourceThread(in source : sp<IMediaSource>, in type : int, inout sink : LinkedBlockingQueue<const sp<WebmFrame> >, in timeCodeScale : uint64_t, in startTimeRealUs : int64_t, in startTimeOffsetMs : int32_t, in numTracks : int, in realTimeRecording : bool)
+    clearFlags();
+    mStartTimeUs = startTimeRealUs;
+    if (realTimeRecording && numTracks > 1) {
+        /*
+         * Copied from MPEG4Writer
+         *
+         * This extra delay of accepting incoming audio/video signals
+         * helps to align a/v start time at the beginning of a recording
+         * session, and it also helps eliminate the "recording" sound for
+         * camcorder applications.
+         *
+         * If client does not set the start time offset, we fall back to
+         * use the default initial delay value.
+         */
+        int64_t startTimeOffsetUs = startTimeOffsetMs * 1000LL;
+        if (startTimeOffsetUs < 0) {  // Start time offset was not set
+            startTimeOffsetUs = kInitialDelayTimeUs;
+        }
+        mStartTimeUs += startTimeOffsetUs;
+        ALOGI("Start time offset: %" PRId64 " us", startTimeOffsetUs);
+    }
+!!!40037559.cpp!!!	run() : void
+    int32_t count = 0;
+    int64_t timestampUs = 0xdeadbeef;
+    int64_t lastTimestampUs = 0; // Previous sample time stamp
+    int64_t lastDurationUs = 0; // Previous sample duration
+    int64_t previousPausedDurationUs = 0;
+
+    const uint64_t kUninitialized = 0xffffffffffffffffL;
+    mStartTimeUs = kUninitialized;
+
+    status_t err = OK;
+    MediaBuffer *buffer;
+    while (!mDone && (err = mSource->read(&buffer, NULL)) == OK) {
+        if (buffer->range_length() == 0) {
+            buffer->release();
+            buffer = NULL;
+            continue;
+        }
+
+        sp<MetaData> md = buffer->meta_data();
+        CHECK(md->findInt64(kKeyTime, &timestampUs));
+        if (mStartTimeUs == kUninitialized) {
+            mStartTimeUs = timestampUs;
+        }
+        timestampUs -= mStartTimeUs;
+
+        if (mPaused && !mResumed) {
+            lastDurationUs = timestampUs - lastTimestampUs;
+            lastTimestampUs = timestampUs;
+            buffer->release();
+            buffer = NULL;
+            continue;
+        }
+        ++count;
+
+        // adjust time-stamps after pause/resume
+        if (mResumed) {
+            int64_t durExcludingEarlierPausesUs = timestampUs - previousPausedDurationUs;
+            CHECK_GE(durExcludingEarlierPausesUs, 0ll);
+            int64_t pausedDurationUs = durExcludingEarlierPausesUs - mTrackDurationUs;
+            CHECK_GE(pausedDurationUs, lastDurationUs);
+            previousPausedDurationUs += pausedDurationUs - lastDurationUs;
+            mResumed = false;
+        }
+        timestampUs -= previousPausedDurationUs;
+        CHECK_GE(timestampUs, 0ll);
+
+        int32_t isSync = false;
+        md->findInt32(kKeyIsSyncFrame, &isSync);
+        const sp<WebmFrame> f = new WebmFrame(
+            mType,
+            isSync,
+            timestampUs * 1000 / mTimeCodeScale,
+            buffer);
+        mSink.push(f);
+
+        ALOGV(
+            "%s %s frame at %" PRId64 " size %zu\n",
+            mType == kVideoType ? "video" : "audio",
+            isSync ? "I" : "P",
+            timestampUs * 1000 / mTimeCodeScale,
+            buffer->range_length());
+
+        buffer->release();
+        buffer = NULL;
+
+        if (timestampUs > mTrackDurationUs) {
+            mTrackDurationUs = timestampUs;
+        }
+        lastDurationUs = timestampUs - lastTimestampUs;
+        lastTimestampUs = timestampUs;
+    }
+
+    mTrackDurationUs += lastDurationUs;
+    mSink.push(WebmFrame::EOS);
+!!!40037687.cpp!!!	start() : status_t
+    sp<MetaData> meta = new MetaData;
+    meta->setInt64(kKeyTime, mStartTimeUs);
+    status_t err = mSource->start(meta.get());
+    if (err != OK) {
+        mDone = true;
+        mReachedEOS = true;
+        return err;
+    } else {
+        mStarted = true;
+        return WebmFrameThread::start();
+    }
+!!!40037815.cpp!!!	resume() : status_t
+    if (!mDone && mPaused) {
+        mPaused = false;
+        mResumed = true;
+    }
+    return OK;
+!!!40037943.cpp!!!	pause() : status_t
+    if (mStarted) {
+        mPaused = true;
+    }
+    return OK;
+!!!40038071.cpp!!!	stop() : status_t
+    if (mStarted) {
+        mStarted = false;
+        mDone = true;
+        mSource->stop();
+        return WebmFrameThread::stop();
+    }
+    return OK;
+!!!40038327.cpp!!!	clearFlags() : void
+    mDone = false;
+    mPaused = false;
+    mResumed = false;
+    mStarted = false;
+    mReachedEOS = false;

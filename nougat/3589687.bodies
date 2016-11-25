@@ -1,0 +1,877 @@
+class ACodec::BaseState
+!!!40156983.cpp!!!	getPortMode(in portIndex : OMX_U32) : ACodec::BaseState::PortMode
+    return KEEP_BUFFERS;
+!!!40157111.cpp!!!	onMessageReceived(in msg : sp<AMessage>) : bool
+    switch (msg->what()) {
+        case kWhatInputBufferFilled:
+        {
+            onInputBufferFilled(msg);
+            break;
+        }
+
+        case kWhatOutputBufferDrained:
+        {
+            onOutputBufferDrained(msg);
+            break;
+        }
+
+        case ACodec::kWhatOMXMessageList:
+        {
+            return checkOMXMessage(msg) ? onOMXMessageList(msg) : true;
+        }
+
+        case ACodec::kWhatOMXMessageItem:
+        {
+            // no need to check as we already did it for kWhatOMXMessageList
+            return onOMXMessage(msg);
+        }
+
+        case ACodec::kWhatOMXMessage:
+        {
+            return checkOMXMessage(msg) ? onOMXMessage(msg) : true;
+        }
+
+        case ACodec::kWhatSetSurface:
+        {
+            sp<AReplyToken> replyID;
+            CHECK(msg->senderAwaitsResponse(&replyID));
+
+            sp<RefBase> obj;
+            CHECK(msg->findObject("surface", &obj));
+
+            status_t err = mCodec->handleSetSurface(static_cast<Surface *>(obj.get()));
+
+            sp<AMessage> response = new AMessage;
+            response->setInt32("err", err);
+            response->postReply(replyID);
+            break;
+        }
+
+        case ACodec::kWhatCreateInputSurface:
+        case ACodec::kWhatSetInputSurface:
+        case ACodec::kWhatSignalEndOfInputStream:
+        {
+            // This may result in an app illegal state exception.
+            ALOGE("Message 0x%x was not handled", msg->what());
+            mCodec->signalError(OMX_ErrorUndefined, INVALID_OPERATION);
+            return true;
+        }
+
+        case ACodec::kWhatOMXDied:
+        {
+            // This will result in kFlagSawMediaServerDie handling in MediaCodec.
+            ALOGE("OMX/mediaserver died, signalling error!");
+            mCodec->signalError(OMX_ErrorResourcesLost, DEAD_OBJECT);
+            break;
+        }
+
+        case ACodec::kWhatReleaseCodecInstance:
+        {
+            ALOGI("[%s] forcing the release of codec",
+                    mCodec->mComponentName.c_str());
+            status_t err = mCodec->mOMX->freeNode(mCodec->mNode);
+            ALOGE_IF("[%s] failed to release codec instance: err=%d",
+                       mCodec->mComponentName.c_str(), err);
+            sp<AMessage> notify = mCodec->mNotify->dup();
+            notify->setInt32("what", CodecBase::kWhatShutdownCompleted);
+            notify->post();
+            break;
+        }
+
+        default:
+            return false;
+    }
+
+    return true;
+!!!40157239.cpp!!!	onOMXEvent(in event : OMX_EVENTTYPE, in data1 : OMX_U32, in data2 : OMX_U32) : bool
+    if (event == OMX_EventDataSpaceChanged) {
+        ColorAspects aspects;
+        aspects.mRange = (ColorAspects::Range)((data2 >> 24) & 0xFF);
+        aspects.mPrimaries = (ColorAspects::Primaries)((data2 >> 16) & 0xFF);
+        aspects.mMatrixCoeffs = (ColorAspects::MatrixCoeffs)((data2 >> 8) & 0xFF);
+        aspects.mTransfer = (ColorAspects::Transfer)(data2 & 0xFF);
+
+        mCodec->onDataSpaceChanged((android_dataspace)data1, aspects);
+        return true;
+    }
+
+    if (event != OMX_EventError) {
+        ALOGV("[%s] EVENT(%d, 0x%08x, 0x%08x)",
+             mCodec->mComponentName.c_str(), event, data1, data2);
+
+        return false;
+    }
+
+    ALOGE("[%s] ERROR(0x%08x)", mCodec->mComponentName.c_str(), data1);
+
+    // verify OMX component sends back an error we expect.
+    OMX_ERRORTYPE omxError = (OMX_ERRORTYPE)data1;
+    if (!isOMXError(omxError)) {
+        ALOGW("Invalid OMX error %#x", omxError);
+        omxError = OMX_ErrorUndefined;
+    }
+    mCodec->signalError(omxError);
+
+    return true;
+!!!40157367.cpp!!!	onOutputBufferDrained(in msg : sp<AMessage>) : void
+    IOMX::buffer_id bufferID;
+    CHECK(msg->findInt32("buffer-id", (int32_t*)&bufferID));
+    ssize_t index;
+    BufferInfo *info = mCodec->findBufferByID(kPortIndexOutput, bufferID, &index);
+    BufferInfo::Status status = BufferInfo::getSafeStatus(info);
+    if (status != BufferInfo::OWNED_BY_DOWNSTREAM) {
+        ALOGE("Wrong ownership in OBD: %s(%d) buffer #%u", _asString(status), status, bufferID);
+        mCodec->dumpBuffers(kPortIndexOutput);
+        mCodec->signalError(OMX_ErrorUndefined, FAILED_TRANSACTION);
+        return;
+    }
+
+    android_native_rect_t crop;
+    if (msg->findRect("crop", &crop.left, &crop.top, &crop.right, &crop.bottom)
+            && memcmp(&crop, &mCodec->mLastNativeWindowCrop, sizeof(crop)) != 0) {
+        mCodec->mLastNativeWindowCrop = crop;
+        status_t err = native_window_set_crop(mCodec->mNativeWindow.get(), &crop);
+        ALOGW_IF(err != NO_ERROR, "failed to set crop: %d", err);
+    }
+
+    int32_t dataSpace;
+    if (msg->findInt32("dataspace", &dataSpace)
+            && dataSpace != mCodec->mLastNativeWindowDataSpace) {
+        status_t err = native_window_set_buffers_data_space(
+                mCodec->mNativeWindow.get(), (android_dataspace)dataSpace);
+        mCodec->mLastNativeWindowDataSpace = dataSpace;
+        ALOGW_IF(err != NO_ERROR, "failed to set dataspace: %d", err);
+    }
+
+    int32_t render;
+    if (mCodec->mNativeWindow != NULL
+            && msg->findInt32("render", &render) && render != 0
+            && info->mData != NULL && info->mData->size() != 0) {
+        ATRACE_NAME("render");
+        // The client wants this buffer to be rendered.
+
+        // save buffers sent to the surface so we can get render time when they return
+        int64_t mediaTimeUs = -1;
+        info->mData->meta()->findInt64("timeUs", &mediaTimeUs);
+        if (mediaTimeUs >= 0) {
+            mCodec->mRenderTracker.onFrameQueued(
+                    mediaTimeUs, info->mGraphicBuffer, new Fence(::dup(info->mFenceFd)));
+        }
+
+        int64_t timestampNs = 0;
+        if (!msg->findInt64("timestampNs", &timestampNs)) {
+            // use media timestamp if client did not request a specific render timestamp
+            if (info->mData->meta()->findInt64("timeUs", &timestampNs)) {
+                ALOGV("using buffer PTS of %lld", (long long)timestampNs);
+                timestampNs *= 1000;
+            }
+        }
+
+        status_t err;
+        err = native_window_set_buffers_timestamp(mCodec->mNativeWindow.get(), timestampNs);
+        ALOGW_IF(err != NO_ERROR, "failed to set buffer timestamp: %d", err);
+
+        info->checkReadFence("onOutputBufferDrained before queueBuffer");
+        err = mCodec->mNativeWindow->queueBuffer(
+                    mCodec->mNativeWindow.get(), info->mGraphicBuffer.get(), info->mFenceFd);
+        info->mFenceFd = -1;
+        if (err == OK) {
+            info->mStatus = BufferInfo::OWNED_BY_NATIVE_WINDOW;
+        } else {
+            ALOGE("queueBuffer failed in onOutputBufferDrained: %d", err);
+            mCodec->signalError(OMX_ErrorUndefined, makeNoSideEffectStatus(err));
+            info->mStatus = BufferInfo::OWNED_BY_US;
+            // keeping read fence as write fence to avoid clobbering
+            info->mIsReadFence = false;
+        }
+    } else {
+        if (mCodec->mNativeWindow != NULL &&
+            (info->mData == NULL || info->mData->size() != 0)) {
+            // move read fence into write fence to avoid clobbering
+            info->mIsReadFence = false;
+            ATRACE_NAME("frame-drop");
+        }
+        info->mStatus = BufferInfo::OWNED_BY_US;
+    }
+
+    PortMode mode = getPortMode(kPortIndexOutput);
+
+    switch (mode) {
+        case KEEP_BUFFERS:
+        {
+            // XXX fishy, revisit!!! What about the FREE_BUFFERS case below?
+
+            if (info->mStatus == BufferInfo::OWNED_BY_NATIVE_WINDOW) {
+                // We cannot resubmit the buffer we just rendered, dequeue
+                // the spare instead.
+
+                info = mCodec->dequeueBufferFromNativeWindow();
+            }
+            break;
+        }
+
+        case RESUBMIT_BUFFERS:
+        {
+            if (!mCodec->mPortEOS[kPortIndexOutput]) {
+                if (info->mStatus == BufferInfo::OWNED_BY_NATIVE_WINDOW) {
+                    // We cannot resubmit the buffer we just rendered, dequeue
+                    // the spare instead.
+
+                    info = mCodec->dequeueBufferFromNativeWindow();
+                }
+
+                if (info != NULL) {
+                    ALOGV("[%s] calling fillBuffer %u",
+                         mCodec->mComponentName.c_str(), info->mBufferID);
+                    info->checkWriteFence("onOutputBufferDrained::RESUBMIT_BUFFERS");
+                    status_t err = mCodec->mOMX->fillBuffer(
+                            mCodec->mNode, info->mBufferID, info->mFenceFd);
+                    info->mFenceFd = -1;
+                    if (err == OK) {
+                        info->mStatus = BufferInfo::OWNED_BY_COMPONENT;
+                    } else {
+                        mCodec->signalError(OMX_ErrorUndefined, makeNoSideEffectStatus(err));
+                    }
+                }
+            }
+            break;
+        }
+
+        case FREE_BUFFERS:
+        {
+            status_t err = mCodec->freeBuffer(kPortIndexOutput, index);
+            if (err != OK) {
+                mCodec->signalError(OMX_ErrorUndefined, makeNoSideEffectStatus(err));
+            }
+            break;
+        }
+
+        default:
+            ALOGE("Invalid port mode: %d", mode);
+            return;
+    }
+!!!40157495.cpp!!!	onInputBufferFilled(in msg : sp<AMessage>) : void
+    IOMX::buffer_id bufferID;
+    CHECK(msg->findInt32("buffer-id", (int32_t*)&bufferID));
+    sp<ABuffer> buffer;
+    int32_t err = OK;
+    bool eos = false;
+    PortMode mode = getPortMode(kPortIndexInput);
+
+    if (!msg->findBuffer("buffer", &buffer)) {
+        /* these are unfilled buffers returned by client */
+        CHECK(msg->findInt32("err", &err));
+
+        if (err == OK) {
+            /* buffers with no errors are returned on MediaCodec.flush */
+            mode = KEEP_BUFFERS;
+        } else {
+            ALOGV("[%s] saw error %d instead of an input buffer",
+                 mCodec->mComponentName.c_str(), err);
+            eos = true;
+        }
+
+        buffer.clear();
+    }
+
+    int32_t tmp;
+    if (buffer != NULL && buffer->meta()->findInt32("eos", &tmp) && tmp) {
+        eos = true;
+        err = ERROR_END_OF_STREAM;
+    }
+
+    BufferInfo *info = mCodec->findBufferByID(kPortIndexInput, bufferID);
+    BufferInfo::Status status = BufferInfo::getSafeStatus(info);
+    if (status != BufferInfo::OWNED_BY_UPSTREAM) {
+        ALOGE("Wrong ownership in IBF: %s(%d) buffer #%u", _asString(status), status, bufferID);
+        mCodec->dumpBuffers(kPortIndexInput);
+        mCodec->signalError(OMX_ErrorUndefined, FAILED_TRANSACTION);
+        return;
+    }
+
+    info->mStatus = BufferInfo::OWNED_BY_US;
+
+    switch (mode) {
+        case KEEP_BUFFERS:
+        {
+            if (eos) {
+                if (!mCodec->mPortEOS[kPortIndexInput]) {
+                    mCodec->mPortEOS[kPortIndexInput] = true;
+                    mCodec->mInputEOSResult = err;
+                }
+            }
+            break;
+        }
+
+        case RESUBMIT_BUFFERS:
+        {
+            if (buffer != NULL && !mCodec->mPortEOS[kPortIndexInput]) {
+                // Do not send empty input buffer w/o EOS to the component.
+                if (buffer->size() == 0 && !eos) {
+                    postFillThisBuffer(info);
+                    break;
+                }
+
+                int64_t timeUs;
+                CHECK(buffer->meta()->findInt64("timeUs", &timeUs));
+
+                OMX_U32 flags = OMX_BUFFERFLAG_ENDOFFRAME;
+
+                MetadataBufferType metaType = mCodec->mInputMetadataType;
+                int32_t isCSD = 0;
+                if (buffer->meta()->findInt32("csd", &isCSD) && isCSD != 0) {
+                    if (mCodec->mIsLegacyVP9Decoder) {
+                        ALOGV("[%s] is legacy VP9 decoder. Ignore %u codec specific data",
+                            mCodec->mComponentName.c_str(), bufferID);
+                        postFillThisBuffer(info);
+                        break;
+                    }
+                    flags |= OMX_BUFFERFLAG_CODECCONFIG;
+                    metaType = kMetadataBufferTypeInvalid;
+                }
+
+                if (eos) {
+                    flags |= OMX_BUFFERFLAG_EOS;
+                }
+
+                if (buffer != info->mCodecData) {
+                    ALOGV("[%s] Needs to copy input data for buffer %u. (%p != %p)",
+                         mCodec->mComponentName.c_str(),
+                         bufferID,
+                         buffer.get(), info->mCodecData.get());
+
+                    sp<DataConverter> converter = mCodec->mConverter[kPortIndexInput];
+                    if (converter == NULL || isCSD) {
+                        converter = getCopyConverter();
+                    }
+                    status_t err = converter->convert(buffer, info->mCodecData);
+                    if (err != OK) {
+                        mCodec->signalError(OMX_ErrorUndefined, err);
+                        return;
+                    }
+                }
+
+                if (flags & OMX_BUFFERFLAG_CODECCONFIG) {
+                    ALOGV("[%s] calling emptyBuffer %u w/ codec specific data",
+                         mCodec->mComponentName.c_str(), bufferID);
+                } else if (flags & OMX_BUFFERFLAG_EOS) {
+                    ALOGV("[%s] calling emptyBuffer %u w/ EOS",
+                         mCodec->mComponentName.c_str(), bufferID);
+                } else {
+#if TRACK_BUFFER_TIMING
+                    ALOGI("[%s] calling emptyBuffer %u w/ time %lld us",
+                         mCodec->mComponentName.c_str(), bufferID, (long long)timeUs);
+#else
+                    ALOGV("[%s] calling emptyBuffer %u w/ time %lld us",
+                         mCodec->mComponentName.c_str(), bufferID, (long long)timeUs);
+#endif
+                }
+
+#if TRACK_BUFFER_TIMING
+                ACodec::BufferStats stats;
+                stats.mEmptyBufferTimeUs = ALooper::GetNowUs();
+                stats.mFillBufferDoneTimeUs = -1ll;
+                mCodec->mBufferStats.add(timeUs, stats);
+#endif
+
+                if (mCodec->storingMetadataInDecodedBuffers()) {
+                    // try to submit an output buffer for each input buffer
+                    PortMode outputMode = getPortMode(kPortIndexOutput);
+
+                    ALOGV("MetadataBuffersToSubmit=%u portMode=%s",
+                            mCodec->mMetadataBuffersToSubmit,
+                            (outputMode == FREE_BUFFERS ? "FREE" :
+                             outputMode == KEEP_BUFFERS ? "KEEP" : "RESUBMIT"));
+                    if (outputMode == RESUBMIT_BUFFERS) {
+                        mCodec->submitOutputMetadataBuffer();
+                    }
+                }
+                info->checkReadFence("onInputBufferFilled");
+
+                status_t err2 = OK;
+                switch (metaType) {
+                case kMetadataBufferTypeInvalid:
+                    break;
+#ifndef OMX_ANDROID_COMPILE_AS_32BIT_ON_64BIT_PLATFORMS
+                case kMetadataBufferTypeNativeHandleSource:
+                    if (info->mCodecData->size() >= sizeof(VideoNativeHandleMetadata)) {
+                        VideoNativeHandleMetadata *vnhmd =
+                            (VideoNativeHandleMetadata*)info->mCodecData->base();
+                        err2 = mCodec->mOMX->updateNativeHandleInMeta(
+                                mCodec->mNode, kPortIndexInput,
+                                NativeHandle::create(vnhmd->pHandle, false /* ownsHandle */),
+                                bufferID);
+                    }
+                    break;
+                case kMetadataBufferTypeANWBuffer:
+                    if (info->mCodecData->size() >= sizeof(VideoNativeMetadata)) {
+                        VideoNativeMetadata *vnmd = (VideoNativeMetadata*)info->mCodecData->base();
+                        err2 = mCodec->mOMX->updateGraphicBufferInMeta(
+                                mCodec->mNode, kPortIndexInput,
+                                new GraphicBuffer(vnmd->pBuffer, false /* keepOwnership */),
+                                bufferID);
+                    }
+                    break;
+#endif
+                default:
+                    ALOGW("Can't marshall %s data in %zu sized buffers in %zu-bit mode",
+                            asString(metaType), info->mCodecData->size(),
+                            sizeof(buffer_handle_t) * 8);
+                    err2 = ERROR_UNSUPPORTED;
+                    break;
+                }
+
+                if (err2 == OK) {
+                    err2 = mCodec->mOMX->emptyBuffer(
+                        mCodec->mNode,
+                        bufferID,
+                        0,
+                        info->mCodecData->size(),
+                        flags,
+                        timeUs,
+                        info->mFenceFd);
+                }
+                info->mFenceFd = -1;
+                if (err2 != OK) {
+                    mCodec->signalError(OMX_ErrorUndefined, makeNoSideEffectStatus(err2));
+                    return;
+                }
+                info->mStatus = BufferInfo::OWNED_BY_COMPONENT;
+
+                if (!eos && err == OK) {
+                    getMoreInputDataIfPossible();
+                } else {
+                    ALOGV("[%s] Signalled EOS (%d) on the input port",
+                         mCodec->mComponentName.c_str(), err);
+
+                    mCodec->mPortEOS[kPortIndexInput] = true;
+                    mCodec->mInputEOSResult = err;
+                }
+            } else if (!mCodec->mPortEOS[kPortIndexInput]) {
+                if (err != OK && err != ERROR_END_OF_STREAM) {
+                    ALOGV("[%s] Signalling EOS on the input port due to error %d",
+                         mCodec->mComponentName.c_str(), err);
+                } else {
+                    ALOGV("[%s] Signalling EOS on the input port",
+                         mCodec->mComponentName.c_str());
+                }
+
+                ALOGV("[%s] calling emptyBuffer %u signalling EOS",
+                     mCodec->mComponentName.c_str(), bufferID);
+
+                info->checkReadFence("onInputBufferFilled");
+                status_t err2 = mCodec->mOMX->emptyBuffer(
+                        mCodec->mNode,
+                        bufferID,
+                        0,
+                        0,
+                        OMX_BUFFERFLAG_EOS,
+                        0,
+                        info->mFenceFd);
+                info->mFenceFd = -1;
+                if (err2 != OK) {
+                    mCodec->signalError(OMX_ErrorUndefined, makeNoSideEffectStatus(err2));
+                    return;
+                }
+                info->mStatus = BufferInfo::OWNED_BY_COMPONENT;
+
+                mCodec->mPortEOS[kPortIndexInput] = true;
+                mCodec->mInputEOSResult = err;
+            }
+            break;
+        }
+
+        case FREE_BUFFERS:
+            break;
+
+        default:
+            ALOGE("invalid port mode: %d", mode);
+            break;
+    }
+!!!40157623.cpp!!!	postFillThisBuffer(inout info : BufferInfo) : void
+    if (mCodec->mPortEOS[kPortIndexInput]) {
+        return;
+    }
+
+    CHECK_EQ((int)info->mStatus, (int)BufferInfo::OWNED_BY_US);
+
+    sp<AMessage> notify = mCodec->mNotify->dup();
+    notify->setInt32("what", CodecBase::kWhatFillThisBuffer);
+    notify->setInt32("buffer-id", info->mBufferID);
+
+    info->mData->meta()->clear();
+    notify->setBuffer("buffer", info->mData);
+
+    sp<AMessage> reply = new AMessage(kWhatInputBufferFilled, mCodec);
+    reply->setInt32("buffer-id", info->mBufferID);
+
+    notify->setMessage("reply", reply);
+
+    notify->post();
+
+    info->mStatus = BufferInfo::OWNED_BY_UPSTREAM;
+!!!40157751.cpp!!!	onOMXMessage(in msg : sp<AMessage>) : bool
+    int32_t type;
+    CHECK(msg->findInt32("type", &type));
+
+    switch (type) {
+        case omx_message::EVENT:
+        {
+            int32_t event, data1, data2;
+            CHECK(msg->findInt32("event", &event));
+            CHECK(msg->findInt32("data1", &data1));
+            CHECK(msg->findInt32("data2", &data2));
+
+            if (event == OMX_EventCmdComplete
+                    && data1 == OMX_CommandFlush
+                    && data2 == (int32_t)OMX_ALL) {
+                // Use of this notification is not consistent across
+                // implementations. We'll drop this notification and rely
+                // on flush-complete notifications on the individual port
+                // indices instead.
+
+                return true;
+            }
+
+            return onOMXEvent(
+                    static_cast<OMX_EVENTTYPE>(event),
+                    static_cast<OMX_U32>(data1),
+                    static_cast<OMX_U32>(data2));
+        }
+
+        case omx_message::EMPTY_BUFFER_DONE:
+        {
+            IOMX::buffer_id bufferID;
+            int32_t fenceFd;
+
+            CHECK(msg->findInt32("buffer", (int32_t*)&bufferID));
+            CHECK(msg->findInt32("fence_fd", &fenceFd));
+
+            return onOMXEmptyBufferDone(bufferID, fenceFd);
+        }
+
+        case omx_message::FILL_BUFFER_DONE:
+        {
+            IOMX::buffer_id bufferID;
+            CHECK(msg->findInt32("buffer", (int32_t*)&bufferID));
+
+            int32_t rangeOffset, rangeLength, flags, fenceFd;
+            int64_t timeUs;
+
+            CHECK(msg->findInt32("range_offset", &rangeOffset));
+            CHECK(msg->findInt32("range_length", &rangeLength));
+            CHECK(msg->findInt32("flags", &flags));
+            CHECK(msg->findInt64("timestamp", &timeUs));
+            CHECK(msg->findInt32("fence_fd", &fenceFd));
+
+            return onOMXFillBufferDone(
+                    bufferID,
+                    (size_t)rangeOffset, (size_t)rangeLength,
+                    (OMX_U32)flags,
+                    timeUs,
+                    fenceFd);
+        }
+
+        case omx_message::FRAME_RENDERED:
+        {
+            int64_t mediaTimeUs, systemNano;
+
+            CHECK(msg->findInt64("media_time_us", &mediaTimeUs));
+            CHECK(msg->findInt64("system_nano", &systemNano));
+
+            return onOMXFrameRendered(
+                    mediaTimeUs, systemNano);
+        }
+
+        default:
+            ALOGE("Unexpected message type: %d", type);
+            return false;
+    }
+!!!40157879.cpp!!!	onOMXMessageList(in msg : sp<AMessage>) : bool
+    sp<RefBase> obj;
+    CHECK(msg->findObject("messages", &obj));
+    sp<MessageList> msgList = static_cast<MessageList *>(obj.get());
+
+    bool receivedRenderedEvents = false;
+    for (std::list<sp<AMessage>>::const_iterator it = msgList->getList().cbegin();
+          it != msgList->getList().cend(); ++it) {
+        (*it)->setWhat(ACodec::kWhatOMXMessageItem);
+        mCodec->handleMessage(*it);
+        int32_t type;
+        CHECK((*it)->findInt32("type", &type));
+        if (type == omx_message::FRAME_RENDERED) {
+            receivedRenderedEvents = true;
+        }
+    }
+
+    if (receivedRenderedEvents) {
+        // NOTE: all buffers are rendered in this case
+        mCodec->notifyOfRenderedFrames();
+    }
+    return true;
+!!!40158007.cpp!!!	checkOMXMessage(in msg : sp<AMessage>) : bool
+    // there is a possibility that this is an outstanding message for a
+    // codec that we have already destroyed
+    if (mCodec->mNode == 0) {
+        ALOGI("ignoring message as already freed component: %s",
+                msg->debugString().c_str());
+        return false;
+    }
+
+    IOMX::node_id nodeID;
+    CHECK(msg->findInt32("node", (int32_t*)&nodeID));
+    if (nodeID != mCodec->mNode) {
+        ALOGE("Unexpected message for nodeID: %u, should have been %u", nodeID, mCodec->mNode);
+        return false;
+    }
+    return true;
+!!!40158135.cpp!!!	onOMXEmptyBufferDone(in bufferID : IOMX::buffer_id, in fenceFd : int) : bool
+    ALOGV("[%s] onOMXEmptyBufferDone %u",
+         mCodec->mComponentName.c_str(), bufferID);
+
+    BufferInfo *info = mCodec->findBufferByID(kPortIndexInput, bufferID);
+    BufferInfo::Status status = BufferInfo::getSafeStatus(info);
+    if (status != BufferInfo::OWNED_BY_COMPONENT) {
+        ALOGE("Wrong ownership in EBD: %s(%d) buffer #%u", _asString(status), status, bufferID);
+        mCodec->dumpBuffers(kPortIndexInput);
+        if (fenceFd >= 0) {
+            ::close(fenceFd);
+        }
+        return false;
+    }
+    info->mStatus = BufferInfo::OWNED_BY_US;
+
+    // input buffers cannot take fences, so wait for any fence now
+    (void)mCodec->waitForFence(fenceFd, "onOMXEmptyBufferDone");
+    fenceFd = -1;
+
+    // still save fence for completeness
+    info->setWriteFence(fenceFd, "onOMXEmptyBufferDone");
+
+    // We're in "store-metadata-in-buffers" mode, the underlying
+    // OMX component had access to data that's implicitly refcounted
+    // by this "MediaBuffer" object. Now that the OMX component has
+    // told us that it's done with the input buffer, we can decrement
+    // the mediaBuffer's reference count.
+    info->mData->setMediaBufferBase(NULL);
+
+    PortMode mode = getPortMode(kPortIndexInput);
+
+    switch (mode) {
+        case KEEP_BUFFERS:
+            break;
+
+        case RESUBMIT_BUFFERS:
+            postFillThisBuffer(info);
+            break;
+
+        case FREE_BUFFERS:
+        default:
+            ALOGE("SHOULD NOT REACH HERE: cannot free empty output buffers");
+            return false;
+    }
+
+    return true;
+!!!40158263.cpp!!!	onOMXFillBufferDone(in bufferID : IOMX::buffer_id, in rangeOffset : size_t, in rangeLength : size_t, in flags : OMX_U32, in timeUs : int64_t, in fenceFd : int) : bool
+    ALOGV("[%s] onOMXFillBufferDone %u time %" PRId64 " us, flags = 0x%08x",
+         mCodec->mComponentName.c_str(), bufferID, timeUs, flags);
+
+    ssize_t index;
+    status_t err= OK;
+
+#if TRACK_BUFFER_TIMING
+    index = mCodec->mBufferStats.indexOfKey(timeUs);
+    if (index >= 0) {
+        ACodec::BufferStats *stats = &mCodec->mBufferStats.editValueAt(index);
+        stats->mFillBufferDoneTimeUs = ALooper::GetNowUs();
+
+        ALOGI("frame PTS %lld: %lld",
+                timeUs,
+                stats->mFillBufferDoneTimeUs - stats->mEmptyBufferTimeUs);
+
+        mCodec->mBufferStats.removeItemsAt(index);
+        stats = NULL;
+    }
+#endif
+
+    BufferInfo *info =
+        mCodec->findBufferByID(kPortIndexOutput, bufferID, &index);
+    BufferInfo::Status status = BufferInfo::getSafeStatus(info);
+    if (status != BufferInfo::OWNED_BY_COMPONENT) {
+        ALOGE("Wrong ownership in FBD: %s(%d) buffer #%u", _asString(status), status, bufferID);
+        mCodec->dumpBuffers(kPortIndexOutput);
+        mCodec->signalError(OMX_ErrorUndefined, FAILED_TRANSACTION);
+        if (fenceFd >= 0) {
+            ::close(fenceFd);
+        }
+        return true;
+    }
+
+    info->mDequeuedAt = ++mCodec->mDequeueCounter;
+    info->mStatus = BufferInfo::OWNED_BY_US;
+
+    if (info->mRenderInfo != NULL) {
+        // The fence for an emptied buffer must have signaled, but there still could be queued
+        // or out-of-order dequeued buffers in the render queue prior to this buffer. Drop these,
+        // as we will soon requeue this buffer to the surface. While in theory we could still keep
+        // track of buffers that are requeued to the surface, it is better to add support to the
+        // buffer-queue to notify us of released buffers and their fences (in the future).
+        mCodec->notifyOfRenderedFrames(true /* dropIncomplete */);
+    }
+
+    // byte buffers cannot take fences, so wait for any fence now
+    if (mCodec->mNativeWindow == NULL) {
+        (void)mCodec->waitForFence(fenceFd, "onOMXFillBufferDone");
+        fenceFd = -1;
+    }
+    info->setReadFence(fenceFd, "onOMXFillBufferDone");
+
+    PortMode mode = getPortMode(kPortIndexOutput);
+
+    switch (mode) {
+        case KEEP_BUFFERS:
+            break;
+
+        case RESUBMIT_BUFFERS:
+        {
+            if (rangeLength == 0 && (!(flags & OMX_BUFFERFLAG_EOS)
+                    || mCodec->mPortEOS[kPortIndexOutput])) {
+                ALOGV("[%s] calling fillBuffer %u",
+                     mCodec->mComponentName.c_str(), info->mBufferID);
+
+                err = mCodec->mOMX->fillBuffer(mCodec->mNode, info->mBufferID, info->mFenceFd);
+                info->mFenceFd = -1;
+                if (err != OK) {
+                    mCodec->signalError(OMX_ErrorUndefined, makeNoSideEffectStatus(err));
+                    return true;
+                }
+
+                info->mStatus = BufferInfo::OWNED_BY_COMPONENT;
+                break;
+            }
+
+            sp<AMessage> reply =
+                new AMessage(kWhatOutputBufferDrained, mCodec);
+
+            if (mCodec->mOutputFormat != mCodec->mLastOutputFormat && rangeLength > 0) {
+                // pretend that output format has changed on the first frame (we used to do this)
+                if (mCodec->mBaseOutputFormat == mCodec->mOutputFormat) {
+                    mCodec->onOutputFormatChanged(mCodec->mOutputFormat);
+                }
+                mCodec->addKeyFormatChangesToRenderBufferNotification(reply);
+                mCodec->sendFormatChange();
+            } else if (rangeLength > 0 && mCodec->mNativeWindow != NULL) {
+                // If potentially rendering onto a surface, always save key format data (crop &
+                // data space) so that we can set it if and once the buffer is rendered.
+                mCodec->addKeyFormatChangesToRenderBufferNotification(reply);
+            }
+
+            if (mCodec->usingMetadataOnEncoderOutput()) {
+                native_handle_t *handle = NULL;
+                VideoNativeHandleMetadata &nativeMeta =
+                    *(VideoNativeHandleMetadata *)info->mData->data();
+                if (info->mData->size() >= sizeof(nativeMeta)
+                        && nativeMeta.eType == kMetadataBufferTypeNativeHandleSource) {
+#ifdef OMX_ANDROID_COMPILE_AS_32BIT_ON_64BIT_PLATFORMS
+                    // handle is only valid on 32-bit/mediaserver process
+                    handle = NULL;
+#else
+                    handle = (native_handle_t *)nativeMeta.pHandle;
+#endif
+                }
+                info->mData->meta()->setPointer("handle", handle);
+                info->mData->meta()->setInt32("rangeOffset", rangeOffset);
+                info->mData->meta()->setInt32("rangeLength", rangeLength);
+            } else if (info->mData == info->mCodecData) {
+                info->mData->setRange(rangeOffset, rangeLength);
+            } else {
+                info->mCodecData->setRange(rangeOffset, rangeLength);
+                // in this case we know that mConverter is not null
+                status_t err = mCodec->mConverter[kPortIndexOutput]->convert(
+                        info->mCodecData, info->mData);
+                if (err != OK) {
+                    mCodec->signalError(OMX_ErrorUndefined, makeNoSideEffectStatus(err));
+                    return true;
+                }
+            }
+#if 0
+            if (mCodec->mNativeWindow == NULL) {
+                if (IsIDR(info->mData)) {
+                    ALOGI("IDR frame");
+                }
+            }
+#endif
+
+            if (mCodec->mSkipCutBuffer != NULL) {
+                mCodec->mSkipCutBuffer->submit(info->mData);
+            }
+            info->mData->meta()->setInt64("timeUs", timeUs);
+
+            sp<AMessage> notify = mCodec->mNotify->dup();
+            notify->setInt32("what", CodecBase::kWhatDrainThisBuffer);
+            notify->setInt32("buffer-id", info->mBufferID);
+            notify->setBuffer("buffer", info->mData);
+            notify->setInt32("flags", flags);
+
+            reply->setInt32("buffer-id", info->mBufferID);
+
+            notify->setMessage("reply", reply);
+
+            notify->post();
+
+            info->mStatus = BufferInfo::OWNED_BY_DOWNSTREAM;
+
+            if (flags & OMX_BUFFERFLAG_EOS) {
+                ALOGV("[%s] saw output EOS", mCodec->mComponentName.c_str());
+
+                sp<AMessage> notify = mCodec->mNotify->dup();
+                notify->setInt32("what", CodecBase::kWhatEOS);
+                notify->setInt32("err", mCodec->mInputEOSResult);
+                notify->post();
+
+                mCodec->mPortEOS[kPortIndexOutput] = true;
+            }
+            break;
+        }
+
+        case FREE_BUFFERS:
+            err = mCodec->freeBuffer(kPortIndexOutput, index);
+            if (err != OK) {
+                mCodec->signalError(OMX_ErrorUndefined, makeNoSideEffectStatus(err));
+                return true;
+            }
+            break;
+
+        default:
+            ALOGE("Invalid port mode: %d", mode);
+            return false;
+    }
+
+    return true;
+!!!40158519.cpp!!!	getMoreInputDataIfPossible() : void
+    if (mCodec->mPortEOS[kPortIndexInput]) {
+        return;
+    }
+
+    BufferInfo *eligible = NULL;
+
+    for (size_t i = 0; i < mCodec->mBuffers[kPortIndexInput].size(); ++i) {
+        BufferInfo *info = &mCodec->mBuffers[kPortIndexInput].editItemAt(i);
+
+#if 0
+        if (info->mStatus == BufferInfo::OWNED_BY_UPSTREAM) {
+            // There's already a "read" pending.
+            return;
+        }
+#endif
+
+        if (info->mStatus == BufferInfo::OWNED_BY_US) {
+            eligible = info;
+        }
+    }
+
+    if (eligible == NULL) {
+        return;
+    }
+
+    postFillThisBuffer(eligible);

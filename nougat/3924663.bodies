@@ -1,0 +1,251 @@
+class DeviceDiscoveryAction
+!!!42166839.java!!!	DeviceDiscoveryAction(inout source : HdmiCecLocalDevice, inout callback : DeviceDiscoveryAction::DeviceDiscoveryCallback)
+        super(source);
+        mCallback = Preconditions.checkNotNull(callback);
+!!!42166967.java!!!	start() : boolean
+        mDevices.clear();
+        mState = STATE_WAITING_FOR_DEVICE_POLLING;
+
+        pollDevices(new DevicePollingCallback() {
+            @Override
+            public void onPollingFinished(List<Integer> ackedAddress) {
+                if (ackedAddress.isEmpty()) {
+                    Slog.v(TAG, "No device is detected.");
+                    wrapUpAndFinish();
+                    return;
+                }
+
+                Slog.v(TAG, "Device detected: " + ackedAddress);
+                allocateDevices(ackedAddress);
+                startPhysicalAddressStage();
+            }
+        }, Constants.POLL_ITERATION_REVERSE_ORDER
+            | Constants.POLL_STRATEGY_REMOTES_DEVICES, HdmiConfig.DEVICE_POLLING_RETRY);
+        return true;
+!!!42167095.java!!!	allocateDevices(inout addresses : List<Integer>) : void
+        for (Integer i : addresses) {
+            DeviceInfo info = new DeviceInfo(i);
+            mDevices.add(info);
+        }
+!!!42167223.java!!!	startPhysicalAddressStage() : void
+        Slog.v(TAG, "Start [Physical Address Stage]:" + mDevices.size());
+        mProcessedDeviceCount = 0;
+        mState = STATE_WAITING_FOR_PHYSICAL_ADDRESS;
+
+        checkAndProceedStage();
+!!!42167351.java!!!	verifyValidLogicalAddress(in address : int) : boolean
+        return address >= Constants.ADDR_TV && address < Constants.ADDR_UNREGISTERED;
+!!!42167479.java!!!	queryPhysicalAddress(in address : int) : void
+        if (!verifyValidLogicalAddress(address)) {
+            checkAndProceedStage();
+            return;
+        }
+
+        mActionTimer.clearTimerMessage();
+
+        // Check cache first and send request if not exist.
+        if (mayProcessMessageIfCached(address, Constants.MESSAGE_REPORT_PHYSICAL_ADDRESS)) {
+            return;
+        }
+        sendCommand(HdmiCecMessageBuilder.buildGivePhysicalAddress(getSourceAddress(), address));
+        addTimer(mState, HdmiConfig.TIMEOUT_MS);
+!!!42167607.java!!!	startOsdNameStage() : void
+        Slog.v(TAG, "Start [Osd Name Stage]:" + mDevices.size());
+        mProcessedDeviceCount = 0;
+        mState = STATE_WAITING_FOR_OSD_NAME;
+
+        checkAndProceedStage();
+!!!42167735.java!!!	queryOsdName(in address : int) : void
+        if (!verifyValidLogicalAddress(address)) {
+            checkAndProceedStage();
+            return;
+        }
+
+        mActionTimer.clearTimerMessage();
+
+        if (mayProcessMessageIfCached(address, Constants.MESSAGE_SET_OSD_NAME)) {
+            return;
+        }
+        sendCommand(HdmiCecMessageBuilder.buildGiveOsdNameCommand(getSourceAddress(), address));
+        addTimer(mState, HdmiConfig.TIMEOUT_MS);
+!!!42167863.java!!!	startVendorIdStage() : void
+        Slog.v(TAG, "Start [Vendor Id Stage]:" + mDevices.size());
+
+        mProcessedDeviceCount = 0;
+        mState = STATE_WAITING_FOR_VENDOR_ID;
+
+        checkAndProceedStage();
+!!!42167991.java!!!	queryVendorId(in address : int) : void
+        if (!verifyValidLogicalAddress(address)) {
+            checkAndProceedStage();
+            return;
+        }
+
+        mActionTimer.clearTimerMessage();
+
+        if (mayProcessMessageIfCached(address, Constants.MESSAGE_DEVICE_VENDOR_ID)) {
+            return;
+        }
+        sendCommand(
+                HdmiCecMessageBuilder.buildGiveDeviceVendorIdCommand(getSourceAddress(), address));
+        addTimer(mState, HdmiConfig.TIMEOUT_MS);
+!!!42168119.java!!!	mayProcessMessageIfCached(in address : int, in opcode : int) : boolean
+        HdmiCecMessage message = getCecMessageCache().getMessage(address, opcode);
+        if (message != null) {
+            processCommand(message);
+            return true;
+        }
+        return false;
+!!!42168247.java!!!	processCommand(inout cmd : HdmiCecMessage) : boolean
+        switch (mState) {
+            case STATE_WAITING_FOR_PHYSICAL_ADDRESS:
+                if (cmd.getOpcode() == Constants.MESSAGE_REPORT_PHYSICAL_ADDRESS) {
+                    handleReportPhysicalAddress(cmd);
+                    return true;
+                }
+                return false;
+            case STATE_WAITING_FOR_OSD_NAME:
+                if (cmd.getOpcode() == Constants.MESSAGE_SET_OSD_NAME) {
+                    handleSetOsdName(cmd);
+                    return true;
+                }
+                return false;
+            case STATE_WAITING_FOR_VENDOR_ID:
+                if (cmd.getOpcode() == Constants.MESSAGE_DEVICE_VENDOR_ID) {
+                    handleVendorId(cmd);
+                    return true;
+                }
+                return false;
+            case STATE_WAITING_FOR_DEVICE_POLLING:
+                // Fall through.
+            default:
+                return false;
+        }
+!!!42168375.java!!!	handleReportPhysicalAddress(inout cmd : HdmiCecMessage) : void
+        Preconditions.checkState(mProcessedDeviceCount < mDevices.size());
+
+        DeviceInfo current = mDevices.get(mProcessedDeviceCount);
+        if (current.mLogicalAddress != cmd.getSource()) {
+            Slog.w(TAG, "Unmatched address[expected:" + current.mLogicalAddress + ", actual:" +
+                    cmd.getSource());
+            return;
+        }
+
+        byte params[] = cmd.getParams();
+        current.mPhysicalAddress = HdmiUtils.twoBytesToInt(params);
+        current.mPortId = getPortId(current.mPhysicalAddress);
+        current.mDeviceType = params[2] & 0xFF;
+
+        tv().updateCecSwitchInfo(current.mLogicalAddress, current.mDeviceType,
+                    current.mPhysicalAddress);
+
+        increaseProcessedDeviceCount();
+        checkAndProceedStage();
+!!!42168503.java!!!	getPortId(in physicalAddress : int) : int
+        return tv().getPortId(physicalAddress);
+!!!42168631.java!!!	handleSetOsdName(inout cmd : HdmiCecMessage) : void
+        Preconditions.checkState(mProcessedDeviceCount < mDevices.size());
+
+        DeviceInfo current = mDevices.get(mProcessedDeviceCount);
+        if (current.mLogicalAddress != cmd.getSource()) {
+            Slog.w(TAG, "Unmatched address[expected:" + current.mLogicalAddress + ", actual:" +
+                    cmd.getSource());
+            return;
+        }
+
+        String displayName = null;
+        try {
+            displayName = new String(cmd.getParams(), "US-ASCII");
+        } catch (UnsupportedEncodingException e) {
+            Slog.w(TAG, "Failed to decode display name: " + cmd.toString());
+            // If failed to get display name, use the default name of device.
+            displayName = HdmiUtils.getDefaultDeviceName(current.mLogicalAddress);
+        }
+        current.mDisplayName = displayName;
+        increaseProcessedDeviceCount();
+        checkAndProceedStage();
+!!!42168759.java!!!	handleVendorId(inout cmd : HdmiCecMessage) : void
+        Preconditions.checkState(mProcessedDeviceCount < mDevices.size());
+
+        DeviceInfo current = mDevices.get(mProcessedDeviceCount);
+        if (current.mLogicalAddress != cmd.getSource()) {
+            Slog.w(TAG, "Unmatched address[expected:" + current.mLogicalAddress + ", actual:" +
+                    cmd.getSource());
+            return;
+        }
+
+        byte[] params = cmd.getParams();
+        int vendorId = HdmiUtils.threeBytesToInt(params);
+        current.mVendorId = vendorId;
+        increaseProcessedDeviceCount();
+        checkAndProceedStage();
+!!!42168887.java!!!	increaseProcessedDeviceCount() : void
+        mProcessedDeviceCount++;
+        mTimeoutRetry = 0;
+!!!42169015.java!!!	removeDevice(in index : int) : void
+        mDevices.remove(index);
+!!!42169143.java!!!	wrapUpAndFinish() : void
+        Slog.v(TAG, "---------Wrap up Device Discovery:[" + mDevices.size() + "]---------");
+        ArrayList<HdmiDeviceInfo> result = new ArrayList<>();
+        for (DeviceInfo info : mDevices) {
+            HdmiDeviceInfo cecDeviceInfo = info.toHdmiDeviceInfo();
+            Slog.v(TAG, " DeviceInfo: " + cecDeviceInfo);
+            result.add(cecDeviceInfo);
+        }
+        Slog.v(TAG, "--------------------------------------------");
+        mCallback.onDeviceDiscoveryDone(result);
+        finish();
+        // Process any commands buffered while device discovery action was in progress.
+        tv().processAllDelayedMessages();
+!!!42169271.java!!!	checkAndProceedStage() : void
+        if (mDevices.isEmpty()) {
+            wrapUpAndFinish();
+            return;
+        }
+
+        // If finished current stage, move on to next stage.
+        if (mProcessedDeviceCount == mDevices.size()) {
+            mProcessedDeviceCount = 0;
+            switch (mState) {
+                case STATE_WAITING_FOR_PHYSICAL_ADDRESS:
+                    startOsdNameStage();
+                    return;
+                case STATE_WAITING_FOR_OSD_NAME:
+                    startVendorIdStage();
+                    return;
+                case STATE_WAITING_FOR_VENDOR_ID:
+                    wrapUpAndFinish();
+                    return;
+                default:
+                    return;
+            }
+        } else {
+            sendQueryCommand();
+        }
+!!!42169399.java!!!	sendQueryCommand() : void
+        int address = mDevices.get(mProcessedDeviceCount).mLogicalAddress;
+        switch (mState) {
+            case STATE_WAITING_FOR_PHYSICAL_ADDRESS:
+                queryPhysicalAddress(address);
+                return;
+            case STATE_WAITING_FOR_OSD_NAME:
+                queryOsdName(address);
+                return;
+            case STATE_WAITING_FOR_VENDOR_ID:
+                queryVendorId(address);
+            default:
+                return;
+        }
+!!!42169527.java!!!	handleTimerEvent(in state : int) : void
+        if (mState == STATE_NONE || mState != state) {
+            return;
+        }
+
+        if (++mTimeoutRetry < HdmiConfig.TIMEOUT_RETRY) {
+            sendQueryCommand();
+            return;
+        }
+        mTimeoutRetry = 0;
+        Slog.v(TAG, "Timeout[State=" + mState + ", Processed=" + mProcessedDeviceCount);
+        removeDevice(mProcessedDeviceCount);
+        checkAndProceedStage();

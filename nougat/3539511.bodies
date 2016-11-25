@@ -1,0 +1,96 @@
+class MidiEngine
+!!!39924151.cpp!!!	MidiEngine(in dataSource : sp<DataSource>, in fileMetadata : sp<MetaData>, in trackMetadata : sp<MetaData>)
+    mIoWrapper = new MidiIoWrapper(dataSource);
+    // spin up a new EAS engine
+    EAS_I32 temp;
+    EAS_RESULT result = EAS_Init(&mEasData);
+
+    if (result == EAS_SUCCESS) {
+        result = EAS_OpenFile(mEasData, mIoWrapper->getLocator(), &mEasHandle);
+    }
+    if (result == EAS_SUCCESS) {
+        result = EAS_Prepare(mEasData, mEasHandle);
+    }
+    if (result == EAS_SUCCESS) {
+        result = EAS_ParseMetaData(mEasData, mEasHandle, &temp);
+    }
+
+    if (result != EAS_SUCCESS) {
+        return;
+    }
+
+    if (fileMetadata != NULL) {
+        fileMetadata->setCString(kKeyMIMEType, MEDIA_MIMETYPE_AUDIO_MIDI);
+    }
+
+    if (trackMetadata != NULL) {
+        trackMetadata->setCString(kKeyMIMEType, MEDIA_MIMETYPE_AUDIO_RAW);
+        trackMetadata->setInt64(kKeyDuration, 1000ll * temp); // milli->micro
+        mEasConfig = EAS_Config();
+        trackMetadata->setInt32(kKeySampleRate, mEasConfig->sampleRate);
+        trackMetadata->setInt32(kKeyChannelCount, mEasConfig->numChannels);
+        trackMetadata->setInt32(kKeyPcmEncoding, kAudioEncodingPcm16bit);
+    }
+    mIsInitialized = true;
+!!!39924279.cpp!!!	~MidiEngine()
+    if (mEasHandle) {
+        EAS_CloseFile(mEasData, mEasHandle);
+    }
+    if (mEasData) {
+        EAS_Shutdown(mEasData);
+    }
+    delete mGroup;
+
+!!!39924407.cpp!!!	initCheck() : status_t
+    return mIsInitialized ? OK : UNKNOWN_ERROR;
+!!!39924535.cpp!!!	allocateBuffers() : status_t
+    // select reverb preset and enable
+    EAS_SetParameter(mEasData, EAS_MODULE_REVERB, EAS_PARAM_REVERB_PRESET, EAS_PARAM_REVERB_CHAMBER);
+    EAS_SetParameter(mEasData, EAS_MODULE_REVERB, EAS_PARAM_REVERB_BYPASS, EAS_FALSE);
+
+    mGroup = new MediaBufferGroup;
+    int bufsize = sizeof(EAS_PCM)
+            * mEasConfig->mixBufferSize * mEasConfig->numChannels * NUM_COMBINE_BUFFERS;
+    ALOGV("using %d byte buffer", bufsize);
+    mGroup->add_buffer(new MediaBuffer(bufsize));
+    return OK;
+!!!39924663.cpp!!!	releaseBuffers() : status_t
+    delete mGroup;
+    mGroup = NULL;
+    return OK;
+!!!39924791.cpp!!!	seekTo(in positionUs : int64_t) : status_t
+    ALOGV("seekTo %lld", (long long)positionUs);
+    EAS_RESULT result = EAS_Locate(mEasData, mEasHandle, positionUs / 1000, false);
+    return result == EAS_SUCCESS ? OK : UNKNOWN_ERROR;
+!!!39924919.cpp!!!	readBuffer() : MediaBuffer
+    EAS_STATE state;
+    EAS_State(mEasData, mEasHandle, &state);
+    if ((state == EAS_STATE_STOPPED) || (state == EAS_STATE_ERROR)) {
+        return NULL;
+    }
+    MediaBuffer *buffer;
+    status_t err = mGroup->acquire_buffer(&buffer);
+    if (err != OK) {
+        ALOGE("readBuffer: no buffer");
+        return NULL;
+    }
+    EAS_I32 timeMs;
+    EAS_GetLocation(mEasData, mEasHandle, &timeMs);
+    int64_t timeUs = 1000ll * timeMs;
+    buffer->meta_data()->setInt64(kKeyTime, timeUs);
+
+    EAS_PCM* p = (EAS_PCM*) buffer->data();
+    int numBytesOutput = 0;
+    for (int i = 0; i < NUM_COMBINE_BUFFERS; i++) {
+        EAS_I32 numRendered;
+        EAS_RESULT result = EAS_Render(mEasData, p, mEasConfig->mixBufferSize, &numRendered);
+        if (result != EAS_SUCCESS) {
+            ALOGE("EAS_Render returned %ld", result);
+            break;
+        }
+        p += numRendered * mEasConfig->numChannels;
+        numBytesOutput += numRendered * mEasConfig->numChannels * sizeof(EAS_PCM);
+    }
+    buffer->set_range(0, numBytesOutput);
+    ALOGV("readBuffer: returning %zd in buffer %p", buffer->range_length(), buffer);
+    return buffer;

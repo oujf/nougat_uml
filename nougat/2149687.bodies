@@ -1,0 +1,303 @@
+class SmsUsageMonitor
+!!!37783607.java!!!	mergeShortCodeCategories(in type1 : int, in type2 : int) : int
+        if (type1 > type2) return type1;
+        return type2;
+!!!37784375.java!!!	SmsUsageMonitor(inout context : Context)
+        mContext = context;
+        ContentResolver resolver = context.getContentResolver();
+
+        mMaxAllowed = Settings.Global.getInt(resolver,
+                Settings.Global.SMS_OUTGOING_CHECK_MAX_COUNT,
+                DEFAULT_SMS_MAX_COUNT);
+
+        mCheckPeriod = Settings.Global.getInt(resolver,
+                Settings.Global.SMS_OUTGOING_CHECK_INTERVAL_MS,
+                DEFAULT_SMS_CHECK_PERIOD);
+
+        mSettingsObserverHandler = new SettingsObserverHandler(mContext, mCheckEnabled);
+
+        loadPremiumSmsPolicyDb();
+!!!37784503.java!!!	getPatternMatcherFromFile(inout country : String) : SmsUsageMonitor::ShortCodePatternMatcher
+        FileReader patternReader = null;
+        XmlPullParser parser = null;
+        try {
+            patternReader = new FileReader(mPatternFile);
+            parser = Xml.newPullParser();
+            parser.setInput(patternReader);
+            return getPatternMatcherFromXmlParser(parser, country);
+        } catch (FileNotFoundException e) {
+            Rlog.e(TAG, "Short Code Pattern File not found");
+        } catch (XmlPullParserException e) {
+            Rlog.e(TAG, "XML parser exception reading short code pattern file", e);
+        } finally {
+            mPatternFileLastModified = mPatternFile.lastModified();
+            if (patternReader != null) {
+                try {
+                    patternReader.close();
+                } catch (IOException e) {}
+            }
+        }
+        return null;
+!!!37784631.java!!!	getPatternMatcherFromResource(inout country : String) : SmsUsageMonitor::ShortCodePatternMatcher
+        int id = com.android.internal.R.xml.sms_short_codes;
+        XmlResourceParser parser = null;
+        try {
+            parser = mContext.getResources().getXml(id);
+            return getPatternMatcherFromXmlParser(parser, country);
+        } finally {
+            if (parser != null) parser.close();
+        }
+!!!37784759.java!!!	getPatternMatcherFromXmlParser(inout parser : XmlPullParser, inout country : String) : SmsUsageMonitor::ShortCodePatternMatcher
+        try {
+            XmlUtils.beginDocument(parser, TAG_SHORTCODES);
+
+            while (true) {
+                XmlUtils.nextElement(parser);
+                String element = parser.getName();
+                if (element == null) {
+                    Rlog.e(TAG, "Parsing pattern data found null");
+                    break;
+                }
+
+                if (element.equals(TAG_SHORTCODE)) {
+                    String currentCountry = parser.getAttributeValue(null, ATTR_COUNTRY);
+                    if (VDBG) Rlog.d(TAG, "Found country " + currentCountry);
+                    if (country.equals(currentCountry)) {
+                        String pattern = parser.getAttributeValue(null, ATTR_PATTERN);
+                        String premium = parser.getAttributeValue(null, ATTR_PREMIUM);
+                        String free = parser.getAttributeValue(null, ATTR_FREE);
+                        String standard = parser.getAttributeValue(null, ATTR_STANDARD);
+                        return new ShortCodePatternMatcher(pattern, premium, free, standard);
+                    }
+                } else {
+                    Rlog.e(TAG, "Error: skipping unknown XML tag " + element);
+                }
+            }
+        } catch (XmlPullParserException e) {
+            Rlog.e(TAG, "XML parser exception reading short code patterns", e);
+        } catch (IOException e) {
+            Rlog.e(TAG, "I/O exception reading short code patterns", e);
+        }
+        if (DBG) Rlog.d(TAG, "Country (" + country + ") not found");
+        return null;    // country not found
+!!!37784887.java!!!	dispose() : void
+        mSmsStamp.clear();
+!!!37785015.java!!!	check(inout appName : String, in smsWaiting : int) : boolean
+        synchronized (mSmsStamp) {
+            removeExpiredTimestamps();
+
+            ArrayList<Long> sentList = mSmsStamp.get(appName);
+            if (sentList == null) {
+                sentList = new ArrayList<Long>();
+                mSmsStamp.put(appName, sentList);
+            }
+
+            return isUnderLimit(sentList, smsWaiting);
+        }
+!!!37785143.java!!!	checkDestination(inout destAddress : String, inout countryIso : String) : int
+        synchronized (mSettingsObserverHandler) {
+            // always allow emergency numbers
+            if (PhoneNumberUtils.isEmergencyNumber(destAddress, countryIso)) {
+                if (DBG) Rlog.d(TAG, "isEmergencyNumber");
+                return CATEGORY_NOT_SHORT_CODE;
+            }
+            // always allow if the feature is disabled
+            if (!mCheckEnabled.get()) {
+                if (DBG) Rlog.e(TAG, "check disabled");
+                return CATEGORY_NOT_SHORT_CODE;
+            }
+
+            if (countryIso != null) {
+                if (mCurrentCountry == null || !countryIso.equals(mCurrentCountry) ||
+                        mPatternFile.lastModified() != mPatternFileLastModified) {
+                    if (mPatternFile.exists()) {
+                        if (DBG) Rlog.d(TAG, "Loading SMS Short Code patterns from file");
+                        mCurrentPatternMatcher = getPatternMatcherFromFile(countryIso);
+                    } else {
+                        if (DBG) Rlog.d(TAG, "Loading SMS Short Code patterns from resource");
+                        mCurrentPatternMatcher = getPatternMatcherFromResource(countryIso);
+                    }
+                    mCurrentCountry = countryIso;
+                }
+            }
+
+            if (mCurrentPatternMatcher != null) {
+                return mCurrentPatternMatcher.getNumberCategory(destAddress);
+            } else {
+                // Generic rule: numbers of 5 digits or less are considered potential short codes
+                Rlog.e(TAG, "No patterns for \"" + countryIso + "\": using generic short code rule");
+                if (destAddress.length() <= 5) {
+                    return CATEGORY_POSSIBLE_PREMIUM_SHORT_CODE;
+                } else {
+                    return CATEGORY_NOT_SHORT_CODE;
+                }
+            }
+        }
+!!!37785271.java!!!	loadPremiumSmsPolicyDb() : void
+        synchronized (mPremiumSmsPolicy) {
+            if (mPolicyFile == null) {
+                File dir = new File(SMS_POLICY_FILE_DIRECTORY);
+                mPolicyFile = new AtomicFile(new File(dir, SMS_POLICY_FILE_NAME));
+
+                mPremiumSmsPolicy.clear();
+
+                FileInputStream infile = null;
+                try {
+                    infile = mPolicyFile.openRead();
+                    final XmlPullParser parser = Xml.newPullParser();
+                    parser.setInput(infile, StandardCharsets.UTF_8.name());
+
+                    XmlUtils.beginDocument(parser, TAG_SMS_POLICY_BODY);
+
+                    while (true) {
+                        XmlUtils.nextElement(parser);
+
+                        String element = parser.getName();
+                        if (element == null) break;
+
+                        if (element.equals(TAG_PACKAGE)) {
+                            String packageName = parser.getAttributeValue(null, ATTR_PACKAGE_NAME);
+                            String policy = parser.getAttributeValue(null, ATTR_PACKAGE_SMS_POLICY);
+                            if (packageName == null) {
+                                Rlog.e(TAG, "Error: missing package name attribute");
+                            } else if (policy == null) {
+                                Rlog.e(TAG, "Error: missing package policy attribute");
+                            } else try {
+                                mPremiumSmsPolicy.put(packageName, Integer.parseInt(policy));
+                            } catch (NumberFormatException e) {
+                                Rlog.e(TAG, "Error: non-numeric policy type " + policy);
+                            }
+                        } else {
+                            Rlog.e(TAG, "Error: skipping unknown XML tag " + element);
+                        }
+                    }
+                } catch (FileNotFoundException e) {
+                    // No data yet
+                } catch (IOException e) {
+                    Rlog.e(TAG, "Unable to read premium SMS policy database", e);
+                } catch (NumberFormatException e) {
+                    Rlog.e(TAG, "Unable to parse premium SMS policy database", e);
+                } catch (XmlPullParserException e) {
+                    Rlog.e(TAG, "Unable to parse premium SMS policy database", e);
+                } finally {
+                    if (infile != null) {
+                        try {
+                            infile.close();
+                        } catch (IOException ignored) {
+                        }
+                    }
+                }
+            }
+        }
+!!!37785399.java!!!	writePremiumSmsPolicyDb() : void
+        synchronized (mPremiumSmsPolicy) {
+            FileOutputStream outfile = null;
+            try {
+                outfile = mPolicyFile.startWrite();
+
+                XmlSerializer out = new FastXmlSerializer();
+                out.setOutput(outfile, StandardCharsets.UTF_8.name());
+
+                out.startDocument(null, true);
+
+                out.startTag(null, TAG_SMS_POLICY_BODY);
+
+                for (Map.Entry<String, Integer> policy : mPremiumSmsPolicy.entrySet()) {
+                    out.startTag(null, TAG_PACKAGE);
+                    out.attribute(null, ATTR_PACKAGE_NAME, policy.getKey());
+                    out.attribute(null, ATTR_PACKAGE_SMS_POLICY, policy.getValue().toString());
+                    out.endTag(null, TAG_PACKAGE);
+                }
+
+                out.endTag(null, TAG_SMS_POLICY_BODY);
+                out.endDocument();
+
+                mPolicyFile.finishWrite(outfile);
+            } catch (IOException e) {
+                Rlog.e(TAG, "Unable to write premium SMS policy database", e);
+                if (outfile != null) {
+                    mPolicyFile.failWrite(outfile);
+                }
+            }
+        }
+!!!37785527.java!!!	getPremiumSmsPermission(inout packageName : String) : int
+        checkCallerIsSystemOrPhoneOrSameApp(packageName);
+        synchronized (mPremiumSmsPolicy) {
+            Integer policy = mPremiumSmsPolicy.get(packageName);
+            if (policy == null) {
+                return PREMIUM_SMS_PERMISSION_UNKNOWN;
+            } else {
+                return policy;
+            }
+        }
+!!!37785655.java!!!	setPremiumSmsPermission(inout packageName : String, in permission : int) : void
+        checkCallerIsSystemOrPhoneApp();
+        if (permission < PREMIUM_SMS_PERMISSION_ASK_USER
+                || permission > PREMIUM_SMS_PERMISSION_ALWAYS_ALLOW) {
+            throw new IllegalArgumentException("invalid SMS permission type " + permission);
+        }
+        synchronized (mPremiumSmsPolicy) {
+            mPremiumSmsPolicy.put(packageName, permission);
+        }
+        // write policy file in the background
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                writePremiumSmsPolicyDb();
+            }
+        }).start();
+!!!37785783.java!!!	checkCallerIsSystemOrPhoneOrSameApp(inout pkg : String) : void
+        int uid = Binder.getCallingUid();
+        int appId = UserHandle.getAppId(uid);
+        if (appId == Process.SYSTEM_UID || appId == Process.PHONE_UID || uid == 0) {
+            return;
+        }
+        try {
+            ApplicationInfo ai = AppGlobals.getPackageManager().getApplicationInfo(
+                    pkg, 0, UserHandle.getCallingUserId());
+            if (!UserHandle.isSameApp(ai.uid, uid)) {
+                throw new SecurityException("Calling uid " + uid + " gave package"
+                        + pkg + " which is owned by uid " + ai.uid);
+            }
+        } catch (RemoteException re) {
+            throw new SecurityException("Unknown package " + pkg + "\n" + re);
+        }
+!!!37785911.java!!!	checkCallerIsSystemOrPhoneApp() : void
+        int uid = Binder.getCallingUid();
+        int appId = UserHandle.getAppId(uid);
+        if (appId == Process.SYSTEM_UID || appId == Process.PHONE_UID || uid == 0) {
+            return;
+        }
+        throw new SecurityException("Disallowed call for uid " + uid);
+!!!37786039.java!!!	removeExpiredTimestamps() : void
+        long beginCheckPeriod = System.currentTimeMillis() - mCheckPeriod;
+
+        synchronized (mSmsStamp) {
+            Iterator<Map.Entry<String, ArrayList<Long>>> iter = mSmsStamp.entrySet().iterator();
+            while (iter.hasNext()) {
+                Map.Entry<String, ArrayList<Long>> entry = iter.next();
+                ArrayList<Long> oldList = entry.getValue();
+                if (oldList.isEmpty() || oldList.get(oldList.size() - 1) < beginCheckPeriod) {
+                    iter.remove();
+                }
+            }
+        }
+!!!37786167.java!!!	isUnderLimit(inout sent : ArrayList<Long>, in smsWaiting : int) : boolean
+        Long ct = System.currentTimeMillis();
+        long beginCheckPeriod = ct - mCheckPeriod;
+
+        if (VDBG) log("SMS send size=" + sent.size() + " time=" + ct);
+
+        while (!sent.isEmpty() && sent.get(0) < beginCheckPeriod) {
+            sent.remove(0);
+        }
+
+        if ((sent.size() + smsWaiting) <= mMaxAllowed) {
+            for (int i = 0; i < smsWaiting; i++ ) {
+                sent.add(ct);
+            }
+            return true;
+        }
+        return false;
+!!!37786295.java!!!	log(inout msg : String) : void
+        Rlog.d(TAG, msg);

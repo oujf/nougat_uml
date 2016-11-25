@@ -1,0 +1,478 @@
+class TrustManagerService
+!!!42930487.java!!!	TrustManagerService(inout context : Context)
+        super(context);
+        mContext = context;
+        mUserManager = (UserManager) mContext.getSystemService(Context.USER_SERVICE);
+        mActivityManager = (ActivityManager) mContext.getSystemService(Context.ACTIVITY_SERVICE);
+        mLockPatternUtils = new LockPatternUtils(context);
+        mStrongAuthTracker = new StrongAuthTracker(context);
+!!!42930615.java!!!	onStart() : void
+        publishBinderService(Context.TRUST_SERVICE, mService);
+!!!42930743.java!!!	onBootPhase(in phase : int) : void
+        if (isSafeMode()) {
+            // No trust agents in safe mode.
+            return;
+        }
+        if (phase == SystemService.PHASE_SYSTEM_SERVICES_READY) {
+            mPackageMonitor.register(mContext, mHandler.getLooper(), UserHandle.ALL, true);
+            mReceiver.register(mContext);
+            mLockPatternUtils.registerStrongAuthTracker(mStrongAuthTracker);
+        } else if (phase == SystemService.PHASE_THIRD_PARTY_APPS_CAN_START) {
+            mTrustAgentsCanRun = true;
+            refreshAgentList(UserHandle.USER_ALL);
+        } else if (phase == SystemService.PHASE_BOOT_COMPLETED) {
+            maybeEnableFactoryTrustAgents(mLockPatternUtils, UserHandle.USER_SYSTEM);
+        }
+!!!42931127.java!!!	updateTrustAll() : void
+        List<UserInfo> userInfos = mUserManager.getUsers(true /* excludeDying */);
+        for (UserInfo userInfo : userInfos) {
+            updateTrust(userInfo.id, 0);
+        }
+!!!42931255.java!!!	updateTrust(in userId : int, in flags : int) : void
+        boolean managed = aggregateIsTrustManaged(userId);
+        dispatchOnTrustManagedChanged(managed, userId);
+        if (mStrongAuthTracker.isTrustAllowedForUser(userId)
+                && isTrustUsuallyManagedInternal(userId) != managed) {
+            updateTrustUsuallyManaged(userId, managed);
+        }
+        boolean trusted = aggregateIsTrusted(userId);
+        boolean changed;
+        synchronized (mUserIsTrusted) {
+            changed = mUserIsTrusted.get(userId) != trusted;
+            mUserIsTrusted.put(userId, trusted);
+        }
+        dispatchOnTrustChanged(trusted, userId, flags);
+        if (changed) {
+            refreshDeviceLockedForUser(userId);
+        }
+!!!42931383.java!!!	updateTrustUsuallyManaged(in userId : int, inout managed : boolean) : void
+        synchronized (mTrustUsuallyManagedForUser) {
+            mTrustUsuallyManagedForUser.put(userId, managed);
+        }
+        // Wait a few minutes before committing to flash, in case the trust agent is transiently not
+        // managing trust (crashed, needs to acknowledge DPM restrictions, etc).
+        mHandler.removeMessages(MSG_FLUSH_TRUST_USUALLY_MANAGED);
+        mHandler.sendMessageDelayed(
+                mHandler.obtainMessage(MSG_FLUSH_TRUST_USUALLY_MANAGED),
+                TRUST_USUALLY_MANAGED_FLUSH_DELAY);
+!!!42931511.java!!!	refreshAgentList(in userIdOrAll : int) : void
+        if (DEBUG) Slog.d(TAG, "refreshAgentList(" + userIdOrAll + ")");
+        if (!mTrustAgentsCanRun) {
+            return;
+        }
+        if (userIdOrAll != UserHandle.USER_ALL && userIdOrAll < UserHandle.USER_SYSTEM) {
+            Log.e(TAG, "refreshAgentList(userId=" + userIdOrAll + "): Invalid user handle,"
+                    + " must be USER_ALL or a specific user.", new Throwable("here"));
+            userIdOrAll = UserHandle.USER_ALL;
+        }
+        PackageManager pm = mContext.getPackageManager();
+
+        List<UserInfo> userInfos;
+        if (userIdOrAll == UserHandle.USER_ALL) {
+            userInfos = mUserManager.getUsers(true /* excludeDying */);
+        } else {
+            userInfos = new ArrayList<>();
+            userInfos.add(mUserManager.getUserInfo(userIdOrAll));
+        }
+        LockPatternUtils lockPatternUtils = mLockPatternUtils;
+
+        ArraySet<AgentInfo> obsoleteAgents = new ArraySet<>();
+        obsoleteAgents.addAll(mActiveAgents);
+
+        for (UserInfo userInfo : userInfos) {
+            if (userInfo == null || userInfo.partial || !userInfo.isEnabled()
+                    || userInfo.guestToRemove) continue;
+            if (!userInfo.supportsSwitchToByUser()) continue;
+            if (!StorageManager.isUserKeyUnlocked(userInfo.id)) continue;
+            if (!mActivityManager.isUserRunning(userInfo.id)) continue;
+            if (!lockPatternUtils.isSecure(userInfo.id)) continue;
+            if (!mStrongAuthTracker.canAgentsRunForUser(userInfo.id)) continue;
+            DevicePolicyManager dpm = lockPatternUtils.getDevicePolicyManager();
+            int disabledFeatures = dpm.getKeyguardDisabledFeatures(null, userInfo.id);
+            final boolean disableTrustAgents =
+                    (disabledFeatures & DevicePolicyManager.KEYGUARD_DISABLE_TRUST_AGENTS) != 0;
+
+            List<ComponentName> enabledAgents = lockPatternUtils.getEnabledTrustAgents(userInfo.id);
+            if (enabledAgents == null) {
+                continue;
+            }
+            List<ResolveInfo> resolveInfos = resolveAllowedTrustAgents(pm, userInfo.id);
+            for (ResolveInfo resolveInfo : resolveInfos) {
+                ComponentName name = getComponentName(resolveInfo);
+
+                if (!enabledAgents.contains(name)) continue;
+                if (disableTrustAgents) {
+                    List<PersistableBundle> config =
+                            dpm.getTrustAgentConfiguration(null /* admin */, name, userInfo.id);
+                    // Disable agent if no features are enabled.
+                    if (config == null || config.isEmpty()) continue;
+                }
+
+                AgentInfo agentInfo = new AgentInfo();
+                agentInfo.component = name;
+                agentInfo.userId = userInfo.id;
+                if (!mActiveAgents.contains(agentInfo)) {
+                    agentInfo.label = resolveInfo.loadLabel(pm);
+                    agentInfo.icon = resolveInfo.loadIcon(pm);
+                    agentInfo.settings = getSettingsComponentName(pm, resolveInfo);
+                    agentInfo.agent = new TrustAgentWrapper(mContext, this,
+                            new Intent().setComponent(name), userInfo.getUserHandle());
+                    mActiveAgents.add(agentInfo);
+                } else {
+                    obsoleteAgents.remove(agentInfo);
+                }
+            }
+        }
+
+        boolean trustMayHaveChanged = false;
+        for (int i = 0; i < obsoleteAgents.size(); i++) {
+            AgentInfo info = obsoleteAgents.valueAt(i);
+            if (userIdOrAll == UserHandle.USER_ALL || userIdOrAll == info.userId) {
+                if (info.agent.isManagingTrust()) {
+                    trustMayHaveChanged = true;
+                }
+                info.agent.destroy();
+                mActiveAgents.remove(info);
+            }
+        }
+
+        if (trustMayHaveChanged) {
+            if (userIdOrAll == UserHandle.USER_ALL) {
+                updateTrustAll();
+            } else {
+                updateTrust(userIdOrAll, 0);
+            }
+        }
+!!!42931639.java!!!	setDeviceLockedForUser(in userId : int, inout locked : boolean) : void
+        if (mLockPatternUtils.isSeparateProfileChallengeEnabled(userId)) {
+            synchronized (mDeviceLockedForUser) {
+                mDeviceLockedForUser.put(userId, locked);
+            }
+            if (locked) {
+                try {
+                    ActivityManagerNative.getDefault().notifyLockedProfile(userId);
+                } catch (RemoteException e) {
+                }
+            }
+        }
+!!!42931767.java!!!	isDeviceLockedInner(in userId : int) : boolean
+        synchronized (mDeviceLockedForUser) {
+            return mDeviceLockedForUser.get(userId, true);
+        }
+!!!42931895.java!!!	refreshDeviceLockedForUser(in userId : int) : void
+        if (userId != UserHandle.USER_ALL && userId < UserHandle.USER_SYSTEM) {
+            Log.e(TAG, "refreshDeviceLockedForUser(userId=" + userId + "): Invalid user handle,"
+                    + " must be USER_ALL or a specific user.", new Throwable("here"));
+            userId = UserHandle.USER_ALL;
+        }
+
+        List<UserInfo> userInfos;
+        if (userId == UserHandle.USER_ALL) {
+            userInfos = mUserManager.getUsers(true /* excludeDying */);
+        } else {
+            userInfos = new ArrayList<>();
+            userInfos.add(mUserManager.getUserInfo(userId));
+        }
+
+        IWindowManager wm = WindowManagerGlobal.getWindowManagerService();
+
+        for (int i = 0; i < userInfos.size(); i++) {
+            UserInfo info = userInfos.get(i);
+
+            if (info == null || info.partial || !info.isEnabled() || info.guestToRemove
+                    || !info.supportsSwitchToByUser()) {
+                continue;
+            }
+
+            int id = info.id;
+            boolean secure = mLockPatternUtils.isSecure(id);
+            boolean trusted = aggregateIsTrusted(id);
+            boolean showingKeyguard = true;
+            if (mCurrentUser == id) {
+                try {
+                    showingKeyguard = wm.isKeyguardLocked();
+                } catch (RemoteException e) {
+                }
+            }
+            boolean deviceLocked = secure && showingKeyguard && !trusted;
+
+            boolean changed;
+            synchronized (mDeviceLockedForUser) {
+                changed = isDeviceLockedInner(id) != deviceLocked;
+                mDeviceLockedForUser.put(id, deviceLocked);
+            }
+            if (changed) {
+                dispatchDeviceLocked(id, deviceLocked);
+            }
+        }
+!!!42932023.java!!!	dispatchDeviceLocked(in userId : int, inout isLocked : boolean) : void
+        for (int i = 0; i < mActiveAgents.size(); i++) {
+            AgentInfo agent = mActiveAgents.valueAt(i);
+            if (agent.userId == userId) {
+                if (isLocked) {
+                    agent.agent.onDeviceLocked();
+                } else{
+                    agent.agent.onDeviceUnlocked();
+                }
+            }
+        }
+!!!42932151.java!!!	updateDevicePolicyFeatures() : void
+        for (int i = 0; i < mActiveAgents.size(); i++) {
+            AgentInfo info = mActiveAgents.valueAt(i);
+            if (info.agent.isConnected()) {
+                info.agent.updateDevicePolicyFeatures();
+            }
+        }
+!!!42932279.java!!!	removeAgentsOfPackage(inout packageName : String) : void
+        boolean trustMayHaveChanged = false;
+        for (int i = mActiveAgents.size() - 1; i >= 0; i--) {
+            AgentInfo info = mActiveAgents.valueAt(i);
+            if (packageName.equals(info.component.getPackageName())) {
+                Log.i(TAG, "Resetting agent " + info.component.flattenToShortString());
+                if (info.agent.isManagingTrust()) {
+                    trustMayHaveChanged = true;
+                }
+                info.agent.destroy();
+                mActiveAgents.removeAt(i);
+            }
+        }
+        if (trustMayHaveChanged) {
+            updateTrustAll();
+        }
+!!!42932407.java!!!	resetAgent(inout name : ComponentName, in userId : int) : void
+        boolean trustMayHaveChanged = false;
+        for (int i = mActiveAgents.size() - 1; i >= 0; i--) {
+            AgentInfo info = mActiveAgents.valueAt(i);
+            if (name.equals(info.component) && userId == info.userId) {
+                Log.i(TAG, "Resetting agent " + info.component.flattenToShortString());
+                if (info.agent.isManagingTrust()) {
+                    trustMayHaveChanged = true;
+                }
+                info.agent.destroy();
+                mActiveAgents.removeAt(i);
+            }
+        }
+        if (trustMayHaveChanged) {
+            updateTrust(userId, 0);
+        }
+        refreshAgentList(userId);
+!!!42932535.java!!!	getSettingsComponentName(inout pm : PackageManager, inout resolveInfo : ResolveInfo) : ComponentName
+        if (resolveInfo == null || resolveInfo.serviceInfo == null
+                || resolveInfo.serviceInfo.metaData == null) return null;
+        String cn = null;
+        XmlResourceParser parser = null;
+        Exception caughtException = null;
+        try {
+            parser = resolveInfo.serviceInfo.loadXmlMetaData(pm,
+                    TrustAgentService.TRUST_AGENT_META_DATA);
+            if (parser == null) {
+                Slog.w(TAG, "Can't find " + TrustAgentService.TRUST_AGENT_META_DATA + " meta-data");
+                return null;
+            }
+            Resources res = pm.getResourcesForApplication(resolveInfo.serviceInfo.applicationInfo);
+            AttributeSet attrs = Xml.asAttributeSet(parser);
+            int type;
+            while ((type = parser.next()) != XmlPullParser.END_DOCUMENT
+                    && type != XmlPullParser.START_TAG) {
+                // Drain preamble.
+            }
+            String nodeName = parser.getName();
+            if (!"trust-agent".equals(nodeName)) {
+                Slog.w(TAG, "Meta-data does not start with trust-agent tag");
+                return null;
+            }
+            TypedArray sa = res
+                    .obtainAttributes(attrs, com.android.internal.R.styleable.TrustAgent);
+            cn = sa.getString(com.android.internal.R.styleable.TrustAgent_settingsActivity);
+            sa.recycle();
+        } catch (PackageManager.NameNotFoundException e) {
+            caughtException = e;
+        } catch (IOException e) {
+            caughtException = e;
+        } catch (XmlPullParserException e) {
+            caughtException = e;
+        } finally {
+            if (parser != null) parser.close();
+        }
+        if (caughtException != null) {
+            Slog.w(TAG, "Error parsing : " + resolveInfo.serviceInfo.packageName, caughtException);
+            return null;
+        }
+        if (cn == null) {
+            return null;
+        }
+        if (cn.indexOf('/') < 0) {
+            cn = resolveInfo.serviceInfo.packageName + "/" + cn;
+        }
+        return ComponentName.unflattenFromString(cn);
+!!!42932663.java!!!	getComponentName(inout resolveInfo : ResolveInfo) : ComponentName
+        if (resolveInfo == null || resolveInfo.serviceInfo == null) return null;
+        return new ComponentName(resolveInfo.serviceInfo.packageName, resolveInfo.serviceInfo.name);
+!!!42932791.java!!!	maybeEnableFactoryTrustAgents(inout utils : LockPatternUtils, in userId : int) : void
+        if (0 != Settings.Secure.getIntForUser(mContext.getContentResolver(),
+                Settings.Secure.TRUST_AGENTS_INITIALIZED, 0, userId)) {
+            return;
+        }
+        PackageManager pm = mContext.getPackageManager();
+        List<ResolveInfo> resolveInfos = resolveAllowedTrustAgents(pm, userId);
+        ArraySet<ComponentName> discoveredAgents = new ArraySet<>();
+        for (ResolveInfo resolveInfo : resolveInfos) {
+            ComponentName componentName = getComponentName(resolveInfo);
+            int applicationInfoFlags = resolveInfo.serviceInfo.applicationInfo.flags;
+            if ((applicationInfoFlags & ApplicationInfo.FLAG_SYSTEM) == 0) {
+                Log.i(TAG, "Leaving agent " + componentName + " disabled because package "
+                        + "is not a system package.");
+                continue;
+            }
+            discoveredAgents.add(componentName);
+        }
+
+        List<ComponentName> previouslyEnabledAgents = utils.getEnabledTrustAgents(userId);
+        if (previouslyEnabledAgents != null) {
+            discoveredAgents.addAll(previouslyEnabledAgents);
+        }
+        utils.setEnabledTrustAgents(discoveredAgents, userId);
+        Settings.Secure.putIntForUser(mContext.getContentResolver(),
+                Settings.Secure.TRUST_AGENTS_INITIALIZED, 1, userId);
+!!!42932919.java!!!	resolveAllowedTrustAgents(inout pm : PackageManager, in userId : int) : ResolveInfo
+        List<ResolveInfo> resolveInfos = pm.queryIntentServicesAsUser(TRUST_AGENT_INTENT,
+                PackageManager.MATCH_DIRECT_BOOT_AWARE | PackageManager.MATCH_DIRECT_BOOT_UNAWARE,
+                userId);
+        ArrayList<ResolveInfo> allowedAgents = new ArrayList<>(resolveInfos.size());
+        for (ResolveInfo resolveInfo : resolveInfos) {
+            if (resolveInfo.serviceInfo == null) continue;
+            if (resolveInfo.serviceInfo.applicationInfo == null) continue;
+            String packageName = resolveInfo.serviceInfo.packageName;
+            if (pm.checkPermission(PERMISSION_PROVIDE_AGENT, packageName)
+                    != PackageManager.PERMISSION_GRANTED) {
+                ComponentName name = getComponentName(resolveInfo);
+                Log.w(TAG, "Skipping agent " + name + " because package does not have"
+                        + " permission " + PERMISSION_PROVIDE_AGENT + ".");
+                continue;
+            }
+            allowedAgents.add(resolveInfo);
+        }
+        return allowedAgents;
+!!!42933047.java!!!	aggregateIsTrusted(in userId : int) : boolean
+        if (!mStrongAuthTracker.isTrustAllowedForUser(userId)) {
+            return false;
+        }
+        for (int i = 0; i < mActiveAgents.size(); i++) {
+            AgentInfo info = mActiveAgents.valueAt(i);
+            if (info.userId == userId) {
+                if (info.agent.isTrusted()) {
+                    return true;
+                }
+            }
+        }
+        return false;
+!!!42933175.java!!!	aggregateIsTrustManaged(in userId : int) : boolean
+        if (!mStrongAuthTracker.isTrustAllowedForUser(userId)) {
+            return false;
+        }
+        for (int i = 0; i < mActiveAgents.size(); i++) {
+            AgentInfo info = mActiveAgents.valueAt(i);
+            if (info.userId == userId) {
+                if (info.agent.isManagingTrust()) {
+                    return true;
+                }
+            }
+        }
+        return false;
+!!!42933303.java!!!	dispatchUnlockAttempt(inout successful : boolean, in userId : int) : void
+        if (successful) {
+            mStrongAuthTracker.allowTrustFromUnlock(userId);
+        }
+
+        for (int i = 0; i < mActiveAgents.size(); i++) {
+            AgentInfo info = mActiveAgents.valueAt(i);
+            if (info.userId == userId) {
+                info.agent.onUnlockAttempt(successful);
+            }
+        }
+!!!42933431.java!!!	addListener(inout listener : ITrustListener) : void
+        for (int i = 0; i < mTrustListeners.size(); i++) {
+            if (mTrustListeners.get(i).asBinder() == listener.asBinder()) {
+                return;
+            }
+        }
+        mTrustListeners.add(listener);
+        updateTrustAll();
+!!!42933559.java!!!	removeListener(inout listener : ITrustListener) : void
+        for (int i = 0; i < mTrustListeners.size(); i++) {
+            if (mTrustListeners.get(i).asBinder() == listener.asBinder()) {
+                mTrustListeners.remove(i);
+                return;
+            }
+        }
+!!!42933687.java!!!	dispatchOnTrustChanged(inout enabled : boolean, in userId : int, in flags : int) : void
+        if (DEBUG) {
+            Log.i(TAG, "onTrustChanged(" + enabled + ", " + userId + ", 0x"
+                    + Integer.toHexString(flags) + ")");
+        }
+        if (!enabled) flags = 0;
+        for (int i = 0; i < mTrustListeners.size(); i++) {
+            try {
+                mTrustListeners.get(i).onTrustChanged(enabled, userId, flags);
+            } catch (DeadObjectException e) {
+                Slog.d(TAG, "Removing dead TrustListener.");
+                mTrustListeners.remove(i);
+                i--;
+            } catch (RemoteException e) {
+                Slog.e(TAG, "Exception while notifying TrustListener.", e);
+            }
+        }
+!!!42933815.java!!!	dispatchOnTrustManagedChanged(inout managed : boolean, in userId : int) : void
+        if (DEBUG) {
+            Log.i(TAG, "onTrustManagedChanged(" + managed + ", " + userId + ")");
+        }
+        for (int i = 0; i < mTrustListeners.size(); i++) {
+            try {
+                mTrustListeners.get(i).onTrustManagedChanged(managed, userId);
+            } catch (DeadObjectException e) {
+                Slog.d(TAG, "Removing dead TrustListener.");
+                mTrustListeners.remove(i);
+                i--;
+            } catch (RemoteException e) {
+                Slog.e(TAG, "Exception while notifying TrustListener.", e);
+            }
+        }
+!!!42933943.java!!!	onStartUser(in userId : int) : void
+        mHandler.obtainMessage(MSG_START_USER, userId, 0, null).sendToTarget();
+!!!42934071.java!!!	onCleanupUser(in userId : int) : void
+        mHandler.obtainMessage(MSG_CLEANUP_USER, userId, 0, null).sendToTarget();
+!!!42934199.java!!!	onSwitchUser(in userId : int) : void
+        mHandler.obtainMessage(MSG_SWITCH_USER, userId, 0, null).sendToTarget();
+!!!42934327.java!!!	onUnlockUser(in userId : int) : void
+        mHandler.obtainMessage(MSG_UNLOCK_USER, userId, 0, null).sendToTarget();
+!!!42934455.java!!!	isTrustUsuallyManagedInternal(in userId : int) : boolean
+        synchronized (mTrustUsuallyManagedForUser) {
+            int i = mTrustUsuallyManagedForUser.indexOfKey(userId);
+            if (i >= 0) {
+                return mTrustUsuallyManagedForUser.valueAt(i);
+            }
+        }
+        // It's not in memory yet, get the value from persisted storage instead
+        boolean persistedValue = mLockPatternUtils.isTrustUsuallyManaged(userId);
+        synchronized (mTrustUsuallyManagedForUser) {
+            int i = mTrustUsuallyManagedForUser.indexOfKey(userId);
+            if (i >= 0) {
+                // Someone set the trust usually managed in the mean time. Better use that.
+                return mTrustUsuallyManagedForUser.valueAt(i);
+            } else {
+                // .. otherwise it's safe to cache the fetched value now.
+                mTrustUsuallyManagedForUser.put(userId, persistedValue);
+                return persistedValue;
+            }
+        }
+!!!42934583.java!!!	resolveProfileParent(in userId : int) : int
+        long identity = Binder.clearCallingIdentity();
+        try {
+            UserInfo parent = mUserManager.getProfileParent(userId);
+            if (parent != null) {
+                return parent.getUserHandle().getIdentifier();
+            }
+            return userId;
+        } finally {
+            Binder.restoreCallingIdentity(identity);
+        }

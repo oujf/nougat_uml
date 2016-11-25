@@ -1,0 +1,341 @@
+class UserSwitcherController
+!!!30700471.java!!!	UserSwitcherController(inout context : Context, inout keyguardMonitor : KeyguardMonitor, inout handler : Handler, inout activityStarter : ActivityStarter)
+        mContext = context;
+        mGuestResumeSessionReceiver.register(context);
+        mKeyguardMonitor = keyguardMonitor;
+        mHandler = handler;
+        mActivityStarter = activityStarter;
+        mUserManager = UserManager.get(context);
+        IntentFilter filter = new IntentFilter();
+        filter.addAction(Intent.ACTION_USER_ADDED);
+        filter.addAction(Intent.ACTION_USER_REMOVED);
+        filter.addAction(Intent.ACTION_USER_INFO_CHANGED);
+        filter.addAction(Intent.ACTION_USER_SWITCHED);
+        filter.addAction(Intent.ACTION_USER_STOPPED);
+        filter.addAction(Intent.ACTION_USER_UNLOCKED);
+        mContext.registerReceiverAsUser(mReceiver, UserHandle.SYSTEM, filter,
+                null /* permission */, null /* scheduler */);
+
+        mSecondaryUserServiceIntent = new Intent(context, SystemUISecondaryUserService.class);
+
+        filter = new IntentFilter();
+        filter.addAction(ACTION_REMOVE_GUEST);
+        filter.addAction(ACTION_LOGOUT_USER);
+        mContext.registerReceiverAsUser(mReceiver, UserHandle.SYSTEM, filter,
+                PERMISSION_SELF, null /* scheduler */);
+
+        mContext.getContentResolver().registerContentObserver(
+                Settings.Global.getUriFor(SIMPLE_USER_SWITCHER_GLOBAL_SETTING), true,
+                mSettingsObserver);
+        mContext.getContentResolver().registerContentObserver(
+                Settings.Global.getUriFor(Settings.Global.ADD_USERS_WHEN_LOCKED), true,
+                mSettingsObserver);
+        mContext.getContentResolver().registerContentObserver(
+                Settings.Global.getUriFor(
+                        Settings.Global.ALLOW_USER_SWITCHING_WHEN_SYSTEM_USER_LOCKED),
+                true, mSettingsObserver);
+        // Fetch initial values.
+        mSettingsObserver.onChange(false);
+
+        keyguardMonitor.addCallback(mCallback);
+        listenForCallState();
+
+        refreshUsers(UserHandle.USER_NULL);
+!!!30700599.java!!!	refreshUsers(in forcePictureLoadForId : int) : void
+        if (DEBUG) Log.d(TAG, "refreshUsers(forcePictureLoadForId=" + forcePictureLoadForId+")");
+        if (forcePictureLoadForId != UserHandle.USER_NULL) {
+            mForcePictureLoadForUserId.put(forcePictureLoadForId, true);
+        }
+
+        if (mPauseRefreshUsers) {
+            return;
+        }
+
+        boolean forceAllUsers = mForcePictureLoadForUserId.get(UserHandle.USER_ALL);
+        SparseArray<Bitmap> bitmaps = new SparseArray<>(mUsers.size());
+        final int N = mUsers.size();
+        for (int i = 0; i < N; i++) {
+            UserRecord r = mUsers.get(i);
+            if (r == null || r.picture == null || r.info == null || forceAllUsers
+                    || mForcePictureLoadForUserId.get(r.info.id)) {
+                continue;
+            }
+            bitmaps.put(r.info.id, r.picture);
+        }
+        mForcePictureLoadForUserId.clear();
+
+        final boolean addUsersWhenLocked = mAddUsersWhenLocked;
+        new AsyncTask<SparseArray<Bitmap>, Void, ArrayList<UserRecord>>() {
+            @SuppressWarnings("unchecked")
+            @Override
+            protected ArrayList<UserRecord> doInBackground(SparseArray<Bitmap>... params) {
+                final SparseArray<Bitmap> bitmaps = params[0];
+                List<UserInfo> infos = mUserManager.getUsers(true);
+                if (infos == null) {
+                    return null;
+                }
+                ArrayList<UserRecord> records = new ArrayList<>(infos.size());
+                int currentId = ActivityManager.getCurrentUser();
+                boolean canSwitchUsers = mUserManager.canSwitchUsers();
+                UserInfo currentUserInfo = null;
+                UserRecord guestRecord = null;
+
+                for (UserInfo info : infos) {
+                    boolean isCurrent = currentId == info.id;
+                    if (isCurrent) {
+                        currentUserInfo = info;
+                    }
+                    boolean switchToEnabled = canSwitchUsers || isCurrent;
+                    if (info.isEnabled()) {
+                        if (info.isGuest()) {
+                            // Tapping guest icon triggers remove and a user switch therefore
+                            // the icon shouldn't be enabled even if the user is current
+                            guestRecord = new UserRecord(info, null /* picture */,
+                                    true /* isGuest */, isCurrent, false /* isAddUser */,
+                                    false /* isRestricted */, canSwitchUsers);
+                        } else if (info.supportsSwitchToByUser()) {
+                            Bitmap picture = bitmaps.get(info.id);
+                            if (picture == null) {
+                                picture = mUserManager.getUserIcon(info.id);
+
+                                if (picture != null) {
+                                    int avatarSize = mContext.getResources()
+                                            .getDimensionPixelSize(R.dimen.max_avatar_size);
+                                    picture = Bitmap.createScaledBitmap(
+                                            picture, avatarSize, avatarSize, true);
+                                }
+                            }
+                            int index = isCurrent ? 0 : records.size();
+                            records.add(index, new UserRecord(info, picture, false /* isGuest */,
+                                    isCurrent, false /* isAddUser */, false /* isRestricted */,
+                                    switchToEnabled));
+                        }
+                    }
+                }
+
+                boolean systemCanCreateUsers = !mUserManager.hasBaseUserRestriction(
+                                UserManager.DISALLOW_ADD_USER, UserHandle.SYSTEM);
+                boolean currentUserCanCreateUsers = currentUserInfo != null
+                        && (currentUserInfo.isAdmin()
+                                || currentUserInfo.id == UserHandle.USER_SYSTEM)
+                        && systemCanCreateUsers;
+                boolean anyoneCanCreateUsers = systemCanCreateUsers && addUsersWhenLocked;
+                boolean canCreateGuest = (currentUserCanCreateUsers || anyoneCanCreateUsers)
+                        && guestRecord == null;
+                boolean canCreateUser = (currentUserCanCreateUsers || anyoneCanCreateUsers)
+                        && mUserManager.canAddMoreUsers();
+                boolean createIsRestricted = !addUsersWhenLocked;
+
+                if (!mSimpleUserSwitcher) {
+                    if (guestRecord == null) {
+                        if (canCreateGuest) {
+                            guestRecord = new UserRecord(null /* info */, null /* picture */,
+                                    true /* isGuest */, false /* isCurrent */,
+                                    false /* isAddUser */, createIsRestricted, canSwitchUsers);
+                            checkIfAddUserDisallowedByAdminOnly(guestRecord);
+                            records.add(guestRecord);
+                        }
+                    } else {
+                        int index = guestRecord.isCurrent ? 0 : records.size();
+                        records.add(index, guestRecord);
+                    }
+                }
+
+                if (!mSimpleUserSwitcher && canCreateUser) {
+                    UserRecord addUserRecord = new UserRecord(null /* info */, null /* picture */,
+                            false /* isGuest */, false /* isCurrent */, true /* isAddUser */,
+                            createIsRestricted, canSwitchUsers);
+                    checkIfAddUserDisallowedByAdminOnly(addUserRecord);
+                    records.add(addUserRecord);
+                }
+
+                return records;
+            }
+
+            @Override
+            protected void onPostExecute(ArrayList<UserRecord> userRecords) {
+                if (userRecords != null) {
+                    mUsers = userRecords;
+                    notifyAdapters();
+                }
+            }
+        }.execute((SparseArray) bitmaps);
+!!!30700727.java!!!	pauseRefreshUsers() : void
+        if (!mPauseRefreshUsers) {
+            mHandler.postDelayed(mUnpauseRefreshUsers, PAUSE_REFRESH_USERS_TIMEOUT_MS);
+            mPauseRefreshUsers = true;
+        }
+!!!30700855.java!!!	notifyAdapters() : void
+        for (int i = mAdapters.size() - 1; i >= 0; i--) {
+            BaseUserAdapter adapter = mAdapters.get(i).get();
+            if (adapter != null) {
+                adapter.notifyDataSetChanged();
+            } else {
+                mAdapters.remove(i);
+            }
+        }
+!!!30700983.java!!!	isSimpleUserSwitcher() : boolean
+        return mSimpleUserSwitcher;
+!!!30701111.java!!!	useFullscreenUserSwitcher() : boolean
+        // Use adb to override:
+        // adb shell settings put system enable_fullscreen_user_switcher 0  # Turn it off.
+        // adb shell settings put system enable_fullscreen_user_switcher 1  # Turn it on.
+        // Restart SystemUI or adb reboot.
+        final int DEFAULT = -1;
+        final int overrideUseFullscreenUserSwitcher =
+                Settings.System.getInt(mContext.getContentResolver(),
+                        "enable_fullscreen_user_switcher", DEFAULT);
+        if (overrideUseFullscreenUserSwitcher != DEFAULT) {
+            return overrideUseFullscreenUserSwitcher != 0;
+        }
+        // Otherwise default to the build setting.
+        return mContext.getResources().getBoolean(R.bool.config_enableFullscreenUserSwitcher);
+!!!30701239.java!!!	logoutCurrentUser() : void
+        int currentUser = ActivityManager.getCurrentUser();
+        if (currentUser != UserHandle.USER_SYSTEM) {
+            pauseRefreshUsers();
+            ActivityManager.logoutCurrentUser();
+        }
+!!!30701367.java!!!	removeUserId(in userId : int) : void
+        if (userId == UserHandle.USER_SYSTEM) {
+            Log.w(TAG, "User " + userId + " could not removed.");
+            return;
+        }
+        if (ActivityManager.getCurrentUser() == userId) {
+            switchToUserId(UserHandle.USER_SYSTEM);
+        }
+        if (mUserManager.removeUser(userId)) {
+            refreshUsers(UserHandle.USER_NULL);
+        }
+!!!30701495.java!!!	switchTo(inout record : UserSwitcherController::UserRecord) : void
+        int id;
+        if (record.isGuest && record.info == null) {
+            // No guest user. Create one.
+            UserInfo guest = mUserManager.createGuest(
+                    mContext, mContext.getString(R.string.guest_nickname));
+            if (guest == null) {
+                // Couldn't create guest, most likely because there already exists one, we just
+                // haven't reloaded the user list yet.
+                return;
+            }
+            id = guest.id;
+        } else if (record.isAddUser) {
+            showAddUserDialog();
+            return;
+        } else {
+            id = record.info.id;
+        }
+
+        if (ActivityManager.getCurrentUser() == id) {
+            if (record.isGuest) {
+                showExitGuestDialog(id);
+            }
+            return;
+        }
+
+        switchToUserId(id);
+!!!30701623.java!!!	switchTo(in userId : int) : void
+        final int count = mUsers.size();
+        for (int i = 0; i < count; ++i) {
+            UserRecord record = mUsers.get(i);
+            if (record.info != null && record.info.id == userId) {
+                switchTo(record);
+                return;
+            }
+        }
+
+        Log.e(TAG, "Couldn't switch to user, id=" + userId);
+!!!30701751.java!!!	switchToUserId(in id : int) : void
+        try {
+            pauseRefreshUsers();
+            ActivityManagerNative.getDefault().switchUser(id);
+        } catch (RemoteException e) {
+            Log.e(TAG, "Couldn't switch user.", e);
+        }
+!!!30701879.java!!!	showExitGuestDialog(in id : int) : void
+        if (mExitGuestDialog != null && mExitGuestDialog.isShowing()) {
+            mExitGuestDialog.cancel();
+        }
+        mExitGuestDialog = new ExitGuestDialog(mContext, id);
+        mExitGuestDialog.show();
+!!!30702007.java!!!	showAddUserDialog() : void
+        if (mAddUserDialog != null && mAddUserDialog.isShowing()) {
+            mAddUserDialog.cancel();
+        }
+        mAddUserDialog = new AddUserDialog(mContext);
+        mAddUserDialog.show();
+!!!30702135.java!!!	exitGuest(in id : int) : void
+        int newId = UserHandle.USER_SYSTEM;
+        if (mLastNonGuestUser != UserHandle.USER_SYSTEM) {
+            UserInfo info = mUserManager.getUserInfo(mLastNonGuestUser);
+            if (info != null && info.isEnabled() && info.supportsSwitchToByUser()) {
+                newId = info.id;
+            }
+        }
+        switchToUserId(newId);
+        mUserManager.removeUser(id);
+!!!30702263.java!!!	listenForCallState() : void
+        TelephonyManager.from(mContext).listen(new PhoneStateListener() {
+            private int mCallState;
+            @Override
+            public void onCallStateChanged(int state, String incomingNumber) {
+                if (mCallState == state) return;
+                if (DEBUG) Log.v(TAG, "Call state changed: " + state);
+                mCallState = state;
+                int currentUserId = ActivityManager.getCurrentUser();
+                UserInfo userInfo = mUserManager.getUserInfo(currentUserId);
+                if (userInfo != null && userInfo.isGuest()) {
+                    showGuestNotification(currentUserId);
+                }
+                refreshUsers(UserHandle.USER_NULL);
+            }
+        }, PhoneStateListener.LISTEN_CALL_STATE);
+!!!30702391.java!!!	showGuestNotification(in guestUserId : int) : void
+        boolean canSwitchUsers = mUserManager.canSwitchUsers();
+        // Disable 'Remove guest' action if cannot switch users right now
+        PendingIntent removeGuestPI = canSwitchUsers ? PendingIntent.getBroadcastAsUser(mContext,
+                0, new Intent(ACTION_REMOVE_GUEST), 0, UserHandle.SYSTEM) : null;
+
+        Notification.Builder builder = new Notification.Builder(mContext)
+                .setVisibility(Notification.VISIBILITY_SECRET)
+                .setPriority(Notification.PRIORITY_MIN)
+                .setSmallIcon(R.drawable.ic_person)
+                .setContentTitle(mContext.getString(R.string.guest_notification_title))
+                .setContentText(mContext.getString(R.string.guest_notification_text))
+                .setContentIntent(removeGuestPI)
+                .setShowWhen(false)
+                .addAction(R.drawable.ic_delete,
+                        mContext.getString(R.string.guest_notification_remove_action),
+                        removeGuestPI);
+        SystemUI.overrideNotificationAppName(mContext, builder);
+        NotificationManager.from(mContext).notifyAsUser(TAG_REMOVE_GUEST, ID_REMOVE_GUEST,
+                builder.build(), new UserHandle(guestUserId));
+!!!30702519.java!!!	dump(inout fd : FileDescriptor, inout pw : PrintWriter, inout args : String) : void
+        pw.println("UserSwitcherController state:");
+        pw.println("  mLastNonGuestUser=" + mLastNonGuestUser);
+        pw.print("  mUsers.size="); pw.println(mUsers.size());
+        for (int i = 0; i < mUsers.size(); i++) {
+            final UserRecord u = mUsers.get(i);
+            pw.print("    "); pw.println(u.toString());
+        }
+!!!30702647.java!!!	getCurrentUserName(inout context : Context) : String
+        if (mUsers.isEmpty()) return null;
+        UserRecord item = mUsers.get(0);
+        if (item == null || item.info == null) return null;
+        if (item.isGuest) return context.getString(R.string.guest_nickname);
+        return item.info.name;
+!!!30702775.java!!!	onDensityOrFontScaleChanged() : void
+        refreshUsers(UserHandle.USER_ALL);
+!!!30703927.java!!!	checkIfAddUserDisallowedByAdminOnly(inout record : UserSwitcherController::UserRecord) : void
+        EnforcedAdmin admin = RestrictedLockUtils.checkIfRestrictionEnforced(mContext,
+                UserManager.DISALLOW_ADD_USER, ActivityManager.getCurrentUser());
+        if (admin != null && !RestrictedLockUtils.hasBaseUserRestriction(mContext,
+                UserManager.DISALLOW_ADD_USER, ActivityManager.getCurrentUser())) {
+            record.isDisabledByAdmin = true;
+            record.enforcedAdmin = admin;
+        } else {
+            record.isDisabledByAdmin = false;
+            record.enforcedAdmin = null;
+        }
+!!!30704055.java!!!	startActivity(inout intent : Intent) : void
+        mActivityStarter.startActivity(intent, true);

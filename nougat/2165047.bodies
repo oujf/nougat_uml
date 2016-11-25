@@ -1,0 +1,1061 @@
+class ImsPhoneCallTracker
+!!!37995703.java!!!	ImsPhoneCallTracker(inout phone : ImsPhone)
+        this.mPhone = phone;
+
+        mEventLog = new TelephonyEventLog(mPhone.getPhoneId());
+
+        IntentFilter intentfilter = new IntentFilter();
+        intentfilter.addAction(ImsManager.ACTION_IMS_INCOMING_CALL);
+        intentfilter.addAction(CarrierConfigManager.ACTION_CARRIER_CONFIG_CHANGED);
+        mPhone.getContext().registerReceiver(mReceiver, intentfilter);
+        mAllowEmergencyVideoCalls = isEmergencyVtCallAllowed(mPhone.getSubId());
+
+        Thread t = new Thread() {
+            public void run() {
+                getImsService();
+            }
+        };
+        t.start();
+!!!37995831.java!!!	createIncomingCallPendingIntent() : PendingIntent
+        Intent intent = new Intent(ImsManager.ACTION_IMS_INCOMING_CALL);
+        intent.addFlags(Intent.FLAG_RECEIVER_FOREGROUND);
+        return PendingIntent.getBroadcast(mPhone.getContext(), 0, intent,
+                PendingIntent.FLAG_UPDATE_CURRENT);
+!!!37995959.java!!!	getImsService() : void
+        if (DBG) log("getImsService");
+        mImsManager = ImsManager.getInstance(mPhone.getContext(), mPhone.getPhoneId());
+        try {
+            mServiceId = mImsManager.open(ImsServiceClass.MMTEL,
+                    createIncomingCallPendingIntent(),
+                    mImsConnectionStateListener);
+
+            mImsManager.setImsConfigListener(mImsConfigListener);
+
+            // Get the ECBM interface and set IMSPhone's listener object for notifications
+            getEcbmInterface().setEcbmStateListener(mPhone.getImsEcbmStateListener());
+            if (mPhone.isInEcm()) {
+                // Call exit ECBM which will invoke onECBMExited
+                mPhone.exitEmergencyCallbackMode();
+            }
+            int mPreferredTtyMode = Settings.Secure.getInt(
+                mPhone.getContext().getContentResolver(),
+                Settings.Secure.PREFERRED_TTY_MODE,
+                Phone.TTY_MODE_OFF);
+           mImsManager.setUiTTYMode(mPhone.getContext(), mServiceId, mPreferredTtyMode, null);
+
+        } catch (ImsException e) {
+            loge("getImsService: " + e);
+            //Leave mImsManager as null, then CallStateException will be thrown when dialing
+            mImsManager = null;
+        }
+!!!37996087.java!!!	dispose() : void
+        if (DBG) log("dispose");
+        mRingingCall.dispose();
+        mBackgroundCall.dispose();
+        mForegroundCall.dispose();
+        mHandoverCall.dispose();
+
+        clearDisconnected();
+        mPhone.getContext().unregisterReceiver(mReceiver);
+!!!37996215.java!!!	finalize() : void
+        log("ImsPhoneCallTracker finalized");
+!!!37996343.java!!!	registerForVoiceCallStarted(inout h : Handler, in what : int, inout obj : Object) : void
+        Registrant r = new Registrant(h, what, obj);
+        mVoiceCallStartedRegistrants.add(r);
+!!!37996471.java!!!	unregisterForVoiceCallStarted(inout h : Handler) : void
+        mVoiceCallStartedRegistrants.remove(h);
+!!!37996599.java!!!	registerForVoiceCallEnded(inout h : Handler, in what : int, inout obj : Object) : void
+        Registrant r = new Registrant(h, what, obj);
+        mVoiceCallEndedRegistrants.add(r);
+!!!37996727.java!!!	unregisterForVoiceCallEnded(inout h : Handler) : void
+        mVoiceCallEndedRegistrants.remove(h);
+!!!37996855.java!!!	dial(inout dialString : String, in videoState : int, inout intentExtras : Bundle) : Connection
+        SharedPreferences sp = PreferenceManager.getDefaultSharedPreferences(mPhone.getContext());
+        int oirMode = sp.getInt(Phone.CLIR_KEY, CommandsInterface.CLIR_DEFAULT);
+        return dial(dialString, oirMode, videoState, intentExtras);
+!!!37996983.java!!!	dial(inout dialString : String, in clirMode : int, in videoState : int, inout intentExtras : Bundle) : Connection
+        boolean isPhoneInEcmMode = isPhoneInEcbMode();
+        boolean isEmergencyNumber = PhoneNumberUtils.isEmergencyNumber(dialString);
+
+        if (DBG) log("dial clirMode=" + clirMode);
+
+        // note that this triggers call state changed notif
+        clearDisconnected();
+
+        if (mImsManager == null) {
+            throw new CallStateException("service not available");
+        }
+
+        if (!canDial()) {
+            throw new CallStateException("cannot dial in current state");
+        }
+
+        if (isPhoneInEcmMode && isEmergencyNumber) {
+            handleEcmTimer(ImsPhone.CANCEL_ECM_TIMER);
+        }
+
+        // If the call is to an emergency number and the carrier does not support video emergency
+        // calls, dial as an audio-only call.
+        if (isEmergencyNumber && VideoProfile.isVideo(videoState) &&
+                !mAllowEmergencyVideoCalls) {
+            loge("dial: carrier does not support video emergency calls; downgrade to audio-only");
+            videoState = VideoProfile.STATE_AUDIO_ONLY;
+        }
+
+        boolean holdBeforeDial = false;
+
+        // The new call must be assigned to the foreground call.
+        // That call must be idle, so place anything that's
+        // there on hold
+        if (mForegroundCall.getState() == ImsPhoneCall.State.ACTIVE) {
+            if (mBackgroundCall.getState() != ImsPhoneCall.State.IDLE) {
+                //we should have failed in !canDial() above before we get here
+                throw new CallStateException("cannot dial in current state");
+            }
+            // foreground call is empty for the newly dialed connection
+            holdBeforeDial = true;
+            // Cache the video state for pending MO call.
+            mPendingCallVideoState = videoState;
+            mPendingIntentExtras = intentExtras;
+            switchWaitingOrHoldingAndActive();
+        }
+
+        ImsPhoneCall.State fgState = ImsPhoneCall.State.IDLE;
+        ImsPhoneCall.State bgState = ImsPhoneCall.State.IDLE;
+
+        mClirMode = clirMode;
+
+        synchronized (mSyncHold) {
+            if (holdBeforeDial) {
+                fgState = mForegroundCall.getState();
+                bgState = mBackgroundCall.getState();
+
+                //holding foreground call failed
+                if (fgState == ImsPhoneCall.State.ACTIVE) {
+                    throw new CallStateException("cannot dial in current state");
+                }
+
+                //holding foreground call succeeded
+                if (bgState == ImsPhoneCall.State.HOLDING) {
+                    holdBeforeDial = false;
+                }
+            }
+
+            mPendingMO = new ImsPhoneConnection(mPhone,
+                    checkForTestEmergencyNumber(dialString), this, mForegroundCall,
+                    isEmergencyNumber);
+            mPendingMO.setVideoState(videoState);
+        }
+        addConnection(mPendingMO);
+
+        if (!holdBeforeDial) {
+            if ((!isPhoneInEcmMode) || (isPhoneInEcmMode && isEmergencyNumber)) {
+                dialInternal(mPendingMO, clirMode, videoState, intentExtras);
+            } else {
+                try {
+                    getEcbmInterface().exitEmergencyCallbackMode();
+                } catch (ImsException e) {
+                    e.printStackTrace();
+                    throw new CallStateException("service not available");
+                }
+                mPhone.setOnEcbModeExitResponse(this, EVENT_EXIT_ECM_RESPONSE_CDMA, null);
+                pendingCallClirMode = clirMode;
+                mPendingCallVideoState = videoState;
+                pendingCallInEcm = true;
+            }
+        }
+
+        updatePhoneState();
+        mPhone.notifyPreciseCallStateChanged();
+
+        return mPendingMO;
+!!!37997111.java!!!	isEmergencyVtCallAllowed(in subId : int) : boolean
+        CarrierConfigManager carrierConfigManager = (CarrierConfigManager)
+                mPhone.getContext().getSystemService(Context.CARRIER_CONFIG_SERVICE);
+        if (carrierConfigManager == null) {
+            loge("isEmergencyVideoCallsSupported: No carrier config service found.");
+            return false;
+        }
+
+        PersistableBundle carrierConfig = carrierConfigManager.getConfigForSubId(subId);
+        if (carrierConfig == null) {
+            loge("isEmergencyVideoCallsSupported: Empty carrier config.");
+            return false;
+        }
+
+        return carrierConfig.getBoolean(CarrierConfigManager.KEY_ALLOW_EMERGENCY_VIDEO_CALLS_BOOL);
+!!!37997239.java!!!	handleEcmTimer(in action : int) : void
+        mPhone.handleTimerInEmergencyCallbackMode(action);
+        switch (action) {
+            case ImsPhone.CANCEL_ECM_TIMER:
+                break;
+            case ImsPhone.RESTART_ECM_TIMER:
+                break;
+            default:
+                log("handleEcmTimer, unsupported action " + action);
+        }
+!!!37997367.java!!!	dialInternal(inout conn : ImsPhoneConnection, in clirMode : int, in videoState : int, inout intentExtras : Bundle) : void
+
+        if (conn == null) {
+            return;
+        }
+
+        if (conn.getAddress()== null || conn.getAddress().length() == 0
+                || conn.getAddress().indexOf(PhoneNumberUtils.WILD) >= 0) {
+            // Phone number is invalid
+            conn.setDisconnectCause(DisconnectCause.INVALID_NUMBER);
+            sendEmptyMessageDelayed(EVENT_HANGUP_PENDINGMO, TIMEOUT_HANGUP_PENDINGMO);
+            return;
+        }
+
+        // Always unmute when initiating a new call
+        setMute(false);
+        int serviceType = PhoneNumberUtils.isEmergencyNumber(conn.getAddress()) ?
+                ImsCallProfile.SERVICE_TYPE_EMERGENCY : ImsCallProfile.SERVICE_TYPE_NORMAL;
+        int callType = ImsCallProfile.getCallTypeFromVideoState(videoState);
+        //TODO(vt): Is this sufficient?  At what point do we know the video state of the call?
+        conn.setVideoState(videoState);
+
+        try {
+            String[] callees = new String[] { conn.getAddress() };
+            ImsCallProfile profile = mImsManager.createCallProfile(mServiceId,
+                    serviceType, callType);
+            profile.setCallExtraInt(ImsCallProfile.EXTRA_OIR, clirMode);
+
+            // Translate call subject intent-extra from Telecom-specific extra key to the
+            // ImsCallProfile key.
+            if (intentExtras != null) {
+                if (intentExtras.containsKey(android.telecom.TelecomManager.EXTRA_CALL_SUBJECT)) {
+                    intentExtras.putString(ImsCallProfile.EXTRA_DISPLAY_TEXT,
+                            cleanseInstantLetteringMessage(intentExtras.getString(
+                                    android.telecom.TelecomManager.EXTRA_CALL_SUBJECT))
+                    );
+                }
+
+                // Pack the OEM-specific call extras.
+                profile.mCallExtras.putBundle(ImsCallProfile.EXTRA_OEM_EXTRAS, intentExtras);
+
+                // NOTE: Extras to be sent over the network are packed into the
+                // intentExtras individually, with uniquely defined keys.
+                // These key-value pairs are processed by IMS Service before
+                // being sent to the lower layers/to the network.
+            }
+
+            ImsCall imsCall = mImsManager.makeCall(mServiceId, profile,
+                    callees, mImsCallListener);
+            conn.setImsCall(imsCall);
+
+            mEventLog.writeOnImsCallStart(imsCall.getSession(), callees[0]);
+
+            setVideoCallProvider(conn, imsCall);
+        } catch (ImsException e) {
+            loge("dialInternal : " + e);
+            conn.setDisconnectCause(DisconnectCause.ERROR_UNSPECIFIED);
+            sendEmptyMessageDelayed(EVENT_HANGUP_PENDINGMO, TIMEOUT_HANGUP_PENDINGMO);
+        } catch (RemoteException e) {
+        }
+!!!37997495.java!!!	acceptCall(in videoState : int) : void
+        if (DBG) log("acceptCall");
+
+        if (mForegroundCall.getState().isAlive()
+                && mBackgroundCall.getState().isAlive()) {
+            throw new CallStateException("cannot accept call");
+        }
+
+        if ((mRingingCall.getState() == ImsPhoneCall.State.WAITING)
+                && mForegroundCall.getState().isAlive()) {
+            setMute(false);
+            // Cache video state for pending MT call.
+            mPendingCallVideoState = videoState;
+            switchWaitingOrHoldingAndActive();
+        } else if (mRingingCall.getState().isRinging()) {
+            if (DBG) log("acceptCall: incoming...");
+            // Always unmute when answering a new call
+            setMute(false);
+            try {
+                ImsCall imsCall = mRingingCall.getImsCall();
+                if (imsCall != null) {
+                    imsCall.accept(ImsCallProfile.getCallTypeFromVideoState(videoState));
+                    mEventLog.writeOnImsCallAccept(imsCall.getSession());
+                } else {
+                    throw new CallStateException("no valid ims call");
+                }
+            } catch (ImsException e) {
+                throw new CallStateException("cannot accept call");
+            }
+        } else {
+            throw new CallStateException("phone not ringing");
+        }
+!!!37997623.java!!!	rejectCall() : void
+        if (DBG) log("rejectCall");
+
+        if (mRingingCall.getState().isRinging()) {
+            hangup(mRingingCall);
+        } else {
+            throw new CallStateException("phone not ringing");
+        }
+!!!37997751.java!!!	switchAfterConferenceSuccess() : void
+        if (DBG) log("switchAfterConferenceSuccess fg =" + mForegroundCall.getState() +
+                ", bg = " + mBackgroundCall.getState());
+
+        if (mBackgroundCall.getState() == ImsPhoneCall.State.HOLDING) {
+            log("switchAfterConferenceSuccess");
+            mForegroundCall.switchWith(mBackgroundCall);
+        }
+!!!37997879.java!!!	switchWaitingOrHoldingAndActive() : void
+        if (DBG) log("switchWaitingOrHoldingAndActive");
+
+        if (mRingingCall.getState() == ImsPhoneCall.State.INCOMING) {
+            throw new CallStateException("cannot be in the incoming state");
+        }
+
+        if (mForegroundCall.getState() == ImsPhoneCall.State.ACTIVE) {
+            ImsCall imsCall = mForegroundCall.getImsCall();
+            if (imsCall == null) {
+                throw new CallStateException("no ims call");
+            }
+
+            // Swap the ImsCalls pointed to by the foreground and background ImsPhoneCalls.
+            // If hold or resume later fails, we will swap them back.
+            mSwitchingFgAndBgCalls = true;
+            mCallExpectedToResume = mBackgroundCall.getImsCall();
+            mForegroundCall.switchWith(mBackgroundCall);
+
+            // Hold the foreground call; once the foreground call is held, the background call will
+            // be resumed.
+            try {
+                imsCall.hold();
+                mEventLog.writeOnImsCallHold(imsCall.getSession());
+
+                // If there is no background call to resume, then don't expect there to be a switch.
+                if (mCallExpectedToResume == null) {
+                    mSwitchingFgAndBgCalls = false;
+                }
+            } catch (ImsException e) {
+                mForegroundCall.switchWith(mBackgroundCall);
+                throw new CallStateException(e.getMessage());
+            }
+        } else if (mBackgroundCall.getState() == ImsPhoneCall.State.HOLDING) {
+            resumeWaitingOrHolding();
+        }
+!!!37998007.java!!!	conference() : void
+        if (DBG) log("conference");
+
+        ImsCall fgImsCall = mForegroundCall.getImsCall();
+        if (fgImsCall == null) {
+            log("conference no foreground ims call");
+            return;
+        }
+
+        ImsCall bgImsCall = mBackgroundCall.getImsCall();
+        if (bgImsCall == null) {
+            log("conference no background ims call");
+            return;
+        }
+
+        // Keep track of the connect time of the earliest call so that it can be set on the
+        // {@code ImsConference} when it is created.
+        long foregroundConnectTime = mForegroundCall.getEarliestConnectTime();
+        long backgroundConnectTime = mBackgroundCall.getEarliestConnectTime();
+        long conferenceConnectTime;
+        if (foregroundConnectTime > 0 && backgroundConnectTime > 0) {
+            conferenceConnectTime = Math.min(mForegroundCall.getEarliestConnectTime(),
+                    mBackgroundCall.getEarliestConnectTime());
+            log("conference - using connect time = " + conferenceConnectTime);
+        } else if (foregroundConnectTime > 0) {
+            log("conference - bg call connect time is 0; using fg = " + foregroundConnectTime);
+            conferenceConnectTime = foregroundConnectTime;
+        } else {
+            log("conference - fg call connect time is 0; using bg = " + backgroundConnectTime);
+            conferenceConnectTime = backgroundConnectTime;
+        }
+
+        ImsPhoneConnection foregroundConnection = mForegroundCall.getFirstConnection();
+        if (foregroundConnection != null) {
+            foregroundConnection.setConferenceConnectTime(conferenceConnectTime);
+        }
+
+        try {
+            fgImsCall.merge(bgImsCall);
+        } catch (ImsException e) {
+            log("conference " + e.getMessage());
+        }
+!!!37998135.java!!!	explicitCallTransfer() : void
+        //TODO : implement
+!!!37998263.java!!!	clearDisconnected() : void
+        if (DBG) log("clearDisconnected");
+
+        internalClearDisconnected();
+
+        updatePhoneState();
+        mPhone.notifyPreciseCallStateChanged();
+!!!37998391.java!!!	canConference() : boolean
+        return mForegroundCall.getState() == ImsPhoneCall.State.ACTIVE
+            && mBackgroundCall.getState() == ImsPhoneCall.State.HOLDING
+            && !mBackgroundCall.isFull()
+            && !mForegroundCall.isFull();
+!!!37998519.java!!!	canDial() : boolean
+        boolean ret;
+        int serviceState = mPhone.getServiceState().getState();
+        String disableCall = SystemProperties.get(
+                TelephonyProperties.PROPERTY_DISABLE_CALL, "false");
+
+        ret = (serviceState != ServiceState.STATE_POWER_OFF)
+            && mPendingMO == null
+            && !mRingingCall.isRinging()
+            && !disableCall.equals("true")
+            && (!mForegroundCall.getState().isAlive()
+                    || !mBackgroundCall.getState().isAlive());
+
+        return ret;
+!!!37998647.java!!!	canTransfer() : boolean
+        return mForegroundCall.getState() == ImsPhoneCall.State.ACTIVE
+            && mBackgroundCall.getState() == ImsPhoneCall.State.HOLDING;
+!!!37998775.java!!!	internalClearDisconnected() : void
+        mRingingCall.clearDisconnected();
+        mForegroundCall.clearDisconnected();
+        mBackgroundCall.clearDisconnected();
+        mHandoverCall.clearDisconnected();
+!!!37998903.java!!!	updatePhoneState() : void
+        PhoneConstants.State oldState = mState;
+
+        if (mRingingCall.isRinging()) {
+            mState = PhoneConstants.State.RINGING;
+        } else if (mPendingMO != null ||
+                !(mForegroundCall.isIdle() && mBackgroundCall.isIdle())) {
+            mState = PhoneConstants.State.OFFHOOK;
+        } else {
+            mState = PhoneConstants.State.IDLE;
+        }
+
+        if (mState == PhoneConstants.State.IDLE && oldState != mState) {
+            mVoiceCallEndedRegistrants.notifyRegistrants(
+                    new AsyncResult(null, null, null));
+        } else if (oldState == PhoneConstants.State.IDLE && oldState != mState) {
+            mVoiceCallStartedRegistrants.notifyRegistrants (
+                    new AsyncResult(null, null, null));
+        }
+
+        if (DBG) log("updatePhoneState oldState=" + oldState + ", newState=" + mState);
+
+        if (mState != oldState) {
+            mPhone.notifyPhoneStateChanged();
+            mEventLog.writePhoneState(mState);
+        }
+!!!37999031.java!!!	handleRadioNotAvailable() : void
+        // handlePollCalls will clear out its
+        // call list when it gets the CommandException
+        // error result from this
+        pollCallsWhenSafe();
+!!!37999159.java!!!	dumpState() : void
+        List l;
+
+        log("Phone State:" + mState);
+
+        log("Ringing call: " + mRingingCall.toString());
+
+        l = mRingingCall.getConnections();
+        for (int i = 0, s = l.size(); i < s; i++) {
+            log(l.get(i).toString());
+        }
+
+        log("Foreground call: " + mForegroundCall.toString());
+
+        l = mForegroundCall.getConnections();
+        for (int i = 0, s = l.size(); i < s; i++) {
+            log(l.get(i).toString());
+        }
+
+        log("Background call: " + mBackgroundCall.toString());
+
+        l = mBackgroundCall.getConnections();
+        for (int i = 0, s = l.size(); i < s; i++) {
+            log(l.get(i).toString());
+        }
+
+!!!37999287.java!!!	setUiTTYMode(in uiTtyMode : int, inout onComplete : Message) : void
+        try {
+            mImsManager.setUiTTYMode(mPhone.getContext(), mServiceId, uiTtyMode, onComplete);
+        } catch (ImsException e) {
+            loge("setTTYMode : " + e);
+            mPhone.sendErrorResponse(onComplete, e);
+        }
+!!!37999415.java!!!	setMute(inout mute : boolean) : void
+        mDesiredMute = mute;
+        mForegroundCall.setMute(mute);
+!!!37999543.java!!!	getMute() : boolean
+        return mDesiredMute;
+!!!37999671.java!!!	sendDtmf(in c : char, inout result : Message) : void
+        if (DBG) log("sendDtmf");
+
+        ImsCall imscall = mForegroundCall.getImsCall();
+        if (imscall != null) {
+            imscall.sendDtmf(c, result);
+        }
+!!!37999799.java!!!	startDtmf(in c : char) : void
+        if (DBG) log("startDtmf");
+
+        ImsCall imscall = mForegroundCall.getImsCall();
+        if (imscall != null) {
+            imscall.startDtmf(c);
+        } else {
+            loge("startDtmf : no foreground call");
+        }
+!!!37999927.java!!!	stopDtmf() : void
+        if (DBG) log("stopDtmf");
+
+        ImsCall imscall = mForegroundCall.getImsCall();
+        if (imscall != null) {
+            imscall.stopDtmf();
+        } else {
+            loge("stopDtmf : no foreground call");
+        }
+!!!38000055.java!!!	hangup(inout conn : ImsPhoneConnection) : void
+        if (DBG) log("hangup connection");
+
+        if (conn.getOwner() != this) {
+            throw new CallStateException ("ImsPhoneConnection " + conn
+                    + "does not belong to ImsPhoneCallTracker " + this);
+        }
+
+        hangup(conn.getCall());
+!!!38000183.java!!!	hangup(inout call : ImsPhoneCall) : void
+        if (DBG) log("hangup call");
+
+        if (call.getConnections().size() == 0) {
+            throw new CallStateException("no connections");
+        }
+
+        ImsCall imsCall = call.getImsCall();
+        boolean rejectCall = false;
+
+        if (call == mRingingCall) {
+            if (Phone.DEBUG_PHONE) log("(ringing) hangup incoming");
+            rejectCall = true;
+        } else if (call == mForegroundCall) {
+            if (call.isDialingOrAlerting()) {
+                if (Phone.DEBUG_PHONE) {
+                    log("(foregnd) hangup dialing or alerting...");
+                }
+            } else {
+                if (Phone.DEBUG_PHONE) {
+                    log("(foregnd) hangup foreground");
+                }
+                //held call will be resumed by onCallTerminated
+            }
+        } else if (call == mBackgroundCall) {
+            if (Phone.DEBUG_PHONE) {
+                log("(backgnd) hangup waiting or background");
+            }
+        } else {
+            throw new CallStateException ("ImsPhoneCall " + call +
+                    "does not belong to ImsPhoneCallTracker " + this);
+        }
+
+        call.onHangupLocal();
+
+        try {
+            if (imsCall != null) {
+                if (rejectCall) {
+                    imsCall.reject(ImsReasonInfo.CODE_USER_DECLINE);
+                    mEventLog.writeOnImsCallReject(imsCall.getSession());
+                } else {
+                    imsCall.terminate(ImsReasonInfo.CODE_USER_TERMINATED);
+                    mEventLog.writeOnImsCallTerminate(imsCall.getSession());
+                }
+            } else if (mPendingMO != null && call == mForegroundCall) {
+                // is holding a foreground call
+                mPendingMO.update(null, ImsPhoneCall.State.DISCONNECTED);
+                mPendingMO.onDisconnect();
+                removeConnection(mPendingMO);
+                mPendingMO = null;
+                updatePhoneState();
+                removeMessages(EVENT_DIAL_PENDINGMO);
+            }
+        } catch (ImsException e) {
+            throw new CallStateException(e.getMessage());
+        }
+
+        mPhone.notifyPreciseCallStateChanged();
+!!!38000311.java!!!	callEndCleanupHandOverCallIfAny() : void
+        if (mHandoverCall.mConnections.size() > 0) {
+            if (DBG) log("callEndCleanupHandOverCallIfAny, mHandoverCall.mConnections="
+                    + mHandoverCall.mConnections);
+            mHandoverCall.mConnections.clear();
+            mState = PhoneConstants.State.IDLE;
+        }
+!!!38000439.java!!!	resumeWaitingOrHolding() : void
+        if (DBG) log("resumeWaitingOrHolding");
+
+        try {
+            if (mForegroundCall.getState().isAlive()) {
+                //resume foreground call after holding background call
+                //they were switched before holding
+                ImsCall imsCall = mForegroundCall.getImsCall();
+                if (imsCall != null) {
+                    imsCall.resume();
+                    mEventLog.writeOnImsCallResume(imsCall.getSession());
+                }
+            } else if (mRingingCall.getState() == ImsPhoneCall.State.WAITING) {
+                //accept waiting call after holding background call
+                ImsCall imsCall = mRingingCall.getImsCall();
+                if (imsCall != null) {
+                    imsCall.accept(
+                        ImsCallProfile.getCallTypeFromVideoState(mPendingCallVideoState));
+                    mEventLog.writeOnImsCallAccept(imsCall.getSession());
+                }
+            } else {
+                //Just resume background call.
+                //To distinguish resuming call with swapping calls
+                //we do not switch calls.here
+                //ImsPhoneConnection.update will chnage the parent when completed
+                ImsCall imsCall = mBackgroundCall.getImsCall();
+                if (imsCall != null) {
+                    imsCall.resume();
+                    mEventLog.writeOnImsCallResume(imsCall.getSession());
+                }
+            }
+        } catch (ImsException e) {
+            throw new CallStateException(e.getMessage());
+        }
+!!!38000567.java!!!	sendUSSD(inout ussdString : String, inout response : Message) : void
+        if (DBG) log("sendUSSD");
+
+        try {
+            if (mUssdSession != null) {
+                mUssdSession.sendUssd(ussdString);
+                AsyncResult.forMessage(response, null, null);
+                response.sendToTarget();
+                return;
+            }
+
+            String[] callees = new String[] { ussdString };
+            ImsCallProfile profile = mImsManager.createCallProfile(mServiceId,
+                    ImsCallProfile.SERVICE_TYPE_NORMAL, ImsCallProfile.CALL_TYPE_VOICE);
+            profile.setCallExtraInt(ImsCallProfile.EXTRA_DIALSTRING,
+                    ImsCallProfile.DIALSTRING_USSD);
+
+            mUssdSession = mImsManager.makeCall(mServiceId, profile,
+                    callees, mImsUssdListener);
+        } catch (ImsException e) {
+            loge("sendUSSD : " + e);
+            mPhone.sendErrorResponse(response, e);
+        }
+!!!38000695.java!!!	cancelUSSD() : void
+        if (mUssdSession == null) return;
+
+        try {
+            mUssdSession.terminate(ImsReasonInfo.CODE_USER_TERMINATED);
+        } catch (ImsException e) {
+        }
+
+!!!38000823.java!!!	findConnection(in imsCall : ImsCall) : ImsPhoneConnection
+        for (ImsPhoneConnection conn : mConnections) {
+            if (conn.getImsCall() == imsCall) {
+                return conn;
+            }
+        }
+        return null;
+!!!38000951.java!!!	removeConnection(inout conn : ImsPhoneConnection) : void
+        mConnections.remove(conn);
+        // If not emergency call is remaining, notify emergency call registrants
+        if (mIsInEmergencyCall) {
+            boolean isEmergencyCallInList = false;
+            // if no emergency calls pending, set this to false
+            for (ImsPhoneConnection imsPhoneConnection : mConnections) {
+                if (imsPhoneConnection != null && imsPhoneConnection.isEmergency() == true) {
+                    isEmergencyCallInList = true;
+                    break;
+                }
+            }
+
+            if (!isEmergencyCallInList) {
+                mIsInEmergencyCall = false;
+                mPhone.sendEmergencyCallStateChange(false);
+            }
+        }
+!!!38001079.java!!!	addConnection(inout conn : ImsPhoneConnection) : void
+        mConnections.add(conn);
+        if (conn.isEmergency()) {
+            mIsInEmergencyCall = true;
+            mPhone.sendEmergencyCallStateChange(true);
+        }
+!!!38001207.java!!!	processCallStateChange(inout imsCall : ImsCall, inout state : ImsPhoneCall.State, in cause : int) : void
+        if (DBG) log("processCallStateChange " + imsCall + " state=" + state + " cause=" + cause);
+        // This method is called on onCallUpdate() where there is not necessarily a call state
+        // change. In these situations, we'll ignore the state related updates and only process
+        // the change in media capabilities (as expected).  The default is to not ignore state
+        // changes so we do not change existing behavior.
+        processCallStateChange(imsCall, state, cause, false /* do not ignore state update */);
+!!!38001335.java!!!	processCallStateChange(inout imsCall : ImsCall, inout state : ImsPhoneCall.State, in cause : int, inout ignoreState : boolean) : void
+        if (DBG) {
+            log("processCallStateChange state=" + state + " cause=" + cause
+                    + " ignoreState=" + ignoreState);
+        }
+
+        if (imsCall == null) return;
+
+        boolean changed = false;
+        ImsPhoneConnection conn = findConnection(imsCall);
+
+        if (conn == null) {
+            // TODO : what should be done?
+            return;
+        }
+
+        // processCallStateChange is triggered for onCallUpdated as well.
+        // onCallUpdated should not modify the state of the call
+        // It should modify only other capabilities of call through updateMediaCapabilities
+        // State updates will be triggered through individual callbacks
+        // i.e. onCallHeld, onCallResume, etc and conn.update will be responsible for the update
+        conn.updateMediaCapabilities(imsCall);
+        if (ignoreState) {
+            conn.updateAddressDisplay(imsCall);
+            conn.updateExtras(imsCall);
+
+            maybeSetVideoCallProvider(conn, imsCall);
+            return;
+        }
+
+        changed = conn.update(imsCall, state);
+        if (state == ImsPhoneCall.State.DISCONNECTED) {
+            changed = conn.onDisconnect(cause) || changed;
+            //detach the disconnected connections
+            conn.getCall().detach(conn);
+            removeConnection(conn);
+        }
+
+        if (changed) {
+            if (conn.getCall() == mHandoverCall) return;
+            updatePhoneState();
+            mPhone.notifyPreciseCallStateChanged();
+        }
+!!!38001463.java!!!	maybeSetVideoCallProvider(inout conn : ImsPhoneConnection, inout imsCall : ImsCall) : void
+        android.telecom.Connection.VideoProvider connVideoProvider = conn.getVideoProvider();
+        if (connVideoProvider != null || imsCall.getCallSession().getVideoCallProvider() == null) {
+            return;
+        }
+
+        try {
+            setVideoCallProvider(conn, imsCall);
+        } catch (RemoteException e) {
+            loge("maybeSetVideoCallProvider: exception " + e);
+        }
+!!!38001591.java!!!	getDisconnectCauseFromReasonInfo(inout reasonInfo : ImsReasonInfo) : int
+        int cause = DisconnectCause.ERROR_UNSPECIFIED;
+
+        //int type = reasonInfo.getReasonType();
+        int code = reasonInfo.getCode();
+        switch (code) {
+            case ImsReasonInfo.CODE_SIP_BAD_ADDRESS:
+            case ImsReasonInfo.CODE_SIP_NOT_REACHABLE:
+                return DisconnectCause.NUMBER_UNREACHABLE;
+
+            case ImsReasonInfo.CODE_SIP_BUSY:
+                return DisconnectCause.BUSY;
+
+            case ImsReasonInfo.CODE_USER_TERMINATED:
+                return DisconnectCause.LOCAL;
+
+            case ImsReasonInfo.CODE_LOCAL_CALL_DECLINE:
+                return DisconnectCause.INCOMING_REJECTED;
+
+            case ImsReasonInfo.CODE_USER_TERMINATED_BY_REMOTE:
+                return DisconnectCause.NORMAL;
+
+            case ImsReasonInfo.CODE_SIP_REDIRECTED:
+            case ImsReasonInfo.CODE_SIP_BAD_REQUEST:
+            case ImsReasonInfo.CODE_SIP_FORBIDDEN:
+            case ImsReasonInfo.CODE_SIP_NOT_ACCEPTABLE:
+            case ImsReasonInfo.CODE_SIP_USER_REJECTED:
+            case ImsReasonInfo.CODE_SIP_GLOBAL_ERROR:
+                return DisconnectCause.SERVER_ERROR;
+
+            case ImsReasonInfo.CODE_SIP_SERVICE_UNAVAILABLE:
+            case ImsReasonInfo.CODE_SIP_NOT_FOUND:
+            case ImsReasonInfo.CODE_SIP_SERVER_ERROR:
+                return DisconnectCause.SERVER_UNREACHABLE;
+
+            case ImsReasonInfo.CODE_LOCAL_NETWORK_ROAMING:
+            case ImsReasonInfo.CODE_LOCAL_NETWORK_IP_CHANGED:
+            case ImsReasonInfo.CODE_LOCAL_IMS_SERVICE_DOWN:
+            case ImsReasonInfo.CODE_LOCAL_SERVICE_UNAVAILABLE:
+            case ImsReasonInfo.CODE_LOCAL_NOT_REGISTERED:
+            case ImsReasonInfo.CODE_LOCAL_NETWORK_NO_LTE_COVERAGE:
+            case ImsReasonInfo.CODE_LOCAL_NETWORK_NO_SERVICE:
+            case ImsReasonInfo.CODE_LOCAL_CALL_VCC_ON_PROGRESSING:
+                return DisconnectCause.OUT_OF_SERVICE;
+
+            case ImsReasonInfo.CODE_SIP_REQUEST_TIMEOUT:
+            case ImsReasonInfo.CODE_TIMEOUT_1XX_WAITING:
+            case ImsReasonInfo.CODE_TIMEOUT_NO_ANSWER:
+            case ImsReasonInfo.CODE_TIMEOUT_NO_ANSWER_CALL_UPDATE:
+                return DisconnectCause.TIMED_OUT;
+
+            case ImsReasonInfo.CODE_LOCAL_LOW_BATTERY:
+            case ImsReasonInfo.CODE_LOCAL_POWER_OFF:
+                return DisconnectCause.POWER_OFF;
+
+            case ImsReasonInfo.CODE_FDN_BLOCKED:
+                return DisconnectCause.FDN_BLOCKED;
+            default:
+        }
+
+        return cause;
+!!!38001719.java!!!	isPhoneInEcbMode() : boolean
+        return SystemProperties.getBoolean(TelephonyProperties.PROPERTY_INECM_MODE, false);
+!!!38001847.java!!!	dialPendingMO() : void
+        boolean isPhoneInEcmMode = isPhoneInEcbMode();
+        boolean isEmergencyNumber = mPendingMO.isEmergency();
+        if ((!isPhoneInEcmMode) || (isPhoneInEcmMode && isEmergencyNumber)) {
+            sendEmptyMessage(EVENT_DIAL_PENDINGMO);
+        } else {
+            sendEmptyMessage(EVENT_EXIT_ECBM_BEFORE_PENDINGMO);
+        }
+!!!38001975.java!!!	getUtInterface() : ImsUtInterface
+        if (mImsManager == null) {
+            throw new ImsException("no ims manager", ImsReasonInfo.CODE_UNSPECIFIED);
+        }
+
+        ImsUtInterface ut = mImsManager.getSupplementaryServiceConfiguration(mServiceId);
+        return ut;
+!!!38002103.java!!!	transferHandoverConnections(inout call : ImsPhoneCall) : void
+        if (call.mConnections != null) {
+            for (Connection c : call.mConnections) {
+                c.mPreHandoverState = call.mState;
+                log ("Connection state before handover is " + c.getStateBeforeHandover());
+            }
+        }
+        if (mHandoverCall.mConnections == null ) {
+            mHandoverCall.mConnections = call.mConnections;
+        } else { // Multi-call SRVCC
+            mHandoverCall.mConnections.addAll(call.mConnections);
+        }
+        if (mHandoverCall.mConnections != null) {
+            if (call.getImsCall() != null) {
+                call.getImsCall().close();
+            }
+            for (Connection c : mHandoverCall.mConnections) {
+                ((ImsPhoneConnection)c).changeParent(mHandoverCall);
+                ((ImsPhoneConnection)c).releaseWakeLock();
+            }
+        }
+        if (call.getState().isAlive()) {
+            log ("Call is alive and state is " + call.mState);
+            mHandoverCall.mState = call.mState;
+        }
+        call.mConnections.clear();
+        call.mState = ImsPhoneCall.State.IDLE;
+!!!38002231.java!!!	notifySrvccState(inout state : Call::SrvccState) : void
+        if (DBG) log("notifySrvccState state=" + state);
+
+        mSrvccState = state;
+
+        if (mSrvccState == Call.SrvccState.COMPLETED) {
+            transferHandoverConnections(mForegroundCall);
+            transferHandoverConnections(mBackgroundCall);
+            transferHandoverConnections(mRingingCall);
+        }
+!!!38002359.java!!!	handleMessage(inout msg : Message) : void
+        AsyncResult ar;
+        if (DBG) log("handleMessage what=" + msg.what);
+
+        switch (msg.what) {
+            case EVENT_HANGUP_PENDINGMO:
+                if (mPendingMO != null) {
+                    mPendingMO.onDisconnect();
+                    removeConnection(mPendingMO);
+                    mPendingMO = null;
+                }
+                mPendingIntentExtras = null;
+                updatePhoneState();
+                mPhone.notifyPreciseCallStateChanged();
+                break;
+            case EVENT_RESUME_BACKGROUND:
+                try {
+                    resumeWaitingOrHolding();
+                } catch (CallStateException e) {
+                    if (Phone.DEBUG_PHONE) {
+                        loge("handleMessage EVENT_RESUME_BACKGROUND exception=" + e);
+                    }
+                }
+                break;
+            case EVENT_DIAL_PENDINGMO:
+                dialInternal(mPendingMO, mClirMode, mPendingCallVideoState, mPendingIntentExtras);
+                mPendingIntentExtras = null;
+                break;
+
+            case EVENT_EXIT_ECBM_BEFORE_PENDINGMO:
+                if (mPendingMO != null) {
+                    //Send ECBM exit request
+                    try {
+                        getEcbmInterface().exitEmergencyCallbackMode();
+                        mPhone.setOnEcbModeExitResponse(this, EVENT_EXIT_ECM_RESPONSE_CDMA, null);
+                        pendingCallClirMode = mClirMode;
+                        pendingCallInEcm = true;
+                    } catch (ImsException e) {
+                        e.printStackTrace();
+                        mPendingMO.setDisconnectCause(DisconnectCause.ERROR_UNSPECIFIED);
+                        sendEmptyMessageDelayed(EVENT_HANGUP_PENDINGMO, TIMEOUT_HANGUP_PENDINGMO);
+                    }
+                }
+                break;
+
+            case EVENT_EXIT_ECM_RESPONSE_CDMA:
+                // no matter the result, we still do the same here
+                if (pendingCallInEcm) {
+                    dialInternal(mPendingMO, pendingCallClirMode,
+                            mPendingCallVideoState, mPendingIntentExtras);
+                    mPendingIntentExtras = null;
+                    pendingCallInEcm = false;
+                }
+                mPhone.unsetOnEcbModeExitResponse(this);
+                break;
+        }
+!!!38002487.java!!!	log(inout msg : String) : void
+        Rlog.d(LOG_TAG, "[ImsPhoneCallTracker] " + msg);
+!!!38002615.java!!!	loge(inout msg : String) : void
+        Rlog.e(LOG_TAG, "[ImsPhoneCallTracker] " + msg);
+!!!38002743.java!!!	logState() : void
+        if (!VERBOSE_STATE_LOGGING) {
+            return;
+        }
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("Current IMS PhoneCall State:\n");
+        sb.append(" Foreground: ");
+        sb.append(mForegroundCall);
+        sb.append("\n");
+        sb.append(" Background: ");
+        sb.append(mBackgroundCall);
+        sb.append("\n");
+        sb.append(" Ringing: ");
+        sb.append(mRingingCall);
+        sb.append("\n");
+        sb.append(" Handover: ");
+        sb.append(mHandoverCall);
+        sb.append("\n");
+        Rlog.v(LOG_TAG, sb.toString());
+!!!38002871.java!!!	dump(inout fd : FileDescriptor, inout pw : PrintWriter, inout args : String) : void
+        pw.println("ImsPhoneCallTracker extends:");
+        super.dump(fd, pw, args);
+        pw.println(" mVoiceCallEndedRegistrants=" + mVoiceCallEndedRegistrants);
+        pw.println(" mVoiceCallStartedRegistrants=" + mVoiceCallStartedRegistrants);
+        pw.println(" mRingingCall=" + mRingingCall);
+        pw.println(" mForegroundCall=" + mForegroundCall);
+        pw.println(" mBackgroundCall=" + mBackgroundCall);
+        pw.println(" mHandoverCall=" + mHandoverCall);
+        pw.println(" mPendingMO=" + mPendingMO);
+        //pw.println(" mHangupPendingMO=" + mHangupPendingMO);
+        pw.println(" mPhone=" + mPhone);
+        pw.println(" mDesiredMute=" + mDesiredMute);
+        pw.println(" mState=" + mState);
+        for (int i = 0; i < mImsFeatureEnabled.length; i++) {
+            pw.println(" " + mImsFeatureStrings[i] + ": "
+                    + ((mImsFeatureEnabled[i]) ? "enabled" : "disabled"));
+        }
+        pw.flush();
+        pw.println("++++++++++++++++++++++++++++++++");
+
+        try {
+            if (mImsManager != null) {
+                mImsManager.dump(fd, pw, args);
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+
+        if (mConnections != null && mConnections.size() > 0) {
+            pw.println("mConnections:");
+            for (int i = 0; i < mConnections.size(); i++) {
+                pw.println("  [" + i + "]: " + mConnections.get(i));
+            }
+        }
+!!!38003127.java!!!	getEcbmInterface() : ImsEcbm
+        if (mImsManager == null) {
+            throw new ImsException("no ims manager", ImsReasonInfo.CODE_UNSPECIFIED);
+        }
+
+        ImsEcbm ecbm = mImsManager.getEcbmInterface(mServiceId);
+        return ecbm;
+!!!38003255.java!!!	getMultiEndpointInterface() : ImsMultiEndpoint
+        if (mImsManager == null) {
+            throw new ImsException("no ims manager", ImsReasonInfo.CODE_UNSPECIFIED);
+        }
+
+        ImsMultiEndpoint multiendpoint = mImsManager.getMultiEndpointInterface(mServiceId);
+        return multiendpoint;
+!!!38003383.java!!!	isInEmergencyCall() : boolean
+        return mIsInEmergencyCall;
+!!!38003511.java!!!	isVolteEnabled() : boolean
+        return mImsFeatureEnabled[ImsConfig.FeatureConstants.FEATURE_TYPE_VOICE_OVER_LTE];
+!!!38003639.java!!!	isVowifiEnabled() : boolean
+        return mImsFeatureEnabled[ImsConfig.FeatureConstants.FEATURE_TYPE_VOICE_OVER_WIFI];
+!!!38003767.java!!!	isVideoCallEnabled() : boolean
+        return (mImsFeatureEnabled[ImsConfig.FeatureConstants.FEATURE_TYPE_VIDEO_OVER_LTE]
+                || mImsFeatureEnabled[ImsConfig.FeatureConstants.FEATURE_TYPE_VIDEO_OVER_WIFI]);
+!!!38003895.java!!!	getState() : PhoneConstants::State
+        return mState;
+!!!38004023.java!!!	setVideoCallProvider(inout conn : ImsPhoneConnection, inout imsCall : ImsCall) : void
+        IImsVideoCallProvider imsVideoCallProvider =
+                imsCall.getCallSession().getVideoCallProvider();
+        if (imsVideoCallProvider != null) {
+            ImsVideoCallProviderWrapper imsVideoCallProviderWrapper =
+                    new ImsVideoCallProviderWrapper(imsVideoCallProvider);
+            conn.setVideoProvider(imsVideoCallProviderWrapper);
+        }
+!!!38004151.java!!!	isUtEnabled() : boolean
+        return (mImsFeatureEnabled[ImsConfig.FeatureConstants.FEATURE_TYPE_UT_OVER_LTE]
+            || mImsFeatureEnabled[ImsConfig.FeatureConstants.FEATURE_TYPE_UT_OVER_WIFI]);
+!!!38004279.java!!!	cleanseInstantLetteringMessage(inout callSubject : String) : String
+        if (TextUtils.isEmpty(callSubject)) {
+            return callSubject;
+        }
+
+        // Get the carrier config for the current sub.
+        CarrierConfigManager configMgr = (CarrierConfigManager)
+                mPhone.getContext().getSystemService(Context.CARRIER_CONFIG_SERVICE);
+        // Bail if we can't find the carrier config service.
+        if (configMgr == null) {
+            return callSubject;
+        }
+
+        PersistableBundle carrierConfig = configMgr.getConfigForSubId(mPhone.getSubId());
+        // Bail if no carrier config found.
+        if (carrierConfig == null) {
+            return callSubject;
+        }
+
+        // Try to replace invalid characters
+        String invalidCharacters = carrierConfig.getString(
+                CarrierConfigManager.KEY_CARRIER_INSTANT_LETTERING_INVALID_CHARS_STRING);
+        if (!TextUtils.isEmpty(invalidCharacters)) {
+            callSubject = callSubject.replaceAll(invalidCharacters, "");
+        }
+
+        // Try to escape characters which need to be escaped.
+        String escapedCharacters = carrierConfig.getString(
+                CarrierConfigManager.KEY_CARRIER_INSTANT_LETTERING_ESCAPED_CHARS_STRING);
+        if (!TextUtils.isEmpty(escapedCharacters)) {
+            callSubject = escapeChars(escapedCharacters, callSubject);
+        }
+        return callSubject;
+!!!38004407.java!!!	escapeChars(inout toEscape : String, inout source : String) : String
+        StringBuilder escaped = new StringBuilder();
+        for (char c : source.toCharArray()) {
+            if (toEscape.contains(Character.toString(c))) {
+                escaped.append("\\");
+            }
+            escaped.append(c);
+        }
+
+        return escaped.toString();
+!!!38004535.java!!!	pullExternalCall(inout number : String, in videoState : int) : void
+        Bundle extras = new Bundle();
+        extras.putBoolean(ImsCallProfile.EXTRA_IS_CALL_PULL, true);
+        try {
+            Connection connection = dial(number, videoState, extras);
+            mPhone.notifyUnknownConnection(connection);
+        } catch (CallStateException e) {
+            loge("pullExternalCall failed - " + e);
+        }

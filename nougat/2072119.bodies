@@ -1,0 +1,219 @@
+class DriverStartedState
+!!!36950839.java!!!	enter() : void
+            if (DBG) {
+                logd("DriverStartedState enter");
+            }
+
+            // We can't do this in the constructor because WifiStateMachine is created before the
+            // wifi scanning service is initialized
+            if (mWifiScanner == null) {
+                mWifiScanner = mFacade.makeWifiScanner(mContext, getHandler().getLooper());
+
+                mWifiConnectivityManager = new WifiConnectivityManager(mContext,
+                    WifiStateMachine.this, mWifiScanner, mWifiConfigManager, mWifiInfo,
+                    mWifiQualifiedNetworkSelector, mWifiInjector,
+                    getHandler().getLooper());
+            }
+
+            mWifiLogger.startLogging(DBG);
+            mIsRunning = true;
+            updateBatteryWorkSource(null);
+            /**
+             * Enable bluetooth coexistence scan mode when bluetooth connection is active.
+             * When this mode is on, some of the low-level scan parameters used by the
+             * driver are changed to reduce interference with bluetooth
+             */
+            mWifiNative.setBluetoothCoexistenceScanMode(mBluetoothConnectionActive);
+            /* initialize network state */
+            setNetworkDetailedState(DetailedState.DISCONNECTED);
+
+            // Disable legacy multicast filtering, which on some chipsets defaults to enabled.
+            // Legacy IPv6 multicast filtering blocks ICMPv6 router advertisements which breaks IPv6
+            // provisioning. Legacy IPv4 multicast filtering may be re-enabled later via
+            // IpManager.Callback.setFallbackMulticastFilter()
+            mWifiNative.stopFilteringMulticastV4Packets();
+            mWifiNative.stopFilteringMulticastV6Packets();
+
+            if (mOperationalMode != CONNECT_MODE) {
+                mWifiNative.disconnect();
+                mWifiConfigManager.disableAllNetworksNative();
+                if (mOperationalMode == SCAN_ONLY_WITH_WIFI_OFF_MODE) {
+                    setWifiState(WIFI_STATE_DISABLED);
+                }
+                transitionTo(mScanModeState);
+            } else {
+
+                // Status pulls in the current supplicant state and network connection state
+                // events over the monitor connection. This helps framework sync up with
+                // current supplicant state
+                // TODO: actually check th supplicant status string and make sure the supplicant
+                // is in disconnecte4d state.
+                mWifiNative.status();
+                // Transitioning to Disconnected state will trigger a scan and subsequently AutoJoin
+                transitionTo(mDisconnectedState);
+                transitionTo(mDisconnectedState);
+            }
+
+            // We may have missed screen update at boot
+            if (mScreenBroadcastReceived.get() == false) {
+                PowerManager powerManager = (PowerManager)mContext.getSystemService(
+                        Context.POWER_SERVICE);
+                handleScreenStateChanged(powerManager.isScreenOn());
+            } else {
+                // Set the right suspend mode settings
+                mWifiNative.setSuspendOptimizations(mSuspendOptNeedsDisabled == 0
+                        && mUserWantsSuspendOpt.get());
+
+                // Inform WifiConnectivtyManager the screen state in case
+                // WifiConnectivityManager missed the last screen update because
+                // it was not started yet.
+                mWifiConnectivityManager.handleScreenStateChanged(mScreenOn);
+            }
+            mWifiNative.setPowerSave(true);
+
+            if (mP2pSupported) {
+                if (mOperationalMode == CONNECT_MODE) {
+                    mWifiP2pChannel.sendMessage(WifiStateMachine.CMD_ENABLE_P2P);
+                } else {
+                    // P2P statemachine starts in disabled state, and is not enabled until
+                    // CMD_ENABLE_P2P is sent from here; so, nothing needs to be done to
+                    // keep it disabled.
+                }
+            }
+
+            final Intent intent = new Intent(WifiManager.WIFI_SCAN_AVAILABLE);
+            intent.addFlags(Intent.FLAG_RECEIVER_REGISTERED_ONLY_BEFORE_BOOT);
+            intent.putExtra(WifiManager.EXTRA_SCAN_AVAILABLE, WIFI_STATE_ENABLED);
+            mContext.sendStickyBroadcastAsUser(intent, UserHandle.ALL);
+
+            // Enable link layer stats gathering
+            mWifiNative.setWifiLinkLayerStats("wlan0", 1);
+!!!36950967.java!!!	processMessage(inout message : Message) : boolean
+            logStateAndMessage(message, this);
+
+            switch(message.what) {
+                case CMD_START_SCAN:
+                    handleScanRequest(message);
+                    break;
+                case CMD_SET_FREQUENCY_BAND:
+                    int band =  message.arg1;
+                    if (DBG) log("set frequency band " + band);
+                    if (mWifiNative.setBand(band)) {
+
+                        if (DBG)  logd("did set frequency band " + band);
+
+                        mFrequencyBand.set(band);
+                        // Flush old data - like scan results
+                        mWifiNative.bssFlush();
+
+                        if (DBG)  logd("done set frequency band " + band);
+
+                    } else {
+                        loge("Failed to set frequency band " + band);
+                    }
+                    break;
+                case CMD_BLUETOOTH_ADAPTER_STATE_CHANGE:
+                    mBluetoothConnectionActive = (message.arg1 !=
+                            BluetoothAdapter.STATE_DISCONNECTED);
+                    mWifiNative.setBluetoothCoexistenceScanMode(mBluetoothConnectionActive);
+                    break;
+                case CMD_STOP_DRIVER:
+                    int mode = message.arg1;
+
+                    log("stop driver");
+                    mWifiConfigManager.disableAllNetworksNative();
+
+                    if (getCurrentState() != mDisconnectedState) {
+                        mWifiNative.disconnect();
+                        handleNetworkDisconnect();
+                    }
+                    mWakeLock.acquire();
+                    mWifiNative.stopDriver();
+                    mWakeLock.release();
+                    if (mP2pSupported) {
+                        transitionTo(mWaitForP2pDisableState);
+                    } else {
+                        transitionTo(mDriverStoppingState);
+                    }
+                    break;
+                case CMD_START_DRIVER:
+                    if (mOperationalMode == CONNECT_MODE) {
+                        mWifiConfigManager.enableAllNetworks();
+                    }
+                    break;
+                case CMD_SET_SUSPEND_OPT_ENABLED:
+                    if (message.arg1 == 1) {
+                        setSuspendOptimizationsNative(SUSPEND_DUE_TO_SCREEN, true);
+                        mSuspendWakeLock.release();
+                    } else {
+                        setSuspendOptimizationsNative(SUSPEND_DUE_TO_SCREEN, false);
+                    }
+                    break;
+                case CMD_SET_HIGH_PERF_MODE:
+                    if (message.arg1 == 1) {
+                        setSuspendOptimizationsNative(SUSPEND_DUE_TO_HIGH_PERF, false);
+                    } else {
+                        setSuspendOptimizationsNative(SUSPEND_DUE_TO_HIGH_PERF, true);
+                    }
+                    break;
+                case CMD_ENABLE_TDLS:
+                    if (message.obj != null) {
+                        String remoteAddress = (String) message.obj;
+                        boolean enable = (message.arg1 == 1);
+                        mWifiNative.startTdls(remoteAddress, enable);
+                    }
+                    break;
+                case WifiMonitor.ANQP_DONE_EVENT:
+                    mWifiConfigManager.notifyANQPDone((Long) message.obj, message.arg1 != 0);
+                    break;
+                case CMD_STOP_IP_PACKET_OFFLOAD: {
+                    int slot = message.arg1;
+                    int ret = stopWifiIPPacketOffload(slot);
+                    if (mNetworkAgent != null) {
+                        mNetworkAgent.onPacketKeepaliveEvent(slot, ret);
+                    }
+                    break;
+                }
+                case WifiMonitor.RX_HS20_ANQP_ICON_EVENT:
+                    mWifiConfigManager.notifyIconReceived((IconEvent) message.obj);
+                    break;
+                case WifiMonitor.HS20_REMEDIATION_EVENT:
+                    wnmFrameReceived((WnmData) message.obj);
+                    break;
+                case CMD_CONFIG_ND_OFFLOAD:
+                    final boolean enabled = (message.arg1 > 0);
+                    mWifiNative.configureNeighborDiscoveryOffload(enabled);
+                    break;
+                case CMD_ENABLE_WIFI_CONNECTIVITY_MANAGER:
+                    if (mWifiConnectivityManager != null) {
+                        mWifiConnectivityManager.enable(message.arg1 == 1 ? true : false);
+                    }
+                    break;
+                case CMD_ENABLE_AUTOJOIN_WHEN_ASSOCIATED:
+                    final boolean allowed = (message.arg1 > 0);
+                    boolean old_state = mWifiConfigManager.getEnableAutoJoinWhenAssociated();
+                    mWifiConfigManager.setEnableAutoJoinWhenAssociated(allowed);
+                    if (!old_state && allowed && mScreenOn
+                            && getCurrentState() == mConnectedState) {
+                        if (mWifiConnectivityManager != null) {
+                            mWifiConnectivityManager.forceConnectivityScan();
+                        }
+                    }
+                    break;
+                default:
+                    return NOT_HANDLED;
+            }
+            return HANDLED;
+!!!36951095.java!!!	exit() : void
+
+            mWifiLogger.stopLogging();
+
+            mIsRunning = false;
+            updateBatteryWorkSource(null);
+            mScanResults = new ArrayList<>();
+
+            final Intent intent = new Intent(WifiManager.WIFI_SCAN_AVAILABLE);
+            intent.addFlags(Intent.FLAG_RECEIVER_REGISTERED_ONLY_BEFORE_BOOT);
+            intent.putExtra(WifiManager.EXTRA_SCAN_AVAILABLE, WIFI_STATE_DISABLED);
+            mContext.sendStickyBroadcastAsUser(intent, UserHandle.ALL);
+            mBufferedScanMsg.clear();

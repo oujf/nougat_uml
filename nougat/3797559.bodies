@@ -1,0 +1,198 @@
+class Camera3ZslStream
+!!!41177015.cpp!!!	Camera3ZslStream(in id : int, in width : uint32_t, in height : uint32_t, in bufferCount : int)
+
+    sp<IGraphicBufferProducer> producer;
+    sp<IGraphicBufferConsumer> consumer;
+    BufferQueue::createBufferQueue(&producer, &consumer);
+    mProducer = new RingBufferConsumer(consumer, GRALLOC_USAGE_HW_CAMERA_ZSL, bufferCount);
+    mProducer->setName(String8("Camera2-ZslRingBufferConsumer"));
+    mConsumer = new Surface(producer);
+!!!41177271.cpp!!!	dump(in fd : int, in args : Vector<String16>) : void
+    (void) args;
+
+    String8 lines;
+    lines.appendFormat("    Stream[%d]: ZSL\n", mId);
+    write(fd, lines.string(), lines.size());
+
+    Camera3IOStreamBase::dump(fd, args);
+
+    lines = String8();
+    lines.appendFormat("      Input buffers pending: %zu, in flight %zu\n",
+            mInputBufferQueue.size(), mBuffersInFlight.size());
+    write(fd, lines.string(), lines.size());
+!!!41177399.cpp!!!	enqueueInputBufferByTimestamp(in timestamp : nsecs_t, inout actualTimestamp : nsecs_t) : status_t
+
+    Mutex::Autolock l(mLock);
+
+    TimestampFinder timestampFinder = TimestampFinder(timestamp);
+
+    sp<RingBufferConsumer::PinnedBufferItem> pinnedBuffer =
+            mProducer->pinSelectedBuffer(timestampFinder,
+                                        /*waitForFence*/false);
+
+    if (pinnedBuffer == 0) {
+        ALOGE("%s: No ZSL buffers were available yet", __FUNCTION__);
+        return NO_BUFFER_AVAILABLE;
+    }
+
+    nsecs_t actual = pinnedBuffer->getBufferItem().mTimestamp;
+
+    if (actual != timestamp) {
+        // TODO: this is problematic, we'll end up with using wrong result for this pinned buffer.
+        ALOGW("%s: ZSL buffer candidate search didn't find an exact match --"
+              " requested timestamp = %" PRId64 ", actual timestamp = %" PRId64,
+              __FUNCTION__, timestamp, actual);
+    }
+
+    mInputBufferQueue.push_back(pinnedBuffer);
+
+    if (actualTimestamp != NULL) {
+        *actualTimestamp = actual;
+    }
+
+    return OK;
+!!!41177527.cpp!!!	clearInputRingBuffer(inout latestTimestamp : nsecs_t) : status_t
+    Mutex::Autolock l(mLock);
+
+    return clearInputRingBufferLocked(latestTimestamp);
+!!!41177655.cpp!!!	setTransform(in transform : int) : status_t
+    ALOGV("%s: Not implemented", __FUNCTION__);
+    return INVALID_OPERATION;
+!!!41177783.cpp!!!	getInputBufferLocked(inout buffer : camera3_stream_buffer) : status_t
+    ATRACE_CALL();
+
+    status_t res;
+
+    // TODO: potentially register from inputBufferLocked
+    // this should be ok, registerBuffersLocked only calls getBuffer for now
+    // register in output mode instead of input mode for ZSL streams.
+    if (mState == STATE_IN_CONFIG || mState == STATE_IN_RECONFIG) {
+        ALOGE("%s: Stream %d: Buffer registration for input streams"
+              " not implemented (state %d)",
+              __FUNCTION__, mId, mState);
+        return INVALID_OPERATION;
+    }
+
+    if ((res = getBufferPreconditionCheckLocked()) != OK) {
+        return res;
+    }
+
+    ANativeWindowBuffer* anb;
+    int fenceFd;
+
+    assert(mProducer != 0);
+
+    sp<PinnedBufferItem> bufferItem;
+    {
+        List<sp<RingBufferConsumer::PinnedBufferItem> >::iterator it, end;
+        it = mInputBufferQueue.begin();
+        end = mInputBufferQueue.end();
+
+        // Need to call enqueueInputBufferByTimestamp as a prerequisite
+        if (it == end) {
+            ALOGE("%s: Stream %d: No input buffer was queued",
+                    __FUNCTION__, mId);
+            return INVALID_OPERATION;
+        }
+        bufferItem = *it;
+        mInputBufferQueue.erase(it);
+    }
+
+    anb = bufferItem->getBufferItem().mGraphicBuffer->getNativeBuffer();
+    assert(anb != NULL);
+    fenceFd = bufferItem->getBufferItem().mFence->dup();
+
+    /**
+     * FenceFD now owned by HAL except in case of error,
+     * in which case we reassign it to acquire_fence
+     */
+    handoutBufferLocked(*buffer, &(anb->handle), /*acquireFence*/fenceFd,
+                         /*releaseFence*/-1, CAMERA3_BUFFER_STATUS_OK, /*output*/false);
+
+    mBuffersInFlight.push_back(bufferItem);
+
+    return OK;
+!!!41177911.cpp!!!	returnInputBufferLocked(in buffer : camera3_stream_buffer) : status_t
+    ATRACE_CALL();
+
+    status_t res = returnAnyBufferLocked(buffer, /*timestamp*/0,
+                                         /*output*/false);
+
+    return res;
+!!!41178039.cpp!!!	returnBufferCheckedLocked(in buffer : camera3_stream_buffer, in timestamp : nsecs_t, in output : bool, inout releaseFenceOut : sp<Fence>) : status_t
+
+    if (output) {
+        // Output stream path
+        return Camera3OutputStream::returnBufferCheckedLocked(buffer,
+                                                              timestamp,
+                                                              output,
+                                                              releaseFenceOut);
+    }
+
+    /**
+     * Input stream path
+     */
+    bool bufferFound = false;
+    sp<PinnedBufferItem> bufferItem;
+    {
+        // Find the buffer we are returning
+        Vector<sp<PinnedBufferItem> >::iterator it, end;
+        for (it = mBuffersInFlight.begin(), end = mBuffersInFlight.end();
+             it != end;
+             ++it) {
+
+            const sp<PinnedBufferItem>& tmp = *it;
+            ANativeWindowBuffer *anb =
+                    tmp->getBufferItem().mGraphicBuffer->getNativeBuffer();
+            if (anb != NULL && &(anb->handle) == buffer.buffer) {
+                bufferFound = true;
+                bufferItem = tmp;
+                mBuffersInFlight.erase(it);
+                break;
+            }
+        }
+    }
+    if (!bufferFound) {
+        ALOGE("%s: Stream %d: Can't return buffer that wasn't sent to HAL",
+              __FUNCTION__, mId);
+        return INVALID_OPERATION;
+    }
+
+    int releaseFenceFd = buffer.release_fence;
+
+    if (buffer.status == CAMERA3_BUFFER_STATUS_ERROR) {
+        if (buffer.release_fence != -1) {
+            ALOGE("%s: Stream %d: HAL should not set release_fence(%d) when "
+                  "there is an error", __FUNCTION__, mId, buffer.release_fence);
+            close(buffer.release_fence);
+        }
+
+        /**
+         * Reassign release fence as the acquire fence incase of error
+         */
+        releaseFenceFd = buffer.acquire_fence;
+    }
+
+    /**
+     * Unconditionally return buffer to the buffer queue.
+     * - Fwk takes over the release_fence ownership
+     */
+    sp<Fence> releaseFence = new Fence(releaseFenceFd);
+    bufferItem->getBufferItem().mFence = releaseFence;
+    bufferItem.clear(); // dropping last reference unpins buffer
+
+    *releaseFenceOut = releaseFence;
+
+    return OK;
+!!!41178167.cpp!!!	disconnectLocked() : status_t
+    clearInputRingBufferLocked(NULL);
+
+    return Camera3OutputStream::disconnectLocked();
+!!!41178295.cpp!!!	clearInputRingBufferLocked(inout latestTimestamp : nsecs_t) : status_t
+
+    if (latestTimestamp) {
+        *latestTimestamp = mProducer->getLatestTimestamp();
+    }
+    mInputBufferQueue.clear();
+
+    return mProducer->clear();

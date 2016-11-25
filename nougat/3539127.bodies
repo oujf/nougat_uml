@@ -1,0 +1,426 @@
+class ID3
+!!!39920823.cpp!!!	ID3(in source : sp<DataSource>, in ignoreV1 : bool = false, in offset : off64_t = 0)
+    mIsValid = parseV2(source, offset);
+
+    if (!mIsValid && !ignoreV1) {
+        mIsValid = parseV1(source);
+    }
+!!!39920951.cpp!!!	ID3(in data : uint8_t, in size : size_t, in ignoreV1 : bool = false)
+    sp<MemorySource> source = new (std::nothrow) MemorySource(data, size);
+
+    if (source == NULL)
+        return;
+
+    mIsValid = parseV2(source, 0);
+
+    if (!mIsValid && !ignoreV1) {
+        mIsValid = parseV1(source);
+    }
+!!!39921079.cpp!!!	~ID3()
+    if (mData) {
+        free(mData);
+        mData = NULL;
+    }
+!!!39921207.cpp!!!	isValid() : bool
+    return mIsValid;
+!!!39921335.cpp!!!	version() : ID3::Version
+    return mVersion;
+!!!39921463.cpp!!!	getAlbumArt(inout length : size_t, inout mime : String8) : void
+    *length = 0;
+    mime->setTo("");
+
+    Iterator it(
+            *this,
+            (mVersion == ID3_V2_3 || mVersion == ID3_V2_4) ? "APIC" : "PIC");
+
+    while (!it.done()) {
+        size_t size;
+        const uint8_t *data = it.getData(&size);
+        if (!data) {
+            return NULL;
+        }
+
+        if (mVersion == ID3_V2_3 || mVersion == ID3_V2_4) {
+            uint8_t encoding = data[0];
+            mime->setTo((const char *)&data[1]);
+            size_t mimeLen = strlen((const char *)&data[1]) + 1;
+
+#if 0
+            uint8_t picType = data[1 + mimeLen];
+            if (picType != 0x03) {
+                // Front Cover Art
+                it.next();
+                continue;
+            }
+#endif
+
+            size_t descLen = StringSize(&data[2 + mimeLen], encoding);
+
+            if (size < 2 ||
+                    size - 2 < mimeLen ||
+                    size - 2 - mimeLen < descLen) {
+                ALOGW("bogus album art sizes");
+                return NULL;
+            }
+            *length = size - 2 - mimeLen - descLen;
+
+            return &data[2 + mimeLen + descLen];
+        } else {
+            uint8_t encoding = data[0];
+
+            if (!memcmp(&data[1], "PNG", 3)) {
+                mime->setTo("image/png");
+            } else if (!memcmp(&data[1], "JPG", 3)) {
+                mime->setTo("image/jpeg");
+            } else if (!memcmp(&data[1], "-->", 3)) {
+                mime->setTo("text/plain");
+            } else {
+                return NULL;
+            }
+
+#if 0
+            uint8_t picType = data[4];
+            if (picType != 0x03) {
+                // Front Cover Art
+                it.next();
+                continue;
+            }
+#endif
+
+            size_t descLen = StringSize(&data[5], encoding);
+
+            *length = size - 5 - descLen;
+
+            return &data[5 + descLen];
+        }
+    }
+
+    return NULL;
+!!!39923255.cpp!!!	parseV1(in source : sp<DataSource>) : bool
+    const size_t V1_TAG_SIZE = 128;
+
+    off64_t size;
+    if (source->getSize(&size) != OK || size < (off64_t)V1_TAG_SIZE) {
+        return false;
+    }
+
+    mData = (uint8_t *)malloc(V1_TAG_SIZE);
+    if (source->readAt(size - V1_TAG_SIZE, mData, V1_TAG_SIZE)
+            != (ssize_t)V1_TAG_SIZE) {
+        free(mData);
+        mData = NULL;
+
+        return false;
+    }
+
+    if (memcmp("TAG", mData, 3)) {
+        free(mData);
+        mData = NULL;
+
+        return false;
+    }
+
+    mSize = V1_TAG_SIZE;
+    mFirstFrameOffset = 3;
+
+    if (mData[V1_TAG_SIZE - 3] != 0) {
+        mVersion = ID3_V1;
+    } else {
+        mVersion = ID3_V1_1;
+    }
+
+    return true;
+!!!39923383.cpp!!!	parseV2(in source : sp<DataSource>, in offset : off64_t) : bool
+struct id3_header {
+    char id[3];
+    uint8_t version_major;
+    uint8_t version_minor;
+    uint8_t flags;
+    uint8_t enc_size[4];
+    };
+
+    id3_header header;
+    if (source->readAt(
+                offset, &header, sizeof(header)) != (ssize_t)sizeof(header)) {
+        return false;
+    }
+
+    if (memcmp(header.id, "ID3", 3)) {
+        return false;
+    }
+
+    if (header.version_major == 0xff || header.version_minor == 0xff) {
+        return false;
+    }
+
+    if (header.version_major == 2) {
+        if (header.flags & 0x3f) {
+            // We only support the 2 high bits, if any of the lower bits are
+            // set, we cannot guarantee to understand the tag format.
+            return false;
+        }
+
+        if (header.flags & 0x40) {
+            // No compression scheme has been decided yet, ignore the
+            // tag if compression is indicated.
+
+            return false;
+        }
+    } else if (header.version_major == 3) {
+        if (header.flags & 0x1f) {
+            // We only support the 3 high bits, if any of the lower bits are
+            // set, we cannot guarantee to understand the tag format.
+            return false;
+        }
+    } else if (header.version_major == 4) {
+        if (header.flags & 0x0f) {
+            // The lower 4 bits are undefined in this spec.
+            return false;
+        }
+    } else {
+        return false;
+    }
+
+    size_t size;
+    if (!ParseSyncsafeInteger(header.enc_size, &size)) {
+        return false;
+    }
+
+    if (size > kMaxMetadataSize) {
+        ALOGE("skipping huge ID3 metadata of size %zu", size);
+        return false;
+    }
+
+    mData = (uint8_t *)malloc(size);
+
+    if (mData == NULL) {
+        return false;
+    }
+
+    mSize = size;
+    mRawSize = mSize + sizeof(header);
+
+    if (source->readAt(offset + sizeof(header), mData, mSize) != (ssize_t)mSize) {
+        free(mData);
+        mData = NULL;
+
+        return false;
+    }
+
+    if (header.version_major == 4) {
+        void *copy = malloc(size);
+        if (copy == NULL) {
+            free(mData);
+            mData = NULL;
+            ALOGE("b/24623447, no more memory");
+            return false;
+        }
+
+        memcpy(copy, mData, size);
+
+        bool success = removeUnsynchronizationV2_4(false /* iTunesHack */);
+        if (!success) {
+            memcpy(mData, copy, size);
+            mSize = size;
+
+            success = removeUnsynchronizationV2_4(true /* iTunesHack */);
+
+            if (success) {
+                ALOGV("Had to apply the iTunes hack to parse this ID3 tag");
+            }
+        }
+
+        free(copy);
+        copy = NULL;
+
+        if (!success) {
+            free(mData);
+            mData = NULL;
+
+            return false;
+        }
+    } else if (header.flags & 0x80) {
+        ALOGV("removing unsynchronization");
+
+        removeUnsynchronization();
+    }
+
+    mFirstFrameOffset = 0;
+    if (header.version_major == 3 && (header.flags & 0x40)) {
+        // Version 2.3 has an optional extended header.
+
+        if (mSize < 4) {
+            free(mData);
+            mData = NULL;
+
+            return false;
+        }
+
+        size_t extendedHeaderSize = U32_AT(&mData[0]);
+        if (extendedHeaderSize > SIZE_MAX - 4) {
+            free(mData);
+            mData = NULL;
+            ALOGE("b/24623447, extendedHeaderSize is too large");
+            return false;
+        }
+        extendedHeaderSize += 4;
+
+        if (extendedHeaderSize > mSize) {
+            free(mData);
+            mData = NULL;
+
+            return false;
+        }
+
+        mFirstFrameOffset = extendedHeaderSize;
+
+        uint16_t extendedFlags = 0;
+        if (extendedHeaderSize >= 6) {
+            extendedFlags = U16_AT(&mData[4]);
+
+            if (extendedHeaderSize >= 10) {
+                size_t paddingSize = U32_AT(&mData[6]);
+
+                if (paddingSize > SIZE_MAX - mFirstFrameOffset) {
+                    ALOGE("b/24623447, paddingSize is too large");
+                }
+                if (paddingSize > mSize - mFirstFrameOffset) {
+                    free(mData);
+                    mData = NULL;
+
+                    return false;
+                }
+
+                mSize -= paddingSize;
+            }
+
+            if (extendedFlags & 0x8000) {
+                ALOGV("have crc");
+            }
+        }
+    } else if (header.version_major == 4 && (header.flags & 0x40)) {
+        // Version 2.4 has an optional extended header, that's different
+        // from Version 2.3's...
+
+        if (mSize < 4) {
+            free(mData);
+            mData = NULL;
+
+            return false;
+        }
+
+        size_t ext_size;
+        if (!ParseSyncsafeInteger(mData, &ext_size)) {
+            free(mData);
+            mData = NULL;
+
+            return false;
+        }
+
+        if (ext_size < 6 || ext_size > mSize) {
+            free(mData);
+            mData = NULL;
+
+            return false;
+        }
+
+        mFirstFrameOffset = ext_size;
+    }
+
+    if (header.version_major == 2) {
+        mVersion = ID3_V2_2;
+    } else if (header.version_major == 3) {
+        mVersion = ID3_V2_3;
+    } else {
+        CHECK_EQ(header.version_major, 4);
+        mVersion = ID3_V2_4;
+    }
+
+    return true;
+!!!39923511.cpp!!!	removeUnsynchronization() : void
+    for (size_t i = 0; i + 1 < mSize; ++i) {
+        if (mData[i] == 0xff && mData[i + 1] == 0x00) {
+            memmove(&mData[i + 1], &mData[i + 2], mSize - i - 2);
+            --mSize;
+        }
+    }
+!!!39923639.cpp!!!	removeUnsynchronizationV2_4(in iTunesHack : bool) : bool
+    size_t oldSize = mSize;
+
+    size_t offset = 0;
+    while (mSize >= 10 && offset <= mSize - 10) {
+        if (!memcmp(&mData[offset], "\0\0\0\0", 4)) {
+            break;
+        }
+
+        size_t dataSize;
+        if (iTunesHack) {
+            dataSize = U32_AT(&mData[offset + 4]);
+        } else if (!ParseSyncsafeInteger(&mData[offset + 4], &dataSize)) {
+            return false;
+        }
+
+        if (dataSize > mSize - 10 - offset) {
+            return false;
+        }
+
+        uint16_t flags = U16_AT(&mData[offset + 8]);
+        uint16_t prevFlags = flags;
+
+        if (flags & 1) {
+            // Strip data length indicator
+
+            if (mSize < 14 || mSize - 14 < offset || dataSize < 4) {
+                return false;
+            }
+            memmove(&mData[offset + 10], &mData[offset + 14], mSize - offset - 14);
+            mSize -= 4;
+            dataSize -= 4;
+
+            flags &= ~1;
+        }
+
+        if (flags & 2) {
+            // This file has "unsynchronization", so we have to replace occurrences
+            // of 0xff 0x00 with just 0xff in order to get the real data.
+
+            size_t readOffset = offset + 11;
+            size_t writeOffset = offset + 11;
+            for (size_t i = 0; i + 1 < dataSize; ++i) {
+                if (mData[readOffset - 1] == 0xff
+                        && mData[readOffset] == 0x00) {
+                    ++readOffset;
+                    --mSize;
+                    --dataSize;
+                }
+                mData[writeOffset++] = mData[readOffset++];
+            }
+            // move the remaining data following this frame
+            memmove(&mData[writeOffset], &mData[readOffset], oldSize - readOffset);
+
+            flags &= ~2;
+        }
+
+        if (flags != prevFlags || iTunesHack) {
+            WriteSyncsafeInteger(&mData[offset + 4], dataSize);
+            mData[offset + 8] = flags >> 8;
+            mData[offset + 9] = flags & 0xff;
+        }
+
+        offset += 10 + dataSize;
+    }
+
+    memset(&mData[mSize], 0, oldSize - mSize);
+
+    return true;
+!!!39923767.cpp!!!	ParseSyncsafeInteger(in encoded : uint8_t, inout x : size_t) : bool
+    *x = 0;
+    for (int32_t i = 0; i < 4; ++i) {
+        if (encoded[i] & 0x80) {
+            return false;
+        }
+
+        *x = ((*x) << 7) | encoded[i];
+    }
+
+    return true;

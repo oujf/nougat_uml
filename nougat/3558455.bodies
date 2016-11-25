@@ -1,0 +1,197 @@
+class WebmWriter
+!!!40038455.cpp!!!	WebmWriter(in fd : int)
+    mStreams[kAudioIndex] = WebmStream(kAudioType, "Audio", &WebmWriter::audioTrack);
+    mStreams[kVideoIndex] = WebmStream(kVideoType, "Video", &WebmWriter::videoTrack);
+    mSinkThread = new WebmFrameSinkThread(
+            mFd,
+            mSegmentDataStart,
+            mStreams[kVideoIndex].mSink,
+            mStreams[kAudioIndex].mSink,
+            mCuePoints);
+!!!40038711.cpp!!!	addSource(in source : sp<IMediaSource>) : status_t
+    Mutex::Autolock l(mLock);
+    if (mStarted) {
+        ALOGE("Attempt to add source AFTER recording is started");
+        return UNKNOWN_ERROR;
+    }
+
+    // At most 2 tracks can be supported.
+    if (mStreams[kVideoIndex].mTrackEntry != NULL
+            && mStreams[kAudioIndex].mTrackEntry != NULL) {
+        ALOGE("Too many tracks (2) to add");
+        return ERROR_UNSUPPORTED;
+    }
+
+    CHECK(source != NULL);
+
+    // A track of type other than video or audio is not supported.
+    const char *mime;
+    source->getFormat()->findCString(kKeyMIMEType, &mime);
+    const char *vp8 = MEDIA_MIMETYPE_VIDEO_VP8;
+    const char *vp9 = MEDIA_MIMETYPE_VIDEO_VP9;
+    const char *vorbis = MEDIA_MIMETYPE_AUDIO_VORBIS;
+
+    size_t streamIndex;
+    if (!strncasecmp(mime, vp8, strlen(vp8)) ||
+        !strncasecmp(mime, vp9, strlen(vp9))) {
+        streamIndex = kVideoIndex;
+    } else if (!strncasecmp(mime, vorbis, strlen(vorbis))) {
+        streamIndex = kAudioIndex;
+    } else {
+        ALOGE("Track (%s) other than %s, %s or %s is not supported",
+              mime, vp8, vp9, vorbis);
+        return ERROR_UNSUPPORTED;
+    }
+
+    // No more than one video or one audio track is supported.
+    if (mStreams[streamIndex].mTrackEntry != NULL) {
+        ALOGE("%s track already exists", mStreams[streamIndex].mName);
+        return ERROR_UNSUPPORTED;
+    }
+
+    // This is the first track of either audio or video.
+    // Go ahead to add the track.
+    mStreams[streamIndex].mSource = source;
+    mStreams[streamIndex].mTrackEntry = mStreams[streamIndex].mMakeTrack(source->getFormat());
+    if (mStreams[streamIndex].mTrackEntry == NULL) {
+        mStreams[streamIndex].mSource.clear();
+        return BAD_VALUE;
+    }
+    mStreamsInOrder.push_back(mStreams[streamIndex].mTrackEntry);
+
+    return OK;
+!!!40038839.cpp!!!	start(inout params : MetaData = NULL) : status_t
+    if (mInitCheck != OK) {
+        return UNKNOWN_ERROR;
+    }
+
+    if (mStreams[kVideoIndex].mTrackEntry == NULL
+            && mStreams[kAudioIndex].mTrackEntry == NULL) {
+        ALOGE("No source added");
+        return INVALID_OPERATION;
+    }
+
+    if (mMaxFileSizeLimitBytes != 0) {
+        mIsFileSizeLimitExplicitlyRequested = true;
+    }
+
+    if (params) {
+        int32_t isRealTimeRecording;
+        params->findInt32(kKeyRealTimeRecording, &isRealTimeRecording);
+        mIsRealTimeRecording = isRealTimeRecording;
+    }
+
+    if (mStarted) {
+        if (mPaused) {
+            mPaused = false;
+            mStreams[kAudioIndex].mThread->resume();
+            mStreams[kVideoIndex].mThread->resume();
+        }
+        return OK;
+    }
+
+    if (params) {
+        int32_t tcsl;
+        if (params->findInt32(kKeyTimeScale, &tcsl)) {
+            mTimeCodeScale = tcsl;
+        }
+    }
+    if (mTimeCodeScale == 0) {
+        ALOGE("movie time scale is 0");
+        return BAD_VALUE;
+    }
+    ALOGV("movie time scale: %" PRIu64, mTimeCodeScale);
+
+    /*
+     * When the requested file size limit is small, the priority
+     * is to meet the file size limit requirement, rather than
+     * to make the file streamable. mStreamableFile does not tell
+     * whether the actual recorded file is streamable or not.
+     */
+    mStreamableFile = (!mMaxFileSizeLimitBytes)
+        || (mMaxFileSizeLimitBytes >= kMinStreamableFileSizeInBytes);
+
+    /*
+     * Write various metadata.
+     */
+    sp<WebmElement> ebml, segment, info, seekHead, tracks, cues;
+    ebml = WebmElement::EbmlHeader();
+    segment = new WebmMaster(kMkvSegment);
+    seekHead = new EbmlVoid(kMaxMetaSeekSize);
+    info = WebmElement::SegmentInfo(mTimeCodeScale, 0);
+
+    List<sp<WebmElement> > children;
+    for (size_t i = 0; i < mStreamsInOrder.size(); ++i) {
+        children.push_back(mStreamsInOrder[i]);
+    }
+    tracks = new WebmMaster(kMkvTracks, children);
+
+    if (!mStreamableFile) {
+        cues = NULL;
+    } else {
+        int32_t bitRate = -1;
+        if (params) {
+            params->findInt32(kKeyBitRate, &bitRate);
+        }
+        mEstimatedCuesSize = estimateCuesSize(bitRate);
+        CHECK_GE(mEstimatedCuesSize, 8);
+        cues = new EbmlVoid(mEstimatedCuesSize);
+    }
+
+    sp<WebmElement> elems[] = { ebml, segment, seekHead, info, tracks, cues };
+    size_t nElems = sizeof(elems) / sizeof(elems[0]);
+    uint64_t offsets[nElems];
+    uint64_t sizes[nElems];
+    for (uint32_t i = 0; i < nElems; i++) {
+        WebmElement *e = elems[i].get();
+        if (!e) {
+            continue;
+        }
+
+        uint64_t size;
+        offsets[i] = ::lseek(mFd, 0, SEEK_CUR);
+        sizes[i] = e->mSize;
+        e->write(mFd, size);
+    }
+
+    mSegmentOffset = offsets[1];
+    mSegmentDataStart = offsets[2];
+    mInfoOffset = offsets[3];
+    mInfoSize = sizes[3];
+    mTracksOffset = offsets[4];
+    mCuesOffset = offsets[5];
+
+    // start threads
+    if (params) {
+        params->findInt64(kKeyTime, &mStartTimestampUs);
+    }
+
+    initStream(kAudioIndex);
+    initStream(kVideoIndex);
+
+    mStreams[kAudioIndex].mThread->start();
+    mStreams[kVideoIndex].mThread->start();
+    mSinkThread->start();
+
+    mStarted = true;
+    return OK;
+!!!40038967.cpp!!!	stop() : status_t
+    return reset();
+!!!40039095.cpp!!!	pause() : status_t
+    if (mInitCheck != OK) {
+        return OK;
+    }
+    mPaused = true;
+    status_t err = OK;
+    for (int i = 0; i < kMaxStreams; ++i) {
+        if (mStreams[i].mThread == NULL) {
+            continue;
+        }
+        status_t status = mStreams[i].mThread->pause();
+        if (status != OK) {
+            err = status;
+        }
+    }
+    return err;
+!!!40039223.cpp!!!	reachedEOS() : bool
+    return !mSinkThread->running();

@@ -1,0 +1,125 @@
+class SecurityLogMonitor
+!!!33916087.java!!!	SecurityLogMonitor(inout service : DevicePolicyManagerService)
+        mService = service;
+!!!33916215.java!!!	start() : void
+        mLock.lock();
+        try {
+            if (mMonitorThread == null) {
+                mPendingLogs = new ArrayList<SecurityEvent>();
+                mAllowedToRetrieve = false;
+                mNextAllowedRetrivalTimeMillis = -1;
+
+                mMonitorThread = new Thread(this);
+                mMonitorThread.start();
+            }
+        } finally {
+            mLock.unlock();
+        }
+!!!33916343.java!!!	stop() : void
+        mLock.lock();
+        try {
+            if (mMonitorThread != null) {
+                mMonitorThread.interrupt();
+                try {
+                    mMonitorThread.join(TimeUnit.SECONDS.toMillis(5));
+                } catch (InterruptedException e) {
+                    Log.e(TAG, "Interrupted while waiting for thread to stop", e);
+                }
+                // Reset state and clear buffer
+                mPendingLogs = new ArrayList<SecurityEvent>();
+                mAllowedToRetrieve = false;
+                mNextAllowedRetrivalTimeMillis = -1;
+                mMonitorThread = null;
+            }
+        } finally {
+            mLock.unlock();
+        }
+!!!33916471.java!!!	retrieveLogs() : SecurityLog::SecurityEvent
+        mLock.lock();
+        try {
+            if (mAllowedToRetrieve) {
+                mAllowedToRetrieve = false;
+                mNextAllowedRetrivalTimeMillis = System.currentTimeMillis()
+                        + RATE_LIMIT_INTERVAL_MILLISECONDS;
+                List<SecurityEvent> result = mPendingLogs;
+                mPendingLogs = new ArrayList<SecurityEvent>();
+                return result;
+            } else {
+                return null;
+            }
+        } finally {
+            mLock.unlock();
+        }
+!!!33916599.java!!!	run() : void
+        Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND);
+
+        ArrayList<SecurityEvent> logs = new ArrayList<SecurityEvent>();
+        // The timestamp of the latest log entry that has been read, in nanoseconds
+        long lastLogTimestampNanos = -1;
+        while (!Thread.currentThread().isInterrupted()) {
+            try {
+                Thread.sleep(POLLING_INTERVAL_MILLISECONDS);
+
+                if (lastLogTimestampNanos < 0) {
+                    // Non-blocking read that returns all logs immediately.
+                    if (DEBUG) Slog.d(TAG, "SecurityLog.readEvents");
+                    SecurityLog.readEvents(logs);
+                } else {
+                    if (DEBUG) Slog.d(TAG,
+                            "SecurityLog.readEventsSince: " + lastLogTimestampNanos);
+                    // Non-blocking read that returns all logs >= the  timestamp immediately.
+                    SecurityLog.readEventsSince(lastLogTimestampNanos + 1, logs);
+                }
+                if (!logs.isEmpty()) {
+                    if (DEBUG) Slog.d(TAG, "processing new logs");
+                    mLock.lockInterruptibly();
+                    try {
+                        mPendingLogs.addAll(logs);
+                        if (mPendingLogs.size() > BUFFER_ENTRIES_MAXIMUM_LEVEL) {
+                            // Truncate buffer down to half of BUFFER_ENTRIES_MAXIMUM_LEVEL
+                            mPendingLogs = new ArrayList<SecurityEvent>(mPendingLogs.subList(
+                                    mPendingLogs.size() - (BUFFER_ENTRIES_MAXIMUM_LEVEL / 2),
+                                    mPendingLogs.size()));
+                        }
+                    } finally {
+                        mLock.unlock();
+                    }
+                    lastLogTimestampNanos = logs.get(logs.size() - 1).getTimeNanos();
+                    logs.clear();
+                }
+                notifyDeviceOwnerIfNeeded();
+            } catch (IOException e) {
+                Log.e(TAG, "Failed to read security log", e);
+            } catch (InterruptedException e) {
+                Log.i(TAG, "Thread interrupted, exiting.", e);
+                // We are asked to stop.
+                break;
+            }
+        }
+        if (DEBUG) Slog.d(TAG, "MonitorThread exit.");
+!!!33916727.java!!!	notifyDeviceOwnerIfNeeded() : void
+        boolean shouldNotifyDO = false;
+        boolean allowToRetrieveNow = false;
+        mLock.lockInterruptibly();
+        try {
+            int logSize = mPendingLogs.size();
+            if (logSize >= BUFFER_ENTRIES_NOTIFICATION_LEVEL) {
+                // Allow DO to retrieve logs if too many pending logs
+                allowToRetrieveNow = true;
+            } else if (logSize > 0) {
+                if (mNextAllowedRetrivalTimeMillis == -1 ||
+                        System.currentTimeMillis() >= mNextAllowedRetrivalTimeMillis) {
+                    // Rate limit reset
+                    allowToRetrieveNow = true;
+                }
+            }
+            shouldNotifyDO = (!mAllowedToRetrieve) && allowToRetrieveNow;
+            mAllowedToRetrieve = allowToRetrieveNow;
+        } finally {
+            mLock.unlock();
+        }
+        if (shouldNotifyDO) {
+            if (DEBUG) Slog.d(TAG, "notify DO");
+            mService.sendDeviceOwnerCommand(DeviceAdminReceiver.ACTION_SECURITY_LOGS_AVAILABLE,
+                    null);
+        }

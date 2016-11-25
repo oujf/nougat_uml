@@ -1,0 +1,167 @@
+class DisplaySinkService
+!!!34684215.java!!!	DisplaySinkService(inout context : Context, inout transport : Transport, in densityDpi : int)
+        super(context, transport, Protocol.DisplaySinkService.ID);
+        mTransportHandler = transport.getHandler();
+        mDensityDpi = densityDpi;
+!!!34684343.java!!!	setSurfaceView(in surfaceView : SurfaceView) : void
+        if (mSurfaceView != surfaceView) {
+            final SurfaceView oldSurfaceView = mSurfaceView;
+            mSurfaceView = surfaceView;
+
+            if (oldSurfaceView != null) {
+                oldSurfaceView.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        final SurfaceHolder holder = oldSurfaceView.getHolder();
+                        holder.removeCallback(DisplaySinkService.this);
+                        updateSurfaceFromUi(null);
+                    }
+                });
+            }
+
+            if (surfaceView != null) {
+                surfaceView.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        final SurfaceHolder holder = surfaceView.getHolder();
+                        holder.addCallback(DisplaySinkService.this);
+                        updateSurfaceFromUi(holder);
+                    }
+                });
+            }
+        }
+!!!34684471.java!!!	onMessageReceived(in service : int, in what : int, inout content : ByteBuffer) : void
+        switch (what) {
+            case Protocol.DisplaySinkService.MSG_QUERY: {
+                getLogger().log("Received MSG_QUERY.");
+                sendSinkStatus();
+                break;
+            }
+
+            case Protocol.DisplaySinkService.MSG_CONTENT: {
+                decode(content);
+                break;
+            }
+        }
+!!!34684599.java!!!	surfaceCreated(inout holder : SurfaceHolder) : void
+        // Ignore.  Wait for surface changed event that follows.
+!!!34684727.java!!!	surfaceChanged(inout holder : SurfaceHolder, in format : int, in width : int, in height : int) : void
+        updateSurfaceFromUi(holder);
+!!!34684855.java!!!	surfaceDestroyed(inout holder : SurfaceHolder) : void
+        updateSurfaceFromUi(null);
+!!!34684983.java!!!	updateSurfaceFromUi(inout holder : SurfaceHolder) : void
+        Surface surface = null;
+        int width = 0, height = 0;
+        if (holder != null && !holder.isCreating()) {
+            surface = holder.getSurface();
+            if (surface.isValid()) {
+                final Rect frame = holder.getSurfaceFrame();
+                width = frame.width();
+                height = frame.height();
+            } else {
+                surface = null;
+            }
+        }
+
+        synchronized (mSurfaceAndCodecLock) {
+            if (mSurface == surface &&  mSurfaceWidth == width && mSurfaceHeight == height) {
+                return;
+            }
+
+            mSurface = surface;
+            mSurfaceWidth = width;
+            mSurfaceHeight = height;
+
+            if (mCodec != null) {
+                mCodec.stop();
+                mCodec = null;
+                mCodecInputBuffers = null;
+                mCodecBufferInfo = null;
+            }
+
+            if (mSurface != null) {
+                MediaFormat format = MediaFormat.createVideoFormat(
+                        "video/avc", mSurfaceWidth, mSurfaceHeight);
+                try {
+                    mCodec = MediaCodec.createDecoderByType("video/avc");
+                } catch (IOException e) {
+                    throw new RuntimeException(
+                            "failed to create video/avc decoder", e);
+                }
+                mCodec.configure(format, mSurface, null, 0);
+                mCodec.start();
+                mCodecBufferInfo = new BufferInfo();
+            }
+
+            mTransportHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    sendSinkStatus();
+                }
+            });
+        }
+!!!34685111.java!!!	decode(inout content : ByteBuffer) : void
+        if (content == null) {
+            return;
+        }
+        synchronized (mSurfaceAndCodecLock) {
+            if (mCodec == null) {
+                return;
+            }
+
+            while (content.hasRemaining()) {
+                if (!provideCodecInputLocked(content)) {
+                    getLogger().log("Dropping content because there are no available buffers.");
+                    return;
+                }
+
+                consumeCodecOutputLocked();
+            }
+        }
+!!!34685239.java!!!	provideCodecInputLocked(inout content : ByteBuffer) : boolean
+        final int index = mCodec.dequeueInputBuffer(0);
+        if (index < 0) {
+            return false;
+        }
+        if (mCodecInputBuffers == null) {
+            mCodecInputBuffers = mCodec.getInputBuffers();
+        }
+        final ByteBuffer buffer = mCodecInputBuffers[index];
+        final int capacity = buffer.capacity();
+        buffer.clear();
+        if (content.remaining() <= capacity) {
+            buffer.put(content);
+        } else {
+            final int limit = content.limit();
+            content.limit(content.position() + capacity);
+            buffer.put(content);
+            content.limit(limit);
+        }
+        buffer.flip();
+        mCodec.queueInputBuffer(index, 0, buffer.limit(), 0, 0);
+        return true;
+!!!34685367.java!!!	consumeCodecOutputLocked() : void
+        for (;;) {
+            final int index = mCodec.dequeueOutputBuffer(mCodecBufferInfo, 0);
+            if (index >= 0) {
+                mCodec.releaseOutputBuffer(index, true /*render*/);
+            } else if (index != MediaCodec.INFO_OUTPUT_BUFFERS_CHANGED
+                    && index != MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                break;
+            }
+        }
+!!!34685495.java!!!	sendSinkStatus() : void
+        synchronized (mSurfaceAndCodecLock) {
+            if (mCodec != null) {
+                mBuffer.clear();
+                mBuffer.putInt(mSurfaceWidth);
+                mBuffer.putInt(mSurfaceHeight);
+                mBuffer.putInt(mDensityDpi);
+                mBuffer.flip();
+                getTransport().sendMessage(Protocol.DisplaySourceService.ID,
+                        Protocol.DisplaySourceService.MSG_SINK_AVAILABLE, mBuffer);
+            } else {
+                getTransport().sendMessage(Protocol.DisplaySourceService.ID,
+                        Protocol.DisplaySourceService.MSG_SINK_NOT_AVAILABLE, null);
+            }
+        }

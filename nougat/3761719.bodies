@@ -1,0 +1,339 @@
+class ConfigParsingUtils
+!!!41010743.cpp!!!	loadConfig(in path : char, inout config : AudioPolicyConfig) : status_t
+    cnode *root;
+    char *data;
+
+    data = (char *)load_file(path, NULL);
+    if (data == NULL) {
+        return -ENODEV;
+    }
+    root = config_node("", "");
+    config_load(root, data);
+
+    HwModuleCollection hwModules;
+    loadHwModules(root, hwModules, config);
+
+    // legacy audio_policy.conf files have one global_configuration section, attached to primary.
+    loadGlobalConfig(root, config, hwModules.getModuleFromName(AUDIO_HARDWARE_MODULE_ID_PRIMARY));
+
+    config.setHwModules(hwModules);
+
+    config_free(root);
+    free(root);
+    free(data);
+
+    ALOGI("loadAudioPolicyConfig() loaded %s\n", path);
+
+    return NO_ERROR;
+!!!41010871.cpp!!!	loadAudioPortGain(inout root : cnode, inout audioPort : AudioPort, in index : int) : void
+    cnode *node = root->first_child;
+
+    sp<AudioGain> gain = new AudioGain(index, audioPort.useInputChannelMask());
+
+    while (node) {
+        if (strcmp(node->name, GAIN_MODE) == 0) {
+            gain->setMode(GainModeConverter::maskFromString(node->value));
+        } else if (strcmp(node->name, GAIN_CHANNELS) == 0) {
+            audio_channel_mask_t mask;
+            if (audioPort.useInputChannelMask()) {
+                if (InputChannelConverter::fromString(node->value, mask)) {
+                    gain->setChannelMask(mask);
+                }
+            } else {
+                if (OutputChannelConverter::fromString(node->value, mask)) {
+                    gain->setChannelMask(mask);
+                }
+            }
+        } else if (strcmp(node->name, GAIN_MIN_VALUE) == 0) {
+            gain->setMinValueInMb(atoi(node->value));
+        } else if (strcmp(node->name, GAIN_MAX_VALUE) == 0) {
+            gain->setMaxValueInMb(atoi(node->value));
+        } else if (strcmp(node->name, GAIN_DEFAULT_VALUE) == 0) {
+            gain->setDefaultValueInMb(atoi(node->value));
+        } else if (strcmp(node->name, GAIN_STEP_VALUE) == 0) {
+            gain->setStepValueInMb(atoi(node->value));
+        } else if (strcmp(node->name, GAIN_MIN_RAMP_MS) == 0) {
+            gain->setMinRampInMs(atoi(node->value));
+        } else if (strcmp(node->name, GAIN_MAX_RAMP_MS) == 0) {
+            gain->setMaxRampInMs(atoi(node->value));
+        }
+        node = node->next;
+    }
+
+    ALOGV("loadGain() adding new gain mode %08x channel mask %08x min mB %d max mB %d",
+          gain->getMode(), gain->getChannelMask(), gain->getMinValueInMb(),
+          gain->getMaxValueInMb());
+
+    if (gain->getMode() == 0) {
+        return;
+    }
+    audioPort.mGains.add(gain);
+!!!41010999.cpp!!!	loadAudioPortGains(inout root : cnode, inout audioPort : AudioPort) : void
+    cnode *node = root->first_child;
+    int index = 0;
+    while (node) {
+        ALOGV("loadGains() loading gain %s", node->name);
+        loadAudioPortGain(node, audioPort, index++);
+        node = node->next;
+    }
+!!!41011127.cpp!!!	loadDeviceDescriptorGains(inout root : cnode, inout deviceDesc : sp<DeviceDescriptor>) : void
+    loadAudioPortGains(root, *deviceDesc);
+    if (deviceDesc->mGains.size() > 0) {
+        deviceDesc->mGains[0]->getDefaultConfig(&deviceDesc->mGain);
+    }
+!!!41011255.cpp!!!	loadHwModuleDevice(inout root : cnode, inout devices : DeviceVector) : status_t
+    cnode *node = root->first_child;
+
+    audio_devices_t type = AUDIO_DEVICE_NONE;
+    while (node) {
+        if (strcmp(node->name, APM_DEVICE_TYPE) == 0) {
+            DeviceConverter::fromString(node->value, type);
+            break;
+        }
+        node = node->next;
+    }
+    if (type == AUDIO_DEVICE_NONE ||
+            (!audio_is_input_device(type) && !audio_is_output_device(type))) {
+        ALOGW("loadDevice() bad type %08x", type);
+        return BAD_VALUE;
+    }
+    sp<DeviceDescriptor> deviceDesc = new DeviceDescriptor(type, String8(root->name));
+
+    node = root->first_child;
+    while (node) {
+        if (strcmp(node->name, APM_DEVICE_ADDRESS) == 0) {
+            deviceDesc->mAddress = String8((char *)node->value);
+        } else if (strcmp(node->name, CHANNELS_TAG) == 0) {
+            if (audio_is_input_device(type)) {
+                deviceDesc->addAudioProfile(
+                        new AudioProfile(gDynamicFormat,
+                                         inputChannelMasksFromString(node->value),
+                                         SampleRateVector()));
+            } else {
+                deviceDesc->addAudioProfile(
+                        new AudioProfile(gDynamicFormat,
+                                         outputChannelMasksFromString(node->value),
+                                         SampleRateVector()));
+            }
+        } else if (strcmp(node->name, GAINS_TAG) == 0) {
+            loadDeviceDescriptorGains(node, deviceDesc);
+        }
+        node = node->next;
+    }
+
+    ALOGV("loadDevice() adding device tag (literal type) %s type %08x address %s",
+          deviceDesc->getTagName().string(), type, deviceDesc->mAddress.string());
+
+    devices.add(deviceDesc);
+    return NO_ERROR;
+!!!41011383.cpp!!!	loadHwModuleProfile(inout root : cnode, inout module : sp<HwModule>, in role : audio_port_role_t) : status_t
+    cnode *node = root->first_child;
+
+    sp<IOProfile> profile = new IOProfile(String8(root->name), role);
+
+    AudioProfileVector audioProfiles;
+    SampleRateVector sampleRates;
+    ChannelsVector channels;
+    FormatVector formats;
+
+    while (node) {
+        if (strcmp(node->name, FORMATS_TAG) == 0 &&
+                strcmp(node->value, DYNAMIC_VALUE_TAG) != 0) {
+            formats = formatsFromString(node->value);
+        } else if (strcmp(node->name, SAMPLING_RATES_TAG) == 0 &&
+                  strcmp(node->value, DYNAMIC_VALUE_TAG) != 0) {
+            collectionFromString<SampleRateTraits>(node->value, sampleRates);
+        } else if (strcmp(node->name, CHANNELS_TAG) == 0 &&
+                   strcmp(node->value, DYNAMIC_VALUE_TAG) != 0) {
+            if (role == AUDIO_PORT_ROLE_SINK) {
+                channels = inputChannelMasksFromString(node->value);
+            } else {
+                channels = outputChannelMasksFromString(node->value);
+            }
+        } else if (strcmp(node->name, DEVICES_TAG) == 0) {
+            DeviceVector devices;
+            loadDevicesFromTag(node->value, devices, module->getDeclaredDevices());
+            profile->setSupportedDevices(devices);
+        } else if (strcmp(node->name, FLAGS_TAG) == 0) {
+            if (role == AUDIO_PORT_ROLE_SINK) {
+                profile->setFlags(InputFlagConverter::maskFromString(node->value));
+            } else {
+                profile->setFlags(OutputFlagConverter::maskFromString(node->value));
+            }
+        } else if (strcmp(node->name, GAINS_TAG) == 0) {
+            loadAudioPortGains(node, *profile);
+        }
+        node = node->next;
+    }
+    if (formats.isEmpty()) {
+        sp<AudioProfile> profileToAdd = new AudioProfile(gDynamicFormat, channels, sampleRates);
+        profileToAdd->setDynamicFormat(true);
+        profileToAdd->setDynamicChannels(channels.isEmpty());
+        profileToAdd->setDynamicRate(sampleRates.isEmpty());
+        audioProfiles.add(profileToAdd);
+    } else {
+        for (size_t i = 0; i < formats.size(); i++) {
+            // For compatibility reason, for each format, creates a profile with the same
+            // collection of rate and channels.
+            sp<AudioProfile> profileToAdd = new AudioProfile(formats[i], channels, sampleRates);
+            profileToAdd->setDynamicFormat(formats[i] == gDynamicFormat);
+            profileToAdd->setDynamicChannels(channels.isEmpty());
+            profileToAdd->setDynamicRate(sampleRates.isEmpty());
+            audioProfiles.add(profileToAdd);
+        }
+    }
+    profile->setAudioProfiles(audioProfiles);
+    ALOGW_IF(!profile->hasSupportedDevices(), "load%s() invalid supported devices",
+             role == AUDIO_PORT_ROLE_SINK ? "Input" : "Output");
+    if (profile->hasSupportedDevices()) {
+        ALOGV("load%s() adding Supported Devices %04x, mFlags %04x",
+              role == AUDIO_PORT_ROLE_SINK ? "Input" : "Output",
+              profile->getSupportedDevicesType(), profile->getFlags());
+        return module->addProfile(profile);
+    }
+    return BAD_VALUE;
+!!!41011511.cpp!!!	loadDevicesFromTag(in tag : char, inout devices : DeviceVector, in declaredDevices : DeviceVector) : void
+    char *tagLiteral = strndup(tag, strlen(tag));
+    char *devTag = strtok(tagLiteral, "|");
+    while (devTag != NULL) {
+        if (strlen(devTag) != 0) {
+            audio_devices_t type;
+            if (DeviceConverter::fromString(devTag, type)) {
+                uint32_t inBit = type & AUDIO_DEVICE_BIT_IN;
+                type &= ~AUDIO_DEVICE_BIT_IN;
+                while (type) {
+                  audio_devices_t singleType =
+                        inBit | (1 << (31 - __builtin_clz(type)));
+                    type &= ~singleType;
+                    sp<DeviceDescriptor> dev = new DeviceDescriptor(singleType);
+                    devices.add(dev);
+                }
+            } else {
+                sp<DeviceDescriptor> deviceDesc =
+                        declaredDevices.getDeviceFromTagName(String8(devTag));
+                if (deviceDesc != 0) {
+                    devices.add(deviceDesc);
+                }
+            }
+        }
+        devTag = strtok(NULL, "|");
+    }
+    free(tagLiteral);
+!!!41011639.cpp!!!	loadHwModules(inout root : cnode, inout hwModules : HwModuleCollection, inout config : AudioPolicyConfig) : void
+    cnode *node = config_find(root, AUDIO_HW_MODULE_TAG);
+    if (node == NULL) {
+        return;
+    }
+
+    node = node->first_child;
+    while (node) {
+        ALOGV("loadHwModules() loading module %s", node->name);
+        sp<HwModule> module = new HwModule(node->name);
+        if (loadHwModule(node, module, config) == NO_ERROR) {
+            hwModules.add(module);
+        }
+        node = node->next;
+    }
+!!!41011767.cpp!!!	loadGlobalConfig(inout root : cnode, inout config : AudioPolicyConfig, in primaryModule : sp<HwModule>) : void
+    cnode *node = config_find(root, GLOBAL_CONFIG_TAG);
+
+    if (node == NULL) {
+        return;
+    }
+    node = node->first_child;
+    while (node) {
+        if (strcmp(SPEAKER_DRC_ENABLED_TAG, node->name) == 0) {
+            bool speakerDrcEnabled;
+            if (utilities::convertTo<std::string, bool>(node->value, speakerDrcEnabled)) {
+                ALOGV("loadGlobalConfig() mSpeakerDrcEnabled = %d", speakerDrcEnabled);
+                config.setSpeakerDrcEnabled(speakerDrcEnabled);
+            }
+        }
+        node = node->next;
+    }
+    loadModuleGlobalConfig(root, primaryModule, config);
+!!!41011895.cpp!!!	loadModuleGlobalConfig(inout root : cnode, in module : sp<HwModule>, inout config : AudioPolicyConfig) : void
+    cnode *node = config_find(root, GLOBAL_CONFIG_TAG);
+
+    if (node == NULL) {
+        return;
+    }
+    DeviceVector declaredDevices;
+    if (module != NULL) {
+        declaredDevices = module->getDeclaredDevices();
+    }
+
+    node = node->first_child;
+    while (node) {
+        if (strcmp(ATTACHED_OUTPUT_DEVICES_TAG, node->name) == 0) {
+            DeviceVector availableOutputDevices;
+            loadDevicesFromTag(node->value, availableOutputDevices, declaredDevices);
+            ALOGV("loadGlobalConfig() Attached Output Devices %08x",
+                  availableOutputDevices.types());
+            config.addAvailableOutputDevices(availableOutputDevices);
+        } else if (strcmp(DEFAULT_OUTPUT_DEVICE_TAG, node->name) == 0) {
+            audio_devices_t device = AUDIO_DEVICE_NONE;
+            DeviceConverter::fromString(node->value, device);
+            if (device != AUDIO_DEVICE_NONE) {
+                sp<DeviceDescriptor> defaultOutputDevice = new DeviceDescriptor(device);
+                config.setDefaultOutputDevice(defaultOutputDevice);
+                ALOGV("loadGlobalConfig() mDefaultOutputDevice %08x", defaultOutputDevice->type());
+            } else {
+                ALOGW("loadGlobalConfig() default device not specified");
+            }
+        } else if (strcmp(ATTACHED_INPUT_DEVICES_TAG, node->name) == 0) {
+            DeviceVector availableInputDevices;
+            loadDevicesFromTag(node->value, availableInputDevices, declaredDevices);
+            ALOGV("loadGlobalConfig() Available InputDevices %08x", availableInputDevices.types());
+            config.addAvailableInputDevices(availableInputDevices);
+        } else if (strcmp(AUDIO_HAL_VERSION_TAG, node->name) == 0) {
+            uint32_t major, minor;
+            sscanf((char *)node->value, "%u.%u", &major, &minor);
+            module->setHalVersion(HARDWARE_DEVICE_API_VERSION(major, minor));
+            ALOGV("loadGlobalConfig() mHalVersion = %04x major %u minor %u",
+                  module->getHalVersion(), major, minor);
+        }
+        node = node->next;
+    }
+!!!41012023.cpp!!!	loadHwModule(inout root : cnode, inout module : sp<HwModule>, inout config : AudioPolicyConfig) : status_t
+    status_t status = NAME_NOT_FOUND;
+    cnode *node = config_find(root, DEVICES_TAG);
+    if (node != NULL) {
+        node = node->first_child;
+        DeviceVector devices;
+        while (node) {
+            ALOGV("loadHwModule() loading device %s", node->name);
+            status_t tmpStatus = loadHwModuleDevice(node, devices);
+            if (status == NAME_NOT_FOUND || status == NO_ERROR) {
+                status = tmpStatus;
+            }
+            node = node->next;
+        }
+        module->setDeclaredDevices(devices);
+    }
+    node = config_find(root, OUTPUTS_TAG);
+    if (node != NULL) {
+        node = node->first_child;
+        while (node) {
+            ALOGV("loadHwModule() loading output %s", node->name);
+            status_t tmpStatus = loadHwModuleProfile(node, module, AUDIO_PORT_ROLE_SOURCE);
+            if (status == NAME_NOT_FOUND || status == NO_ERROR) {
+                status = tmpStatus;
+            }
+            node = node->next;
+        }
+    }
+    node = config_find(root, INPUTS_TAG);
+    if (node != NULL) {
+        node = node->first_child;
+        while (node) {
+            ALOGV("loadHwModule() loading input %s", node->name);
+            status_t tmpStatus = loadHwModuleProfile(node, module, AUDIO_PORT_ROLE_SINK);
+            if (status == NAME_NOT_FOUND || status == NO_ERROR) {
+                status = tmpStatus;
+            }
+            node = node->next;
+        }
+    }
+    loadModuleGlobalConfig(root, module, config);
+    return status;

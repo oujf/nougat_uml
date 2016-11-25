@@ -1,0 +1,372 @@
+class ZygoteConnection
+!!!6135607.java!!!	ZygoteConnection(inout socket : LocalSocket, inout abiList : String)
+        mSocket = socket;
+        this.abiList = abiList;
+
+        mSocketOutStream
+                = new DataOutputStream(socket.getOutputStream());
+
+        mSocketReader = new BufferedReader(
+                new InputStreamReader(socket.getInputStream()), 256);
+
+        mSocket.setSoTimeout(CONNECTION_TIMEOUT_MILLIS);
+
+        try {
+            peer = mSocket.getPeerCredentials();
+        } catch (IOException ex) {
+            Log.e(TAG, "Cannot read peer credentials", ex);
+            throw ex;
+        }
+!!!6135735.java!!!	getFileDesciptor() : FileDescriptor
+        return mSocket.getFileDescriptor();
+!!!6135863.java!!!	runOnce() : boolean
+
+        String args[];
+        Arguments parsedArgs = null;
+        FileDescriptor[] descriptors;
+
+        try {
+            args = readArgumentList();
+            descriptors = mSocket.getAncillaryFileDescriptors();
+        } catch (IOException ex) {
+            Log.w(TAG, "IOException on command socket " + ex.getMessage());
+            closeSocket();
+            return true;
+        }
+
+        if (args == null) {
+            // EOF reached.
+            closeSocket();
+            return true;
+        }
+
+        /** the stderr of the most recent request, if avail */
+        PrintStream newStderr = null;
+
+        if (descriptors != null && descriptors.length >= 3) {
+            newStderr = new PrintStream(
+                    new FileOutputStream(descriptors[2]));
+        }
+
+        int pid = -1;
+        FileDescriptor childPipeFd = null;
+        FileDescriptor serverPipeFd = null;
+
+        try {
+            parsedArgs = new Arguments(args);
+
+            if (parsedArgs.abiListQuery) {
+                return handleAbiListQuery();
+            }
+
+            if (parsedArgs.permittedCapabilities != 0 || parsedArgs.effectiveCapabilities != 0) {
+                throw new ZygoteSecurityException("Client may not specify capabilities: " +
+                        "permitted=0x" + Long.toHexString(parsedArgs.permittedCapabilities) +
+                        ", effective=0x" + Long.toHexString(parsedArgs.effectiveCapabilities));
+            }
+
+            applyUidSecurityPolicy(parsedArgs, peer);
+            applyInvokeWithSecurityPolicy(parsedArgs, peer);
+
+            applyDebuggerSystemProperty(parsedArgs);
+            applyInvokeWithSystemProperty(parsedArgs);
+
+            int[][] rlimits = null;
+
+            if (parsedArgs.rlimits != null) {
+                rlimits = parsedArgs.rlimits.toArray(intArray2d);
+            }
+
+            if (parsedArgs.invokeWith != null) {
+                FileDescriptor[] pipeFds = Os.pipe2(O_CLOEXEC);
+                childPipeFd = pipeFds[1];
+                serverPipeFd = pipeFds[0];
+                Os.fcntlInt(childPipeFd, F_SETFD, 0);
+            }
+
+            /**
+             * In order to avoid leaking descriptors to the Zygote child,
+             * the native code must close the two Zygote socket descriptors
+             * in the child process before it switches from Zygote-root to
+             * the UID and privileges of the application being launched.
+             *
+             * In order to avoid "bad file descriptor" errors when the
+             * two LocalSocket objects are closed, the Posix file
+             * descriptors are released via a dup2() call which closes
+             * the socket and substitutes an open descriptor to /dev/null.
+             */
+
+            int [] fdsToClose = { -1, -1 };
+
+            FileDescriptor fd = mSocket.getFileDescriptor();
+
+            if (fd != null) {
+                fdsToClose[0] = fd.getInt$();
+            }
+
+            fd = ZygoteInit.getServerSocketFileDescriptor();
+
+            if (fd != null) {
+                fdsToClose[1] = fd.getInt$();
+            }
+
+            fd = null;
+
+            pid = Zygote.forkAndSpecialize(parsedArgs.uid, parsedArgs.gid, parsedArgs.gids,
+                    parsedArgs.debugFlags, rlimits, parsedArgs.mountExternal, parsedArgs.seInfo,
+                    parsedArgs.niceName, fdsToClose, parsedArgs.instructionSet,
+                    parsedArgs.appDataDir);
+        } catch (ErrnoException ex) {
+            logAndPrintError(newStderr, "Exception creating pipe", ex);
+        } catch (IllegalArgumentException ex) {
+            logAndPrintError(newStderr, "Invalid zygote arguments", ex);
+        } catch (ZygoteSecurityException ex) {
+            logAndPrintError(newStderr,
+                    "Zygote security policy prevents request: ", ex);
+        }
+
+        try {
+            if (pid == 0) {
+                // in child
+                IoUtils.closeQuietly(serverPipeFd);
+                serverPipeFd = null;
+                handleChildProc(parsedArgs, descriptors, childPipeFd, newStderr);
+
+                // should never get here, the child is expected to either
+                // throw ZygoteInit.MethodAndArgsCaller or exec().
+                return true;
+            } else {
+                // in parent...pid of < 0 means failure
+                IoUtils.closeQuietly(childPipeFd);
+                childPipeFd = null;
+                return handleParentProc(pid, descriptors, serverPipeFd, parsedArgs);
+            }
+        } finally {
+            IoUtils.closeQuietly(childPipeFd);
+            IoUtils.closeQuietly(serverPipeFd);
+        }
+!!!6135991.java!!!	handleAbiListQuery() : boolean
+        try {
+            final byte[] abiListBytes = abiList.getBytes(StandardCharsets.US_ASCII);
+            mSocketOutStream.writeInt(abiListBytes.length);
+            mSocketOutStream.write(abiListBytes);
+            return false;
+        } catch (IOException ioe) {
+            Log.e(TAG, "Error writing to command socket", ioe);
+            return true;
+        }
+!!!6136119.java!!!	closeSocket() : void
+        try {
+            mSocket.close();
+        } catch (IOException ex) {
+            Log.e(TAG, "Exception while closing command "
+                    + "socket in parent", ex);
+        }
+!!!6136503.java!!!	readArgumentList() : String
+
+        /**
+         * See android.os.Process.zygoteSendArgsAndGetPid()
+         * Presently the wire format to the zygote process is:
+         * a) a count of arguments (argc, in essence)
+         * b) a number of newline-separated argument strings equal to count
+         *
+         * After the zygote process reads these it will write the pid of
+         * the child or -1 on failure.
+         */
+
+        int argc;
+
+        try {
+            String s = mSocketReader.readLine();
+
+            if (s == null) {
+                // EOF reached.
+                return null;
+            }
+            argc = Integer.parseInt(s);
+        } catch (NumberFormatException ex) {
+            Log.e(TAG, "invalid Zygote wire format: non-int at argc");
+            throw new IOException("invalid wire format");
+        }
+
+        // See bug 1092107: large argc can be used for a DOS attack
+        if (argc > MAX_ZYGOTE_ARGC) {
+            throw new IOException("max arg count exceeded");
+        }
+
+        String[] result = new String[argc];
+        for (int i = 0; i < argc; i++) {
+            result[i] = mSocketReader.readLine();
+            if (result[i] == null) {
+                // We got an unexpected EOF.
+                throw new IOException("truncated request");
+            }
+        }
+
+        return result;
+!!!6136631.java!!!	applyUidSecurityPolicy(inout args : ZygoteConnection::Arguments, inout peer : Credentials) : void
+
+        if (peer.getUid() == Process.SYSTEM_UID) {
+            String factoryTest = SystemProperties.get("ro.factorytest");
+            boolean uidRestricted;
+
+            /* In normal operation, SYSTEM_UID can only specify a restricted
+             * set of UIDs. In factory test mode, SYSTEM_UID may specify any uid.
+             */
+            uidRestricted = !(factoryTest.equals("1") || factoryTest.equals("2"));
+
+            if (uidRestricted && args.uidSpecified && (args.uid < Process.SYSTEM_UID)) {
+                throw new ZygoteSecurityException(
+                        "System UID may not launch process with UID < "
+                        + Process.SYSTEM_UID);
+            }
+        }
+
+        // If not otherwise specified, uid and gid are inherited from peer
+        if (!args.uidSpecified) {
+            args.uid = peer.getUid();
+            args.uidSpecified = true;
+        }
+        if (!args.gidSpecified) {
+            args.gid = peer.getGid();
+            args.gidSpecified = true;
+        }
+!!!6136759.java!!!	applyDebuggerSystemProperty(inout args : ZygoteConnection::Arguments) : void
+        if ("1".equals(SystemProperties.get("ro.debuggable"))) {
+            args.debugFlags |= Zygote.DEBUG_ENABLE_DEBUGGER;
+        }
+!!!6136887.java!!!	applyInvokeWithSecurityPolicy(inout args : ZygoteConnection::Arguments, inout peer : Credentials) : void
+        int peerUid = peer.getUid();
+
+        if (args.invokeWith != null && peerUid != 0) {
+            throw new ZygoteSecurityException("Peer is not permitted to specify "
+                    + "an explicit invoke-with wrapper command");
+        }
+!!!6137015.java!!!	applyInvokeWithSystemProperty(inout args : ZygoteConnection::Arguments) : void
+        if (args.invokeWith == null && args.niceName != null) {
+            String property = "wrap." + args.niceName;
+            if (property.length() > 31) {
+                // Properties with a trailing "." are illegal.
+                if (property.charAt(30) != '.') {
+                    property = property.substring(0, 31);
+                } else {
+                    property = property.substring(0, 30);
+                }
+            }
+            args.invokeWith = SystemProperties.get(property);
+            if (args.invokeWith != null && args.invokeWith.length() == 0) {
+                args.invokeWith = null;
+            }
+        }
+!!!6137143.java!!!	handleChildProc(inout parsedArgs : ZygoteConnection::Arguments, inout descriptors : FileDescriptor, inout pipeFd : FileDescriptor, inout newStderr : PrintStream) : void
+        /**
+         * By the time we get here, the native code has closed the two actual Zygote
+         * socket connections, and substituted /dev/null in their place.  The LocalSocket
+         * objects still need to be closed properly.
+         */
+
+        closeSocket();
+        ZygoteInit.closeServerSocket();
+
+        if (descriptors != null) {
+            try {
+                Os.dup2(descriptors[0], STDIN_FILENO);
+                Os.dup2(descriptors[1], STDOUT_FILENO);
+                Os.dup2(descriptors[2], STDERR_FILENO);
+
+                for (FileDescriptor fd: descriptors) {
+                    IoUtils.closeQuietly(fd);
+                }
+                newStderr = System.err;
+            } catch (ErrnoException ex) {
+                Log.e(TAG, "Error reopening stdio", ex);
+            }
+        }
+
+        if (parsedArgs.niceName != null) {
+            Process.setArgV0(parsedArgs.niceName);
+        }
+
+        // End of the postFork event.
+        Trace.traceEnd(Trace.TRACE_TAG_ACTIVITY_MANAGER);
+        if (parsedArgs.invokeWith != null) {
+            WrapperInit.execApplication(parsedArgs.invokeWith,
+                    parsedArgs.niceName, parsedArgs.targetSdkVersion,
+                    VMRuntime.getCurrentInstructionSet(),
+                    pipeFd, parsedArgs.remainingArgs);
+        } else {
+            RuntimeInit.zygoteInit(parsedArgs.targetSdkVersion,
+                    parsedArgs.remainingArgs, null /* classLoader */);
+        }
+!!!6137271.java!!!	handleParentProc(in pid : int, inout descriptors : FileDescriptor, inout pipeFd : FileDescriptor, inout parsedArgs : ZygoteConnection::Arguments) : boolean
+
+        if (pid > 0) {
+            setChildPgid(pid);
+        }
+
+        if (descriptors != null) {
+            for (FileDescriptor fd: descriptors) {
+                IoUtils.closeQuietly(fd);
+            }
+        }
+
+        boolean usingWrapper = false;
+        if (pipeFd != null && pid > 0) {
+            DataInputStream is = new DataInputStream(new FileInputStream(pipeFd));
+            int innerPid = -1;
+            try {
+                innerPid = is.readInt();
+            } catch (IOException ex) {
+                Log.w(TAG, "Error reading pid from wrapped process, child may have died", ex);
+            } finally {
+                try {
+                    is.close();
+                } catch (IOException ex) {
+                }
+            }
+
+            // Ensure that the pid reported by the wrapped process is either the
+            // child process that we forked, or a descendant of it.
+            if (innerPid > 0) {
+                int parentPid = innerPid;
+                while (parentPid > 0 && parentPid != pid) {
+                    parentPid = Process.getParentPid(parentPid);
+                }
+                if (parentPid > 0) {
+                    Log.i(TAG, "Wrapped process has pid " + innerPid);
+                    pid = innerPid;
+                    usingWrapper = true;
+                } else {
+                    Log.w(TAG, "Wrapped process reported a pid that is not a child of "
+                            + "the process that we forked: childPid=" + pid
+                            + " innerPid=" + innerPid);
+                }
+            }
+        }
+
+        try {
+            mSocketOutStream.writeInt(pid);
+            mSocketOutStream.writeBoolean(usingWrapper);
+        } catch (IOException ex) {
+            Log.e(TAG, "Error writing to command socket", ex);
+            return true;
+        }
+
+        return false;
+!!!6137399.java!!!	setChildPgid(in pid : int) : void
+        // Try to move the new child into the peer's process group.
+        try {
+            Os.setpgid(pid, Os.getpgid(peer.getPid()));
+        } catch (ErrnoException ex) {
+            // This exception is expected in the case where
+            // the peer is not in our session
+            // TODO get rid of this log message in the case where
+            // getsid(0) != getsid(peer.getPid())
+            Log.i(TAG, "Zygote: setpgid failed. This is "
+                + "normal if peer is not in our session");
+        }
+!!!6137527.java!!!	logAndPrintError(inout newStderr : PrintStream, inout message : String, inout ex : Throwable) : void
+        Log.e(TAG, message, ex);
+        if (newStderr != null) {
+            newStderr.println(message + (ex == null ? "" : ex));
+        }

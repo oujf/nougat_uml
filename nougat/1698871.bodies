@@ -1,0 +1,183 @@
+class ClassPathPackageInfoSource
+!!!34599735.java!!!	ClassPathPackageInfoSource()
+        classPath = getClassPath();
+!!!34599863.java!!!	setApkPaths(inout apkPaths : String) : void
+        ClassPathPackageInfoSource.apkPaths = apkPaths;
+!!!34599991.java!!!	getPackageInfo(inout pkgName : String) : ClassPathPackageInfo
+        return cache.get(pkgName);
+!!!34600119.java!!!	createPackageInfo(inout packageName : String) : ClassPathPackageInfo
+        Set<String> subpackageNames = new TreeSet<String>();
+        Set<String> classNames = new TreeSet<String>();
+        Set<Class<?>> topLevelClasses = Sets.newHashSet();
+        findClasses(packageName, classNames, subpackageNames);
+        for (String className : classNames) {
+            if (className.endsWith(".R") || className.endsWith(".Manifest")) {
+                // Don't try to load classes that are generated. They usually aren't in test apks.
+                continue;
+            }
+
+            try {
+                // We get errors in the emulator if we don't use the caller's class loader.
+                topLevelClasses.add(Class.forName(className, false,
+                        (classLoader != null) ? classLoader : CLASS_LOADER));
+            } catch (ClassNotFoundException | NoClassDefFoundError e) {
+                // Should not happen unless there is a generated class that is not included in
+                // the .apk.
+                Log.w("ClassPathPackageInfoSource", "Cannot load class. "
+                        + "Make sure it is in your apk. Class name: '" + className
+                        + "'. Message: " + e.getMessage(), e);
+            }
+        }
+        return new ClassPathPackageInfo(this, packageName, subpackageNames,
+                topLevelClasses);
+!!!34600247.java!!!	findClasses(inout packageName : String, inout classNames : Set<String>, inout subpackageNames : Set<String>) : void
+        String packagePrefix = packageName + '.';
+        String pathPrefix = packagePrefix.replace('.', '/');
+
+        for (String entryName : classPath) {
+            File classPathEntry = new File(entryName);
+
+            // Forge may not have brought over every item in the classpath. Be
+            // polite and ignore missing entries.
+            if (classPathEntry.exists()) {
+                try {
+                    if (entryName.endsWith(".apk")) {
+                        findClassesInApk(entryName, packageName, classNames, subpackageNames);
+                    } else {
+                        // scan the directories that contain apk files.
+                        for (String apkPath : apkPaths) {
+                            File file = new File(apkPath);
+                            scanForApkFiles(file, packageName, classNames, subpackageNames);
+                        }
+                    }
+                } catch (IOException e) {
+                    throw new AssertionError("Can't read classpath entry " +
+                            entryName + ": " + e.getMessage());
+                }
+            }
+        }
+!!!34600375.java!!!	scanForApkFiles(inout source : File, inout packageName : String, inout classNames : Set<String>, inout subpackageNames : Set<String>) : void
+        if (source.getPath().endsWith(".apk")) {
+            findClassesInApk(source.getPath(), packageName, classNames, subpackageNames);
+        } else {
+            File[] files = source.listFiles();
+            if (files != null) {
+                for (File file : files) {
+                    scanForApkFiles(file, packageName, classNames, subpackageNames);
+                }
+            }
+        }
+!!!34600503.java!!!	findClassesInDirectory(inout classDir : File, inout packagePrefix : String, inout pathPrefix : String, inout classNames : Set<String>, inout subpackageNames : Set<String>) : void
+        File directory = new File(classDir, pathPrefix);
+
+        if (directory.exists()) {
+            for (File f : directory.listFiles()) {
+                String name = f.getName();
+                if (name.endsWith(CLASS_EXTENSION) && isToplevelClass(name)) {
+                    classNames.add(packagePrefix + getClassName(name));
+                } else if (f.isDirectory()) {
+                    subpackageNames.add(packagePrefix + name);
+                }
+            }
+        }
+!!!34600631.java!!!	findClassesInJar(inout jarFile : File, inout pathPrefix : String, inout classNames : Set<String>, inout subpackageNames : Set<String>) : void
+        Set<String> entryNames = getJarEntries(jarFile);
+        // check if the Jar contains the package.
+        if (!entryNames.contains(pathPrefix)) {
+            return;
+        }
+        int prefixLength = pathPrefix.length();
+        for (String entryName : entryNames) {
+            if (entryName.startsWith(pathPrefix)) {
+                if (entryName.endsWith(CLASS_EXTENSION)) {
+                    // check if the class is in the package itself or in one of its
+                    // subpackages.
+                    int index = entryName.indexOf('/', prefixLength);
+                    if (index >= 0) {
+                        String p = entryName.substring(0, index).replace('/', '.');
+                        subpackageNames.add(p);
+                    } else if (isToplevelClass(entryName)) {
+                        classNames.add(getClassName(entryName).replace('/', '.'));
+                    }
+                }
+            }
+        }
+!!!34600759.java!!!	findClassesInApk(inout apkPath : String, inout packageName : String, inout classNames : Set<String>, inout subpackageNames : Set<String>) : void
+
+        DexFile dexFile = null;
+        try {
+            dexFile = new DexFile(apkPath);
+            Enumeration<String> apkClassNames = dexFile.entries();
+            while (apkClassNames.hasMoreElements()) {
+                String className = apkClassNames.nextElement();
+
+                if (className.startsWith(packageName)) {
+                    String subPackageName = packageName;
+                    int lastPackageSeparator = className.lastIndexOf('.');
+                    if (lastPackageSeparator > 0) {
+                        subPackageName = className.substring(0, lastPackageSeparator);
+                    }
+                    if (subPackageName.length() > packageName.length()) {
+                        subpackageNames.add(subPackageName);
+                    } else if (isToplevelClass(className)) {
+                        classNames.add(className);
+                    }
+                }
+            }
+        } catch (IOException e) {
+            if (false) {
+                Log.w("ClassPathPackageInfoSource",
+                        "Error finding classes at apk path: " + apkPath, e);
+            }
+        } finally {
+            if (dexFile != null) {
+                // Todo: figure out why closing causes a dalvik error resulting in vm shutdown.
+//                dexFile.close();
+            }
+        }
+!!!34600887.java!!!	getJarEntries(inout jarFile : File) : String
+        Set<String> entryNames = jarFiles.get(jarFile);
+        if (entryNames == null) {
+            entryNames = Sets.newHashSet();
+            ZipFile zipFile = new ZipFile(jarFile);
+            Enumeration<? extends ZipEntry> entries = zipFile.entries();
+            while (entries.hasMoreElements()) {
+                String entryName = entries.nextElement().getName();
+                if (entryName.endsWith(CLASS_EXTENSION)) {
+                    // add the entry name of the class
+                    entryNames.add(entryName);
+
+                    // add the entry name of the classes package, i.e. the entry name of
+                    // the directory that the class is in. Used to quickly skip jar files
+                    // if they do not contain a certain package.
+                    //
+                    // Also add parent packages so that a JAR that contains
+                    // pkg1/pkg2/Foo.class will be marked as containing pkg1/ in addition
+                    // to pkg1/pkg2/ and pkg1/pkg2/Foo.class.  We're still interested in
+                    // JAR files that contains subpackages of a given package, even if
+                    // an intermediate package contains no direct classes.
+                    //
+                    // Classes in the default package will cause a single package named
+                    // "" to be added instead.
+                    int lastIndex = entryName.lastIndexOf('/');
+                    do {
+                        String packageName = entryName.substring(0, lastIndex + 1);
+                        entryNames.add(packageName);
+                        lastIndex = entryName.lastIndexOf('/', lastIndex - 1);
+                    } while (lastIndex > 0);
+                }
+            }
+            jarFiles.put(jarFile, entryNames);
+        }
+        return entryNames;
+!!!34601015.java!!!	isToplevelClass(inout fileName : String) : boolean
+        return fileName.indexOf('$') < 0;
+!!!34601143.java!!!	getClassName(inout className : String) : String
+        int classNameEnd = className.length() - CLASS_EXTENSION.length();
+        return className.substring(0, classNameEnd);
+!!!34601271.java!!!	getClassPath() : String
+        String classPath = System.getProperty("java.class.path");
+        String separator = System.getProperty("path.separator", ":");
+        return classPath.split(Pattern.quote(separator));
+!!!34601399.java!!!	setClassLoader(inout classLoader : ClassLoader) : void
+        this.classLoader = classLoader;

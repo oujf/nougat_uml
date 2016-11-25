@@ -1,0 +1,91 @@
+class DnsUdpCheck
+!!!42005815.java!!!	responseCodeStr(in rcode : int) : String
+            try {
+                return DnsResponseCode.values()[rcode].toString();
+            } catch (IndexOutOfBoundsException e) {
+                return String.valueOf(rcode);
+            }
+!!!42005943.java!!!	DnsUdpCheck(inout target : InetAddress, inout measurement : NetworkDiagnostics::Measurement)
+            super(target, measurement);
+
+            // TODO: Ideally, query the target for both types regardless of address family.
+            if (mAddressFamily == AF_INET6) {
+                mQueryType = RR_TYPE_AAAA;
+            } else {
+                mQueryType = RR_TYPE_A;
+            }
+
+            mMeasurement.description = "DNS UDP dst{" + mTarget.getHostAddress() + "}";
+!!!42006071.java!!!	run() : void
+            // Check if this measurement has already failed during setup.
+            if (mMeasurement.finishTime > 0) {
+                // If the measurement failed during construction it didn't
+                // decrement the countdown latch; do so here.
+                mCountDownLatch.countDown();
+                return;
+            }
+
+            try {
+                setupSocket(SOCK_DGRAM, IPPROTO_UDP, TIMEOUT_SEND, TIMEOUT_RECV, DNS_SERVER_PORT);
+            } catch (ErrnoException | IOException e) {
+                mMeasurement.recordFailure(e.toString());
+                return;
+            }
+            mMeasurement.description += " src{" + getSocketAddressString() + "}";
+
+            // This needs to be fixed length so it can be dropped into the pre-canned packet.
+            final String sixRandomDigits = String.valueOf(mRandom.nextInt(900000) + 100000);
+            mMeasurement.description += " qtype{" + mQueryType + "}"
+                    + " qname{" + sixRandomDigits + "-android-ds.metric.gstatic.com}";
+
+            // Build a trivial DNS packet.
+            final byte[] dnsPacket = getDnsQueryPacket(sixRandomDigits);
+
+            int count = 0;
+            mMeasurement.startTime = now();
+            while (now() < mDeadlineTime - (TIMEOUT_RECV + TIMEOUT_RECV)) {
+                count++;
+                try {
+                    Os.write(mFileDescriptor, dnsPacket, 0, dnsPacket.length);
+                } catch (ErrnoException | InterruptedIOException e) {
+                    mMeasurement.recordFailure(e.toString());
+                    break;
+                }
+
+                try {
+                    ByteBuffer reply = ByteBuffer.allocate(PACKET_BUFSIZE);
+                    Os.read(mFileDescriptor, reply);
+                    // TODO: more correct and detailed evaluation of the response,
+                    // possibly adding the returned IP address(es) to the output.
+                    final String rcodeStr = (reply.limit() > 3)
+                            ? " " + responseCodeStr((int) (reply.get(3)) & 0x0f)
+                            : "";
+                    mMeasurement.recordSuccess("1/" + count + rcodeStr);
+                    break;
+                } catch (ErrnoException | InterruptedIOException e) {
+                    continue;
+                }
+            }
+            if (mMeasurement.finishTime == 0) {
+                mMeasurement.recordFailure("0/" + count);
+            }
+
+            close();
+!!!42006199.java!!!	getDnsQueryPacket(inout sixRandomDigits : String) : byte
+            byte[] rnd = sixRandomDigits.getBytes(StandardCharsets.US_ASCII);
+            return new byte[] {
+                (byte) mRandom.nextInt(), (byte) mRandom.nextInt(),  // [0-1]   query ID
+                1, 0,  // [2-3]   flags; byte[2] = 1 for recursion desired (RD).
+                0, 1,  // [4-5]   QDCOUNT (number of queries)
+                0, 0,  // [6-7]   ANCOUNT (number of answers)
+                0, 0,  // [8-9]   NSCOUNT (number of name server records)
+                0, 0,  // [10-11] ARCOUNT (number of additional records)
+                17, rnd[0], rnd[1], rnd[2], rnd[3], rnd[4], rnd[5],
+                        '-', 'a', 'n', 'd', 'r', 'o', 'i', 'd', '-', 'd', 's',
+                6, 'm', 'e', 't', 'r', 'i', 'c',
+                7, 'g', 's', 't', 'a', 't', 'i', 'c',
+                3, 'c', 'o', 'm',
+                0,  // null terminator of FQDN (root TLD)
+                0, (byte) mQueryType,  // QTYPE
+                0, 1  // QCLASS, set to 1 = IN (Internet)
+            };

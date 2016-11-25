@@ -1,0 +1,209 @@
+class WifiChangeStateMachine
+!!!37118263.java!!!	WifiChangeStateMachine(inout looper : Looper)
+            super("SignificantChangeStateMachine", looper);
+
+            // CHECKSTYLE:OFF IndentationCheck
+            addState(mDefaultState);
+                addState(mStationaryState, mDefaultState);
+                addState(mMovingState, mDefaultState);
+            // CHECKSTYLE:ON IndentationCheck
+
+            setInitialState(mDefaultState);
+!!!37118391.java!!!	removeWifiChangeHandler(inout ci : WifiScanningServiceImpl::ClientInfo) : void
+            Iterator<Pair<ClientInfo, Integer>> iter = mActiveWifiChangeHandlers.iterator();
+            while (iter.hasNext()) {
+                Pair<ClientInfo, Integer> entry = iter.next();
+                if (entry.first == ci) {
+                    iter.remove();
+                }
+            }
+            untrackSignificantWifiChangeOnEmpty();
+!!!37119543.java!!!	reconfigureScan(inout results : WifiScanner::ScanData, in period : int) : void
+            // find brightest APs and set them as sentinels
+            if (results.length < MAX_APS_TO_TRACK) {
+                localLog("too few APs (" + results.length + ") available to track wifi change");
+                return;
+            }
+
+            removeScanRequest();
+
+            // remove duplicate BSSIDs
+            HashMap<String, ScanResult> bssidToScanResult = new HashMap<String, ScanResult>();
+            for (ScanResult result : results[0].getResults()) {
+                ScanResult saved = bssidToScanResult.get(result.BSSID);
+                if (saved == null) {
+                    bssidToScanResult.put(result.BSSID, result);
+                } else if (saved.level > result.level) {
+                    bssidToScanResult.put(result.BSSID, result);
+                }
+            }
+
+            // find brightest BSSIDs
+            ScanResult brightest[] = new ScanResult[MAX_APS_TO_TRACK];
+            Collection<ScanResult> results2 = bssidToScanResult.values();
+            for (ScanResult result : results2) {
+                for (int j = 0; j < brightest.length; j++) {
+                    if (brightest[j] == null
+                            || (brightest[j].level < result.level)) {
+                        for (int k = brightest.length; k > (j + 1); k--) {
+                            brightest[k - 1] = brightest[k - 2];
+                        }
+                        brightest[j] = result;
+                        break;
+                    }
+                }
+            }
+
+            // Get channels to scan for
+            ArrayList<Integer> channels = new ArrayList<Integer>();
+            for (int i = 0; i < brightest.length; i++) {
+                boolean found = false;
+                for (int j = i + 1; j < brightest.length; j++) {
+                    if (brightest[j].frequency == brightest[i].frequency) {
+                        found = true;
+                    }
+                }
+                if (!found) {
+                    channels.add(brightest[i].frequency);
+                }
+            }
+
+            if (DBG) localLog("Found " + channels.size() + " channels");
+
+            // set scanning schedule
+            ScanSettings settings = new ScanSettings();
+            settings.band = WifiScanner.WIFI_BAND_UNSPECIFIED;
+            settings.channels = new ChannelSpec[channels.size()];
+            for (int i = 0; i < channels.size(); i++) {
+                settings.channels[i] = new ChannelSpec(channels.get(i));
+            }
+
+            settings.periodInMs = period;
+            addScanRequest(settings);
+
+            WifiScanner.WifiChangeSettings settings2 = new WifiScanner.WifiChangeSettings();
+            settings2.rssiSampleSize = 3;
+            settings2.lostApSampleSize = 3;
+            settings2.unchangedSampleSize = 3;
+            settings2.minApsBreachingThreshold = 2;
+            settings2.bssidInfos = new BssidInfo[brightest.length];
+
+            for (int i = 0; i < brightest.length; i++) {
+                BssidInfo BssidInfo = new BssidInfo();
+                BssidInfo.bssid = brightest[i].BSSID;
+                int threshold = (100 + brightest[i].level) / 32 + 2;
+                BssidInfo.low = brightest[i].level - threshold;
+                BssidInfo.high = brightest[i].level + threshold;
+                settings2.bssidInfos[i] = BssidInfo;
+
+                if (DBG) localLog("Setting bssid=" + BssidInfo.bssid + ", " +
+                        "low=" + BssidInfo.low + ", high=" + BssidInfo.high);
+            }
+
+            trackSignificantWifiChange(settings2);
+            mCurrentBssids = brightest;
+!!!37119671.java!!!	reconfigureScan(inout settings : WifiScanner::WifiChangeSettings) : void
+
+            if (settings.bssidInfos.length < MAX_APS_TO_TRACK) {
+                localLog("too few APs (" + settings.bssidInfos.length
+                        + ") available to track wifi change");
+                return;
+            }
+
+            if (DBG) localLog("Setting configuration specified by app");
+
+            mCurrentBssids = new ScanResult[settings.bssidInfos.length];
+            HashSet<Integer> channels = new HashSet<Integer>();
+
+            for (int i = 0; i < settings.bssidInfos.length; i++) {
+                ScanResult result = new ScanResult();
+                result.BSSID = settings.bssidInfos[i].bssid;
+                mCurrentBssids[i] = result;
+                channels.add(settings.bssidInfos[i].frequencyHint);
+            }
+
+            // cancel previous scan
+            removeScanRequest();
+
+            // set new scanning schedule
+            ScanSettings settings2 = new ScanSettings();
+            settings2.band = WifiScanner.WIFI_BAND_UNSPECIFIED;
+            settings2.channels = new ChannelSpec[channels.size()];
+            int i = 0;
+            for (Integer channel : channels) {
+                settings2.channels[i++] = new ChannelSpec(channel);
+            }
+
+            settings2.periodInMs = settings.periodInMs;
+            addScanRequest(settings2);
+
+            // start tracking new APs
+            trackSignificantWifiChange(settings);
+!!!37119799.java!!!	onChangesFound(inout results : ScanResult) : void
+            sendMessage(CMD_WIFI_CHANGE_DETECTED, 0, 0, results);
+!!!37119927.java!!!	addScanRequest(inout settings : WifiScanner::ScanSettings) : void
+            if (DBG) localLog("Starting scans");
+            if (mInternalClientInfo != null) {
+                mInternalClientInfo.sendRequestToClientHandler(
+                        WifiScanner.CMD_START_BACKGROUND_SCAN, settings, null);
+            }
+!!!37120055.java!!!	removeScanRequest() : void
+            if (DBG) localLog("Stopping scans");
+            if (mInternalClientInfo != null) {
+                mInternalClientInfo.sendRequestToClientHandler(
+                        WifiScanner.CMD_STOP_BACKGROUND_SCAN);
+            }
+!!!37120183.java!!!	trackSignificantWifiChange(inout settings : WifiScanner::WifiChangeSettings) : void
+            if (mScannerImpl != null) {
+                mScannerImpl.untrackSignificantWifiChange();
+                mScannerImpl.trackSignificantWifiChange(settings, this);
+            }
+!!!37120311.java!!!	untrackSignificantWifiChange() : void
+            if (mScannerImpl != null) {
+                mScannerImpl.untrackSignificantWifiChange();
+            }
+!!!37120439.java!!!	addWifiChangeHandler(inout ci : WifiScanningServiceImpl::ClientInfo, in handler : int) : void
+            mActiveWifiChangeHandlers.add(Pair.create(ci, handler));
+            // Add an internal client to make background scan requests.
+            if (mInternalClientInfo == null) {
+                mInternalClientInfo =
+                        new InternalClientInfo(ci.getUid(), new Messenger(this.getHandler()));
+                mInternalClientInfo.register();
+            }
+!!!37120567.java!!!	removeWifiChangeHandler(inout ci : WifiScanningServiceImpl::ClientInfo, in handler : int) : void
+            mActiveWifiChangeHandlers.remove(Pair.create(ci, handler));
+            untrackSignificantWifiChangeOnEmpty();
+!!!37120695.java!!!	untrackSignificantWifiChangeOnEmpty() : void
+            if (mActiveWifiChangeHandlers.isEmpty()) {
+                if (DBG) localLog("Got Disable Wifi Change");
+                mCurrentBssids = null;
+                untrackSignificantWifiChange();
+                // Remove the internal client when there are no more external clients.
+                if (mInternalClientInfo != null) {
+                    mInternalClientInfo.cleanup();
+                    mInternalClientInfo = null;
+                }
+                transitionTo(mDefaultState);
+            }
+!!!37120823.java!!!	reportWifiChanged(inout results : ScanResult) : void
+            WifiScanner.ParcelableScanResults parcelableScanResults =
+                    new WifiScanner.ParcelableScanResults(results);
+            Iterator<Pair<ClientInfo, Integer>> it = mActiveWifiChangeHandlers.iterator();
+            while (it.hasNext()) {
+                Pair<ClientInfo, Integer> entry = it.next();
+                ClientInfo ci = entry.first;
+                int handler = entry.second;
+                ci.reportEvent(WifiScanner.CMD_WIFI_CHANGE_DETECTED, 0, handler,
+                        parcelableScanResults);
+            }
+!!!37120951.java!!!	reportWifiStabilized(inout results : ScanResult) : void
+            WifiScanner.ParcelableScanResults parcelableScanResults =
+                    new WifiScanner.ParcelableScanResults(results);
+            Iterator<Pair<ClientInfo, Integer>> it = mActiveWifiChangeHandlers.iterator();
+            while (it.hasNext()) {
+                Pair<ClientInfo, Integer> entry = it.next();
+                ClientInfo ci = entry.first;
+                int handler = entry.second;
+                ci.reportEvent(WifiScanner.CMD_WIFI_CHANGES_STABILIZED, 0, handler,
+                        parcelableScanResults);
+            }

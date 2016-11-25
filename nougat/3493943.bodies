@@ -1,0 +1,233 @@
+class SoftGSM
+!!!39858743.cpp!!!	SoftGSM(in name : char, in callbacks : OMX_CALLBACKTYPE, in appData : OMX_PTR, inout component : OMX_COMPONENTTYPE)
+
+    CHECK(!strcmp(name, "OMX.google.gsm.decoder"));
+
+    mGsm = gsm_create();
+    CHECK(mGsm);
+    int msopt = 1;
+    gsm_option(mGsm, GSM_OPT_WAV49, &msopt);
+
+    initPorts();
+!!!39858871.cpp!!!	~SoftGSM()
+    gsm_destroy(mGsm);
+!!!39858999.cpp!!!	internalGetParameter(in index : OMX_INDEXTYPE, in params : OMX_PTR) : OMX_ERRORTYPE
+    switch (index) {
+        case OMX_IndexParamAudioPcm:
+        {
+            OMX_AUDIO_PARAM_PCMMODETYPE *pcmParams =
+                (OMX_AUDIO_PARAM_PCMMODETYPE *)params;
+
+            if (!isValidOMXParam(pcmParams)) {
+                return OMX_ErrorBadParameter;
+            }
+
+            if (pcmParams->nPortIndex > 1) {
+                return OMX_ErrorUndefined;
+            }
+
+            pcmParams->eNumData = OMX_NumericalDataSigned;
+            pcmParams->eEndian = OMX_EndianBig;
+            pcmParams->bInterleaved = OMX_TRUE;
+            pcmParams->nBitPerSample = 16;
+            pcmParams->ePCMMode = OMX_AUDIO_PCMModeLinear;
+            pcmParams->eChannelMapping[0] = OMX_AUDIO_ChannelLF;
+            pcmParams->eChannelMapping[1] = OMX_AUDIO_ChannelRF;
+
+            pcmParams->nChannels = 1;
+            pcmParams->nSamplingRate = 8000;
+
+            return OMX_ErrorNone;
+        }
+
+        default:
+            return SimpleSoftOMXComponent::internalGetParameter(index, params);
+    }
+!!!39859127.cpp!!!	internalSetParameter(in index : OMX_INDEXTYPE, in params : OMX_PTR) : OMX_ERRORTYPE
+    switch (index) {
+        case OMX_IndexParamAudioPcm:
+        {
+            OMX_AUDIO_PARAM_PCMMODETYPE *pcmParams =
+                (OMX_AUDIO_PARAM_PCMMODETYPE *)params;
+
+            if (!isValidOMXParam(pcmParams)) {
+                return OMX_ErrorBadParameter;
+            }
+
+            if (pcmParams->nPortIndex != 0 && pcmParams->nPortIndex != 1) {
+                return OMX_ErrorUndefined;
+            }
+
+            if (pcmParams->nChannels != 1) {
+                return OMX_ErrorUndefined;
+            }
+
+            if (pcmParams->nSamplingRate != 8000) {
+                return OMX_ErrorUndefined;
+            }
+
+            return OMX_ErrorNone;
+        }
+
+        case OMX_IndexParamStandardComponentRole:
+        {
+            const OMX_PARAM_COMPONENTROLETYPE *roleParams =
+                (const OMX_PARAM_COMPONENTROLETYPE *)params;
+
+            if (!isValidOMXParam(roleParams)) {
+                return OMX_ErrorBadParameter;
+            }
+
+            if (strncmp((const char *)roleParams->cRole,
+                        "audio_decoder.gsm",
+                        OMX_MAX_STRINGNAME_SIZE - 1)) {
+                return OMX_ErrorUndefined;
+            }
+
+            return OMX_ErrorNone;
+        }
+
+        default:
+            return SimpleSoftOMXComponent::internalSetParameter(index, params);
+    }
+!!!39859255.cpp!!!	onQueueFilled(in portIndex : OMX_U32) : void
+    if (mSignalledError) {
+        return;
+    }
+
+    List<BufferInfo *> &inQueue = getPortQueue(0);
+    List<BufferInfo *> &outQueue = getPortQueue(1);
+
+    while (!inQueue.empty() && !outQueue.empty()) {
+        BufferInfo *inInfo = *inQueue.begin();
+        OMX_BUFFERHEADERTYPE *inHeader = inInfo->mHeader;
+
+        BufferInfo *outInfo = *outQueue.begin();
+        OMX_BUFFERHEADERTYPE *outHeader = outInfo->mHeader;
+
+        if (inHeader->nFlags & OMX_BUFFERFLAG_EOS) {
+            inQueue.erase(inQueue.begin());
+            inInfo->mOwnedByUs = false;
+            notifyEmptyBufferDone(inHeader);
+
+            outHeader->nFilledLen = 0;
+            outHeader->nFlags = OMX_BUFFERFLAG_EOS;
+
+            outQueue.erase(outQueue.begin());
+            outInfo->mOwnedByUs = false;
+            notifyFillBufferDone(outHeader);
+            return;
+        }
+
+        if (inHeader->nFilledLen > kMaxNumSamplesPerFrame) {
+            ALOGE("input buffer too large (%d).", inHeader->nFilledLen);
+            notify(OMX_EventError, OMX_ErrorUndefined, 0, NULL);
+            mSignalledError = true;
+        }
+
+        if(((inHeader->nFilledLen / kMSGSMFrameSize) * kMSGSMFrameSize) != inHeader->nFilledLen) {
+            ALOGE("input buffer not multiple of %d (%d).", kMSGSMFrameSize, inHeader->nFilledLen);
+            notify(OMX_EventError, OMX_ErrorUndefined, 0, NULL);
+            mSignalledError = true;
+        }
+
+        if (outHeader->nAllocLen < (inHeader->nFilledLen / kMSGSMFrameSize) * 320) {
+            ALOGE("output buffer is not large enough (%d).", outHeader->nAllocLen);
+            android_errorWriteLog(0x534e4554, "27793367");
+            notify(OMX_EventError, OMX_ErrorUndefined, 0, NULL);
+            mSignalledError = true;
+            return;
+        }
+
+        uint8_t *inputptr = inHeader->pBuffer + inHeader->nOffset;
+
+        int n = mSignalledError ? 0 : DecodeGSM(mGsm,
+                  reinterpret_cast<int16_t *>(outHeader->pBuffer), inputptr, inHeader->nFilledLen);
+
+        outHeader->nTimeStamp = inHeader->nTimeStamp;
+        outHeader->nOffset = 0;
+        outHeader->nFilledLen = n * sizeof(int16_t);
+        outHeader->nFlags = 0;
+
+        inInfo->mOwnedByUs = false;
+        inQueue.erase(inQueue.begin());
+        inInfo = NULL;
+        notifyEmptyBufferDone(inHeader);
+        inHeader = NULL;
+
+        outInfo->mOwnedByUs = false;
+        outQueue.erase(outQueue.begin());
+        outInfo = NULL;
+        notifyFillBufferDone(outHeader);
+        outHeader = NULL;
+    }
+!!!39859383.cpp!!!	onPortFlushCompleted(in portIndex : OMX_U32) : void
+    if (portIndex == 0) {
+        gsm_destroy(mGsm);
+        mGsm = gsm_create();
+        int msopt = 1;
+        gsm_option(mGsm, GSM_OPT_WAV49, &msopt);
+    }
+!!!39859511.cpp!!!	onReset() : void
+    gsm_destroy(mGsm);
+    mGsm = gsm_create();
+    int msopt = 1;
+    gsm_option(mGsm, GSM_OPT_WAV49, &msopt);
+    mSignalledError = false;
+!!!39859639.cpp!!!	initPorts() : void
+    OMX_PARAM_PORTDEFINITIONTYPE def;
+    InitOMXParams(&def);
+
+    def.nPortIndex = 0;
+    def.eDir = OMX_DirInput;
+    def.nBufferCountMin = kNumBuffers;
+    def.nBufferCountActual = def.nBufferCountMin;
+    def.nBufferSize = 1024 / kMSGSMFrameSize * kMSGSMFrameSize;
+    def.bEnabled = OMX_TRUE;
+    def.bPopulated = OMX_FALSE;
+    def.eDomain = OMX_PortDomainAudio;
+    def.bBuffersContiguous = OMX_FALSE;
+    def.nBufferAlignment = 1;
+
+    def.format.audio.cMIMEType =
+        const_cast<char *>(MEDIA_MIMETYPE_AUDIO_MSGSM);
+
+    def.format.audio.pNativeRender = NULL;
+    def.format.audio.bFlagErrorConcealment = OMX_FALSE;
+    def.format.audio.eEncoding = OMX_AUDIO_CodingGSMFR;
+
+    addPort(def);
+
+    def.nPortIndex = 1;
+    def.eDir = OMX_DirOutput;
+    def.nBufferCountMin = kNumBuffers;
+    def.nBufferCountActual = def.nBufferCountMin;
+    def.nBufferSize = kMaxNumSamplesPerFrame * sizeof(int16_t);
+    def.bEnabled = OMX_TRUE;
+    def.bPopulated = OMX_FALSE;
+    def.eDomain = OMX_PortDomainAudio;
+    def.bBuffersContiguous = OMX_FALSE;
+    def.nBufferAlignment = 2;
+
+    def.format.audio.cMIMEType = const_cast<char *>("audio/raw");
+    def.format.audio.pNativeRender = NULL;
+    def.format.audio.bFlagErrorConcealment = OMX_FALSE;
+    def.format.audio.eEncoding = OMX_AUDIO_CodingPCM;
+
+    addPort(def);
+!!!39859767.cpp!!!	DecodeGSM(in handle : gsm, inout out : int16_t, inout in : uint8_t, in inSize : size_t) : int
+
+    int ret = 0;
+    while (inSize > 0) {
+        gsm_decode(handle, in, out);
+        in += 33;
+        inSize -= 33;
+        out += 160;
+        ret += 160;
+        gsm_decode(handle, in, out);
+        in += 32;
+        inSize -= 32;
+        out += 160;
+        ret += 160;
+    }
+    return ret;

@@ -1,0 +1,223 @@
+class WebmElement
+!!!40029879.cpp!!!	serializePayloadSize(inout buf : uint8_t) : int
+    return serializeCodedUnsigned(encodeUnsigned(mSize), buf);
+!!!40030135.cpp!!!	totalSize() : uint64_t
+    uint8_t buf[8];
+    //............... + sizeOf(encodeUnsigned(size))
+    return sizeOf(mId) + serializePayloadSize(buf) + mSize;
+!!!40030263.cpp!!!	serializeInto(inout buf : uint8_t) : uint64_t
+    uint8_t *cur = buf;
+    int head = serializeCodedUnsigned(mId, cur);
+    cur += head;
+    int neck = serializePayloadSize(cur);
+    cur += neck;
+    serializePayload(cur);
+    cur += mSize;
+    return cur - buf;
+!!!40030391.cpp!!!	serialize(inout size : uint64_t) : uint8_t
+    size = totalSize();
+    uint8_t *buf = new uint8_t[size];
+    serializeInto(buf);
+    return buf;
+!!!40030519.cpp!!!	write(in fd : int, inout size : uint64_t) : int
+    uint8_t buf[8];
+    size = totalSize();
+    off64_t off = ::lseek64(fd, (size - 1), SEEK_CUR) - (size - 1);
+    ::write(fd, buf, 1); // extend file
+
+    off64_t curOff = off + size;
+    off64_t alignedOff = off & ~(::sysconf(_SC_PAGE_SIZE) - 1);
+    off64_t mapSize = curOff - alignedOff;
+    off64_t pageOff = off - alignedOff;
+    void *dst = ::mmap64(NULL, mapSize, PROT_WRITE, MAP_SHARED, fd, alignedOff);
+    if (dst == MAP_FAILED) {
+        ALOGE("mmap64 failed; errno = %d", errno);
+        ALOGE("fd %d; flags: %o", fd, ::fcntl(fd, F_GETFL, 0));
+        return errno;
+    } else {
+        serializeInto((uint8_t*) dst + pageOff);
+        ::msync(dst, mapSize, MS_SYNC);
+        return ::munmap(dst, mapSize);
+    }
+!!!40030647.cpp!!!	EbmlHeader(in ver : int = 1, in readVer : int = 1, in maxIdLen : int = 4, in maxSizeLen : int = 8, in docVer : int = 2, in docReadVer : int = 2) : sp<WebmElement>
+    List<sp<WebmElement> > headerFields;
+    headerFields.push_back(new WebmUnsigned(kMkvEbmlVersion, ver));
+    headerFields.push_back(new WebmUnsigned(kMkvEbmlReadVersion, readVer));
+    headerFields.push_back(new WebmUnsigned(kMkvEbmlMaxIdlength, maxIdLen));
+    headerFields.push_back(new WebmUnsigned(kMkvEbmlMaxSizeLength, maxSizeLen));
+    headerFields.push_back(new WebmString(kMkvDocType, "webm"));
+    headerFields.push_back(new WebmUnsigned(kMkvDocTypeVersion, docVer));
+    headerFields.push_back(new WebmUnsigned(kMkvDocTypeReadVersion, docReadVer));
+    return new WebmMaster(kMkvEbml, headerFields);
+!!!40030775.cpp!!!	SegmentInfo(in scale : uint64_t = 1000000, in dur : double = 0) : sp<WebmElement>
+    List<sp<WebmElement> > segmentInfo;
+    // place duration first; easier to patch
+    segmentInfo.push_back(new WebmFloat(kMkvSegmentDuration, dur));
+    segmentInfo.push_back(new WebmUnsigned(kMkvTimecodeScale, scale));
+    segmentInfo.push_back(new WebmString(kMkvMuxingApp, "android"));
+    segmentInfo.push_back(new WebmString(kMkvWritingApp, "android"));
+    return new WebmMaster(kMkvInfo, segmentInfo);
+!!!40030903.cpp!!!	AudioTrackEntry(in chans : int, in rate : double, in buf : sp<ABuffer>, in bps : int = 0, in uid : uint64_t = 0, in lacing : bool = false, in lang : char = "und") : sp<WebmElement>
+    if (uid == 0) {
+        uid = kAudioTrackNum;
+    }
+
+    List<sp<WebmElement> > trackEntryFields;
+    populateCommonTrackEntries(
+            kAudioTrackNum,
+            uid,
+            lacing,
+            lang,
+            "A_VORBIS",
+            kAudioType,
+            trackEntryFields);
+
+    List<sp<WebmElement> > audioInfo;
+    audioInfo.push_back(new WebmUnsigned(kMkvChannels, chans));
+    audioInfo.push_back(new WebmFloat(kMkvSamplingFrequency, rate));
+    if (bps) {
+        WebmElement *bitDepth = new WebmUnsigned(kMkvBitDepth, bps);
+        audioInfo.push_back(bitDepth);
+    }
+
+    trackEntryFields.push_back(new WebmMaster(kMkvAudio, audioInfo));
+    trackEntryFields.push_back(new WebmBinary(kMkvCodecPrivate, buf));
+    return new WebmMaster(kMkvTrackEntry, trackEntryFields);
+!!!40031031.cpp!!!	VideoTrackEntry(in codec : char, in width : uint64_t, in height : uint64_t, in meta : sp<MetaData>, in uid : uint64_t = 0, in lacing : bool = false, in lang : char = "und") : sp<WebmElement>
+    if (uid == 0) {
+        uid = kVideoTrackNum;
+    }
+
+    List<sp<WebmElement> > trackEntryFields;
+    populateCommonTrackEntries(
+            kVideoTrackNum,
+            uid,
+            lacing,
+            lang,
+            codec,
+            kVideoType,
+            trackEntryFields);
+
+    // CSD
+    uint32_t type;
+    const void *data;
+    size_t size;
+    if (meta->findData(kKeyVp9CodecPrivate, &type, &data, &size)) {
+        sp<ABuffer> buf = new ABuffer((void *)data, size); // note: buf does not own data
+        trackEntryFields.push_back(new WebmBinary(kMkvCodecPrivate, buf));
+    }
+
+    List<sp<WebmElement> > videoInfo;
+    videoInfo.push_back(new WebmUnsigned(kMkvPixelWidth, width));
+    videoInfo.push_back(new WebmUnsigned(kMkvPixelHeight, height));
+
+    // Color aspects
+    {
+        List<sp<WebmElement> > colorInfo;
+
+        ColorAspects aspects;
+        aspects.mPrimaries = ColorAspects::PrimariesUnspecified;
+        aspects.mTransfer = ColorAspects::TransferUnspecified;
+        aspects.mMatrixCoeffs = ColorAspects::MatrixUnspecified;
+        aspects.mRange = ColorAspects::RangeUnspecified;
+        bool havePrimaries = meta->findInt32(kKeyColorPrimaries, (int32_t*)&aspects.mPrimaries);
+        bool haveTransfer = meta->findInt32(kKeyTransferFunction, (int32_t*)&aspects.mTransfer);
+        bool haveCoeffs = meta->findInt32(kKeyColorMatrix, (int32_t*)&aspects.mMatrixCoeffs);
+        bool haveRange = meta->findInt32(kKeyColorRange, (int32_t*)&aspects.mRange);
+
+        int32_t primaries, transfer, coeffs;
+        bool fullRange;
+        ColorUtils::convertCodecColorAspectsToIsoAspects(
+                aspects, &primaries, &transfer, &coeffs, &fullRange);
+        if (havePrimaries) {
+            colorInfo.push_back(new WebmUnsigned(kMkvPrimaries, primaries));
+        }
+        if (haveTransfer) {
+            colorInfo.push_back(new WebmUnsigned(kMkvTransferCharacteristics, transfer));
+        }
+        if (haveCoeffs) {
+            colorInfo.push_back(new WebmUnsigned(kMkvMatrixCoefficients, coeffs));
+        }
+        if (haveRange) {
+            colorInfo.push_back(new WebmUnsigned(kMkvRange, fullRange ? 2 : 1));
+        }
+
+        // Also add HDR static info, some of which goes to MasteringMetadata element
+
+        const HDRStaticInfo *info;
+        uint32_t type;
+        const void *data;
+        size_t size;
+        if (meta->findData(kKeyHdrStaticInfo, &type, &data, &size)
+                && type == 'hdrS' && size == sizeof(*info)) {
+            info = (const HDRStaticInfo*)data;
+            if (info->mID == HDRStaticInfo::kType1) {
+                List<sp<WebmElement> > masteringInfo;
+
+                // convert HDRStaticInfo values to matroska equivalent values for each non-0 group
+                if (info->sType1.mMaxFrameAverageLightLevel) {
+                    colorInfo.push_back(new WebmUnsigned(
+                            kMkvMaxFALL, info->sType1.mMaxFrameAverageLightLevel));
+                }
+                if (info->sType1.mMaxContentLightLevel) {
+                    colorInfo.push_back(new WebmUnsigned(
+                            kMkvMaxCLL, info->sType1.mMaxContentLightLevel));
+                }
+                if (info->sType1.mMinDisplayLuminance) {
+                    // HDRStaticInfo Type1 stores min luminance scaled 10000:1
+                    masteringInfo.push_back(new WebmFloat(
+                            kMkvLuminanceMin, info->sType1.mMinDisplayLuminance * 0.0001));
+                }
+                if (info->sType1.mMaxDisplayLuminance) {
+                    masteringInfo.push_back(new WebmFloat(
+                            kMkvLuminanceMax, (float)info->sType1.mMaxDisplayLuminance));
+                }
+                // HDRStaticInfo Type1 stores primaries scaled 50000:1
+                if (info->sType1.mW.x || info->sType1.mW.y) {
+                    masteringInfo.push_back(new WebmFloat(
+                            kMkvWhitePointChromaticityX, info->sType1.mW.x * 0.00002));
+                    masteringInfo.push_back(new WebmFloat(
+                            kMkvWhitePointChromaticityY, info->sType1.mW.y * 0.00002));
+                }
+                if (info->sType1.mR.x || info->sType1.mR.y || info->sType1.mG.x
+                        || info->sType1.mG.y || info->sType1.mB.x || info->sType1.mB.y) {
+                    masteringInfo.push_back(new WebmFloat(
+                            kMkvPrimaryRChromaticityX, info->sType1.mR.x * 0.00002));
+                    masteringInfo.push_back(new WebmFloat(
+                            kMkvPrimaryRChromaticityY, info->sType1.mR.y * 0.00002));
+                    masteringInfo.push_back(new WebmFloat(
+                            kMkvPrimaryGChromaticityX, info->sType1.mG.x * 0.00002));
+                    masteringInfo.push_back(new WebmFloat(
+                            kMkvPrimaryGChromaticityY, info->sType1.mG.y * 0.00002));
+                    masteringInfo.push_back(new WebmFloat(
+                            kMkvPrimaryBChromaticityX, info->sType1.mB.x * 0.00002));
+                    masteringInfo.push_back(new WebmFloat(
+                            kMkvPrimaryBChromaticityY, info->sType1.mB.y * 0.00002));
+                }
+                if (masteringInfo.size()) {
+                    colorInfo.push_back(new WebmMaster(kMkvMasteringMetadata, masteringInfo));
+                }
+            }
+        }
+        if (colorInfo.size()) {
+            videoInfo.push_back(new WebmMaster(kMkvColour, colorInfo));
+        }
+    }
+
+    trackEntryFields.push_back(new WebmMaster(kMkvVideo, videoInfo));
+    return new WebmMaster(kMkvTrackEntry, trackEntryFields);
+!!!40031159.cpp!!!	SeekEntry(in id : uint64_t, in off : uint64_t) : sp<WebmElement>
+    List<sp<WebmElement> > seekEntryFields;
+    seekEntryFields.push_back(new WebmUnsigned(kMkvSeekId, id));
+    seekEntryFields.push_back(new WebmUnsigned(kMkvSeekPosition, off));
+    return new WebmMaster(kMkvSeek, seekEntryFields);
+!!!40031287.cpp!!!	CuePointEntry(in time : uint64_t, in track : int, in off : uint64_t) : sp<WebmElement>
+    List<sp<WebmElement> > cuePointEntryFields;
+    cuePointEntryFields.push_back(new WebmUnsigned(kMkvCueTrack, track));
+    cuePointEntryFields.push_back(new WebmUnsigned(kMkvCueClusterPosition, off));
+    WebmElement *cueTrackPositions = new WebmMaster(kMkvCueTrackPositions, cuePointEntryFields);
+
+    cuePointEntryFields.clear();
+    cuePointEntryFields.push_back(new WebmUnsigned(kMkvCueTime, time));
+    cuePointEntryFields.push_back(cueTrackPositions);
+    return new WebmMaster(kMkvCuePoint, cuePointEntryFields);

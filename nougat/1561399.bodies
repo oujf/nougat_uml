@@ -1,0 +1,217 @@
+class JobServiceHandler
+!!!32949943.java!!!	JobServiceHandler(inout looper : Looper)
+            super(looper);
+!!!32950071.java!!!	handleMessage(inout message : Message) : void
+            switch (message.what) {
+                case MSG_SERVICE_BOUND:
+                    removeOpTimeOut();
+                    handleServiceBoundH();
+                    break;
+                case MSG_CALLBACK:
+                    if (DEBUG) {
+                        Slog.d(TAG, "MSG_CALLBACK of : " + mRunningJob
+                                + " v:" + VERB_STRINGS[mVerb]);
+                    }
+                    removeOpTimeOut();
+
+                    if (mVerb == VERB_STARTING) {
+                        final boolean workOngoing = message.arg2 == 1;
+                        handleStartedH(workOngoing);
+                    } else if (mVerb == VERB_EXECUTING ||
+                            mVerb == VERB_STOPPING) {
+                        final boolean reschedule = message.arg2 == 1;
+                        handleFinishedH(reschedule);
+                    } else {
+                        if (DEBUG) {
+                            Slog.d(TAG, "Unrecognised callback: " + mRunningJob);
+                        }
+                    }
+                    break;
+                case MSG_CANCEL:
+                    if (mVerb == VERB_FINISHED) {
+                        if (DEBUG) {
+                            Slog.d(TAG,
+                                   "Trying to process cancel for torn-down context, ignoring.");
+                        }
+                        return;
+                    }
+                    mParams.setStopReason(message.arg1);
+                    if (message.arg1 == JobParameters.REASON_PREEMPT) {
+                        mPreferredUid = mRunningJob != null ? mRunningJob.getUid() :
+                                NO_PREFERRED_UID;
+                    }
+                    handleCancelH();
+                    break;
+                case MSG_TIMEOUT:
+                    handleOpTimeoutH();
+                    break;
+                case MSG_SHUTDOWN_EXECUTION:
+                    closeAndCleanupJobH(true /* needsReschedule */);
+                    break;
+                default:
+                    Slog.e(TAG, "Unrecognised message: " + message);
+            }
+!!!32950199.java!!!	handleServiceBoundH() : void
+            if (DEBUG) {
+                Slog.d(TAG, "MSG_SERVICE_BOUND for " + mRunningJob.toShortString());
+            }
+            if (mVerb != VERB_BINDING) {
+                Slog.e(TAG, "Sending onStartJob for a job that isn't pending. "
+                        + VERB_STRINGS[mVerb]);
+                closeAndCleanupJobH(false /* reschedule */);
+                return;
+            }
+            if (mCancelled.get()) {
+                if (DEBUG) {
+                    Slog.d(TAG, "Job cancelled while waiting for bind to complete. "
+                            + mRunningJob);
+                }
+                closeAndCleanupJobH(true /* reschedule */);
+                return;
+            }
+            try {
+                mVerb = VERB_STARTING;
+                scheduleOpTimeOut();
+                service.startJob(mParams);
+            } catch (RemoteException e) {
+                Slog.e(TAG, "Error sending onStart message to '" +
+                        mRunningJob.getServiceComponent().getShortClassName() + "' ", e);
+            }
+!!!32950327.java!!!	handleStartedH(inout workOngoing : boolean) : void
+            switch (mVerb) {
+                case VERB_STARTING:
+                    mVerb = VERB_EXECUTING;
+                    if (!workOngoing) {
+                        // Job is finished already so fast-forward to handleFinished.
+                        handleFinishedH(false);
+                        return;
+                    }
+                    if (mCancelled.get()) {
+                        if (DEBUG) {
+                            Slog.d(TAG, "Job cancelled while waiting for onStartJob to complete.");
+                        }
+                        // Cancelled *while* waiting for acknowledgeStartMessage from client.
+                        handleCancelH();
+                        return;
+                    }
+                    scheduleOpTimeOut();
+                    break;
+                default:
+                    Slog.e(TAG, "Handling started job but job wasn't starting! Was "
+                            + VERB_STRINGS[mVerb] + ".");
+                    return;
+            }
+!!!32950455.java!!!	handleFinishedH(inout reschedule : boolean) : void
+            switch (mVerb) {
+                case VERB_EXECUTING:
+                case VERB_STOPPING:
+                    closeAndCleanupJobH(reschedule);
+                    break;
+                default:
+                    Slog.e(TAG, "Got an execution complete message for a job that wasn't being" +
+                            "executed. Was " + VERB_STRINGS[mVerb] + ".");
+            }
+!!!32950583.java!!!	handleCancelH() : void
+            if (JobSchedulerService.DEBUG) {
+                Slog.d(TAG, "Handling cancel for: " + mRunningJob.getJobId() + " "
+                        + VERB_STRINGS[mVerb]);
+            }
+            switch (mVerb) {
+                case VERB_BINDING:
+                case VERB_STARTING:
+                    mCancelled.set(true);
+                    break;
+                case VERB_EXECUTING:
+                    if (hasMessages(MSG_CALLBACK)) {
+                        // If the client has called jobFinished, ignore this cancel.
+                        return;
+                    }
+                    sendStopMessageH();
+                    break;
+                case VERB_STOPPING:
+                    // Nada.
+                    break;
+                default:
+                    Slog.e(TAG, "Cancelling a job without a valid verb: " + mVerb);
+                    break;
+            }
+!!!32950711.java!!!	handleOpTimeoutH() : void
+            switch (mVerb) {
+                case VERB_BINDING:
+                    Slog.e(TAG, "Time-out while trying to bind " + mRunningJob.toShortString() +
+                            ", dropping.");
+                    closeAndCleanupJobH(false /* needsReschedule */);
+                    break;
+                case VERB_STARTING:
+                    // Client unresponsive - wedged or failed to respond in time. We don't really
+                    // know what happened so let's log it and notify the JobScheduler
+                    // FINISHED/NO-RETRY.
+                    Slog.e(TAG, "No response from client for onStartJob '" +
+                            mRunningJob.toShortString());
+                    closeAndCleanupJobH(false /* needsReschedule */);
+                    break;
+                case VERB_STOPPING:
+                    // At least we got somewhere, so fail but ask the JobScheduler to reschedule.
+                    Slog.e(TAG, "No response from client for onStopJob, '" +
+                            mRunningJob.toShortString());
+                    closeAndCleanupJobH(true /* needsReschedule */);
+                    break;
+                case VERB_EXECUTING:
+                    // Not an error - client ran out of time.
+                    Slog.i(TAG, "Client timed out while executing (no jobFinished received)." +
+                            " sending onStop. "  + mRunningJob.toShortString());
+                    mParams.setStopReason(JobParameters.REASON_TIMEOUT);
+                    sendStopMessageH();
+                    break;
+                default:
+                    Slog.e(TAG, "Handling timeout for an invalid job state: " +
+                            mRunningJob.toShortString() + ", dropping.");
+                    closeAndCleanupJobH(false /* needsReschedule */);
+            }
+!!!32950839.java!!!	sendStopMessageH() : void
+            removeOpTimeOut();
+            if (mVerb != VERB_EXECUTING) {
+                Slog.e(TAG, "Sending onStopJob for a job that isn't started. " + mRunningJob);
+                closeAndCleanupJobH(false /* reschedule */);
+                return;
+            }
+            try {
+                mVerb = VERB_STOPPING;
+                scheduleOpTimeOut();
+                service.stopJob(mParams);
+            } catch (RemoteException e) {
+                Slog.e(TAG, "Error sending onStopJob to client.", e);
+                closeAndCleanupJobH(false /* reschedule */);
+            }
+!!!32950967.java!!!	closeAndCleanupJobH(inout reschedule : boolean) : void
+            final JobStatus completedJob;
+            synchronized (mLock) {
+                if (mVerb == VERB_FINISHED) {
+                    return;
+                }
+                completedJob = mRunningJob;
+                mJobPackageTracker.noteInactive(completedJob);
+                try {
+                    mBatteryStats.noteJobFinish(mRunningJob.getBatteryName(),
+                            mRunningJob.getSourceUid());
+                } catch (RemoteException e) {
+                    // Whatever.
+                }
+                if (mWakeLock != null) {
+                    mWakeLock.release();
+                }
+                mContext.unbindService(JobServiceContext.this);
+                mWakeLock = null;
+                mRunningJob = null;
+                mParams = null;
+                mVerb = VERB_FINISHED;
+                mCancelled.set(false);
+                service = null;
+                mAvailable = true;
+            }
+            removeOpTimeOut();
+            removeMessages(MSG_CALLBACK);
+            removeMessages(MSG_SERVICE_BOUND);
+            removeMessages(MSG_CANCEL);
+            removeMessages(MSG_SHUTDOWN_EXECUTION);
+            mCompletedListener.onJobCompleted(completedJob, reschedule);

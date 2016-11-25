@@ -1,0 +1,336 @@
+class SmHandler
+!!!6254391.java!!!	handleMessage(inout msg : Message) : void
+            if (!mHasQuit) {
+                if (mSm != null && msg.what != SM_INIT_CMD && msg.what != SM_QUIT_CMD) {
+                    mSm.onPreHandleMessage(msg);
+                }
+
+                if (mDbg) mSm.log("handleMessage: E msg.what=" + msg.what);
+
+                /** Save the current message */
+                mMsg = msg;
+
+                /** State that processed the message */
+                State msgProcessedState = null;
+                if (mIsConstructionCompleted) {
+                    /** Normal path */
+                    msgProcessedState = processMsg(msg);
+                } else if (!mIsConstructionCompleted && (mMsg.what == SM_INIT_CMD)
+                        && (mMsg.obj == mSmHandlerObj)) {
+                    /** Initial one time path. */
+                    mIsConstructionCompleted = true;
+                    invokeEnterMethods(0);
+                } else {
+                    throw new RuntimeException("StateMachine.handleMessage: "
+                            + "The start method not called, received msg: " + msg);
+                }
+                performTransitions(msgProcessedState, msg);
+
+                // We need to check if mSm == null here as we could be quitting.
+                if (mDbg && mSm != null) mSm.log("handleMessage: X");
+
+                if (mSm != null && msg.what != SM_INIT_CMD && msg.what != SM_QUIT_CMD) {
+                    mSm.onPostHandleMessage(msg);
+                }
+            }
+!!!6254519.java!!!	performTransitions(inout msgProcessedState : State, inout msg : Message) : void
+            /**
+             * If transitionTo has been called, exit and then enter
+             * the appropriate states. We loop on this to allow
+             * enter and exit methods to use transitionTo.
+             */
+            State orgState = mStateStack[mStateStackTopIndex].state;
+
+            /**
+             * Record whether message needs to be logged before we transition and
+             * and we won't log special messages SM_INIT_CMD or SM_QUIT_CMD which
+             * always set msg.obj to the handler.
+             */
+            boolean recordLogMsg = mSm.recordLogRec(mMsg) && (msg.obj != mSmHandlerObj);
+
+            if (mLogRecords.logOnlyTransitions()) {
+                /** Record only if there is a transition */
+                if (mDestState != null) {
+                    mLogRecords.add(mSm, mMsg, mSm.getLogRecString(mMsg), msgProcessedState,
+                            orgState, mDestState);
+                }
+            } else if (recordLogMsg) {
+                /** Record message */
+                mLogRecords.add(mSm, mMsg, mSm.getLogRecString(mMsg), msgProcessedState, orgState,
+                        mDestState);
+            }
+
+            State destState = mDestState;
+            if (destState != null) {
+                /**
+                 * Process the transitions including transitions in the enter/exit methods
+                 */
+                while (true) {
+                    if (mDbg) mSm.log("handleMessage: new destination call exit/enter");
+
+                    /**
+                     * Determine the states to exit and enter and return the
+                     * common ancestor state of the enter/exit states. Then
+                     * invoke the exit methods then the enter methods.
+                     */
+                    StateInfo commonStateInfo = setupTempStateStackWithStatesToEnter(destState);
+                    invokeExitMethods(commonStateInfo);
+                    int stateStackEnteringIndex = moveTempStateStackToStateStack();
+                    invokeEnterMethods(stateStackEnteringIndex);
+
+                    /**
+                     * Since we have transitioned to a new state we need to have
+                     * any deferred messages moved to the front of the message queue
+                     * so they will be processed before any other messages in the
+                     * message queue.
+                     */
+                    moveDeferredMessageAtFrontOfQueue();
+
+                    if (destState != mDestState) {
+                        // A new mDestState so continue looping
+                        destState = mDestState;
+                    } else {
+                        // No change in mDestState so we're done
+                        break;
+                    }
+                }
+                mDestState = null;
+            }
+
+            /**
+             * After processing all transitions check and
+             * see if the last transition was to quit or halt.
+             */
+            if (destState != null) {
+                if (destState == mQuittingState) {
+                    /**
+                     * Call onQuitting to let subclasses cleanup.
+                     */
+                    mSm.onQuitting();
+                    cleanupAfterQuitting();
+                } else if (destState == mHaltingState) {
+                    /**
+                     * Call onHalting() if we've transitioned to the halting
+                     * state. All subsequent messages will be processed in
+                     * in the halting state which invokes haltedProcessMessage(msg);
+                     */
+                    mSm.onHalting();
+                }
+            }
+!!!6254647.java!!!	cleanupAfterQuitting() : void
+            if (mSm.mSmThread != null) {
+                // If we made the thread then quit looper which stops the thread.
+                getLooper().quit();
+                mSm.mSmThread = null;
+            }
+
+            mSm.mSmHandler = null;
+            mSm = null;
+            mMsg = null;
+            mLogRecords.cleanup();
+            mStateStack = null;
+            mTempStateStack = null;
+            mStateInfo.clear();
+            mInitialState = null;
+            mDestState = null;
+            mDeferredMessages.clear();
+            mHasQuit = true;
+!!!6254775.java!!!	completeConstruction() : void
+            if (mDbg) mSm.log("completeConstruction: E");
+
+            /**
+             * Determine the maximum depth of the state hierarchy
+             * so we can allocate the state stacks.
+             */
+            int maxDepth = 0;
+            for (StateInfo si : mStateInfo.values()) {
+                int depth = 0;
+                for (StateInfo i = si; i != null; depth++) {
+                    i = i.parentStateInfo;
+                }
+                if (maxDepth < depth) {
+                    maxDepth = depth;
+                }
+            }
+            if (mDbg) mSm.log("completeConstruction: maxDepth=" + maxDepth);
+
+            mStateStack = new StateInfo[maxDepth];
+            mTempStateStack = new StateInfo[maxDepth];
+            setupInitialStateStack();
+
+            /** Sending SM_INIT_CMD message to invoke enter methods asynchronously */
+            sendMessageAtFrontOfQueue(obtainMessage(SM_INIT_CMD, mSmHandlerObj));
+
+            if (mDbg) mSm.log("completeConstruction: X");
+!!!6254903.java!!!	processMsg(inout msg : Message) : State
+            StateInfo curStateInfo = mStateStack[mStateStackTopIndex];
+            if (mDbg) {
+                mSm.log("processMsg: " + curStateInfo.state.getName());
+            }
+
+            if (isQuit(msg)) {
+                transitionTo(mQuittingState);
+            } else {
+                while (!curStateInfo.state.processMessage(msg)) {
+                    /**
+                     * Not processed
+                     */
+                    curStateInfo = curStateInfo.parentStateInfo;
+                    if (curStateInfo == null) {
+                        /**
+                         * No parents left so it's not handled
+                         */
+                        mSm.unhandledMessage(msg);
+                        break;
+                    }
+                    if (mDbg) {
+                        mSm.log("processMsg: " + curStateInfo.state.getName());
+                    }
+                }
+            }
+            return (curStateInfo != null) ? curStateInfo.state : null;
+!!!6255031.java!!!	invokeExitMethods(inout commonStateInfo : StateMachine::SmHandler::StateInfo) : void
+            while ((mStateStackTopIndex >= 0)
+                    && (mStateStack[mStateStackTopIndex] != commonStateInfo)) {
+                State curState = mStateStack[mStateStackTopIndex].state;
+                if (mDbg) mSm.log("invokeExitMethods: " + curState.getName());
+                curState.exit();
+                mStateStack[mStateStackTopIndex].active = false;
+                mStateStackTopIndex -= 1;
+            }
+!!!6255159.java!!!	invokeEnterMethods(in stateStackEnteringIndex : int) : void
+            for (int i = stateStackEnteringIndex; i <= mStateStackTopIndex; i++) {
+                if (mDbg) mSm.log("invokeEnterMethods: " + mStateStack[i].state.getName());
+                mStateStack[i].state.enter();
+                mStateStack[i].active = true;
+            }
+!!!6255287.java!!!	moveDeferredMessageAtFrontOfQueue() : void
+            /**
+             * The oldest messages on the deferred list must be at
+             * the front of the queue so start at the back, which
+             * as the most resent message and end with the oldest
+             * messages at the front of the queue.
+             */
+            for (int i = mDeferredMessages.size() - 1; i >= 0; i--) {
+                Message curMsg = mDeferredMessages.get(i);
+                if (mDbg) mSm.log("moveDeferredMessageAtFrontOfQueue; what=" + curMsg.what);
+                sendMessageAtFrontOfQueue(curMsg);
+            }
+            mDeferredMessages.clear();
+!!!6255415.java!!!	moveTempStateStackToStateStack() : int
+            int startingIndex = mStateStackTopIndex + 1;
+            int i = mTempStateStackCount - 1;
+            int j = startingIndex;
+            while (i >= 0) {
+                if (mDbg) mSm.log("moveTempStackToStateStack: i=" + i + ",j=" + j);
+                mStateStack[j] = mTempStateStack[i];
+                j += 1;
+                i -= 1;
+            }
+
+            mStateStackTopIndex = j - 1;
+            if (mDbg) {
+                mSm.log("moveTempStackToStateStack: X mStateStackTop=" + mStateStackTopIndex
+                        + ",startingIndex=" + startingIndex + ",Top="
+                        + mStateStack[mStateStackTopIndex].state.getName());
+            }
+            return startingIndex;
+!!!6255543.java!!!	setupTempStateStackWithStatesToEnter(inout destState : State) : StateMachine::SmHandler::StateInfo
+            /**
+             * Search up the parent list of the destination state for an active
+             * state. Use a do while() loop as the destState must always be entered
+             * even if it is active. This can happen if we are exiting/entering
+             * the current state.
+             */
+            mTempStateStackCount = 0;
+            StateInfo curStateInfo = mStateInfo.get(destState);
+            do {
+                mTempStateStack[mTempStateStackCount++] = curStateInfo;
+                curStateInfo = curStateInfo.parentStateInfo;
+            } while ((curStateInfo != null) && !curStateInfo.active);
+
+            if (mDbg) {
+                mSm.log("setupTempStateStackWithStatesToEnter: X mTempStateStackCount="
+                        + mTempStateStackCount + ",curStateInfo: " + curStateInfo);
+            }
+            return curStateInfo;
+!!!6255671.java!!!	setupInitialStateStack() : void
+            if (mDbg) {
+                mSm.log("setupInitialStateStack: E mInitialState=" + mInitialState.getName());
+            }
+
+            StateInfo curStateInfo = mStateInfo.get(mInitialState);
+            for (mTempStateStackCount = 0; curStateInfo != null; mTempStateStackCount++) {
+                mTempStateStack[mTempStateStackCount] = curStateInfo;
+                curStateInfo = curStateInfo.parentStateInfo;
+            }
+
+            // Empty the StateStack
+            mStateStackTopIndex = -1;
+
+            moveTempStateStackToStateStack();
+!!!6255799.java!!!	getCurrentMessage() : Message
+            return mMsg;
+!!!6255927.java!!!	getCurrentState() : IState
+            return mStateStack[mStateStackTopIndex].state;
+!!!6256055.java!!!	addState(inout state : State, inout parent : State) : StateMachine::SmHandler::StateInfo
+            if (mDbg) {
+                mSm.log("addStateInternal: E state=" + state.getName() + ",parent="
+                        + ((parent == null) ? "" : parent.getName()));
+            }
+            StateInfo parentStateInfo = null;
+            if (parent != null) {
+                parentStateInfo = mStateInfo.get(parent);
+                if (parentStateInfo == null) {
+                    // Recursively add our parent as it's not been added yet.
+                    parentStateInfo = addState(parent, null);
+                }
+            }
+            StateInfo stateInfo = mStateInfo.get(state);
+            if (stateInfo == null) {
+                stateInfo = new StateInfo();
+                mStateInfo.put(state, stateInfo);
+            }
+
+            // Validate that we aren't adding the same state in two different hierarchies.
+            if ((stateInfo.parentStateInfo != null)
+                    && (stateInfo.parentStateInfo != parentStateInfo)) {
+                throw new RuntimeException("state already added");
+            }
+            stateInfo.state = state;
+            stateInfo.parentStateInfo = parentStateInfo;
+            stateInfo.active = false;
+            if (mDbg) mSm.log("addStateInternal: X stateInfo: " + stateInfo);
+            return stateInfo;
+!!!6256183.java!!!	SmHandler(inout looper : Looper, inout sm : StateMachine)
+            super(looper);
+            mSm = sm;
+
+            addState(mHaltingState, null);
+            addState(mQuittingState, null);
+!!!6256311.java!!!	setInitialState(inout initialState : State) : void
+            if (mDbg) mSm.log("setInitialState: initialState=" + initialState.getName());
+            mInitialState = initialState;
+!!!6256439.java!!!	transitionTo(inout destState : IState) : void
+            mDestState = (State) destState;
+            if (mDbg) mSm.log("transitionTo: destState=" + mDestState.getName());
+!!!6256567.java!!!	deferMessage(inout msg : Message) : void
+            if (mDbg) mSm.log("deferMessage: msg=" + msg.what);
+
+            /* Copy the "msg" to "newMsg" as "msg" will be recycled */
+            Message newMsg = obtainMessage();
+            newMsg.copyFrom(msg);
+
+            mDeferredMessages.add(newMsg);
+!!!6256695.java!!!	quit() : void
+            if (mDbg) mSm.log("quit:");
+            sendMessage(obtainMessage(SM_QUIT_CMD, mSmHandlerObj));
+!!!6256823.java!!!	quitNow() : void
+            if (mDbg) mSm.log("quitNow:");
+            sendMessageAtFrontOfQueue(obtainMessage(SM_QUIT_CMD, mSmHandlerObj));
+!!!6256951.java!!!	isQuit(inout msg : Message) : boolean
+            return (msg.what == SM_QUIT_CMD) && (msg.obj == mSmHandlerObj);
+!!!6257079.java!!!	isDbg() : boolean
+            return mDbg;
+!!!6257207.java!!!	setDbg(inout dbg : boolean) : void
+            mDbg = dbg;

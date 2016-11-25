@@ -1,0 +1,322 @@
+class CameraOps
+!!!38698295.java!!!	resume() : String
+        String errorMessage = "Unknown error";
+        boolean foundCamera = false;
+        try {
+            // Find first back-facing camera that has necessary capability
+            String[] cameraIds = mCameraManager.getCameraIdList();
+            for (String id : cameraIds) {
+                CameraCharacteristics info = mCameraManager.getCameraCharacteristics(id);
+                int facing = info.get(CameraCharacteristics.LENS_FACING);
+
+                int level = info.get(CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL);
+                boolean hasFullLevel
+                        = (level == CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL_FULL);
+
+                int[] capabilities = info.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES);
+                int syncLatency = info.get(CameraCharacteristics.SYNC_MAX_LATENCY);
+                boolean hasManualControl = hasCapability(capabilities,
+                        CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR);
+                boolean hasEnoughCapability = hasManualControl &&
+                        syncLatency == CameraCharacteristics.SYNC_MAX_LATENCY_PER_FRAME_CONTROL;
+                Range<Integer> irange;
+                Range<Long> lrange;
+
+                irange = info.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE);
+                mISOmax = irange.getUpper();
+                mISOmin = irange.getLower();
+                lrange = info.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE);
+                mExpMax = lrange.getUpper();
+                mExpMin = lrange.getLower();
+                mFocusMin = info.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE);
+
+                mFocusDist = mFocusMin;
+                StreamConfigurationMap map = info.get(
+                        CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
+                Size[] sizes = map.getOutputSizes(ImageFormat.JPEG);
+                Size largest = Collections.max(Arrays.asList(sizes), new Comparator<Size>() {
+                    @Override
+                    public int compare(Size lhs, Size rhs) {
+                        int leftArea = lhs.getHeight() * lhs.getWidth();
+                        int rightArea = lhs.getHeight() * lhs.getWidth();
+                        return Integer.compare(leftArea, rightArea);
+                    }
+                });
+                mImageReader = ImageReader.newInstance(largest.getWidth(), largest.getHeight(),
+                        ImageFormat.JPEG, /*maxImages*/2);
+                mImageReader.setOnImageAvailableListener(
+                        mOnImageAvailableListener, mBackgroundHandler);
+
+                if (facing == CameraCharacteristics.LENS_FACING_BACK &&
+                        (hasFullLevel || hasEnoughCapability)) {
+                    // Found suitable camera - get info, open, and set up outputs
+                    mCameraInfo = info;
+                    openCamera(id);
+                    foundCamera = true;
+                    break;
+                }
+            }
+            if (!foundCamera) {
+                errorMessage = "no back camera";
+            }
+        } catch (CameraAccessException e) {
+            errorMessage = e.getMessage();
+        }
+        // startBackgroundThread
+        mBackgroundThread = new HandlerThread("CameraBackground");
+        mBackgroundThread.start();
+        mBackgroundHandler = new Handler(mBackgroundThread.getLooper());
+        return (foundCamera) ? null : errorMessage;
+!!!38698423.java!!!	hasCapability(inout capabilities : int, in capability : int) : boolean
+        for (int c : capabilities) {
+            if (c == capability) return true;
+        }
+        return false;
+!!!38698807.java!!!	CameraOps(inout manager : CameraManager, inout errorDisplayer : CameraOps::ErrorDisplayer, inout readyListener : CameraOps::CameraReadyListener)
+        mReadyHandler = new Handler(Looper.getMainLooper());
+
+        mCameraThread = new HandlerThread("CameraOpsThread");
+        mCameraThread.start();
+
+        if (manager == null || errorDisplayer == null ||
+                readyListener == null || mReadyHandler == null) {
+            throw new IllegalArgumentException("Need valid displayer, listener, handler");
+        }
+
+        mCameraManager = manager;
+        mErrorDisplayer = errorDisplayer;
+        mReadyListener = readyListener;
+
+!!!38698935.java!!!	openCamera(in cameraId : String) : void
+        mCameraHandler = new Handler(mCameraThread.getLooper());
+
+        mCameraHandler.post(new Runnable() {
+            public void run() {
+                if (mCameraDevice != null) {
+                    throw new IllegalStateException("Camera already open");
+                }
+                try {
+
+                    mCameraManager.openCamera(cameraId, mCameraDeviceListener, mCameraHandler);
+                } catch (CameraAccessException e) {
+                    String errorMessage = mErrorDisplayer.getErrorString(e);
+                    mErrorDisplayer.showErrorDialog(errorMessage);
+                }
+            }
+        });
+!!!38699063.java!!!	pause() : void
+        closeCameraAndWait();
+        mBackgroundThread.quitSafely();
+        try {
+            mBackgroundThread.join();
+            mBackgroundThread = null;
+            mBackgroundHandler = null;
+        } catch (InterruptedException e) {
+            e.printStackTrace();
+        }
+!!!38699191.java!!!	getBestSize() : Size
+        // Find a good size for output - largest 16:9 aspect ratio that's less than 720p
+        final int MAX_WIDTH = 1280;
+        final float TARGET_ASPECT = 16.f / 9.f;
+        final float ASPECT_TOLERANCE = 0.1f;
+
+
+        StreamConfigurationMap configs =
+                mCameraInfo.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
+
+        Size[] outputSizes = configs.getOutputSizes(SurfaceHolder.class);
+
+        Size outputSize = outputSizes[0];
+        float outputAspect = (float) outputSize.getWidth() / outputSize.getHeight();
+        for (Size candidateSize : outputSizes) {
+            if (candidateSize.getWidth() > MAX_WIDTH) continue;
+            float candidateAspect = (float) candidateSize.getWidth() / candidateSize.getHeight();
+            boolean goodCandidateAspect =
+                    Math.abs(candidateAspect - TARGET_ASPECT) < ASPECT_TOLERANCE;
+            boolean goodOutputAspect =
+                    Math.abs(outputAspect - TARGET_ASPECT) < ASPECT_TOLERANCE;
+            if ((goodCandidateAspect && !goodOutputAspect) ||
+                    candidateSize.getWidth() > outputSize.getWidth()) {
+                outputSize = candidateSize;
+                outputAspect = candidateAspect;
+            }
+        }
+        return outputSize;
+!!!38699319.java!!!	closeCameraAndWait() : void
+        mCloseWaiter.close();
+        mCameraHandler.post(mCloseCameraRunnable);
+        boolean closed = mCloseWaiter.block(CAMERA_CLOSE_TIMEOUT);
+        if (!closed) {
+            Log.e(TAG, "Timeout closing camera");
+        }
+!!!38699447.java!!!	setSurface(inout surface : Surface) : void
+        final List<Surface> surfaceList = new ArrayList<Surface>();
+        surfaceList.add(surface);
+        surfaceList.add(mImageReader.getSurface());
+
+        mCameraHandler.post(new Runnable() {
+            public void run() {
+                mSurfaces = surfaceList;
+                startCameraSession();
+            }
+        });
+!!!38699575.java!!!	createCaptureRequest(in template : int) : CaptureRequest::Builder
+        CameraDevice device = mCameraDevice;
+        if (device == null) {
+            throw new IllegalStateException("Can't get requests when no camera is open");
+        }
+        return device.createCaptureRequest(template);
+!!!38699703.java!!!	setRepeatingRequest(in request : CaptureRequest, in listener : CameraCaptureSession::CaptureCallback, in handler : Handler) : void
+        mCameraHandler.post(new Runnable() {
+            public void run() {
+                try {
+                    mCameraSession.setRepeatingRequest(request, listener, handler);
+                } catch (CameraAccessException e) {
+                    String errorMessage = mErrorDisplayer.getErrorString(e);
+                    mErrorDisplayer.showErrorDialog(errorMessage);
+                }
+            }
+        });
+!!!38699831.java!!!	setRepeatingBurst(in requests : List<CaptureRequest>, in listener : CameraCaptureSession::CaptureCallback, in handler : Handler) : void
+        mCameraHandler.post(new Runnable() {
+            public void run() {
+                try {
+                    mCameraSession.setRepeatingBurst(requests, listener, handler);
+
+                } catch (CameraAccessException e) {
+                    String errorMessage = mErrorDisplayer.getErrorString(e);
+                    mErrorDisplayer.showErrorDialog(errorMessage);
+                }
+            }
+        });
+!!!38699959.java!!!	startCameraSession() : void
+        // Wait until both the camera device is open and the SurfaceView is ready
+        if (mCameraDevice == null || mSurfaces == null) return;
+
+        try {
+
+            mCameraDevice.createCaptureSession(
+                    mSurfaces, mCameraSessionListener, mCameraHandler);
+        } catch (CameraAccessException e) {
+            String errorMessage = mErrorDisplayer.getErrorString(e);
+            mErrorDisplayer.showErrorDialog(errorMessage);
+            mCameraDevice.close();
+            mCameraDevice = null;
+        }
+!!!38700087.java!!!	captureStillPicture(in currentJpegRotation : int, inout name : String, inout resolver : ContentResolver) : void
+        mSaveFileName = name;
+        mContentResolver = resolver;
+        try {
+            // TODO call lock focus if we are in "AF-S(One-Shot AF) mode"
+            // TODO call precapture if we are using flash
+            // This is the CaptureRequest.Builder that we use to take a picture.
+            final CaptureRequest.Builder captureBuilder =
+                    createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE);
+            Log.v(TAG, " Target " + mImageReader.getWidth() + "," + mImageReader.getHeight());
+
+            captureBuilder.addTarget(mImageReader.getSurface());
+
+            captureBuilder.set(CaptureRequest.JPEG_ORIENTATION, currentJpegRotation);
+
+            CameraCaptureSession.CaptureCallback captureCallback
+                    = new CameraCaptureSession.CaptureCallback() {
+
+                @Override
+                public void onCaptureCompleted(CameraCaptureSession session, CaptureRequest request,
+                                               TotalCaptureResult result) {
+                    Log.v(TAG, " onCaptureCompleted");
+                    setParameters();
+                }
+            };
+
+
+            setRequest(captureBuilder.build(), captureCallback, null);
+        } catch (CameraAccessException e) {
+            e.printStackTrace();
+        }
+!!!38700215.java!!!	setRequest(in request : CaptureRequest, in listener : CameraCaptureSession::CaptureCallback, in handler : Handler) : void
+        mCameraHandler.post(new Runnable() {
+            public void run() {
+                try {
+                    mCameraSession.stopRepeating();
+                    mCameraSession.capture(request, listener, handler);
+                } catch (CameraAccessException e) {
+                    String errorMessage = mErrorDisplayer.getErrorString(e);
+                    mErrorDisplayer.showErrorDialog(errorMessage);
+                }
+            }
+        });
+!!!38700343.java!!!	setUpCamera(inout processingNormalSurface : Surface) : void
+        mProcessingNormalSurface = processingNormalSurface;
+        // Ready to send requests in, so set them up
+        try {
+            CaptureRequest.Builder previewBuilder =
+                    createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
+            previewBuilder.addTarget(mProcessingNormalSurface);
+            previewBuilder.setTag(mAutoExposureTag);
+            mPreviewRequest = previewBuilder.build();
+            mHdrBuilder = createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
+            mHdrBuilder.set(CaptureRequest.CONTROL_AE_MODE,
+                    CaptureRequest.CONTROL_AE_MODE_OFF);
+            mHdrBuilder.addTarget(mProcessingNormalSurface);
+            setParameters();
+
+        } catch (CameraAccessException e) {
+            String errorMessage = e.getMessage();
+            // MessageDialogFragment.newInstance(errorMessage).show(getFragmentManager(), FRAGMENT_DIALOG);
+        }
+!!!38700471.java!!!	setParameters() : void
+        if (mHdrBuilder == null) {
+            Log.v(TAG," Camera not set up");
+            return;
+        }
+        if (mAutoExposure) {
+            mHdrBuilder.set(CaptureRequest.SENSOR_FRAME_DURATION, ONE_SECOND / 30);
+            mHdrBuilder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, getExposure());
+            mHdrBuilder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON);
+        } else {
+            mHdrBuilder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF);
+            mHdrBuilder.set(CaptureRequest.SENSOR_FRAME_DURATION, ONE_SECOND / 30);
+            mHdrBuilder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, getExposure());
+            mHdrBuilder.set(CaptureRequest.SENSOR_SENSITIVITY, getIso());
+        }
+        if (mAutoFocus) {
+            mHdrBuilder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO);
+            mHdrBuilder.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_START);
+        } else {
+            mHdrBuilder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF);
+            mHdrBuilder.set(CaptureRequest.LENS_FOCUS_DISTANCE, getFocusDistance());
+            mHdrBuilder.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_START);
+        }
+
+        setRepeatingRequest(mHdrBuilder.build(), mCaptureCallback, mReadyHandler);
+!!!38700983.java!!!	getFocusDistance() : float
+        return mFocusDist;
+!!!38701111.java!!!	setFocusDistance(in focusDistance : float) : void
+        mFocusDist = focusDistance;
+!!!38701239.java!!!	setIso(in iso : int) : void
+        mIso = iso;
+!!!38701367.java!!!	isAutoExposure() : boolean
+        return mAutoExposure;
+!!!38701495.java!!!	setAutoExposure(inout autoExposure : boolean) : void
+        mAutoExposure = autoExposure;
+!!!38701623.java!!!	isAutoFocus() : boolean
+        return mAutoFocus;
+!!!38701751.java!!!	setAutoFocus(inout autoFocus : boolean) : void
+        mAutoFocus = autoFocus;
+!!!38701879.java!!!	getIso() : int
+        return mIso;
+!!!38702007.java!!!	getExposure() : long
+        return mExposure;
+!!!38702135.java!!!	setExposure(in exposure : long) : void
+        mExposure = exposure;
+!!!38702263.java!!!	getIsoMax() : int
+        return mISOmax;
+!!!38702391.java!!!	getIsoMin() : int
+        return mISOmin;
+!!!38702519.java!!!	getExpMax() : long
+        return mExpMax;
+!!!38702647.java!!!	getExpMin() : long
+        return mExpMin;
+!!!38702775.java!!!	getFocusMin() : float
+        return mFocusMin;

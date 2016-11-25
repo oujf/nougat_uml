@@ -1,0 +1,249 @@
+class MultiDex
+!!!36378423.java!!!	install(inout context : Context) : void
+        Log.i(TAG, "install");
+        if (IS_VM_MULTIDEX_CAPABLE) {
+            Log.i(TAG, "VM has multidex support, MultiDex support library is disabled.");
+            return;
+        }
+
+        if (Build.VERSION.SDK_INT < MIN_SDK_VERSION) {
+            throw new RuntimeException("Multi dex installation failed. SDK " + Build.VERSION.SDK_INT
+                    + " is unsupported. Min SDK version is " + MIN_SDK_VERSION + ".");
+        }
+
+        try {
+            ApplicationInfo applicationInfo = getApplicationInfo(context);
+            if (applicationInfo == null) {
+                // Looks like running on a test Context, so just return without patching.
+                return;
+            }
+
+            synchronized (installedApk) {
+                String apkPath = applicationInfo.sourceDir;
+                if (installedApk.contains(apkPath)) {
+                    return;
+                }
+                installedApk.add(apkPath);
+
+                if (Build.VERSION.SDK_INT > MAX_SUPPORTED_SDK_VERSION) {
+                    Log.w(TAG, "MultiDex is not guaranteed to work in SDK version "
+                            + Build.VERSION.SDK_INT + ": SDK version higher than "
+                            + MAX_SUPPORTED_SDK_VERSION + " should be backed by "
+                            + "runtime with built-in multidex capabilty but it's not the "
+                            + "case here: java.vm.version=\""
+                            + System.getProperty("java.vm.version") + "\"");
+                }
+
+                /* The patched class loader is expected to be a descendant of
+                 * dalvik.system.BaseDexClassLoader. We modify its
+                 * dalvik.system.DexPathList pathList field to append additional DEX
+                 * file entries.
+                 */
+                ClassLoader loader;
+                try {
+                    loader = context.getClassLoader();
+                } catch (RuntimeException e) {
+                    /* Ignore those exceptions so that we don't break tests relying on Context like
+                     * a android.test.mock.MockContext or a android.content.ContextWrapper with a
+                     * null base Context.
+                     */
+                    Log.w(TAG, "Failure while trying to obtain Context class loader. " +
+                            "Must be running in test mode. Skip patching.", e);
+                    return;
+                }
+                if (loader == null) {
+                    // Note, the context class loader is null when running Robolectric tests.
+                    Log.e(TAG,
+                            "Context class loader is null. Must be running in test mode. "
+                            + "Skip patching.");
+                    return;
+                }
+
+                try {
+                  clearOldDexDir(context);
+                } catch (Throwable t) {
+                  Log.w(TAG, "Something went wrong when trying to clear old MultiDex extraction, "
+                      + "continuing without cleaning.", t);
+                }
+
+                File dexDir = getDexDir(context, applicationInfo);
+                List<File> files = MultiDexExtractor.load(context, applicationInfo, dexDir, false);
+                if (checkValidZipFiles(files)) {
+                    installSecondaryDexes(loader, dexDir, files);
+                } else {
+                    Log.w(TAG, "Files were not valid zip files.  Forcing a reload.");
+                    // Try again, but this time force a reload of the zip file.
+                    files = MultiDexExtractor.load(context, applicationInfo, dexDir, true);
+
+                    if (checkValidZipFiles(files)) {
+                        installSecondaryDexes(loader, dexDir, files);
+                    } else {
+                        // Second time didn't work, give up
+                        throw new RuntimeException("Zip files were not valid.");
+                    }
+                }
+            }
+
+        } catch (Exception e) {
+            Log.e(TAG, "Multidex installation failure", e);
+            throw new RuntimeException("Multi dex installation failed (" + e.getMessage() + ").");
+        }
+        Log.i(TAG, "install done");
+!!!36378551.java!!!	getApplicationInfo(inout context : Context) : ApplicationInfo
+        PackageManager pm;
+        String packageName;
+        try {
+            pm = context.getPackageManager();
+            packageName = context.getPackageName();
+        } catch (RuntimeException e) {
+            /* Ignore those exceptions so that we don't break tests relying on Context like
+             * a android.test.mock.MockContext or a android.content.ContextWrapper with a null
+             * base Context.
+             */
+            Log.w(TAG, "Failure while trying to obtain ApplicationInfo from Context. " +
+                    "Must be running in test mode. Skip patching.", e);
+            return null;
+        }
+        if (pm == null || packageName == null) {
+            // This is most likely a mock context, so just return without patching.
+            return null;
+        }
+        ApplicationInfo applicationInfo =
+                pm.getApplicationInfo(packageName, PackageManager.GET_META_DATA);
+        return applicationInfo;
+!!!36378679.java!!!	isVMMultidexCapable(inout versionString : String) : boolean
+        boolean isMultidexCapable = false;
+        if (versionString != null) {
+            Matcher matcher = Pattern.compile("(\\d+)\\.(\\d+)(\\.\\d+)?").matcher(versionString);
+            if (matcher.matches()) {
+                try {
+                    int major = Integer.parseInt(matcher.group(1));
+                    int minor = Integer.parseInt(matcher.group(2));
+                    isMultidexCapable = (major > VM_WITH_MULTIDEX_VERSION_MAJOR)
+                            || ((major == VM_WITH_MULTIDEX_VERSION_MAJOR)
+                                    && (minor >= VM_WITH_MULTIDEX_VERSION_MINOR));
+                } catch (NumberFormatException e) {
+                    // let isMultidexCapable be false
+                }
+            }
+        }
+        Log.i(TAG, "VM with version " + versionString +
+                (isMultidexCapable ?
+                        " has multidex support" :
+                        " does not have multidex support"));
+        return isMultidexCapable;
+!!!36378807.java!!!	installSecondaryDexes(inout loader : ClassLoader, inout dexDir : File, inout files : List<File>) : void
+        if (!files.isEmpty()) {
+            if (Build.VERSION.SDK_INT >= 19) {
+                V19.install(loader, files, dexDir);
+            } else if (Build.VERSION.SDK_INT >= 14) {
+                V14.install(loader, files, dexDir);
+            } else {
+                V4.install(loader, files);
+            }
+        }
+!!!36378935.java!!!	checkValidZipFiles(inout files : List<File>) : boolean
+        for (File file : files) {
+            if (!MultiDexExtractor.verifyZipFile(file)) {
+                return false;
+            }
+        }
+        return true;
+!!!36379063.java!!!	findField(inout instance : Object, inout name : String) : Field
+        for (Class<?> clazz = instance.getClass(); clazz != null; clazz = clazz.getSuperclass()) {
+            try {
+                Field field = clazz.getDeclaredField(name);
+
+
+                if (!field.isAccessible()) {
+                    field.setAccessible(true);
+                }
+
+                return field;
+            } catch (NoSuchFieldException e) {
+                // ignore and search next
+            }
+        }
+
+        throw new NoSuchFieldException("Field " + name + " not found in " + instance.getClass());
+!!!36379191.java!!!	findMethod(inout instance : Object, inout name : String, inout parameterTypes : Class<?>...) : Method
+        for (Class<?> clazz = instance.getClass(); clazz != null; clazz = clazz.getSuperclass()) {
+            try {
+                Method method = clazz.getDeclaredMethod(name, parameterTypes);
+
+
+                if (!method.isAccessible()) {
+                    method.setAccessible(true);
+                }
+
+                return method;
+            } catch (NoSuchMethodException e) {
+                // ignore and search next
+            }
+        }
+
+        throw new NoSuchMethodException("Method " + name + " with parameters " +
+                Arrays.asList(parameterTypes) + " not found in " + instance.getClass());
+!!!36379319.java!!!	expandFieldArray(inout instance : Object, inout fieldName : String, inout extraElements : Object) : void
+        Field jlrField = findField(instance, fieldName);
+        Object[] original = (Object[]) jlrField.get(instance);
+        Object[] combined = (Object[]) Array.newInstance(
+                original.getClass().getComponentType(), original.length + extraElements.length);
+        System.arraycopy(original, 0, combined, 0, original.length);
+        System.arraycopy(extraElements, 0, combined, original.length, extraElements.length);
+        jlrField.set(instance, combined);
+!!!36379447.java!!!	clearOldDexDir(inout context : Context) : void
+        File dexDir = new File(context.getFilesDir(), OLD_SECONDARY_FOLDER_NAME);
+        if (dexDir.isDirectory()) {
+            Log.i(TAG, "Clearing old secondary dex dir (" + dexDir.getPath() + ").");
+            File[] files = dexDir.listFiles();
+            if (files == null) {
+                Log.w(TAG, "Failed to list secondary dex dir content (" + dexDir.getPath() + ").");
+                return;
+            }
+            for (File oldFile : files) {
+                Log.i(TAG, "Trying to delete old file " + oldFile.getPath() + " of size "
+                        + oldFile.length());
+                if (!oldFile.delete()) {
+                    Log.w(TAG, "Failed to delete old file " + oldFile.getPath());
+                } else {
+                    Log.i(TAG, "Deleted old file " + oldFile.getPath());
+                }
+            }
+            if (!dexDir.delete()) {
+                Log.w(TAG, "Failed to delete secondary dex dir " + dexDir.getPath());
+            } else {
+                Log.i(TAG, "Deleted old secondary dex dir " + dexDir.getPath());
+            }
+        }
+!!!36379575.java!!!	getDexDir(inout context : Context, inout applicationInfo : ApplicationInfo) : File
+        File cache = new File(applicationInfo.dataDir, CODE_CACHE_NAME);
+        try {
+            mkdirChecked(cache);
+        } catch (IOException e) {
+            /* If we can't emulate code_cache, then store to filesDir. This means abandoning useless
+             * files on disk if the device ever updates to android 5+. But since this seems to
+             * happen only on some devices running android 2, this should cause no pollution.
+             */
+            cache = new File(context.getFilesDir(), CODE_CACHE_NAME);
+            mkdirChecked(cache);
+        }
+        File dexDir = new File(cache, CODE_CACHE_SECONDARY_FOLDER_NAME);
+        mkdirChecked(dexDir);
+        return dexDir;
+!!!36379703.java!!!	mkdirChecked(inout dir : File) : void
+        dir.mkdir();
+        if (!dir.isDirectory()) {
+            File parent = dir.getParentFile();
+            if (parent == null) {
+                Log.e(TAG, "Failed to create dir " + dir.getPath() + ". Parent file is null.");
+            } else {
+                Log.e(TAG, "Failed to create dir " + dir.getPath() +
+                        ". parent file is a dir " + parent.isDirectory() +
+                        ", a file " + parent.isFile() +
+                        ", exists " + parent.exists() +
+                        ", readable " + parent.canRead() +
+                        ", writable " + parent.canWrite());
+            }
+            throw new IOException("Failed to create directory " + dir.getPath());
+        }

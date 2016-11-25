@@ -1,0 +1,290 @@
+class RemotePrintDocument
+!!!44094135.java!!!	RemotePrintDocument(inout context : Context, inout adapter : IPrintDocumentAdapter, inout fileProvider : MutexFileProvider, inout deathObserver : RemotePrintDocument::RemoteAdapterDeathObserver, inout callbacks : RemotePrintDocument::UpdateResultCallbacks)
+        mPrintDocumentAdapter = adapter;
+        mLooper = context.getMainLooper();
+        mContext = context;
+        mAdapterDeathObserver = deathObserver;
+        mDocumentInfo = new RemotePrintDocumentInfo();
+        mDocumentInfo.fileProvider = fileProvider;
+        mUpdateCallbacks = callbacks;
+        connectToRemoteDocument();
+!!!44094263.java!!!	start() : void
+        if (DEBUG) {
+            Log.i(LOG_TAG, "[CALLED] start()");
+        }
+        if (mState == STATE_FAILED) {
+            Log.w(LOG_TAG, "Failed before start.");
+        } else if (mState == STATE_DESTROYED) {
+            Log.w(LOG_TAG, "Destroyed before start.");
+        } else {
+            if (mState != STATE_INITIAL) {
+                throw new IllegalStateException("Cannot start in state:" + stateToString(mState));
+            }
+            try {
+                mPrintDocumentAdapter.start();
+                mState = STATE_STARTED;
+            } catch (RemoteException re) {
+                Log.e(LOG_TAG, "Error calling start()", re);
+                mState = STATE_FAILED;
+            }
+        }
+!!!44094391.java!!!	update(inout attributes : PrintAttributes, inout pages : PageRange, inout preview : boolean) : boolean
+        boolean willUpdate;
+
+        if (DEBUG) {
+            Log.i(LOG_TAG, "[CALLED] update()");
+        }
+
+        if (hasUpdateError()) {
+            throw new IllegalStateException("Cannot update without a clearing the failure");
+        }
+
+        if (mState == STATE_INITIAL || mState == STATE_FINISHED || mState == STATE_DESTROYED) {
+            throw new IllegalStateException("Cannot update in state:" + stateToString(mState));
+        }
+
+        // We schedule a layout if the constraints changed.
+        if (!mUpdateSpec.hasSameConstraints(attributes, preview)) {
+            willUpdate = true;
+
+            // If there is a current command that is running we ask for a
+            // cancellation and start over.
+            if (mCurrentCommand != null && (mCurrentCommand.isRunning()
+                    || mCurrentCommand.isPending())) {
+                mCurrentCommand.cancel(false);
+            }
+
+            // Schedule a layout command.
+            PrintAttributes oldAttributes = mDocumentInfo.attributes != null
+                    ? mDocumentInfo.attributes : new PrintAttributes.Builder().build();
+            AsyncCommand command = new LayoutCommand(mLooper, mPrintDocumentAdapter,
+                  mDocumentInfo, oldAttributes, attributes, preview, mCommandResultCallback);
+            scheduleCommand(command);
+
+            mState = STATE_UPDATING;
+        // If no layout in progress and we don't have all pages - schedule a write.
+        } else if ((!(mCurrentCommand instanceof LayoutCommand)
+                || (!mCurrentCommand.isPending() && !mCurrentCommand.isRunning()))
+                && pages != null && !PageRangeUtils.contains(mUpdateSpec.pages, pages,
+                mDocumentInfo.info.getPageCount())) {
+            willUpdate = true;
+
+            // Cancel the current write as a new one is to be scheduled.
+            if (mCurrentCommand instanceof WriteCommand
+                    && (mCurrentCommand.isPending() || mCurrentCommand.isRunning())) {
+                mCurrentCommand.cancel(false);
+            }
+
+            // Schedule a write command.
+            AsyncCommand command = new WriteCommand(mContext, mLooper, mPrintDocumentAdapter,
+                    mDocumentInfo, mDocumentInfo.info.getPageCount(), pages,
+                    mDocumentInfo.fileProvider, mCommandResultCallback);
+            scheduleCommand(command);
+
+            mState = STATE_UPDATING;
+        } else {
+            willUpdate = false;
+            if (DEBUG) {
+                Log.i(LOG_TAG, "[SKIPPING] No update needed");
+            }
+        }
+
+        // Keep track of what is requested.
+        mUpdateSpec.update(attributes, preview, pages);
+
+        runPendingCommand();
+
+        return willUpdate;
+!!!44094519.java!!!	finish() : void
+        if (DEBUG) {
+            Log.i(LOG_TAG, "[CALLED] finish()");
+        }
+        if (mState != STATE_STARTED && mState != STATE_UPDATED
+                && mState != STATE_FAILED && mState != STATE_CANCELING
+                && mState != STATE_CANCELED && mState != STATE_DESTROYED) {
+            throw new IllegalStateException("Cannot finish in state:"
+                    + stateToString(mState));
+        }
+        try {
+            mPrintDocumentAdapter.finish();
+            mState = STATE_FINISHED;
+        } catch (RemoteException re) {
+            Log.e(LOG_TAG, "Error calling finish()");
+            mState = STATE_FAILED;
+        }
+!!!44094647.java!!!	cancel(inout force : boolean) : void
+        if (DEBUG) {
+            Log.i(LOG_TAG, "[CALLED] cancel(" + force + ")");
+        }
+
+        mNextCommand = null;
+
+        if (mState != STATE_UPDATING) {
+            return;
+        }
+
+        mState = STATE_CANCELING;
+
+        mCurrentCommand.cancel(force);
+!!!44094775.java!!!	destroy() : void
+        if (DEBUG) {
+            Log.i(LOG_TAG, "[CALLED] destroy()");
+        }
+        if (mState == STATE_DESTROYED) {
+            throw new IllegalStateException("Cannot destroy in state:" + stateToString(mState));
+        }
+
+        mState = STATE_DESTROYED;
+
+        disconnectFromRemoteDocument();
+!!!44094903.java!!!	kill(inout reason : String) : void
+        if (DEBUG) {
+            Log.i(LOG_TAG, "[CALLED] kill()");
+        }
+
+        try {
+            mPrintDocumentAdapter.kill(reason);
+        } catch (RemoteException re) {
+            Log.e(LOG_TAG, "Error calling kill()", re);
+        }
+!!!44095031.java!!!	isUpdating() : boolean
+        return mState == STATE_UPDATING || mState == STATE_CANCELING;
+!!!44095159.java!!!	isDestroyed() : boolean
+        return mState == STATE_DESTROYED;
+!!!44095287.java!!!	hasUpdateError() : boolean
+        return mState == STATE_FAILED;
+!!!44095415.java!!!	hasLaidOutPages() : boolean
+        return mDocumentInfo.info != null
+                && mDocumentInfo.info.getPageCount() > 0;
+!!!44095543.java!!!	clearUpdateError() : void
+        if (!hasUpdateError()) {
+            throw new IllegalStateException("No update error to clear");
+        }
+        mState = STATE_STARTED;
+!!!44095671.java!!!	getDocumentInfo() : RemotePrintDocument::RemotePrintDocumentInfo
+        return mDocumentInfo;
+!!!44095799.java!!!	writeContent(inout contentResolver : ContentResolver, inout uri : Uri) : void
+        File file = null;
+        InputStream in = null;
+        OutputStream out = null;
+        try {
+            file = mDocumentInfo.fileProvider.acquireFile(null);
+            in = new FileInputStream(file);
+            out = contentResolver.openOutputStream(uri);
+            final byte[] buffer = new byte[8192];
+            while (true) {
+                final int readByteCount = in.read(buffer);
+                if (readByteCount < 0) {
+                    break;
+                }
+                out.write(buffer, 0, readByteCount);
+            }
+        } catch (IOException e) {
+            Log.e(LOG_TAG, "Error writing document content.", e);
+        } finally {
+            IoUtils.closeQuietly(in);
+            IoUtils.closeQuietly(out);
+            if (file != null) {
+                mDocumentInfo.fileProvider.releaseFile();
+            }
+        }
+!!!44095927.java!!!	notifyUpdateCanceled() : void
+        if (DEBUG) {
+            Log.i(LOG_TAG, "[CALLING] onUpdateCanceled()");
+        }
+        mUpdateCallbacks.onUpdateCanceled();
+!!!44096055.java!!!	notifyUpdateCompleted() : void
+        if (DEBUG) {
+            Log.i(LOG_TAG, "[CALLING] onUpdateCompleted()");
+        }
+        mUpdateCallbacks.onUpdateCompleted(mDocumentInfo);
+!!!44096183.java!!!	notifyUpdateFailed(inout error : CharSequence) : void
+        if (DEBUG) {
+            Log.i(LOG_TAG, "[CALLING] onUpdateCompleted()");
+        }
+        mUpdateCallbacks.onUpdateFailed(error);
+!!!44096311.java!!!	connectToRemoteDocument() : void
+        try {
+            mPrintDocumentAdapter.asBinder().linkToDeath(mDeathRecipient, 0);
+        } catch (RemoteException re) {
+            Log.w(LOG_TAG, "The printing process is dead.");
+            destroy();
+            return;
+        }
+
+        try {
+            mPrintDocumentAdapter.setObserver(new PrintDocumentAdapterObserver(this));
+        } catch (RemoteException re) {
+            Log.w(LOG_TAG, "Error setting observer to the print adapter.");
+            destroy();
+        }
+!!!44096439.java!!!	disconnectFromRemoteDocument() : void
+        try {
+            mPrintDocumentAdapter.setObserver(null);
+        } catch (RemoteException re) {
+            Log.w(LOG_TAG, "Error setting observer to the print adapter.");
+            // Keep going - best effort...
+        }
+
+        mPrintDocumentAdapter.asBinder().unlinkToDeath(mDeathRecipient, 0);
+!!!44096567.java!!!	scheduleCommand(inout command : RemotePrintDocument::AsyncCommand) : void
+        if (mCurrentCommand == null) {
+            mCurrentCommand = command;
+        } else {
+            mNextCommand = command;
+        }
+!!!44096695.java!!!	runPendingCommand() : void
+        if (mCurrentCommand != null
+                && (mCurrentCommand.isCompleted()
+                        || mCurrentCommand.isCanceled())) {
+            mCurrentCommand = mNextCommand;
+            mNextCommand = null;
+        }
+
+        if (mCurrentCommand != null) {
+            if (mCurrentCommand.isPending()) {
+                mCurrentCommand.run();
+
+                mState = STATE_UPDATING;
+            }
+        } else {
+            mState = STATE_UPDATED;
+        }
+!!!44096823.java!!!	stateToString(in state : int) : String
+        switch (state) {
+            case STATE_FINISHED: {
+                return "STATE_FINISHED";
+            }
+            case STATE_FAILED: {
+                return "STATE_FAILED";
+            }
+            case STATE_STARTED: {
+                return "STATE_STARTED";
+            }
+            case STATE_UPDATING: {
+                return "STATE_UPDATING";
+            }
+            case STATE_UPDATED: {
+                return "STATE_UPDATED";
+            }
+            case STATE_CANCELING: {
+                return "STATE_CANCELING";
+            }
+            case STATE_CANCELED: {
+                return "STATE_CANCELED";
+            }
+            case STATE_DESTROYED: {
+                return "STATE_DESTROYED";
+            }
+            default: {
+                return "STATE_UNKNOWN";
+            }
+        }
+!!!44103095.java!!!	onPrintingAppDied() : void
+        mState = STATE_FAILED;
+        new Handler(mLooper).post(new Runnable() {
+            @Override
+            public void run() {
+                mAdapterDeathObserver.onDied();
+            }
+        });

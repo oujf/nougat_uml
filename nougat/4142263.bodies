@@ -1,0 +1,297 @@
+class FusedPrintersProvider
+!!!44111287.java!!!	getCurrentLocation() : Location
+        synchronized (mLocationLock) {
+            return mLocation;
+        }
+!!!44111415.java!!!	FusedPrintersProvider(inout activity : Activity, in internalLoaderId : int)
+        super(activity);
+        mLocationLock = new Object();
+        mPersistenceManager = new PersistenceManager(activity, internalLoaderId);
+        mLocationManager = (LocationManager) activity.getSystemService(Context.LOCATION_SERVICE);
+!!!44111543.java!!!	addHistoricalPrinter(inout printer : PrinterInfo) : void
+        mPersistenceManager.addPrinterAndWritePrinterHistory(printer);
+!!!44111671.java!!!	updateAndAddPrinter(inout dest : List<PrinterInfo>, inout printer : PrinterInfo, inout updatedPrinters : Map<PrinterId, PrinterInfo>) : void
+        PrinterInfo updatedPrinter = updatedPrinters.remove(printer.getId());
+        if (updatedPrinter != null) {
+            dest.add(updatedPrinter);
+        } else {
+            dest.add(printer);
+        }
+!!!44111799.java!!!	computeAndDeliverResult(inout discoveredPrinters : Map<PrinterId, PrinterInfo>, inout favoritePrinters : List<Pair<PrinterInfo, Location>>) : void
+        List<PrinterInfo> printers = new ArrayList<>();
+
+        // Store the printerIds that have already been added. We cannot compare the printerInfos in
+        // "printers" as they might have been taken from discoveredPrinters and the printerInfo does
+        // not equals() anymore
+        HashSet<PrinterId> alreadyAddedPrinter = new HashSet<>(MAX_FAVORITE_PRINTER_COUNT);
+
+        Location location = getCurrentLocation();
+
+        // Add the favorite printers that have last been used close to the current location
+        final int favoritePrinterCount = favoritePrinters.size();
+        if (location != null) {
+            for (int i = 0; i < favoritePrinterCount; i++) {
+                // Only add a certain amount of favorite printers
+                if (printers.size() == MAX_FAVORITE_PRINTER_COUNT) {
+                    break;
+                }
+
+                PrinterInfo favoritePrinter = favoritePrinters.get(i).first;
+                Location printerLocation = favoritePrinters.get(i).second;
+
+                if (printerLocation != null
+                        && !alreadyAddedPrinter.contains(favoritePrinter.getId())) {
+                    if (printerLocation.distanceTo(location) <= MAX_PRINTER_DISTANCE) {
+                        updateAndAddPrinter(printers, favoritePrinter, discoveredPrinters);
+                        alreadyAddedPrinter.add(favoritePrinter.getId());
+                    }
+                }
+            }
+        }
+
+        // Add the other favorite printers
+        for (int i = 0; i < favoritePrinterCount; i++) {
+            // Only add a certain amount of favorite printers
+            if (printers.size() == MAX_FAVORITE_PRINTER_COUNT) {
+                break;
+            }
+
+            PrinterInfo favoritePrinter = favoritePrinters.get(i).first;
+            if (!alreadyAddedPrinter.contains(favoritePrinter.getId())) {
+                updateAndAddPrinter(printers, favoritePrinter, discoveredPrinters);
+                alreadyAddedPrinter.add(favoritePrinter.getId());
+            }
+        }
+
+        // Add other updated printers. Printers that have already been added have been removed from
+        // discoveredPrinters in the calls to updateAndAddPrinter
+        final int printerCount = mPrinters.size();
+        for (int i = 0; i < printerCount; i++) {
+            PrinterInfo printer = mPrinters.get(i);
+            PrinterInfo updatedPrinter = discoveredPrinters.remove(
+                    printer.getId());
+            if (updatedPrinter != null) {
+                printers.add(updatedPrinter);
+            }
+        }
+
+        // Add the new printers, i.e. what is left.
+        printers.addAll(discoveredPrinters.values());
+
+        // Update the list of printers.
+        mPrinters.clear();
+        mPrinters.addAll(printers);
+
+        if (isStarted()) {
+            // If stated deliver the new printers.
+            deliverResult(printers);
+        } else {
+            // Otherwise, take a note for the change.
+            onContentChanged();
+        }
+!!!44111927.java!!!	onStartLoading() : void
+        if (DEBUG) {
+            Log.i(LOG_TAG, "onStartLoading() " + FusedPrintersProvider.this.hashCode());
+        }
+
+        mLocationManager.requestLocationUpdates(LocationRequest.create()
+                .setQuality(LocationRequest.POWER_LOW).setInterval(LOCATION_UPDATE_MS), this,
+                Looper.getMainLooper());
+
+        Location lastLocation = mLocationManager.getLastLocation();
+        if (lastLocation != null) {
+            onLocationChanged(lastLocation);
+        }
+
+        // Jumpstart location with a single forced update
+        Criteria oneTimeCriteria = new Criteria();
+        oneTimeCriteria.setAccuracy(Criteria.ACCURACY_FINE);
+        mLocationManager.requestSingleUpdate(oneTimeCriteria, this, Looper.getMainLooper());
+
+        // The contract is that if we already have a valid,
+        // result the we have to deliver it immediately.
+        (new Handler(Looper.getMainLooper())).post(new Runnable() {
+            @Override public void run() {
+                deliverResult(new ArrayList<>(mPrinters));
+            }
+        });
+
+        // Always load the data to ensure discovery period is
+        // started and to make sure obsolete printers are updated.
+        onForceLoad();
+!!!44112055.java!!!	onStopLoading() : void
+        if (DEBUG) {
+            Log.i(LOG_TAG, "onStopLoading() " + FusedPrintersProvider.this.hashCode());
+        }
+        onCancelLoad();
+
+        mLocationManager.removeUpdates(this);
+!!!44112183.java!!!	onForceLoad() : void
+        if (DEBUG) {
+            Log.i(LOG_TAG, "onForceLoad() " + FusedPrintersProvider.this.hashCode());
+        }
+        loadInternal();
+!!!44112311.java!!!	loadInternal() : void
+        if (mDiscoverySession == null) {
+            PrintManager printManager = (PrintManager) getContext()
+                    .getSystemService(Context.PRINT_SERVICE);
+            mDiscoverySession = printManager.createPrinterDiscoverySession();
+            mPersistenceManager.readPrinterHistory();
+        } else if (mPersistenceManager.isHistoryChanged()) {
+            mPersistenceManager.readPrinterHistory();
+        }
+        if (mPersistenceManager.isReadHistoryCompleted()
+                && !mDiscoverySession.isPrinterDiscoveryStarted()) {
+            mDiscoverySession.setOnPrintersChangeListener(new OnPrintersChangeListener() {
+                @Override
+                public void onPrintersChanged() {
+                    if (DEBUG) {
+                        Log.i(LOG_TAG, "onPrintersChanged() count:"
+                                + mDiscoverySession.getPrinters().size()
+                                + " " + FusedPrintersProvider.this.hashCode());
+                    }
+
+                    updatePrinters(mDiscoverySession.getPrinters(), mFavoritePrinters,
+                            getCurrentLocation());
+                }
+            });
+            final int favoriteCount = mFavoritePrinters.size();
+            List<PrinterId> printerIds = new ArrayList<>(favoriteCount);
+            for (int i = 0; i < favoriteCount; i++) {
+                printerIds.add(mFavoritePrinters.get(i).first.getId());
+            }
+            mDiscoverySession.startPrinterDiscovery(printerIds);
+            List<PrinterInfo> printers = mDiscoverySession.getPrinters();
+
+            updatePrinters(printers, mFavoritePrinters, getCurrentLocation());
+        }
+!!!44112439.java!!!	updatePrinters(inout printers : List<PrinterInfo>, inout favoritePrinters : List<Pair<PrinterInfo, Location>>, inout location : Location) : void
+        if (mPrintersUpdatedBefore && mPrinters.equals(printers)
+                && mFavoritePrinters.equals(favoritePrinters)
+                && Objects.equals(mLocationOfLastPrinterUpdate, location)) {
+            return;
+        }
+
+        mLocationOfLastPrinterUpdate = location;
+        mPrintersUpdatedBefore = true;
+
+        // Some of the found printers may have be a printer that is in the
+        // history but with its properties changed. Hence, we try to update the
+        // printer to use its current properties instead of the historical one.
+        mPersistenceManager.updateHistoricalPrintersIfNeeded(printers);
+
+        Map<PrinterId, PrinterInfo> printersMap = new LinkedHashMap<>();
+        final int printerCount = printers.size();
+        for (int i = 0; i < printerCount; i++) {
+            PrinterInfo printer = printers.get(i);
+            printersMap.put(printer.getId(), printer);
+        }
+
+        computeAndDeliverResult(printersMap, favoritePrinters);
+!!!44112567.java!!!	onCancelLoad() : boolean
+        if (DEBUG) {
+            Log.i(LOG_TAG, "onCancelLoad() " + FusedPrintersProvider.this.hashCode());
+        }
+        return cancelInternal();
+!!!44112695.java!!!	cancelInternal() : boolean
+        if (mDiscoverySession != null
+                && mDiscoverySession.isPrinterDiscoveryStarted()) {
+            if (mTrackedPrinter != null) {
+                mDiscoverySession.stopPrinterStateTracking(mTrackedPrinter);
+                mTrackedPrinter = null;
+            }
+            mDiscoverySession.stopPrinterDiscovery();
+            return true;
+        } else if (mPersistenceManager.isReadHistoryInProgress()) {
+            return mPersistenceManager.stopReadPrinterHistory();
+        }
+        return false;
+!!!44112823.java!!!	onReset() : void
+        if (DEBUG) {
+            Log.i(LOG_TAG, "onReset() " + FusedPrintersProvider.this.hashCode());
+        }
+        onStopLoading();
+        mPrinters.clear();
+        if (mDiscoverySession != null) {
+            mDiscoverySession.destroy();
+        }
+!!!44112951.java!!!	onAbandon() : void
+        if (DEBUG) {
+            Log.i(LOG_TAG, "onAbandon() " + FusedPrintersProvider.this.hashCode());
+        }
+        onStopLoading();
+!!!44113079.java!!!	isLocationAcceptable(inout location : Location) : boolean
+        return location != null
+                && location.getElapsedRealtimeNanos() > SystemClock.elapsedRealtimeNanos()
+                        - MAX_LOCATION_AGE_MS * 1000_000L
+                && location.hasAccuracy()
+                && location.getAccuracy() < MIN_LOCATION_ACCURACY;
+!!!44113207.java!!!	onLocationChanged(inout location : Location) : void
+        synchronized(mLocationLock) {
+            // We expect the user to not move too fast while printing. Hence prefer more accurate
+            // updates over more recent ones for LOCATION_UPDATE_MS. We add a 10% fudge factor here
+            // as the location provider might send an update slightly too early.
+            if (isLocationAcceptable(location)
+                    && !location.equals(mLocation)
+                    && (mLocation == null
+                            || location
+                                    .getElapsedRealtimeNanos() > mLocation.getElapsedRealtimeNanos()
+                                            + LOCATION_UPDATE_MS * 0.9 * 1000_000L
+                            || (!mLocation.hasAccuracy()
+                                    || location.getAccuracy() < mLocation.getAccuracy()))) {
+                // Other callers of updatePrinters might want to know the location, hence cache it
+                mLocation = location;
+
+                if (areHistoricalPrintersLoaded()) {
+                    updatePrinters(mDiscoverySession.getPrinters(), mFavoritePrinters, mLocation);
+                }
+            }
+        }
+!!!44113335.java!!!	onStatusChanged(inout provider : String, in status : int, inout extras : Bundle) : void
+        // nothing to do
+!!!44113463.java!!!	onProviderEnabled(inout provider : String) : void
+        // nothing to do
+!!!44113591.java!!!	onProviderDisabled(inout provider : String) : void
+        // nothing to do
+!!!44113719.java!!!	areHistoricalPrintersLoaded() : boolean
+        return mPersistenceManager.mReadHistoryCompleted;
+!!!44113847.java!!!	setTrackedPrinter(inout printerId : PrinterId) : void
+        if (isStarted() && mDiscoverySession != null
+                && mDiscoverySession.isPrinterDiscoveryStarted()) {
+            if (mTrackedPrinter != null) {
+                if (mTrackedPrinter.equals(printerId)) {
+                    return;
+                }
+                mDiscoverySession.stopPrinterStateTracking(mTrackedPrinter);
+            }
+            mTrackedPrinter = printerId;
+            if (printerId != null) {
+                mDiscoverySession.startPrinterStateTracking(printerId);
+            }
+        }
+!!!44113975.java!!!	isFavoritePrinter(inout printerId : PrinterId) : boolean
+        final int printerCount = mFavoritePrinters.size();
+        for (int i = 0; i < printerCount; i++) {
+            PrinterInfo favoritePritner = mFavoritePrinters.get(i).first;
+            if (favoritePritner.getId().equals(printerId)) {
+                return true;
+            }
+        }
+        return false;
+!!!44114103.java!!!	forgetFavoritePrinter(inout printerId : PrinterId) : void
+        final int favoritePrinterCount = mFavoritePrinters.size();
+        List<Pair<PrinterInfo, Location>> newFavoritePrinters = new ArrayList<>(
+                favoritePrinterCount - 1);
+
+        // Remove the printer from the favorites.
+        for (int i = 0; i < favoritePrinterCount; i++) {
+            if (!mFavoritePrinters.get(i).first.getId().equals(printerId)) {
+                newFavoritePrinters.add(mFavoritePrinters.get(i));
+            }
+        }
+
+        // Remove the printer from history and persist the latter.
+        mPersistenceManager.removeHistoricalPrinterAndWritePrinterHistory(printerId);
+
+        // Recompute and deliver the printers.
+        updatePrinters(mDiscoverySession.getPrinters(), newFavoritePrinters, getCurrentLocation());

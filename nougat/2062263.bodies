@@ -1,0 +1,1121 @@
+class WifiServiceImpl
+!!!36910903.java!!!	WifiServiceImpl(inout context : Context)
+        mContext = context;
+        mWifiInjector = WifiInjector.getInstance();
+        mFacade = new FrameworkFacade();
+        HandlerThread wifiThread = new HandlerThread("WifiService");
+        wifiThread.start();
+        mWifiMetrics = mWifiInjector.getWifiMetrics();
+        mTrafficPoller = new WifiTrafficPoller(mContext, wifiThread.getLooper(),
+                WifiNative.getWlanNativeInterface().getInterfaceName());
+        mUserManager = UserManager.get(mContext);
+        HandlerThread wifiStateMachineThread = new HandlerThread("WifiStateMachine");
+        wifiStateMachineThread.start();
+        mCountryCode = new WifiCountryCode(
+                WifiNative.getWlanNativeInterface(),
+                SystemProperties.get(BOOT_DEFAULT_WIFI_COUNTRY_CODE),
+                mFacade.getStringSetting(mContext, Settings.Global.WIFI_COUNTRY_CODE),
+                mContext.getResources().getBoolean(
+                        R.bool.config_wifi_revert_country_code_on_cellular_loss));
+        mWifiStateMachine = new WifiStateMachine(mContext, mFacade,
+            wifiStateMachineThread.getLooper(), mUserManager, mWifiInjector,
+            new BackupManagerProxy(), mCountryCode);
+        mSettingsStore = new WifiSettingsStore(mContext);
+        mWifiStateMachine.enableRssiPolling(true);
+        mBatteryStats = BatteryStatsService.getService();
+        mPowerManager = context.getSystemService(PowerManager.class);
+        mAppOps = (AppOpsManager)context.getSystemService(Context.APP_OPS_SERVICE);
+        mCertManager = new WifiCertManager(mContext);
+
+        mNotificationController = new WifiNotificationController(mContext,
+                wifiThread.getLooper(), mWifiStateMachine, mFacade, null);
+
+        mClientHandler = new ClientHandler(wifiThread.getLooper());
+        mWifiStateMachineHandler = new WifiStateMachineHandler(wifiThread.getLooper());
+        mWifiController = new WifiController(mContext, mWifiStateMachine,
+                mSettingsStore, mLocks, wifiThread.getLooper(), mFacade);
+!!!36911031.java!!!	checkAndStartWifi() : void
+        /* Check if wi-fi needs to be enabled */
+        boolean wifiEnabled = mSettingsStore.isWifiToggleEnabled();
+        Slog.i(TAG, "WifiService starting up with Wi-Fi " +
+                (wifiEnabled ? "enabled" : "disabled"));
+
+        registerForScanModeChange();
+        mContext.registerReceiver(
+                new BroadcastReceiver() {
+                    @Override
+                    public void onReceive(Context context, Intent intent) {
+                        if (mSettingsStore.handleAirplaneModeToggled()) {
+                            mWifiController.sendMessage(CMD_AIRPLANE_TOGGLED);
+                        }
+                        if (mSettingsStore.isAirplaneModeOn()) {
+                            Log.d(TAG, "resetting country code because Airplane mode is ON");
+                            mCountryCode.airplaneModeEnabled();
+                        }
+                    }
+                },
+                new IntentFilter(Intent.ACTION_AIRPLANE_MODE_CHANGED));
+
+        mContext.registerReceiver(
+                new BroadcastReceiver() {
+                    @Override
+                    public void onReceive(Context context, Intent intent) {
+                        String state = intent.getStringExtra(IccCardConstants.INTENT_KEY_ICC_STATE);
+                        if (IccCardConstants.INTENT_VALUE_ICC_ABSENT.equals(state)) {
+                            Log.d(TAG, "resetting networks because SIM was removed");
+                            mWifiStateMachine.resetSimAuthNetworks();
+                            Log.d(TAG, "resetting country code because SIM is removed");
+                            mCountryCode.simCardRemoved();
+                        }
+                    }
+                },
+                new IntentFilter(TelephonyIntents.ACTION_SIM_STATE_CHANGED));
+
+        // Adding optimizations of only receiving broadcasts when wifi is enabled
+        // can result in race conditions when apps toggle wifi in the background
+        // without active user involvement. Always receive broadcasts.
+        registerForBroadcasts();
+        registerForPackageOrUserRemoval();
+        mInIdleMode = mPowerManager.isDeviceIdleMode();
+
+        mWifiController.start();
+
+        // If we are already disabled (could be due to airplane mode), avoid changing persist
+        // state here
+        if (wifiEnabled) setWifiEnabled(wifiEnabled);
+!!!36911159.java!!!	handleUserSwitch(in userId : int) : void
+        mWifiStateMachine.handleUserSwitch(userId);
+!!!36911287.java!!!	pingSupplicant() : boolean
+        enforceAccessPermission();
+        if (mWifiStateMachineChannel != null) {
+            return mWifiStateMachine.syncPingSupplicant(mWifiStateMachineChannel);
+        } else {
+            Slog.e(TAG, "mWifiStateMachineChannel is not initialized");
+            return false;
+        }
+!!!36911415.java!!!	startScan(inout settings : ScanSettings, inout workSource : WorkSource) : void
+        enforceChangePermission();
+        synchronized (this) {
+            if (mInIdleMode) {
+                // Need to send an immediate scan result broadcast in case the
+                // caller is waiting for a result ..
+
+                // clear calling identity to send broadcast
+                long callingIdentity = Binder.clearCallingIdentity();
+                try {
+                    mWifiStateMachine.sendScanResultsAvailableBroadcast(/* scanSucceeded = */ false);
+                } finally {
+                    // restore calling identity
+                    Binder.restoreCallingIdentity(callingIdentity);
+                }
+                mScanPending = true;
+                return;
+            }
+        }
+        if (settings != null) {
+            settings = new ScanSettings(settings);
+            if (!settings.isValid()) {
+                Slog.e(TAG, "invalid scan setting");
+                return;
+            }
+        }
+        if (workSource != null) {
+            enforceWorkSourcePermission();
+            // WifiManager currently doesn't use names, so need to clear names out of the
+            // supplied WorkSource to allow future WorkSource combining.
+            workSource.clearNames();
+        }
+        if (workSource == null && Binder.getCallingUid() >= 0) {
+            workSource = new WorkSource(Binder.getCallingUid());
+        }
+        mWifiStateMachine.startScan(Binder.getCallingUid(), scanRequestCounter++,
+                settings, workSource);
+!!!36911543.java!!!	getWpsNfcConfigurationToken(in netId : int) : String
+        enforceConnectivityInternalPermission();
+        return mWifiStateMachine.syncGetWpsNfcConfigurationToken(netId);
+!!!36911671.java!!!	handleIdleModeChanged() : void
+        boolean doScan = false;
+        synchronized (this) {
+            boolean idle = mPowerManager.isDeviceIdleMode();
+            if (mInIdleMode != idle) {
+                mInIdleMode = idle;
+                if (!idle) {
+                    if (mScanPending) {
+                        mScanPending = false;
+                        doScan = true;
+                    }
+                }
+            }
+        }
+        if (doScan) {
+            // Someone requested a scan while we were idle; do a full scan now.
+            startScan(null, null);
+        }
+!!!36911799.java!!!	enforceAccessPermission() : void
+        mContext.enforceCallingOrSelfPermission(android.Manifest.permission.ACCESS_WIFI_STATE,
+                "WifiService");
+!!!36911927.java!!!	enforceChangePermission() : void
+        mContext.enforceCallingOrSelfPermission(android.Manifest.permission.CHANGE_WIFI_STATE,
+                "WifiService");
+!!!36912055.java!!!	enforceLocationHardwarePermission() : void
+        mContext.enforceCallingOrSelfPermission(Manifest.permission.LOCATION_HARDWARE,
+                "LocationHardware");
+!!!36912183.java!!!	enforceReadCredentialPermission() : void
+        mContext.enforceCallingOrSelfPermission(android.Manifest.permission.READ_WIFI_CREDENTIAL,
+                                                "WifiService");
+!!!36912311.java!!!	enforceWorkSourcePermission() : void
+        mContext.enforceCallingPermission(android.Manifest.permission.UPDATE_DEVICE_STATS,
+                "WifiService");
+
+!!!36912439.java!!!	enforceMulticastChangePermission() : void
+        mContext.enforceCallingOrSelfPermission(
+                android.Manifest.permission.CHANGE_WIFI_MULTICAST_STATE,
+                "WifiService");
+!!!36912567.java!!!	enforceConnectivityInternalPermission() : void
+        mContext.enforceCallingOrSelfPermission(
+                android.Manifest.permission.CONNECTIVITY_INTERNAL,
+                "ConnectivityService");
+!!!36912695.java!!!	setWifiEnabled(inout enable : boolean) : boolean
+        enforceChangePermission();
+        Slog.d(TAG, "setWifiEnabled: " + enable + " pid=" + Binder.getCallingPid()
+                    + ", uid=" + Binder.getCallingUid());
+
+        /*
+        * Caller might not have WRITE_SECURE_SETTINGS,
+        * only CHANGE_WIFI_STATE is enforced
+        */
+
+        long ident = Binder.clearCallingIdentity();
+        try {
+            if (! mSettingsStore.handleWifiToggled(enable)) {
+                // Nothing to do if wifi cannot be toggled
+                return true;
+            }
+        } finally {
+            Binder.restoreCallingIdentity(ident);
+        }
+
+        mWifiController.sendMessage(CMD_WIFI_TOGGLED);
+        return true;
+!!!36912823.java!!!	getWifiEnabledState() : int
+        enforceAccessPermission();
+        return mWifiStateMachine.syncGetWifiState();
+!!!36912951.java!!!	setWifiApEnabled(inout wifiConfig : WifiConfiguration, inout enabled : boolean) : void
+        enforceChangePermission();
+        ConnectivityManager.enforceTetherChangePermission(mContext);
+        if (mUserManager.hasUserRestriction(UserManager.DISALLOW_CONFIG_TETHERING)) {
+            throw new SecurityException("DISALLOW_CONFIG_TETHERING is enabled for this user.");
+        }
+        // null wifiConfig is a meaningful input for CMD_SET_AP
+        if (wifiConfig == null || isValid(wifiConfig)) {
+            mWifiController.obtainMessage(CMD_SET_AP, enabled ? 1 : 0, 0, wifiConfig).sendToTarget();
+        } else {
+            Slog.e(TAG, "Invalid WifiConfiguration");
+        }
+!!!36913079.java!!!	getWifiApEnabledState() : int
+        enforceAccessPermission();
+        return mWifiStateMachine.syncGetWifiApState();
+!!!36913207.java!!!	getWifiApConfiguration() : WifiConfiguration
+        enforceAccessPermission();
+        return mWifiStateMachine.syncGetWifiApConfiguration();
+!!!36913335.java!!!	buildWifiConfig(inout uriString : String, inout mimeType : String, inout data : byte) : WifiConfiguration
+        if (mimeType.equals(ConfigBuilder.WifiConfigType)) {
+            try {
+                return ConfigBuilder.buildConfig(uriString, data, mContext);
+            }
+            catch (IOException | GeneralSecurityException | SAXException e) {
+                Log.e(TAG, "Failed to parse wi-fi configuration: " + e);
+            }
+        }
+        else {
+            Log.i(TAG, "Unknown wi-fi config type: " + mimeType);
+        }
+        return null;
+!!!36913463.java!!!	setWifiApConfiguration(inout wifiConfig : WifiConfiguration) : void
+        enforceChangePermission();
+        if (wifiConfig == null)
+            return;
+        if (isValid(wifiConfig)) {
+            mWifiStateMachine.setWifiApConfiguration(wifiConfig);
+        } else {
+            Slog.e(TAG, "Invalid WifiConfiguration");
+        }
+!!!36913591.java!!!	isScanAlwaysAvailable() : boolean
+        enforceAccessPermission();
+        return mSettingsStore.isScanAlwaysAvailable();
+!!!36913719.java!!!	disconnect() : void
+        enforceChangePermission();
+        mWifiStateMachine.disconnectCommand();
+!!!36913847.java!!!	reconnect() : void
+        enforceChangePermission();
+        mWifiStateMachine.reconnectCommand();
+!!!36913975.java!!!	reassociate() : void
+        enforceChangePermission();
+        mWifiStateMachine.reassociateCommand();
+!!!36914103.java!!!	getSupportedFeatures() : int
+        enforceAccessPermission();
+        if (mWifiStateMachineChannel != null) {
+            return mWifiStateMachine.syncGetSupportedFeatures(mWifiStateMachineChannel);
+        } else {
+            Slog.e(TAG, "mWifiStateMachineChannel is not initialized");
+            return 0;
+        }
+!!!36914231.java!!!	requestActivityInfo(inout result : ResultReceiver) : void
+        Bundle bundle = new Bundle();
+        bundle.putParcelable(BatteryStats.RESULT_RECEIVER_CONTROLLER_KEY, reportActivityInfo());
+        result.send(0, bundle);
+!!!36914359.java!!!	reportActivityInfo() : WifiActivityEnergyInfo
+        enforceAccessPermission();
+        if ((getSupportedFeatures() & WifiManager.WIFI_FEATURE_LINK_LAYER_STATS) == 0) {
+            return null;
+        }
+        WifiLinkLayerStats stats;
+        WifiActivityEnergyInfo energyInfo = null;
+        if (mWifiStateMachineChannel != null) {
+            stats = mWifiStateMachine.syncGetLinkLayerStats(mWifiStateMachineChannel);
+            if (stats != null) {
+                final long rxIdleCurrent = mContext.getResources().getInteger(
+                        com.android.internal.R.integer.config_wifi_idle_receive_cur_ma);
+                final long rxCurrent = mContext.getResources().getInteger(
+                        com.android.internal.R.integer.config_wifi_active_rx_cur_ma);
+                final long txCurrent = mContext.getResources().getInteger(
+                        com.android.internal.R.integer.config_wifi_tx_cur_ma);
+                final double voltage = mContext.getResources().getInteger(
+                        com.android.internal.R.integer.config_wifi_operating_voltage_mv)
+                        / 1000.0;
+
+                final long rxIdleTime = stats.on_time - stats.tx_time - stats.rx_time;
+                final long[] txTimePerLevel;
+                if (stats.tx_time_per_level != null) {
+                    txTimePerLevel = new long[stats.tx_time_per_level.length];
+                    for (int i = 0; i < txTimePerLevel.length; i++) {
+                        txTimePerLevel[i] = stats.tx_time_per_level[i];
+                        // TODO(b/27227497): Need to read the power consumed per level from config
+                    }
+                } else {
+                    // This will happen if the HAL get link layer API returned null.
+                    txTimePerLevel = new long[0];
+                }
+                final long energyUsed = (long)((stats.tx_time * txCurrent +
+                        stats.rx_time * rxCurrent +
+                        rxIdleTime * rxIdleCurrent) * voltage);
+                if (VDBG || rxIdleTime < 0 || stats.on_time < 0 || stats.tx_time < 0 ||
+                        stats.rx_time < 0 || energyUsed < 0) {
+                    StringBuilder sb = new StringBuilder();
+                    sb.append(" rxIdleCur=" + rxIdleCurrent);
+                    sb.append(" rxCur=" + rxCurrent);
+                    sb.append(" txCur=" + txCurrent);
+                    sb.append(" voltage=" + voltage);
+                    sb.append(" on_time=" + stats.on_time);
+                    sb.append(" tx_time=" + stats.tx_time);
+                    sb.append(" tx_time_per_level=" + Arrays.toString(txTimePerLevel));
+                    sb.append(" rx_time=" + stats.rx_time);
+                    sb.append(" rxIdleTime=" + rxIdleTime);
+                    sb.append(" energy=" + energyUsed);
+                    Log.d(TAG, " reportActivityInfo: " + sb.toString());
+                }
+
+                // Convert the LinkLayerStats into EnergyActivity
+                energyInfo = new WifiActivityEnergyInfo(SystemClock.elapsedRealtime(),
+                        WifiActivityEnergyInfo.STACK_STATE_STATE_IDLE, stats.tx_time,
+                        txTimePerLevel, stats.rx_time, rxIdleTime, energyUsed);
+            }
+            if (energyInfo != null && energyInfo.isValid()) {
+                return energyInfo;
+            } else {
+                return null;
+            }
+        } else {
+            Slog.e(TAG, "mWifiStateMachineChannel is not initialized");
+            return null;
+        }
+!!!36914487.java!!!	getConfiguredNetworks() : WifiConfiguration
+        enforceAccessPermission();
+        if (mWifiStateMachineChannel != null) {
+            return mWifiStateMachine.syncGetConfiguredNetworks(Binder.getCallingUid(),
+                    mWifiStateMachineChannel);
+        } else {
+            Slog.e(TAG, "mWifiStateMachineChannel is not initialized");
+            return null;
+        }
+!!!36914615.java!!!	getPrivilegedConfiguredNetworks() : WifiConfiguration
+        enforceReadCredentialPermission();
+        enforceAccessPermission();
+        if (mWifiStateMachineChannel != null) {
+            return mWifiStateMachine.syncGetPrivilegedConfiguredNetwork(mWifiStateMachineChannel);
+        } else {
+            Slog.e(TAG, "mWifiStateMachineChannel is not initialized");
+            return null;
+        }
+!!!36914743.java!!!	getMatchingWifiConfig(inout scanResult : ScanResult) : WifiConfiguration
+        enforceAccessPermission();
+        return mWifiStateMachine.syncGetMatchingWifiConfig(scanResult, mWifiStateMachineChannel);
+!!!36914871.java!!!	addOrUpdateNetwork(inout config : WifiConfiguration) : int
+        enforceChangePermission();
+        if (isValid(config) && isValidPasspoint(config)) {
+
+            WifiEnterpriseConfig enterpriseConfig = config.enterpriseConfig;
+
+            if (config.isPasspoint() &&
+                    (enterpriseConfig.getEapMethod() == WifiEnterpriseConfig.Eap.TLS ||
+                            enterpriseConfig.getEapMethod() == WifiEnterpriseConfig.Eap.TTLS)) {
+                if (config.updateIdentifier != null) {
+                    enforceAccessPermission();
+                }
+                else {
+                    try {
+                        verifyCert(enterpriseConfig.getCaCertificate());
+                    } catch (CertPathValidatorException cpve) {
+                        Slog.e(TAG, "CA Cert " +
+                                enterpriseConfig.getCaCertificate().getSubjectX500Principal() +
+                                " untrusted: " + cpve.getMessage());
+                        return -1;
+                    } catch (GeneralSecurityException | IOException e) {
+                        Slog.e(TAG, "Failed to verify certificate" +
+                                enterpriseConfig.getCaCertificate().getSubjectX500Principal() +
+                                ": " + e);
+                        return -1;
+                    }
+                }
+            }
+
+            //TODO: pass the Uid the WifiStateMachine as a message parameter
+            Slog.i("addOrUpdateNetwork", " uid = " + Integer.toString(Binder.getCallingUid())
+                    + " SSID " + config.SSID
+                    + " nid=" + Integer.toString(config.networkId));
+            if (config.networkId == WifiConfiguration.INVALID_NETWORK_ID) {
+                config.creatorUid = Binder.getCallingUid();
+            } else {
+                config.lastUpdateUid = Binder.getCallingUid();
+            }
+            if (mWifiStateMachineChannel != null) {
+                return mWifiStateMachine.syncAddOrUpdateNetwork(mWifiStateMachineChannel, config);
+            } else {
+                Slog.e(TAG, "mWifiStateMachineChannel is not initialized");
+                return -1;
+            }
+        } else {
+            Slog.e(TAG, "bad network configuration");
+            return -1;
+        }
+!!!36914999.java!!!	verifyCert(inout caCert : X509Certificate) : void
+        CertificateFactory factory = CertificateFactory.getInstance("X.509");
+        CertPathValidator validator =
+                CertPathValidator.getInstance(CertPathValidator.getDefaultType());
+        CertPath path = factory.generateCertPath(
+                Arrays.asList(caCert));
+        KeyStore ks = KeyStore.getInstance("AndroidCAStore");
+        ks.load(null, null);
+        PKIXParameters params = new PKIXParameters(ks);
+        params.setRevocationEnabled(false);
+        validator.validate(path, params);
+!!!36915127.java!!!	removeNetwork(in netId : int) : boolean
+        enforceChangePermission();
+
+        if (mWifiStateMachineChannel != null) {
+            return mWifiStateMachine.syncRemoveNetwork(mWifiStateMachineChannel, netId);
+        } else {
+            Slog.e(TAG, "mWifiStateMachineChannel is not initialized");
+            return false;
+        }
+!!!36915255.java!!!	enableNetwork(in netId : int, inout disableOthers : boolean) : boolean
+        enforceChangePermission();
+        if (mWifiStateMachineChannel != null) {
+            return mWifiStateMachine.syncEnableNetwork(mWifiStateMachineChannel, netId,
+                    disableOthers);
+        } else {
+            Slog.e(TAG, "mWifiStateMachineChannel is not initialized");
+            return false;
+        }
+!!!36915383.java!!!	disableNetwork(in netId : int) : boolean
+        enforceChangePermission();
+        if (mWifiStateMachineChannel != null) {
+            return mWifiStateMachine.syncDisableNetwork(mWifiStateMachineChannel, netId);
+        } else {
+            Slog.e(TAG, "mWifiStateMachineChannel is not initialized");
+            return false;
+        }
+!!!36915511.java!!!	getConnectionInfo() : WifiInfo
+        enforceAccessPermission();
+        /*
+         * Make sure we have the latest information, by sending
+         * a status request to the supplicant.
+         */
+        return mWifiStateMachine.syncRequestConnectionInfo();
+!!!36915639.java!!!	getScanResults(inout callingPackage : String) : ScanResult
+        enforceAccessPermission();
+        int userId = UserHandle.getCallingUserId();
+        int uid = Binder.getCallingUid();
+        boolean canReadPeerMacAddresses = checkPeersMacAddress();
+        boolean isActiveNetworkScorer =
+                NetworkScorerAppManager.isCallerActiveScorer(mContext, uid);
+        boolean hasInteractUsersFull = checkInteractAcrossUsersFull();
+        long ident = Binder.clearCallingIdentity();
+        try {
+            if (!canReadPeerMacAddresses && !isActiveNetworkScorer
+                    && !isLocationEnabled(callingPackage)) {
+                return new ArrayList<ScanResult>();
+            }
+            if (!canReadPeerMacAddresses && !isActiveNetworkScorer
+                    && !checkCallerCanAccessScanResults(callingPackage, uid)) {
+                return new ArrayList<ScanResult>();
+            }
+            if (mAppOps.noteOp(AppOpsManager.OP_WIFI_SCAN, uid, callingPackage)
+                    != AppOpsManager.MODE_ALLOWED) {
+                return new ArrayList<ScanResult>();
+            }
+            if (!isCurrentProfile(userId) && !hasInteractUsersFull) {
+                return new ArrayList<ScanResult>();
+            }
+            return mWifiStateMachine.syncGetScanResultsList();
+        } finally {
+            Binder.restoreCallingIdentity(ident);
+        }
+!!!36915767.java!!!	addPasspointManagementObject(inout mo : String) : int
+        return mWifiStateMachine.syncAddPasspointManagementObject(mWifiStateMachineChannel, mo);
+!!!36915895.java!!!	modifyPasspointManagementObject(inout fqdn : String, inout mos : List<PasspointManagementObjectDefinition>) : int
+        return mWifiStateMachine.syncModifyPasspointManagementObject(mWifiStateMachineChannel, fqdn, mos);
+!!!36916023.java!!!	queryPasspointIcon(in bssid : long, inout fileName : String) : void
+        mWifiStateMachine.syncQueryPasspointIcon(mWifiStateMachineChannel, bssid, fileName);
+!!!36916151.java!!!	matchProviderWithCurrentNetwork(inout fqdn : String) : int
+        return mWifiStateMachine.matchProviderWithCurrentNetwork(mWifiStateMachineChannel, fqdn);
+!!!36916279.java!!!	deauthenticateNetwork(in holdoff : long, inout ess : boolean) : void
+        mWifiStateMachine.deauthenticateNetwork(mWifiStateMachineChannel, holdoff, ess);
+!!!36916407.java!!!	isLocationEnabled(inout callingPackage : String) : boolean
+        boolean legacyForegroundApp = !isMApp(mContext, callingPackage)
+                && isForegroundApp(callingPackage);
+        return legacyForegroundApp || Settings.Secure.getInt(mContext.getContentResolver(),
+                Settings.Secure.LOCATION_MODE, Settings.Secure.LOCATION_MODE_OFF)
+                != Settings.Secure.LOCATION_MODE_OFF;
+!!!36916535.java!!!	checkInteractAcrossUsersFull() : boolean
+        return mContext.checkCallingOrSelfPermission(
+                android.Manifest.permission.INTERACT_ACROSS_USERS_FULL)
+                == PackageManager.PERMISSION_GRANTED;
+!!!36916663.java!!!	checkPeersMacAddress() : boolean
+        return mContext.checkCallingOrSelfPermission(
+                android.Manifest.permission.PEERS_MAC_ADDRESS) == PackageManager.PERMISSION_GRANTED;
+!!!36916791.java!!!	isCurrentProfile(in userId : int) : boolean
+        int currentUser = ActivityManager.getCurrentUser();
+        if (userId == currentUser) {
+            return true;
+        }
+        List<UserInfo> profiles = mUserManager.getProfiles(currentUser);
+        for (UserInfo user : profiles) {
+            if (userId == user.id) {
+                return true;
+            }
+        }
+        return false;
+!!!36916919.java!!!	saveConfiguration() : boolean
+        boolean result = true;
+        enforceChangePermission();
+        if (mWifiStateMachineChannel != null) {
+            return mWifiStateMachine.syncSaveConfig(mWifiStateMachineChannel);
+        } else {
+            Slog.e(TAG, "mWifiStateMachineChannel is not initialized");
+            return false;
+        }
+!!!36917047.java!!!	setCountryCode(inout countryCode : String, inout persist : boolean) : void
+        Slog.i(TAG, "WifiService trying to set country code to " + countryCode +
+                " with persist set to " + persist);
+        enforceConnectivityInternalPermission();
+        final long token = Binder.clearCallingIdentity();
+        try {
+            if (mCountryCode.setCountryCode(countryCode, persist) && persist) {
+                // Save this country code to persistent storage
+                mFacade.setStringSetting(mContext,
+                        Settings.Global.WIFI_COUNTRY_CODE,
+                        countryCode);
+            }
+        } finally {
+            Binder.restoreCallingIdentity(token);
+        }
+!!!36917175.java!!!	getCountryCode() : String
+        enforceConnectivityInternalPermission();
+        String country = mCountryCode.getCurrentCountryCode();
+        return country;
+!!!36917303.java!!!	setFrequencyBand(in band : int, inout persist : boolean) : void
+        enforceChangePermission();
+        if (!isDualBandSupported()) return;
+        Slog.i(TAG, "WifiService trying to set frequency band to " + band +
+                " with persist set to " + persist);
+        final long token = Binder.clearCallingIdentity();
+        try {
+            mWifiStateMachine.setFrequencyBand(band, persist);
+        } finally {
+            Binder.restoreCallingIdentity(token);
+        }
+!!!36917431.java!!!	getFrequencyBand() : int
+        enforceAccessPermission();
+        return mWifiStateMachine.getFrequencyBand();
+!!!36917559.java!!!	isDualBandSupported() : boolean
+        //TODO: Should move towards adding a driver API that checks at runtime
+        return mContext.getResources().getBoolean(
+                com.android.internal.R.bool.config_wifi_dual_band_support);
+!!!36917687.java!!!	getDhcpInfo() : DhcpInfo
+        enforceAccessPermission();
+        DhcpResults dhcpResults = mWifiStateMachine.syncGetDhcpResults();
+
+        DhcpInfo info = new DhcpInfo();
+
+        if (dhcpResults.ipAddress != null &&
+                dhcpResults.ipAddress.getAddress() instanceof Inet4Address) {
+            info.ipAddress = NetworkUtils.inetAddressToInt((Inet4Address) dhcpResults.ipAddress.getAddress());
+        }
+
+        if (dhcpResults.gateway != null) {
+            info.gateway = NetworkUtils.inetAddressToInt((Inet4Address) dhcpResults.gateway);
+        }
+
+        int dnsFound = 0;
+        for (InetAddress dns : dhcpResults.dnsServers) {
+            if (dns instanceof Inet4Address) {
+                if (dnsFound == 0) {
+                    info.dns1 = NetworkUtils.inetAddressToInt((Inet4Address)dns);
+                } else {
+                    info.dns2 = NetworkUtils.inetAddressToInt((Inet4Address)dns);
+                }
+                if (++dnsFound > 1) break;
+            }
+        }
+        Inet4Address serverAddress = dhcpResults.serverAddress;
+        if (serverAddress != null) {
+            info.serverAddress = NetworkUtils.inetAddressToInt(serverAddress);
+        }
+        info.leaseDuration = dhcpResults.leaseDuration;
+
+        return info;
+!!!36917815.java!!!	addToBlacklist(inout bssid : String) : void
+        enforceChangePermission();
+
+        mWifiStateMachine.addToBlacklist(bssid);
+!!!36917943.java!!!	clearBlacklist() : void
+        enforceChangePermission();
+
+        mWifiStateMachine.clearBlacklist();
+!!!36918199.java!!!	enableTdls(inout remoteAddress : String, inout enable : boolean) : void
+        if (remoteAddress == null) {
+          throw new IllegalArgumentException("remoteAddress cannot be null");
+        }
+
+        TdlsTaskParams params = new TdlsTaskParams();
+        params.remoteIpAddress = remoteAddress;
+        params.enable = enable;
+        new TdlsTask().execute(params);
+!!!36918327.java!!!	enableTdlsWithMacAddress(inout remoteMacAddress : String, inout enable : boolean) : void
+        if (remoteMacAddress == null) {
+          throw new IllegalArgumentException("remoteMacAddress cannot be null");
+        }
+
+        mWifiStateMachine.enableTdls(remoteMacAddress, enable);
+!!!36918455.java!!!	getWifiServiceMessenger() : Messenger
+        enforceAccessPermission();
+        enforceChangePermission();
+        return new Messenger(mClientHandler);
+!!!36918583.java!!!	disableEphemeralNetwork(inout SSID : String) : void
+        enforceAccessPermission();
+        enforceChangePermission();
+        mWifiStateMachine.disableEphemeralNetwork(SSID);
+!!!36918711.java!!!	getConfigFile() : String
+        enforceAccessPermission();
+        return mWifiStateMachine.getConfigFile();
+!!!36918839.java!!!	registerForScanModeChange() : void
+        ContentObserver contentObserver = new ContentObserver(null) {
+            @Override
+            public void onChange(boolean selfChange) {
+                mSettingsStore.handleWifiScanAlwaysAvailableToggled();
+                mWifiController.sendMessage(CMD_SCAN_ALWAYS_MODE_CHANGED);
+            }
+        };
+
+        mContext.getContentResolver().registerContentObserver(
+                Settings.Global.getUriFor(Settings.Global.WIFI_SCAN_ALWAYS_AVAILABLE),
+                false, contentObserver);
+!!!36918967.java!!!	registerForBroadcasts() : void
+        IntentFilter intentFilter = new IntentFilter();
+        intentFilter.addAction(Intent.ACTION_SCREEN_ON);
+        intentFilter.addAction(Intent.ACTION_USER_PRESENT);
+        intentFilter.addAction(Intent.ACTION_SCREEN_OFF);
+        intentFilter.addAction(Intent.ACTION_BATTERY_CHANGED);
+        intentFilter.addAction(WifiManager.NETWORK_STATE_CHANGED_ACTION);
+        intentFilter.addAction(BluetoothAdapter.ACTION_CONNECTION_STATE_CHANGED);
+        intentFilter.addAction(TelephonyIntents.ACTION_EMERGENCY_CALLBACK_MODE_CHANGED);
+        intentFilter.addAction(PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED);
+
+        boolean trackEmergencyCallState = mContext.getResources().getBoolean(
+                com.android.internal.R.bool.config_wifi_turn_off_during_emergency_call);
+        if (trackEmergencyCallState) {
+            intentFilter.addAction(TelephonyIntents.ACTION_EMERGENCY_CALL_STATE_CHANGED);
+        }
+
+        mContext.registerReceiver(mReceiver, intentFilter);
+!!!36919095.java!!!	registerForPackageOrUserRemoval() : void
+        IntentFilter intentFilter = new IntentFilter();
+        intentFilter.addAction(Intent.ACTION_PACKAGE_REMOVED);
+        intentFilter.addAction(Intent.ACTION_USER_REMOVED);
+        mContext.registerReceiverAsUser(new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                switch (intent.getAction()) {
+                    case Intent.ACTION_PACKAGE_REMOVED: {
+                        if (intent.getBooleanExtra(Intent.EXTRA_REPLACING, false)) {
+                            return;
+                        }
+                        int uid = intent.getIntExtra(Intent.EXTRA_UID, -1);
+                        Uri uri = intent.getData();
+                        if (uid == -1 || uri == null) {
+                            return;
+                        }
+                        String pkgName = uri.getSchemeSpecificPart();
+                        mWifiStateMachine.removeAppConfigs(pkgName, uid);
+                        break;
+                    }
+                    case Intent.ACTION_USER_REMOVED: {
+                        int userHandle = intent.getIntExtra(Intent.EXTRA_USER_HANDLE, 0);
+                        mWifiStateMachine.removeUserConfigs(userHandle);
+                        break;
+                    }
+                }
+            }
+        }, UserHandle.ALL, intentFilter, null, null);
+!!!36919223.java!!!	dump(inout fd : FileDescriptor, inout pw : PrintWriter, inout args : String) : void
+        if (mContext.checkCallingOrSelfPermission(android.Manifest.permission.DUMP)
+                != PackageManager.PERMISSION_GRANTED) {
+            pw.println("Permission Denial: can't dump WifiService from from pid="
+                    + Binder.getCallingPid()
+                    + ", uid=" + Binder.getCallingUid());
+            return;
+        }
+        if (args.length > 0 && WifiMetrics.PROTO_DUMP_ARG.equals(args[0])) {
+            // WifiMetrics proto bytes were requested. Dump only these.
+            mWifiStateMachine.updateWifiMetrics();
+            mWifiMetrics.dump(fd, pw, args);
+        } else if (args.length > 0 && IpManager.DUMP_ARG.equals(args[0])) {
+            // IpManager dump was requested. Pass it along and take no further action.
+            String[] ipManagerArgs = new String[args.length - 1];
+            System.arraycopy(args, 1, ipManagerArgs, 0, ipManagerArgs.length);
+            mWifiStateMachine.dumpIpManager(fd, pw, ipManagerArgs);
+        } else {
+            pw.println("Wi-Fi is " + mWifiStateMachine.syncGetWifiStateByName());
+            pw.println("Stay-awake conditions: " +
+                    Settings.Global.getInt(mContext.getContentResolver(),
+                                           Settings.Global.STAY_ON_WHILE_PLUGGED_IN, 0));
+            pw.println("mMulticastEnabled " + mMulticastEnabled);
+            pw.println("mMulticastDisabled " + mMulticastDisabled);
+            pw.println("mInIdleMode " + mInIdleMode);
+            pw.println("mScanPending " + mScanPending);
+            mWifiController.dump(fd, pw, args);
+            mSettingsStore.dump(fd, pw, args);
+            mNotificationController.dump(fd, pw, args);
+            mTrafficPoller.dump(fd, pw, args);
+
+            pw.println("Latest scan results:");
+            List<ScanResult> scanResults = mWifiStateMachine.syncGetScanResultsList();
+            long nowMs = System.currentTimeMillis();
+            if (scanResults != null && scanResults.size() != 0) {
+                pw.println("    BSSID              Frequency  RSSI    Age      SSID " +
+                        "                                Flags");
+                for (ScanResult r : scanResults) {
+                    long ageSec = 0;
+                    long ageMilli = 0;
+                    if (nowMs > r.seen && r.seen > 0) {
+                        ageSec = (nowMs - r.seen) / 1000;
+                        ageMilli = (nowMs - r.seen) % 1000;
+                    }
+                    String candidate = " ";
+                    if (r.isAutoJoinCandidate > 0) candidate = "+";
+                    pw.printf("  %17s  %9d  %5d  %3d.%03d%s   %-32s  %s\n",
+                                             r.BSSID,
+                                             r.frequency,
+                                             r.level,
+                                             ageSec, ageMilli,
+                                             candidate,
+                                             r.SSID == null ? "" : r.SSID,
+                                             r.capabilities);
+                }
+            }
+            pw.println();
+            pw.println("Locks acquired: " + mFullLocksAcquired + " full, " +
+                    mFullHighPerfLocksAcquired + " full high perf, " +
+                    mScanLocksAcquired + " scan");
+            pw.println("Locks released: " + mFullLocksReleased + " full, " +
+                    mFullHighPerfLocksReleased + " full high perf, " +
+                    mScanLocksReleased + " scan");
+            pw.println();
+            pw.println("Locks held:");
+            mLocks.dump(pw);
+
+            pw.println("Multicast Locks held:");
+            for (Multicaster l : mMulticasters) {
+                pw.print("    ");
+                pw.println(l);
+            }
+
+            pw.println();
+            mWifiStateMachine.dump(fd, pw, args);
+            pw.println();
+        }
+!!!36920759.java!!!	enforceWakeSourcePermission(in uid : int, in pid : int) : void
+        if (uid == android.os.Process.myUid()) {
+            return;
+        }
+        mContext.enforcePermission(android.Manifest.permission.UPDATE_DEVICE_STATS,
+                pid, uid, null);
+!!!36920887.java!!!	acquireWifiLock(inout binder : IBinder, in lockMode : int, inout tag : String, inout ws : WorkSource) : boolean
+        mContext.enforceCallingOrSelfPermission(android.Manifest.permission.WAKE_LOCK, null);
+        if (lockMode != WifiManager.WIFI_MODE_FULL &&
+                lockMode != WifiManager.WIFI_MODE_SCAN_ONLY &&
+                lockMode != WifiManager.WIFI_MODE_FULL_HIGH_PERF) {
+            Slog.e(TAG, "Illegal argument, lockMode= " + lockMode);
+            if (DBG) throw new IllegalArgumentException("lockMode=" + lockMode);
+            return false;
+        }
+        if (ws != null && ws.size() == 0) {
+            ws = null;
+        }
+        if (ws != null) {
+            enforceWakeSourcePermission(Binder.getCallingUid(), Binder.getCallingPid());
+        }
+        if (ws == null) {
+            ws = new WorkSource(Binder.getCallingUid());
+        }
+        WifiLock wifiLock = new WifiLock(lockMode, tag, binder, ws);
+        synchronized (mLocks) {
+            return acquireWifiLockLocked(wifiLock);
+        }
+!!!36921015.java!!!	noteAcquireWifiLock(inout wifiLock : WifiServiceImpl::WifiLock) : void
+        switch(wifiLock.mMode) {
+            case WifiManager.WIFI_MODE_FULL:
+            case WifiManager.WIFI_MODE_FULL_HIGH_PERF:
+            case WifiManager.WIFI_MODE_SCAN_ONLY:
+                mBatteryStats.noteFullWifiLockAcquiredFromSource(wifiLock.mWorkSource);
+                break;
+        }
+!!!36921143.java!!!	noteReleaseWifiLock(inout wifiLock : WifiServiceImpl::WifiLock) : void
+        switch(wifiLock.mMode) {
+            case WifiManager.WIFI_MODE_FULL:
+            case WifiManager.WIFI_MODE_FULL_HIGH_PERF:
+            case WifiManager.WIFI_MODE_SCAN_ONLY:
+                mBatteryStats.noteFullWifiLockReleasedFromSource(wifiLock.mWorkSource);
+                break;
+        }
+!!!36921271.java!!!	acquireWifiLockLocked(inout wifiLock : WifiServiceImpl::WifiLock) : boolean
+        if (DBG) Slog.d(TAG, "acquireWifiLockLocked: " + wifiLock);
+
+        mLocks.addLock(wifiLock);
+
+        long ident = Binder.clearCallingIdentity();
+        try {
+            noteAcquireWifiLock(wifiLock);
+            switch(wifiLock.mMode) {
+            case WifiManager.WIFI_MODE_FULL:
+                ++mFullLocksAcquired;
+                break;
+            case WifiManager.WIFI_MODE_FULL_HIGH_PERF:
+                ++mFullHighPerfLocksAcquired;
+                break;
+
+            case WifiManager.WIFI_MODE_SCAN_ONLY:
+                ++mScanLocksAcquired;
+                break;
+            }
+            mWifiController.sendMessage(CMD_LOCKS_CHANGED);
+            return true;
+        } catch (RemoteException e) {
+            return false;
+        } finally {
+            Binder.restoreCallingIdentity(ident);
+        }
+!!!36921399.java!!!	updateWifiLockWorkSource(inout lock : IBinder, inout ws : WorkSource) : void
+        int uid = Binder.getCallingUid();
+        int pid = Binder.getCallingPid();
+        if (ws != null && ws.size() == 0) {
+            ws = null;
+        }
+        if (ws != null) {
+            enforceWakeSourcePermission(uid, pid);
+        }
+        long ident = Binder.clearCallingIdentity();
+        try {
+            synchronized (mLocks) {
+                int index = mLocks.findLockByBinder(lock);
+                if (index < 0) {
+                    throw new IllegalArgumentException("Wifi lock not active");
+                }
+                WifiLock wl = mLocks.mList.get(index);
+                noteReleaseWifiLock(wl);
+                wl.mWorkSource = ws != null ? new WorkSource(ws) : new WorkSource(uid);
+                noteAcquireWifiLock(wl);
+            }
+        } catch (RemoteException e) {
+        } finally {
+            Binder.restoreCallingIdentity(ident);
+        }
+!!!36921527.java!!!	releaseWifiLock(inout lock : IBinder) : boolean
+        mContext.enforceCallingOrSelfPermission(android.Manifest.permission.WAKE_LOCK, null);
+        synchronized (mLocks) {
+            return releaseWifiLockLocked(lock);
+        }
+!!!36921655.java!!!	releaseWifiLockLocked(inout lock : IBinder) : boolean
+        boolean hadLock;
+
+        WifiLock wifiLock = mLocks.removeLock(lock);
+
+        if (DBG) Slog.d(TAG, "releaseWifiLockLocked: " + wifiLock);
+
+        hadLock = (wifiLock != null);
+
+        long ident = Binder.clearCallingIdentity();
+        try {
+            if (hadLock) {
+                noteReleaseWifiLock(wifiLock);
+                switch(wifiLock.mMode) {
+                    case WifiManager.WIFI_MODE_FULL:
+                        ++mFullLocksReleased;
+                        break;
+                    case WifiManager.WIFI_MODE_FULL_HIGH_PERF:
+                        ++mFullHighPerfLocksReleased;
+                        break;
+                    case WifiManager.WIFI_MODE_SCAN_ONLY:
+                        ++mScanLocksReleased;
+                        break;
+                }
+                mWifiController.sendMessage(CMD_LOCKS_CHANGED);
+            }
+        } catch (RemoteException e) {
+        } finally {
+            Binder.restoreCallingIdentity(ident);
+        }
+
+        return hadLock;
+!!!36922551.java!!!	initializeMulticastFiltering() : void
+        enforceMulticastChangePermission();
+
+        synchronized (mMulticasters) {
+            // if anybody had requested filters be off, leave off
+            if (mMulticasters.size() != 0) {
+                return;
+            } else {
+                mWifiStateMachine.startFilteringMulticastPackets();
+            }
+        }
+!!!36922679.java!!!	acquireMulticastLock(inout binder : IBinder, inout tag : String) : void
+        enforceMulticastChangePermission();
+
+        synchronized (mMulticasters) {
+            mMulticastEnabled++;
+            mMulticasters.add(new Multicaster(tag, binder));
+            // Note that we could call stopFilteringMulticastPackets only when
+            // our new size == 1 (first call), but this function won't
+            // be called often and by making the stopPacket call each
+            // time we're less fragile and self-healing.
+            mWifiStateMachine.stopFilteringMulticastPackets();
+        }
+
+        int uid = Binder.getCallingUid();
+        final long ident = Binder.clearCallingIdentity();
+        try {
+            mBatteryStats.noteWifiMulticastEnabled(uid);
+        } catch (RemoteException e) {
+        } finally {
+            Binder.restoreCallingIdentity(ident);
+        }
+!!!36922807.java!!!	releaseMulticastLock() : void
+        enforceMulticastChangePermission();
+
+        int uid = Binder.getCallingUid();
+        synchronized (mMulticasters) {
+            mMulticastDisabled++;
+            int size = mMulticasters.size();
+            for (int i = size - 1; i >= 0; i--) {
+                Multicaster m = mMulticasters.get(i);
+                if ((m != null) && (m.getUid() == uid)) {
+                    removeMulticasterLocked(i, uid);
+                }
+            }
+        }
+!!!36922935.java!!!	removeMulticasterLocked(in i : int, in uid : int) : void
+        Multicaster removed = mMulticasters.remove(i);
+
+        if (removed != null) {
+            removed.unlinkDeathRecipient();
+        }
+        if (mMulticasters.size() == 0) {
+            mWifiStateMachine.startFilteringMulticastPackets();
+        }
+
+        final long ident = Binder.clearCallingIdentity();
+        try {
+            mBatteryStats.noteWifiMulticastDisabled(uid);
+        } catch (RemoteException e) {
+        } finally {
+            Binder.restoreCallingIdentity(ident);
+        }
+!!!36923063.java!!!	isMulticastEnabled() : boolean
+        enforceAccessPermission();
+
+        synchronized (mMulticasters) {
+            return (mMulticasters.size() > 0);
+        }
+!!!36923191.java!!!	enableVerboseLogging(in verbose : int) : void
+        enforceAccessPermission();
+        mWifiStateMachine.enableVerboseLogging(verbose);
+!!!36923319.java!!!	getVerboseLoggingLevel() : int
+        enforceAccessPermission();
+        return mWifiStateMachine.getVerboseLoggingLevel();
+!!!36923447.java!!!	enableAggressiveHandover(in enabled : int) : void
+        enforceAccessPermission();
+        mWifiStateMachine.enableAggressiveHandover(enabled);
+!!!36923575.java!!!	getAggressiveHandover() : int
+        enforceAccessPermission();
+        return mWifiStateMachine.getAggressiveHandover();
+!!!36923703.java!!!	setAllowScansWithTraffic(in enabled : int) : void
+        enforceAccessPermission();
+        mWifiStateMachine.setAllowScansWithTraffic(enabled);
+!!!36923831.java!!!	getAllowScansWithTraffic() : int
+        enforceAccessPermission();
+        return mWifiStateMachine.getAllowScansWithTraffic();
+!!!36923959.java!!!	setEnableAutoJoinWhenAssociated(inout enabled : boolean) : boolean
+        enforceChangePermission();
+        return mWifiStateMachine.setEnableAutoJoinWhenAssociated(enabled);
+!!!36924087.java!!!	getEnableAutoJoinWhenAssociated() : boolean
+        enforceAccessPermission();
+        return mWifiStateMachine.getEnableAutoJoinWhenAssociated();
+!!!36924215.java!!!	getConnectionStatistics() : WifiConnectionStatistics
+        enforceAccessPermission();
+        enforceReadCredentialPermission();
+        if (mWifiStateMachineChannel != null) {
+            return mWifiStateMachine.syncGetConnectionStatistics(mWifiStateMachineChannel);
+        } else {
+            Slog.e(TAG, "mWifiStateMachineChannel is not initialized");
+            return null;
+        }
+!!!36924343.java!!!	factoryReset() : void
+        enforceConnectivityInternalPermission();
+
+        if (mUserManager.hasUserRestriction(UserManager.DISALLOW_NETWORK_RESET)) {
+            return;
+        }
+
+        if (!mUserManager.hasUserRestriction(UserManager.DISALLOW_CONFIG_TETHERING)) {
+            // Turn mobile hotspot off
+            setWifiApEnabled(null, false);
+        }
+
+        if (!mUserManager.hasUserRestriction(UserManager.DISALLOW_CONFIG_WIFI)) {
+            // Enable wifi
+            setWifiEnabled(true);
+            // Delete all Wifi SSIDs
+            List<WifiConfiguration> networks = getConfiguredNetworks();
+            if (networks != null) {
+                for (WifiConfiguration config : networks) {
+                    removeNetwork(config.networkId);
+                }
+                saveConfiguration();
+            }
+        }
+!!!36924471.java!!!	logAndReturnFalse(inout s : String) : boolean
+        Log.d(TAG, s);
+        return false;
+!!!36924599.java!!!	isValid(inout config : WifiConfiguration) : boolean
+        String validity = checkValidity(config);
+        return validity == null || logAndReturnFalse(validity);
+!!!36924727.java!!!	isValidPasspoint(inout config : WifiConfiguration) : boolean
+        String validity = checkPasspointValidity(config);
+        return validity == null || logAndReturnFalse(validity);
+!!!36924855.java!!!	checkValidity(inout config : WifiConfiguration) : String
+        if (config.allowedKeyManagement == null)
+            return "allowed kmgmt";
+
+        if (config.allowedKeyManagement.cardinality() > 1) {
+            if (config.allowedKeyManagement.cardinality() != 2) {
+                return "cardinality != 2";
+            }
+            if (!config.allowedKeyManagement.get(WifiConfiguration.KeyMgmt.WPA_EAP)) {
+                return "not WPA_EAP";
+            }
+            if ((!config.allowedKeyManagement.get(WifiConfiguration.KeyMgmt.IEEE8021X))
+                    && (!config.allowedKeyManagement.get(WifiConfiguration.KeyMgmt.WPA_PSK))) {
+                return "not PSK or 8021X";
+            }
+        }
+        return null;
+!!!36924983.java!!!	checkPasspointValidity(inout config : WifiConfiguration) : String
+        if (!TextUtils.isEmpty(config.FQDN)) {
+            /* this is passpoint configuration; it must not have an SSID */
+            if (!TextUtils.isEmpty(config.SSID)) {
+                return "SSID not expected for Passpoint: '" + config.SSID +
+                        "' FQDN " + toHexString(config.FQDN);
+            }
+            /* this is passpoint configuration; it must have a providerFriendlyName */
+            if (TextUtils.isEmpty(config.providerFriendlyName)) {
+                return "no provider friendly name";
+            }
+            WifiEnterpriseConfig enterpriseConfig = config.enterpriseConfig;
+            /* this is passpoint configuration; it must have enterprise config */
+            if (enterpriseConfig == null
+                    || enterpriseConfig.getEapMethod() == WifiEnterpriseConfig.Eap.NONE ) {
+                return "no enterprise config";
+            }
+            if ((enterpriseConfig.getEapMethod() == WifiEnterpriseConfig.Eap.TLS ||
+                    enterpriseConfig.getEapMethod() == WifiEnterpriseConfig.Eap.TTLS ||
+                    enterpriseConfig.getEapMethod() == WifiEnterpriseConfig.Eap.PEAP) &&
+                    enterpriseConfig.getCaCertificate() == null) {
+                return "no CA certificate";
+            }
+        }
+        return null;
+!!!36925111.java!!!	getCurrentNetwork() : Network
+        enforceAccessPermission();
+        return mWifiStateMachine.getCurrentNetwork();
+!!!36925239.java!!!	toHexString(inout s : String) : String
+        if (s == null) {
+            return "null";
+        }
+        StringBuilder sb = new StringBuilder();
+        sb.append('\'').append(s).append('\'');
+        for (int n = 0; n < s.length(); n++) {
+            sb.append(String.format(" %02x", s.charAt(n) & 0xffff));
+        }
+        return sb.toString();
+!!!36925367.java!!!	checkCallerCanAccessScanResults(inout callingPackage : String, in uid : int) : boolean
+        if (ActivityManager.checkUidPermission(Manifest.permission.ACCESS_FINE_LOCATION, uid)
+                == PackageManager.PERMISSION_GRANTED
+                && checkAppOppAllowed(AppOpsManager.OP_FINE_LOCATION, callingPackage, uid)) {
+            return true;
+        }
+
+        if (ActivityManager.checkUidPermission(Manifest.permission.ACCESS_COARSE_LOCATION, uid)
+                == PackageManager.PERMISSION_GRANTED
+                && checkAppOppAllowed(AppOpsManager.OP_COARSE_LOCATION, callingPackage, uid)) {
+            return true;
+        }
+        boolean apiLevel23App = isMApp(mContext, callingPackage);
+        // Pre-M apps running in the foreground should continue getting scan results
+        if (!apiLevel23App && isForegroundApp(callingPackage)) {
+            return true;
+        }
+        Log.e(TAG, "Permission denial: Need ACCESS_COARSE_LOCATION or ACCESS_FINE_LOCATION "
+                + "permission to get scan results");
+        return false;
+!!!36925495.java!!!	checkAppOppAllowed(in op : int, inout callingPackage : String, in uid : int) : boolean
+        return mAppOps.noteOp(op, uid, callingPackage) == AppOpsManager.MODE_ALLOWED;
+!!!36925623.java!!!	isMApp(inout context : Context, inout pkgName : String) : boolean
+        try {
+            return context.getPackageManager().getApplicationInfo(pkgName, 0)
+                    .targetSdkVersion >= Build.VERSION_CODES.M;
+        } catch (PackageManager.NameNotFoundException e) {
+            // In case of exception, assume M app (more strict checking)
+        }
+        return true;
+!!!36925751.java!!!	hideCertFromUnaffiliatedUsers(inout alias : String) : void
+        mCertManager.hideCertFromUnaffiliatedUsers(alias);
+!!!36925879.java!!!	listClientCertsForCurrentUser() : String
+        return mCertManager.listClientCertsForCurrentUser();
+!!!36926007.java!!!	isForegroundApp(inout pkgName : String) : boolean
+        ActivityManager am = (ActivityManager)mContext.getSystemService(Context.ACTIVITY_SERVICE);
+        List<ActivityManager.RunningTaskInfo> tasks = am.getRunningTasks(1);
+        return !tasks.isEmpty() && pkgName.equals(tasks.get(0).topActivity.getPackageName());
+!!!36926135.java!!!	enableWifiConnectivityManager(inout enabled : boolean) : void
+        enforceConnectivityInternalPermission();
+        mWifiStateMachine.enableWifiConnectivityManager(enabled);

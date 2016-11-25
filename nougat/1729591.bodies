@@ -1,0 +1,200 @@
+class BackingStore
+!!!34724663.java!!!	BackingStore(inout type : FrameType, inout dimensions : int, inout frameManager : FrameManager)
+        mType = type;
+        mDimensions = dimensions != null ? Arrays.copyOf(dimensions, dimensions.length) : null;
+        mFrameManager = frameManager;
+!!!34724791.java!!!	getFrameType() : FrameType
+        return mType;
+!!!34724919.java!!!	lockData(in mode : int, in accessFormat : int) : Object
+        return lockBacking(mode, accessFormat).lock(accessFormat);
+!!!34725047.java!!!	lockBacking(in mode : int, in access : int) : BackingStore::Backing
+        Backing backing = fetchBacking(mode, access);
+        if (backing == null) {
+            throw new RuntimeException("Could not fetch frame data!");
+        }
+        lock(backing, mode);
+        return backing;
+!!!34725175.java!!!	unlock() : boolean
+        if (mWriteLocked) {
+            mWriteLocked = false;
+        } else if (mReadLocks > 0) {
+            --mReadLocks;
+        } else {
+            return false;
+        }
+        mLockedBacking.unlock();
+        mLockedBacking = null;
+        return true;
+!!!34725303.java!!!	retain() : BackingStore
+        if (mRefCount >= 10) {
+            Log.w("BackingStore", "High ref-count of " + mRefCount + " on " + this + "!");
+        }
+        if (mRefCount <= 0) {
+            throw new RuntimeException("RETAINING RELEASED");
+        }
+        ++mRefCount;
+        return this;
+!!!34725431.java!!!	release() : BackingStore
+        if (mRefCount <= 0) {
+            throw new RuntimeException("DOUBLE-RELEASE");
+        }
+        --mRefCount;
+        if (mRefCount == 0) {
+            releaseBackings();
+            return null;
+        }
+        return this;
+!!!34725559.java!!!	resize(inout newDimensions : int) : void
+        Vector<Backing> resized = new Vector<Backing>();
+        for (Backing backing : mBackings) {
+            if (backing.resize(newDimensions)) {
+                resized.add(backing);
+            } else {
+                releaseBacking(backing);
+            }
+        }
+        mBackings = resized;
+        mDimensions = newDimensions;
+!!!34725687.java!!!	getDimensions() : int
+        return mDimensions;
+!!!34725815.java!!!	getElementCount() : int
+        int result = 1;
+        if (mDimensions != null) {
+            for (int dim : mDimensions) {
+                result *= dim;
+            }
+        }
+        return result;
+!!!34725943.java!!!	importStore(inout store : BackingStore) : void
+        // TODO: Better backing selection?
+        if (store.mBackings.size() > 0) {
+            importBacking(store.mBackings.firstElement());
+        }
+        mTimestamp = store.mTimestamp;
+!!!34726071.java!!!	getTimestamp() : long
+        return mTimestamp;
+!!!34726199.java!!!	setTimestamp(in timestamp : long) : void
+        mTimestamp = timestamp;
+!!!34726327.java!!!	fetchBacking(in mode : int, in access : int) : BackingStore::Backing
+        Backing backing = getBacking(mode, access);
+        if (backing == null) {
+            backing = attachNewBacking(mode, access);
+        }
+        syncBacking(backing);
+        return backing;
+!!!34726455.java!!!	syncBacking(inout backing : BackingStore::Backing) : void
+        if (backing != null && backing.isDirty() && mCurrentBacking != null) {
+            backing.syncTo(mCurrentBacking);
+        }
+!!!34726583.java!!!	getBacking(in mode : int, in access : int) : BackingStore::Backing
+        // [Non-iterator looping]
+        for (int i = 0; i < mBackings.size(); ++i) {
+            final Backing backing = mBackings.get(i);
+
+            int backingAccess =
+                    (mode == Frame.MODE_WRITE) ? backing.writeAccess() : backing.readAccess();
+            if ((backingAccess & access) == access) {
+                return backing;
+            }
+        }
+        return null;
+!!!34726711.java!!!	attachNewBacking(in mode : int, in access : int) : BackingStore::Backing
+        Backing backing = createBacking(mode, access);
+        if (mBackings.size() > 0) {
+            backing.markDirty();
+        }
+        mBackings.add(backing);
+        return backing;
+!!!34726839.java!!!	createBacking(in mode : int, in access : int) : BackingStore::Backing
+        // TODO: If the read/write access flags indicate, make/fetch a GraphicBuffer backing.
+        Backing backing = null;
+        int elemSize = mType.getElementSize();
+        if (shouldFetchCached(access)) {
+            backing = mFrameManager.fetchBacking(mode, access, mDimensions, elemSize);
+        }
+        if (backing == null) {
+            switch (access) {
+                case ACCESS_BYTES:
+                    backing = new ByteBufferBacking();
+                    break;
+                case ACCESS_TEXTURE:
+                case ACCESS_RENDERTARGET:
+                    backing = new TextureBacking();
+                    break;
+                case ACCESS_OBJECT:
+                    backing = new ObjectBacking();
+                    break;
+                case ACCESS_BITMAP:
+                    backing = new BitmapBacking();
+                    break;
+                case ACCESS_ALLOCATION:
+                    if (!AllocationBacking.isSupported()) {
+                        throw new RuntimeException(
+                                "Attempted to create an AllocationBacking in context that does " +
+                                "not support RenderScript!");
+                    }
+                    backing = new AllocationBacking(mFrameManager.getContext().getRenderScript());
+                    break;
+            }
+            if (backing == null) {
+                throw new RuntimeException(
+                        "Could not create backing for access type " + access + "!");
+            }
+            if (backing.requiresGpu() && !mFrameManager.getRunner().isOpenGLSupported()) {
+                throw new RuntimeException(
+                        "Cannot create backing that requires GPU in a runner that does not " +
+                        "support OpenGL!");
+            }
+            backing.setDimensions(mDimensions);
+            backing.setElementSize(elemSize);
+            backing.setElementId(mType.getElementId());
+            backing.allocate(mType);
+            mFrameManager.onBackingCreated(backing);
+        }
+        return backing;
+!!!34726967.java!!!	importBacking(inout backing : BackingStore::Backing) : void
+        // TODO: This actually needs synchronization between the two BackingStore threads for the
+        // general case
+        int access = backing.requiresGpu() ? ACCESS_BYTES : backing.readAccess();
+        Backing newBacking = createBacking(Frame.MODE_READ, access);
+        newBacking.syncTo(backing);
+        mBackings.add(newBacking);
+        mCurrentBacking = newBacking;
+!!!34727095.java!!!	releaseBackings() : void
+        // [Non-iterator looping]
+        for (int i = 0; i < mBackings.size(); ++i) {
+            releaseBacking(mBackings.get(i));
+        }
+        mBackings.clear();
+        mCurrentBacking = null;
+!!!34727223.java!!!	releaseBacking(inout backing : BackingStore::Backing) : void
+        mFrameManager.onBackingAvailable(backing);
+!!!34727351.java!!!	lock(inout backingToLock : BackingStore::Backing, in mode : int) : void
+        if (mode == Frame.MODE_WRITE) {
+            // Make sure frame is not read-locked
+            if (mReadLocks > 0) {
+                throw new RuntimeException(
+                        "Attempting to write-lock the read-locked frame " + this + "!");
+            } else if (mWriteLocked) {
+                throw new RuntimeException(
+                        "Attempting to write-lock the write-locked frame " + this + "!");
+            }
+            // Mark all other backings dirty
+            // [Non-iterator looping]
+            for (int i = 0; i < mBackings.size(); ++i) {
+                final Backing backing = mBackings.get(i);
+                if (backing != backingToLock) {
+                    backing.markDirty();
+                }
+            }
+            mWriteLocked = true;
+            mCurrentBacking = backingToLock;
+        } else {
+            if (mWriteLocked) {
+                throw new RuntimeException("Attempting to read-lock locked frame " + this + "!");
+            }
+            ++mReadLocks;
+        }
+        mLockedBacking = backingToLock;
+!!!34727479.java!!!	shouldFetchCached(in access : int) : boolean
+        return access != ACCESS_OBJECT;

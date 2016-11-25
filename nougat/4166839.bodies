@@ -1,0 +1,250 @@
+class AppRestrictionsHelper
+!!!44283703.java!!!	AppRestrictionsHelper(inout context : Context, inout user : UserHandle)
+        mContext = context;
+        mPackageManager = context.getPackageManager();
+        mIPm = AppGlobals.getPackageManager();
+        mUser = user;
+        mUserManager = (UserManager) context.getSystemService(Context.USER_SERVICE);
+        mRestrictedProfile = mUserManager.getUserInfo(mUser.getIdentifier()).isRestricted();
+!!!44283831.java!!!	setPackageSelected(inout packageName : String, inout selected : boolean) : void
+        mSelectedPackages.put(packageName, selected);
+!!!44283959.java!!!	isPackageSelected(inout packageName : String) : boolean
+        return mSelectedPackages.get(packageName);
+!!!44284087.java!!!	setLeanback(inout isLeanback : boolean) : void
+        mLeanback = isLeanback;
+!!!44284215.java!!!	getVisibleApps() : AppRestrictionsHelper::SelectableAppInfo
+        return mVisibleApps;
+!!!44284343.java!!!	applyUserAppsStates(inout listener : AppRestrictionsHelper::OnDisableUiForPackageListener) : void
+        final int userId = mUser.getIdentifier();
+        if (!mUserManager.getUserInfo(userId).isRestricted() && userId != UserHandle.myUserId()) {
+            Log.e(TAG, "Cannot apply application restrictions on another user!");
+            return;
+        }
+        for (Map.Entry<String,Boolean> entry : mSelectedPackages.entrySet()) {
+            String packageName = entry.getKey();
+            boolean enabled = entry.getValue();
+            applyUserAppState(packageName, enabled, listener);
+        }
+!!!44284471.java!!!	applyUserAppState(inout packageName : String, inout enabled : boolean, inout listener : AppRestrictionsHelper::OnDisableUiForPackageListener) : void
+        final int userId = mUser.getIdentifier();
+        if (enabled) {
+            // Enable selected apps
+            try {
+                ApplicationInfo info = mIPm.getApplicationInfo(packageName,
+                        PackageManager.MATCH_UNINSTALLED_PACKAGES, userId);
+                if (info == null || !info.enabled
+                        || (info.flags&ApplicationInfo.FLAG_INSTALLED) == 0) {
+                    mIPm.installExistingPackageAsUser(packageName, mUser.getIdentifier());
+                    if (DEBUG) {
+                        Log.d(TAG, "Installing " + packageName);
+                    }
+                }
+                if (info != null && (info.privateFlags&ApplicationInfo.PRIVATE_FLAG_HIDDEN) != 0
+                        && (info.flags&ApplicationInfo.FLAG_INSTALLED) != 0) {
+                    listener.onDisableUiForPackage(packageName);
+                    mIPm.setApplicationHiddenSettingAsUser(packageName, false, userId);
+                    if (DEBUG) {
+                        Log.d(TAG, "Unhiding " + packageName);
+                    }
+                }
+            } catch (RemoteException re) {
+                // Ignore
+            }
+        } else {
+            // Blacklist all other apps, system or downloaded
+            try {
+                ApplicationInfo info = mIPm.getApplicationInfo(packageName, 0, userId);
+                if (info != null) {
+                    if (mRestrictedProfile) {
+                        mIPm.deletePackageAsUser(packageName, null, mUser.getIdentifier(),
+                                PackageManager.DELETE_SYSTEM_APP);
+                        if (DEBUG) {
+                            Log.d(TAG, "Uninstalling " + packageName);
+                        }
+                    } else {
+                        listener.onDisableUiForPackage(packageName);
+                        mIPm.setApplicationHiddenSettingAsUser(packageName, true, userId);
+                        if (DEBUG) {
+                            Log.d(TAG, "Hiding " + packageName);
+                        }
+                    }
+                }
+            } catch (RemoteException re) {
+                // Ignore
+            }
+        }
+!!!44284599.java!!!	fetchAndMergeApps() : void
+        mVisibleApps = new ArrayList<>();
+        final PackageManager pm = mPackageManager;
+        final IPackageManager ipm = mIPm;
+
+        final HashSet<String> excludePackages = new HashSet<>();
+        addSystemImes(excludePackages);
+
+        // Add launchers
+        Intent launcherIntent = new Intent(Intent.ACTION_MAIN);
+        if (mLeanback) {
+            launcherIntent.addCategory(Intent.CATEGORY_LEANBACK_LAUNCHER);
+        } else {
+            launcherIntent.addCategory(Intent.CATEGORY_LAUNCHER);
+        }
+        addSystemApps(mVisibleApps, launcherIntent, excludePackages);
+
+        // Add widgets
+        Intent widgetIntent = new Intent(AppWidgetManager.ACTION_APPWIDGET_UPDATE);
+        addSystemApps(mVisibleApps, widgetIntent, excludePackages);
+
+        List<ApplicationInfo> installedApps = pm.getInstalledApplications(
+                PackageManager.MATCH_UNINSTALLED_PACKAGES);
+        for (ApplicationInfo app : installedApps) {
+            // If it's not installed, skip
+            if ((app.flags & ApplicationInfo.FLAG_INSTALLED) == 0) continue;
+
+            if ((app.flags & ApplicationInfo.FLAG_SYSTEM) == 0
+                    && (app.flags & ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) == 0) {
+                // Downloaded app
+                SelectableAppInfo info = new SelectableAppInfo();
+                info.packageName = app.packageName;
+                info.appName = app.loadLabel(pm);
+                info.activityName = info.appName;
+                info.icon = app.loadIcon(pm);
+                mVisibleApps.add(info);
+            } else {
+                try {
+                    PackageInfo pi = pm.getPackageInfo(app.packageName, 0);
+                    // If it's a system app that requires an account and doesn't see restricted
+                    // accounts, mark for removal. It might get shown in the UI if it has an icon
+                    // but will still be marked as false and immutable.
+                    if (mRestrictedProfile
+                            && pi.requiredAccountType != null && pi.restrictedAccountType == null) {
+                        mSelectedPackages.put(app.packageName, false);
+                    }
+                } catch (PackageManager.NameNotFoundException re) {
+                    // Skip
+                }
+            }
+        }
+
+        // Get the list of apps already installed for the user
+        List<ApplicationInfo> userApps = null;
+        try {
+            ParceledListSlice<ApplicationInfo> listSlice = ipm.getInstalledApplications(
+                    PackageManager.MATCH_UNINSTALLED_PACKAGES, mUser.getIdentifier());
+            if (listSlice != null) {
+                userApps = listSlice.getList();
+            }
+        } catch (RemoteException re) {
+            // Ignore
+        }
+
+        if (userApps != null) {
+            for (ApplicationInfo app : userApps) {
+                if ((app.flags & ApplicationInfo.FLAG_INSTALLED) == 0) continue;
+
+                if ((app.flags & ApplicationInfo.FLAG_SYSTEM) == 0
+                        && (app.flags & ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) == 0) {
+                    // Downloaded app
+                    SelectableAppInfo info = new SelectableAppInfo();
+                    info.packageName = app.packageName;
+                    info.appName = app.loadLabel(pm);
+                    info.activityName = info.appName;
+                    info.icon = app.loadIcon(pm);
+                    mVisibleApps.add(info);
+                }
+            }
+        }
+
+        // Sort the list of visible apps
+        Collections.sort(mVisibleApps, new AppLabelComparator());
+
+        // Remove dupes
+        Set<String> dedupPackageSet = new HashSet<String>();
+        for (int i = mVisibleApps.size() - 1; i >= 0; i--) {
+            SelectableAppInfo info = mVisibleApps.get(i);
+            if (DEBUG) Log.i(TAG, info.toString());
+            String both = info.packageName + "+" + info.activityName;
+            if (!TextUtils.isEmpty(info.packageName)
+                    && !TextUtils.isEmpty(info.activityName)
+                    && dedupPackageSet.contains(both)) {
+                mVisibleApps.remove(i);
+            } else {
+                dedupPackageSet.add(both);
+            }
+        }
+
+        // Establish master/slave relationship for entries that share a package name
+        HashMap<String,SelectableAppInfo> packageMap = new HashMap<String,SelectableAppInfo>();
+        for (SelectableAppInfo info : mVisibleApps) {
+            if (packageMap.containsKey(info.packageName)) {
+                info.masterEntry = packageMap.get(info.packageName);
+            } else {
+                packageMap.put(info.packageName, info);
+            }
+        }
+!!!44284727.java!!!	addSystemImes(inout excludePackages : Set<String>) : void
+        InputMethodManager imm = (InputMethodManager)
+                mContext.getSystemService(Context.INPUT_METHOD_SERVICE);
+        List<InputMethodInfo> imis = imm.getInputMethodList();
+        for (InputMethodInfo imi : imis) {
+            try {
+                if (imi.isDefault(mContext) && isSystemPackage(imi.getPackageName())) {
+                    excludePackages.add(imi.getPackageName());
+                }
+            } catch (Resources.NotFoundException rnfe) {
+                // Not default
+            }
+        }
+!!!44284855.java!!!	addSystemApps(inout visibleApps : List<SelectableAppInfo>, inout intent : Intent, inout excludePackages : Set<String>) : void
+        final PackageManager pm = mPackageManager;
+        List<ResolveInfo> launchableApps = pm.queryIntentActivities(intent,
+                PackageManager.MATCH_DISABLED_COMPONENTS | PackageManager.MATCH_UNINSTALLED_PACKAGES);
+        for (ResolveInfo app : launchableApps) {
+            if (app.activityInfo != null && app.activityInfo.applicationInfo != null) {
+                final String packageName = app.activityInfo.packageName;
+                int flags = app.activityInfo.applicationInfo.flags;
+                if ((flags & ApplicationInfo.FLAG_SYSTEM) != 0
+                        || (flags & ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) != 0) {
+                    // System app
+                    // Skip excluded packages
+                    if (excludePackages.contains(packageName)) continue;
+                    int enabled = pm.getApplicationEnabledSetting(packageName);
+                    if (enabled == PackageManager.COMPONENT_ENABLED_STATE_DISABLED_UNTIL_USED
+                            || enabled == PackageManager.COMPONENT_ENABLED_STATE_DISABLED) {
+                        // Check if the app is already enabled for the target user
+                        ApplicationInfo targetUserAppInfo = getAppInfoForUser(packageName,
+                                0, mUser);
+                        if (targetUserAppInfo == null
+                                || (targetUserAppInfo.flags&ApplicationInfo.FLAG_INSTALLED) == 0) {
+                            continue;
+                        }
+                    }
+                    SelectableAppInfo info = new SelectableAppInfo();
+                    info.packageName = app.activityInfo.packageName;
+                    info.appName = app.activityInfo.applicationInfo.loadLabel(pm);
+                    info.icon = app.activityInfo.loadIcon(pm);
+                    info.activityName = app.activityInfo.loadLabel(pm);
+                    if (info.activityName == null) info.activityName = info.appName;
+
+                    visibleApps.add(info);
+                }
+            }
+        }
+!!!44284983.java!!!	isSystemPackage(inout packageName : String) : boolean
+        try {
+            final PackageInfo pi = mPackageManager.getPackageInfo(packageName, 0);
+            if (pi.applicationInfo == null) return false;
+            final int flags = pi.applicationInfo.flags;
+            if ((flags & ApplicationInfo.FLAG_SYSTEM) != 0
+                    || (flags & ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) != 0) {
+                return true;
+            }
+        } catch (PackageManager.NameNotFoundException nnfe) {
+            // Missing package?
+        }
+        return false;
+!!!44285111.java!!!	getAppInfoForUser(inout packageName : String, in flags : int, inout user : UserHandle) : ApplicationInfo
+        try {
+            return mIPm.getApplicationInfo(packageName, flags, user.getIdentifier());
+        } catch (RemoteException re) {
+            return null;
+        }

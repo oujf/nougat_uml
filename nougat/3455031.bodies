@@ -1,0 +1,679 @@
+class NuPlayerDriver
+!!!39821623.cpp!!!	NuPlayerDriver(in pid : pid_t)
+    ALOGV("NuPlayerDriver(%p)", this);
+    mLooper->setName("NuPlayerDriver Looper");
+
+    mLooper->start(
+            false, /* runOnCallingThread */
+            true,  /* canCallJava */
+            PRIORITY_AUDIO);
+
+    mPlayer = new NuPlayer(pid);
+    mLooper->registerHandler(mPlayer);
+
+    mPlayer->setDriver(this);
+!!!39821751.cpp!!!	initCheck() : status_t
+    return OK;
+!!!39821879.cpp!!!	setUID(in uid : uid_t) : status_t
+    mPlayer->setUID(uid);
+
+    return OK;
+!!!39822007.cpp!!!	setDataSource(in httpService : sp<IMediaHTTPService>, in url : char, in headers : KeyedVector<String8, String8>) : status_t
+    ALOGV("setDataSource(%p) url(%s)", this, uriDebugString(url, false).c_str());
+    Mutex::Autolock autoLock(mLock);
+
+    if (mState != STATE_IDLE) {
+        return INVALID_OPERATION;
+    }
+
+    mState = STATE_SET_DATASOURCE_PENDING;
+
+    mPlayer->setDataSourceAsync(httpService, url, headers);
+
+    while (mState == STATE_SET_DATASOURCE_PENDING) {
+        mCondition.wait(mLock);
+    }
+
+    return mAsyncResult;
+!!!39822135.cpp!!!	setDataSource(in fd : int, in offset : int64_t, in length : int64_t) : status_t
+    ALOGV("setDataSource(%p) file(%d)", this, fd);
+    Mutex::Autolock autoLock(mLock);
+
+    if (mState != STATE_IDLE) {
+        return INVALID_OPERATION;
+    }
+
+    mState = STATE_SET_DATASOURCE_PENDING;
+
+    mPlayer->setDataSourceAsync(fd, offset, length);
+
+    while (mState == STATE_SET_DATASOURCE_PENDING) {
+        mCondition.wait(mLock);
+    }
+
+    return mAsyncResult;
+!!!39822263.cpp!!!	setDataSource(in source : sp<IStreamSource>) : status_t
+    ALOGV("setDataSource(%p) stream source", this);
+    Mutex::Autolock autoLock(mLock);
+
+    if (mState != STATE_IDLE) {
+        return INVALID_OPERATION;
+    }
+
+    mState = STATE_SET_DATASOURCE_PENDING;
+
+    mPlayer->setDataSourceAsync(source);
+
+    while (mState == STATE_SET_DATASOURCE_PENDING) {
+        mCondition.wait(mLock);
+    }
+
+    return mAsyncResult;
+!!!39822391.cpp!!!	setDataSource(in source : sp<DataSource>) : status_t
+    ALOGV("setDataSource(%p) callback source", this);
+    Mutex::Autolock autoLock(mLock);
+
+    if (mState != STATE_IDLE) {
+        return INVALID_OPERATION;
+    }
+
+    mState = STATE_SET_DATASOURCE_PENDING;
+
+    mPlayer->setDataSourceAsync(source);
+
+    while (mState == STATE_SET_DATASOURCE_PENDING) {
+        mCondition.wait(mLock);
+    }
+
+    return mAsyncResult;
+!!!39822519.cpp!!!	setVideoSurfaceTexture(in bufferProducer : sp<IGraphicBufferProducer>) : status_t
+    ALOGV("setVideoSurfaceTexture(%p)", this);
+    Mutex::Autolock autoLock(mLock);
+
+    if (mSetSurfaceInProgress) {
+        return INVALID_OPERATION;
+    }
+
+    switch (mState) {
+        case STATE_SET_DATASOURCE_PENDING:
+        case STATE_RESET_IN_PROGRESS:
+            return INVALID_OPERATION;
+
+        default:
+            break;
+    }
+
+    mSetSurfaceInProgress = true;
+
+    mPlayer->setVideoSurfaceTextureAsync(bufferProducer);
+
+    while (mSetSurfaceInProgress) {
+        mCondition.wait(mLock);
+    }
+
+    return OK;
+!!!39822647.cpp!!!	prepare() : status_t
+    ALOGV("prepare(%p)", this);
+    Mutex::Autolock autoLock(mLock);
+    return prepare_l();
+!!!39822775.cpp!!!	prepareAsync() : status_t
+    ALOGV("prepareAsync(%p)", this);
+    Mutex::Autolock autoLock(mLock);
+
+    switch (mState) {
+        case STATE_UNPREPARED:
+            mState = STATE_PREPARING;
+            mIsAsyncPrepare = true;
+            mPlayer->prepareAsync();
+            return OK;
+        case STATE_STOPPED:
+            // this is really just paused. handle as seek to start
+            mAtEOS = false;
+            mState = STATE_STOPPED_AND_PREPARING;
+            mIsAsyncPrepare = true;
+            mPlayer->seekToAsync(0, true /* needNotify */);
+            return OK;
+        default:
+            return INVALID_OPERATION;
+    };
+!!!39822903.cpp!!!	start() : status_t
+    ALOGD("start(%p), state is %d, eos is %d", this, mState, mAtEOS);
+    Mutex::Autolock autoLock(mLock);
+    return start_l();
+!!!39823031.cpp!!!	stop() : status_t
+    ALOGD("stop(%p)", this);
+    Mutex::Autolock autoLock(mLock);
+
+    switch (mState) {
+        case STATE_RUNNING:
+            mPlayer->pause();
+            // fall through
+
+        case STATE_PAUSED:
+            mState = STATE_STOPPED;
+            notifyListener_l(MEDIA_STOPPED);
+            break;
+
+        case STATE_PREPARED:
+        case STATE_STOPPED:
+        case STATE_STOPPED_AND_PREPARING:
+        case STATE_STOPPED_AND_PREPARED:
+            mState = STATE_STOPPED;
+            break;
+
+        default:
+            return INVALID_OPERATION;
+    }
+
+    return OK;
+!!!39823159.cpp!!!	pause() : status_t
+    ALOGD("pause(%p)", this);
+    // The NuPlayerRenderer may get flushed if pause for long enough, e.g. the pause timeout tear
+    // down for audio offload mode. If that happens, the NuPlayerRenderer will no longer know the
+    // current position. So similar to seekTo, update |mPositionUs| to the pause position by calling
+    // getCurrentPosition here.
+    int unused;
+    getCurrentPosition(&unused);
+
+    Mutex::Autolock autoLock(mLock);
+
+    switch (mState) {
+        case STATE_PAUSED:
+        case STATE_PREPARED:
+            return OK;
+
+        case STATE_RUNNING:
+            mState = STATE_PAUSED;
+            notifyListener_l(MEDIA_PAUSED);
+            mPlayer->pause();
+            break;
+
+        default:
+            return INVALID_OPERATION;
+    }
+
+    return OK;
+!!!39823287.cpp!!!	isPlaying() : bool
+    return mState == STATE_RUNNING && !mAtEOS;
+!!!39823415.cpp!!!	setPlaybackSettings(in rate : AudioPlaybackRate) : status_t
+    status_t err = mPlayer->setPlaybackSettings(rate);
+    if (err == OK) {
+        // try to update position
+        int unused;
+        getCurrentPosition(&unused);
+        Mutex::Autolock autoLock(mLock);
+        if (rate.mSpeed == 0.f && mState == STATE_RUNNING) {
+            mState = STATE_PAUSED;
+            notifyListener_l(MEDIA_PAUSED);
+        } else if (rate.mSpeed != 0.f
+                && (mState == STATE_PAUSED
+                    || mState == STATE_STOPPED_AND_PREPARED
+                    || mState == STATE_PREPARED)) {
+            err = start_l();
+        }
+    }
+    return err;
+!!!39823543.cpp!!!	getPlaybackSettings(inout rate : AudioPlaybackRate) : status_t
+    return mPlayer->getPlaybackSettings(rate);
+!!!39823671.cpp!!!	setSyncSettings(in sync : AVSyncSettings, in videoFpsHint : float) : status_t
+    return mPlayer->setSyncSettings(sync, videoFpsHint);
+!!!39823799.cpp!!!	getSyncSettings(inout sync : AVSyncSettings, inout videoFps : float) : status_t
+    return mPlayer->getSyncSettings(sync, videoFps);
+!!!39823927.cpp!!!	seekTo(in msec : int) : status_t
+    ALOGD("seekTo(%p) %d ms at state %d", this, msec, mState);
+    Mutex::Autolock autoLock(mLock);
+
+    int64_t seekTimeUs = msec * 1000ll;
+
+    switch (mState) {
+        case STATE_PREPARED:
+        case STATE_STOPPED_AND_PREPARED:
+        case STATE_PAUSED:
+        case STATE_RUNNING:
+        {
+            mAtEOS = false;
+            mSeekInProgress = true;
+            // seeks can take a while, so we essentially paused
+            notifyListener_l(MEDIA_PAUSED);
+            mPlayer->seekToAsync(seekTimeUs, true /* needNotify */);
+            break;
+        }
+
+        default:
+            return INVALID_OPERATION;
+    }
+
+    mPositionUs = seekTimeUs;
+    return OK;
+!!!39824055.cpp!!!	getCurrentPosition(inout msec : int) : status_t
+    int64_t tempUs = 0;
+    {
+        Mutex::Autolock autoLock(mLock);
+        if (mSeekInProgress || (mState == STATE_PAUSED && !mAtEOS)) {
+            tempUs = (mPositionUs <= 0) ? 0 : mPositionUs;
+            *msec = (int)divRound(tempUs, (int64_t)(1000));
+            return OK;
+        }
+    }
+
+    status_t ret = mPlayer->getCurrentPosition(&tempUs);
+
+    Mutex::Autolock autoLock(mLock);
+    // We need to check mSeekInProgress here because mPlayer->seekToAsync is an async call, which
+    // means getCurrentPosition can be called before seek is completed. Iow, renderer may return a
+    // position value that's different the seek to position.
+    if (ret != OK) {
+        tempUs = (mPositionUs <= 0) ? 0 : mPositionUs;
+    } else {
+        mPositionUs = tempUs;
+    }
+    *msec = (int)divRound(tempUs, (int64_t)(1000));
+    return OK;
+!!!39824183.cpp!!!	getDuration(inout msec : int) : status_t
+    Mutex::Autolock autoLock(mLock);
+
+    if (mDurationUs < 0) {
+        return UNKNOWN_ERROR;
+    }
+
+    *msec = (mDurationUs + 500ll) / 1000;
+
+    return OK;
+!!!39824311.cpp!!!	reset() : status_t
+    ALOGD("reset(%p) at state %d", this, mState);
+    Mutex::Autolock autoLock(mLock);
+
+    switch (mState) {
+        case STATE_IDLE:
+            return OK;
+
+        case STATE_SET_DATASOURCE_PENDING:
+        case STATE_RESET_IN_PROGRESS:
+            return INVALID_OPERATION;
+
+        case STATE_PREPARING:
+        {
+            CHECK(mIsAsyncPrepare);
+
+            notifyListener_l(MEDIA_PREPARED);
+            break;
+        }
+
+        default:
+            break;
+    }
+
+    if (mState != STATE_STOPPED) {
+        notifyListener_l(MEDIA_STOPPED);
+    }
+
+    char value[PROPERTY_VALUE_MAX];
+    if (property_get("persist.debug.sf.stats", value, NULL) &&
+            (!strcmp("1", value) || !strcasecmp("true", value))) {
+        Vector<String16> args;
+        dump(-1, args);
+    }
+
+    mState = STATE_RESET_IN_PROGRESS;
+    mPlayer->resetAsync();
+
+    while (mState == STATE_RESET_IN_PROGRESS) {
+        mCondition.wait(mLock);
+    }
+
+    mDurationUs = -1;
+    mPositionUs = -1;
+    mLooping = false;
+
+    return OK;
+!!!39824439.cpp!!!	setLooping(in loop : int) : status_t
+    mLooping = loop != 0;
+    return OK;
+!!!39824567.cpp!!!	playerType() : player_type
+    return NU_PLAYER;
+!!!39824695.cpp!!!	invoke(in request : Parcel, inout reply : Parcel) : status_t
+    if (reply == NULL) {
+        ALOGE("reply is a NULL pointer");
+        return BAD_VALUE;
+    }
+
+    int32_t methodId;
+    status_t ret = request.readInt32(&methodId);
+    if (ret != OK) {
+        ALOGE("Failed to retrieve the requested method to invoke");
+        return ret;
+    }
+
+    switch (methodId) {
+        case INVOKE_ID_SET_VIDEO_SCALING_MODE:
+        {
+            int mode = request.readInt32();
+            return mPlayer->setVideoScalingMode(mode);
+        }
+
+        case INVOKE_ID_GET_TRACK_INFO:
+        {
+            return mPlayer->getTrackInfo(reply);
+        }
+
+        case INVOKE_ID_SELECT_TRACK:
+        {
+            int trackIndex = request.readInt32();
+            int msec = 0;
+            // getCurrentPosition should always return OK
+            getCurrentPosition(&msec);
+            return mPlayer->selectTrack(trackIndex, true /* select */, msec * 1000ll);
+        }
+
+        case INVOKE_ID_UNSELECT_TRACK:
+        {
+            int trackIndex = request.readInt32();
+            return mPlayer->selectTrack(trackIndex, false /* select */, 0xdeadbeef /* not used */);
+        }
+
+        case INVOKE_ID_GET_SELECTED_TRACK:
+        {
+            int32_t type = request.readInt32();
+            return mPlayer->getSelectedTrack(type, reply);
+        }
+
+        default:
+        {
+            return INVALID_OPERATION;
+        }
+    }
+!!!39824823.cpp!!!	setAudioSink(in audioSink : sp<AudioSink>) : void
+    mPlayer->setAudioSink(audioSink);
+    mAudioSink = audioSink;
+!!!39824951.cpp!!!	setParameter(in key : int, in request : Parcel) : status_t
+    return INVALID_OPERATION;
+!!!39825079.cpp!!!	getParameter(in key : int, inout reply : Parcel) : status_t
+    return INVALID_OPERATION;
+!!!39825207.cpp!!!	getMetadata(in ids : media::Metadata::Filter, inout records : Parcel) : status_t
+    Mutex::Autolock autoLock(mLock);
+
+    using media::Metadata;
+
+    Metadata meta(records);
+
+    meta.appendBool(
+            Metadata::kPauseAvailable,
+            mPlayerFlags & NuPlayer::Source::FLAG_CAN_PAUSE);
+
+    meta.appendBool(
+            Metadata::kSeekBackwardAvailable,
+            mPlayerFlags & NuPlayer::Source::FLAG_CAN_SEEK_BACKWARD);
+
+    meta.appendBool(
+            Metadata::kSeekForwardAvailable,
+            mPlayerFlags & NuPlayer::Source::FLAG_CAN_SEEK_FORWARD);
+
+    meta.appendBool(
+            Metadata::kSeekAvailable,
+            mPlayerFlags & NuPlayer::Source::FLAG_CAN_SEEK);
+
+    return OK;
+!!!39825335.cpp!!!	dump(in fd : int, in args : Vector<String16>) : status_t
+
+    Vector<sp<AMessage> > trackStats;
+    mPlayer->getStats(&trackStats);
+
+    AString logString(" NuPlayer\n");
+    char buf[256] = {0};
+
+    for (size_t i = 0; i < trackStats.size(); ++i) {
+        const sp<AMessage> &stats = trackStats.itemAt(i);
+
+        AString mime;
+        if (stats->findString("mime", &mime)) {
+            snprintf(buf, sizeof(buf), "  mime(%s)\n", mime.c_str());
+            logString.append(buf);
+        }
+
+        AString name;
+        if (stats->findString("component-name", &name)) {
+            snprintf(buf, sizeof(buf), "    decoder(%s)\n", name.c_str());
+            logString.append(buf);
+        }
+
+        if (mime.startsWith("video/")) {
+            int32_t width, height;
+            if (stats->findInt32("width", &width)
+                    && stats->findInt32("height", &height)) {
+                snprintf(buf, sizeof(buf), "    resolution(%d x %d)\n", width, height);
+                logString.append(buf);
+            }
+
+            int64_t numFramesTotal = 0;
+            int64_t numFramesDropped = 0;
+
+            stats->findInt64("frames-total", &numFramesTotal);
+            stats->findInt64("frames-dropped-output", &numFramesDropped);
+            snprintf(buf, sizeof(buf), "    numFramesTotal(%lld), numFramesDropped(%lld), "
+                     "percentageDropped(%.2f%%)\n",
+                     (long long)numFramesTotal,
+                     (long long)numFramesDropped,
+                     numFramesTotal == 0
+                            ? 0.0 : (double)(numFramesDropped * 100) / numFramesTotal);
+            logString.append(buf);
+        }
+    }
+
+    ALOGI("%s", logString.c_str());
+
+    if (fd >= 0) {
+        FILE *out = fdopen(dup(fd), "w");
+        fprintf(out, "%s", logString.c_str());
+        fclose(out);
+        out = NULL;
+    }
+
+    return OK;
+!!!39825463.cpp!!!	notifySetDataSourceCompleted(in err : status_t) : void
+    Mutex::Autolock autoLock(mLock);
+
+    CHECK_EQ(mState, STATE_SET_DATASOURCE_PENDING);
+
+    mAsyncResult = err;
+    mState = (err == OK) ? STATE_UNPREPARED : STATE_IDLE;
+    mCondition.broadcast();
+!!!39825591.cpp!!!	notifyPrepareCompleted(in err : status_t) : void
+    Mutex::Autolock autoLock(mLock);
+
+    if (mState != STATE_PREPARING) {
+        // We were preparing asynchronously when the client called
+        // reset(), we sent a premature "prepared" notification and
+        // then initiated the reset. This notification is stale.
+        CHECK(mState == STATE_RESET_IN_PROGRESS || mState == STATE_IDLE);
+        return;
+    }
+
+    CHECK_EQ(mState, STATE_PREPARING);
+
+    mAsyncResult = err;
+
+    if (err == OK) {
+        // update state before notifying client, so that if client calls back into NuPlayerDriver
+        // in response, NuPlayerDriver has the right state
+        mState = STATE_PREPARED;
+        if (mIsAsyncPrepare) {
+            notifyListener_l(MEDIA_PREPARED);
+        }
+    } else {
+        mState = STATE_UNPREPARED;
+        if (mIsAsyncPrepare) {
+            notifyListener_l(MEDIA_ERROR, MEDIA_ERROR_UNKNOWN, err);
+        }
+    }
+
+    sp<MetaData> meta = mPlayer->getFileMeta();
+    int32_t loop;
+    if (meta != NULL
+            && meta->findInt32(kKeyAutoLoop, &loop) && loop != 0) {
+        mAutoLoop = true;
+    }
+
+    mCondition.broadcast();
+!!!39825719.cpp!!!	notifyResetComplete() : void
+    ALOGD("notifyResetComplete(%p)", this);
+    Mutex::Autolock autoLock(mLock);
+
+    CHECK_EQ(mState, STATE_RESET_IN_PROGRESS);
+    mState = STATE_IDLE;
+    mCondition.broadcast();
+!!!39825847.cpp!!!	notifySetSurfaceComplete() : void
+    ALOGV("notifySetSurfaceComplete(%p)", this);
+    Mutex::Autolock autoLock(mLock);
+
+    CHECK(mSetSurfaceInProgress);
+    mSetSurfaceInProgress = false;
+
+    mCondition.broadcast();
+!!!39825975.cpp!!!	notifyDuration(in durationUs : int64_t) : void
+    Mutex::Autolock autoLock(mLock);
+    mDurationUs = durationUs;
+!!!39826103.cpp!!!	notifySeekComplete() : void
+    ALOGV("notifySeekComplete(%p)", this);
+    Mutex::Autolock autoLock(mLock);
+    mSeekInProgress = false;
+    notifySeekComplete_l();
+!!!39826231.cpp!!!	notifySeekComplete_l() : void
+    bool wasSeeking = true;
+    if (mState == STATE_STOPPED_AND_PREPARING) {
+        wasSeeking = false;
+        mState = STATE_STOPPED_AND_PREPARED;
+        mCondition.broadcast();
+        if (!mIsAsyncPrepare) {
+            // if we are preparing synchronously, no need to notify listener
+            return;
+        }
+    } else if (mState == STATE_STOPPED) {
+        // no need to notify listener
+        return;
+    }
+    notifyListener_l(wasSeeking ? MEDIA_SEEK_COMPLETE : MEDIA_PREPARED);
+!!!39826359.cpp!!!	notifyListener(in msg : int, in ext1 : int = 0, in ext2 : int = 0, in in : Parcel = NULL) : void
+    Mutex::Autolock autoLock(mLock);
+    notifyListener_l(msg, ext1, ext2, in);
+!!!39826487.cpp!!!	notifyFlagsChanged(in flags : uint32_t) : void
+    Mutex::Autolock autoLock(mLock);
+
+    mPlayerFlags = flags;
+!!!39826615.cpp!!!	~NuPlayerDriver()
+    ALOGV("~NuPlayerDriver(%p)", this);
+    mLooper->stop();
+!!!39826743.cpp!!!	prepare_l() : status_t
+    switch (mState) {
+        case STATE_UNPREPARED:
+            mState = STATE_PREPARING;
+
+            // Make sure we're not posting any notifications, success or
+            // failure information is only communicated through our result
+            // code.
+            mIsAsyncPrepare = false;
+            mPlayer->prepareAsync();
+            while (mState == STATE_PREPARING) {
+                mCondition.wait(mLock);
+            }
+            return (mState == STATE_PREPARED) ? OK : UNKNOWN_ERROR;
+        case STATE_STOPPED:
+            // this is really just paused. handle as seek to start
+            mAtEOS = false;
+            mState = STATE_STOPPED_AND_PREPARING;
+            mIsAsyncPrepare = false;
+            mPlayer->seekToAsync(0, true /* needNotify */);
+            while (mState == STATE_STOPPED_AND_PREPARING) {
+                mCondition.wait(mLock);
+            }
+            return (mState == STATE_STOPPED_AND_PREPARED) ? OK : UNKNOWN_ERROR;
+        default:
+            return INVALID_OPERATION;
+    };
+!!!39826871.cpp!!!	start_l() : status_t
+    switch (mState) {
+        case STATE_UNPREPARED:
+        {
+            status_t err = prepare_l();
+
+            if (err != OK) {
+                return err;
+            }
+
+            CHECK_EQ(mState, STATE_PREPARED);
+
+            // fall through
+        }
+
+        case STATE_PAUSED:
+        case STATE_STOPPED_AND_PREPARED:
+        case STATE_PREPARED:
+        {
+            mPlayer->start();
+
+            // fall through
+        }
+
+        case STATE_RUNNING:
+        {
+            if (mAtEOS) {
+                mPlayer->seekToAsync(0);
+                mAtEOS = false;
+                mPositionUs = -1;
+            }
+            break;
+        }
+
+        default:
+            return INVALID_OPERATION;
+    }
+
+    mState = STATE_RUNNING;
+
+    return OK;
+!!!39826999.cpp!!!	notifyListener_l(in msg : int, in ext1 : int = 0, in ext2 : int = 0, in in : Parcel = NULL) : void
+    ALOGD("notifyListener_l(%p), (%d, %d, %d), loop setting(%d, %d)",
+            this, msg, ext1, ext2, mAutoLoop, mLooping);
+    switch (msg) {
+        case MEDIA_PLAYBACK_COMPLETE:
+        {
+            if (mState != STATE_RESET_IN_PROGRESS) {
+                if (mAutoLoop) {
+                    audio_stream_type_t streamType = AUDIO_STREAM_MUSIC;
+                    if (mAudioSink != NULL) {
+                        streamType = mAudioSink->getAudioStreamType();
+                    }
+                    if (streamType == AUDIO_STREAM_NOTIFICATION) {
+                        ALOGW("disabling auto-loop for notification");
+                        mAutoLoop = false;
+                    }
+                }
+                if (mLooping || mAutoLoop) {
+                    mPlayer->seekToAsync(0);
+                    if (mAudioSink != NULL) {
+                        // The renderer has stopped the sink at the end in order to play out
+                        // the last little bit of audio. If we're looping, we need to restart it.
+                        mAudioSink->start();
+                    }
+                    // don't send completion event when looping
+                    return;
+                }
+
+                mPlayer->pause();
+                mState = STATE_PAUSED;
+            }
+            // fall through
+        }
+
+        case MEDIA_ERROR:
+        {
+            mAtEOS = true;
+            break;
+        }
+
+        default:
+            break;
+    }
+
+    mLock.unlock();
+    sendEvent(msg, ext1, ext2, in);
+    mLock.lock();

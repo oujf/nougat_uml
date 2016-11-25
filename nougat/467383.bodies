@@ -1,0 +1,341 @@
+class CameraManagerGlobal
+!!!3076535.java!!!	get() : CameraManager::CameraManagerGlobal
+            return gCameraManager;
+!!!3076663.java!!!	asBinder() : IBinder
+            return this;
+!!!3076791.java!!!	getCameraService() : ICameraService
+            synchronized(mLock) {
+                connectCameraServiceLocked();
+                if (mCameraService == null) {
+                    Log.e(TAG, "Camera service is unavailable");
+                }
+                return mCameraService;
+            }
+!!!3076919.java!!!	connectCameraServiceLocked() : void
+            // Only reconnect if necessary
+            if (mCameraService != null) return;
+
+            Log.i(TAG, "Connecting to camera service");
+
+            IBinder cameraServiceBinder = ServiceManager.getService(CAMERA_SERVICE_BINDER_NAME);
+            if (cameraServiceBinder == null) {
+                // Camera service is now down, leave mCameraService as null
+                return;
+            }
+            try {
+                cameraServiceBinder.linkToDeath(this, /*flags*/ 0);
+            } catch (RemoteException e) {
+                // Camera service is now down, leave mCameraService as null
+                return;
+            }
+
+            ICameraService cameraService = ICameraService.Stub.asInterface(cameraServiceBinder);
+
+            try {
+                CameraMetadataNative.setupGlobalVendorTagDescriptor();
+            } catch (ServiceSpecificException e) {
+                handleRecoverableSetupErrors(e);
+            }
+
+            try {
+                cameraService.addListener(this);
+                mCameraService = cameraService;
+            } catch(ServiceSpecificException e) {
+                // Unexpected failure
+                throw new IllegalStateException("Failed to register a camera service listener", e);
+            } catch (RemoteException e) {
+                // Camera service is now down, leave mCameraService as null
+            }
+!!!3077047.java!!!	setTorchMode(inout cameraId : String, inout enabled : boolean) : void
+            synchronized(mLock) {
+
+                if (cameraId == null) {
+                    throw new IllegalArgumentException("cameraId was null");
+                }
+
+                ICameraService cameraService = getCameraService();
+                if (cameraService == null) {
+                    throw new CameraAccessException(CameraAccessException.CAMERA_DISCONNECTED,
+                        "Camera service is currently unavailable");
+                }
+
+                try {
+                    cameraService.setTorchMode(cameraId, enabled, mTorchClientBinder);
+                } catch(ServiceSpecificException e) {
+                    throwAsPublicException(e);
+                } catch (RemoteException e) {
+                    throw new CameraAccessException(CameraAccessException.CAMERA_DISCONNECTED,
+                            "Camera service is currently unavailable");
+                }
+            }
+!!!3077175.java!!!	handleRecoverableSetupErrors(inout e : ServiceSpecificException) : void
+            switch (e.errorCode) {
+                case ICameraService.ERROR_DISCONNECTED:
+                    Log.w(TAG, e.getMessage());
+                    break;
+                default:
+                    throw new IllegalStateException(e);
+            }
+!!!3077303.java!!!	isAvailable(in status : int) : boolean
+            switch (status) {
+                case ICameraServiceListener.STATUS_PRESENT:
+                    return true;
+                default:
+                    return false;
+            }
+!!!3077431.java!!!	validStatus(in status : int) : boolean
+            switch (status) {
+                case ICameraServiceListener.STATUS_NOT_PRESENT:
+                case ICameraServiceListener.STATUS_PRESENT:
+                case ICameraServiceListener.STATUS_ENUMERATING:
+                case ICameraServiceListener.STATUS_NOT_AVAILABLE:
+                    return true;
+                default:
+                    return false;
+            }
+!!!3077559.java!!!	validTorchStatus(in status : int) : boolean
+            switch (status) {
+                case ICameraServiceListener.TORCH_STATUS_NOT_AVAILABLE:
+                case ICameraServiceListener.TORCH_STATUS_AVAILABLE_ON:
+                case ICameraServiceListener.TORCH_STATUS_AVAILABLE_OFF:
+                    return true;
+                default:
+                    return false;
+            }
+!!!3077687.java!!!	postSingleUpdate(in callback : CameraManager::AvailabilityCallback, in handler : Handler, in id : String, in status : int) : void
+            if (isAvailable(status)) {
+                handler.post(
+                    new Runnable() {
+                        @Override
+                        public void run() {
+                            callback.onCameraAvailable(id);
+                        }
+                    });
+            } else {
+                handler.post(
+                    new Runnable() {
+                        @Override
+                        public void run() {
+                            callback.onCameraUnavailable(id);
+                        }
+                    });
+            }
+!!!3077815.java!!!	postSingleTorchUpdate(in callback : CameraManager::TorchCallback, in handler : Handler, in id : String, in status : int) : void
+            switch(status) {
+                case ICameraServiceListener.TORCH_STATUS_AVAILABLE_ON:
+                case ICameraServiceListener.TORCH_STATUS_AVAILABLE_OFF:
+                    handler.post(
+                            new Runnable() {
+                                @Override
+                                public void run() {
+                                    callback.onTorchModeChanged(id, status ==
+                                            ICameraServiceListener.TORCH_STATUS_AVAILABLE_ON);
+                                }
+                            });
+                    break;
+                default:
+                    handler.post(
+                            new Runnable() {
+                                @Override
+                                public void run() {
+                                    callback.onTorchModeUnavailable(id);
+                                }
+                            });
+                    break;
+            }
+!!!3077943.java!!!	updateCallbackLocked(inout callback : CameraManager::AvailabilityCallback, inout handler : Handler) : void
+            for (int i = 0; i < mDeviceStatus.size(); i++) {
+                String id = mDeviceStatus.keyAt(i);
+                Integer status = mDeviceStatus.valueAt(i);
+                postSingleUpdate(callback, handler, id, status);
+            }
+!!!3078071.java!!!	onStatusChangedLocked(in status : int, inout id : String) : void
+            if (DEBUG) {
+                Log.v(TAG,
+                        String.format("Camera id %s has status changed to 0x%x", id, status));
+            }
+
+            if (!validStatus(status)) {
+                Log.e(TAG, String.format("Ignoring invalid device %s status 0x%x", id,
+                                status));
+                return;
+            }
+
+            Integer oldStatus = mDeviceStatus.put(id, status);
+
+            if (oldStatus != null && oldStatus == status) {
+                if (DEBUG) {
+                    Log.v(TAG, String.format(
+                        "Device status changed to 0x%x, which is what it already was",
+                        status));
+                }
+                return;
+            }
+
+            // TODO: consider abstracting out this state minimization + transition
+            // into a separate
+            // more easily testable class
+            // i.e. (new State()).addState(STATE_AVAILABLE)
+            //                   .addState(STATE_NOT_AVAILABLE)
+            //                   .addTransition(STATUS_PRESENT, STATE_AVAILABLE),
+            //                   .addTransition(STATUS_NOT_PRESENT, STATE_NOT_AVAILABLE)
+            //                   .addTransition(STATUS_ENUMERATING, STATE_NOT_AVAILABLE);
+            //                   .addTransition(STATUS_NOT_AVAILABLE, STATE_NOT_AVAILABLE);
+
+            // Translate all the statuses to either 'available' or 'not available'
+            //  available -> available         => no new update
+            //  not available -> not available => no new update
+            if (oldStatus != null && isAvailable(status) == isAvailable(oldStatus)) {
+                if (DEBUG) {
+                    Log.v(TAG,
+                            String.format(
+                                "Device status was previously available (%b), " +
+                                " and is now again available (%b)" +
+                                "so no new client visible update will be sent",
+                                isAvailable(oldStatus), isAvailable(status)));
+                }
+                return;
+            }
+
+            final int callbackCount = mCallbackMap.size();
+            for (int i = 0; i < callbackCount; i++) {
+                Handler handler = mCallbackMap.valueAt(i);
+                final AvailabilityCallback callback = mCallbackMap.keyAt(i);
+
+                postSingleUpdate(callback, handler, id, status);
+            }
+!!!3078199.java!!!	updateTorchCallbackLocked(inout callback : CameraManager::TorchCallback, inout handler : Handler) : void
+            for (int i = 0; i < mTorchStatus.size(); i++) {
+                String id = mTorchStatus.keyAt(i);
+                Integer status = mTorchStatus.valueAt(i);
+                postSingleTorchUpdate(callback, handler, id, status);
+            }
+!!!3078327.java!!!	onTorchStatusChangedLocked(in status : int, inout id : String) : void
+            if (DEBUG) {
+                Log.v(TAG,
+                        String.format("Camera id %s has torch status changed to 0x%x", id, status));
+            }
+
+            if (!validTorchStatus(status)) {
+                Log.e(TAG, String.format("Ignoring invalid device %s torch status 0x%x", id,
+                                status));
+                return;
+            }
+
+            Integer oldStatus = mTorchStatus.put(id, status);
+            if (oldStatus != null && oldStatus == status) {
+                if (DEBUG) {
+                    Log.v(TAG, String.format(
+                        "Torch status changed to 0x%x, which is what it already was",
+                        status));
+                }
+                return;
+            }
+
+            final int callbackCount = mTorchCallbackMap.size();
+            for (int i = 0; i < callbackCount; i++) {
+                final Handler handler = mTorchCallbackMap.valueAt(i);
+                final TorchCallback callback = mTorchCallbackMap.keyAt(i);
+                postSingleTorchUpdate(callback, handler, id, status);
+            }
+!!!3078455.java!!!	registerAvailabilityCallback(inout callback : CameraManager::AvailabilityCallback, inout handler : Handler) : void
+            synchronized (mLock) {
+                connectCameraServiceLocked();
+
+                Handler oldHandler = mCallbackMap.put(callback, handler);
+                // For new callbacks, provide initial availability information
+                if (oldHandler == null) {
+                    updateCallbackLocked(callback, handler);
+                }
+
+                // If not connected to camera service, schedule a reconnect to camera service.
+                if (mCameraService == null) {
+                    scheduleCameraServiceReconnectionLocked();
+                }
+            }
+!!!3078583.java!!!	unregisterAvailabilityCallback(inout callback : CameraManager::AvailabilityCallback) : void
+            synchronized (mLock) {
+                mCallbackMap.remove(callback);
+            }
+!!!3078711.java!!!	registerTorchCallback(inout callback : CameraManager::TorchCallback, inout handler : Handler) : void
+            synchronized(mLock) {
+                connectCameraServiceLocked();
+
+                Handler oldHandler = mTorchCallbackMap.put(callback, handler);
+                // For new callbacks, provide initial torch information
+                if (oldHandler == null) {
+                    updateTorchCallbackLocked(callback, handler);
+                }
+
+                // If not connected to camera service, schedule a reconnect to camera service.
+                if (mCameraService == null) {
+                    scheduleCameraServiceReconnectionLocked();
+                }
+            }
+!!!3078839.java!!!	unregisterTorchCallback(inout callback : CameraManager::TorchCallback) : void
+            synchronized(mLock) {
+                mTorchCallbackMap.remove(callback);
+            }
+!!!3078967.java!!!	onStatusChanged(in status : int, in cameraId : int) : void
+            synchronized(mLock) {
+                onStatusChangedLocked(status, String.valueOf(cameraId));
+            }
+!!!3079095.java!!!	onTorchStatusChanged(in status : int, inout cameraId : String) : void
+            synchronized (mLock) {
+                onTorchStatusChangedLocked(status, cameraId);
+            }
+!!!3079223.java!!!	scheduleCameraServiceReconnectionLocked() : void
+            final Handler handler;
+
+            if (mCallbackMap.size() > 0) {
+                handler = mCallbackMap.valueAt(0);
+            } else if (mTorchCallbackMap.size() > 0) {
+                handler = mTorchCallbackMap.valueAt(0);
+            } else {
+                // Not necessary to reconnect camera service if no client registers a callback.
+                return;
+            }
+
+            if (DEBUG) {
+                Log.v(TAG, "Reconnecting Camera Service in " + CAMERA_SERVICE_RECONNECT_DELAY_MS +
+                        " ms");
+            }
+
+            handler.postDelayed(
+                    new Runnable() {
+                        @Override
+                        public void run() {
+                            ICameraService cameraService = getCameraService();
+                            if (cameraService == null) {
+                                synchronized(mLock) {
+                                    if (DEBUG) {
+                                        Log.v(TAG, "Reconnecting Camera Service failed.");
+                                    }
+                                    scheduleCameraServiceReconnectionLocked();
+                                }
+                            }
+                        }
+                    },
+                    CAMERA_SERVICE_RECONNECT_DELAY_MS);
+!!!3079351.java!!!	binderDied() : void
+            synchronized(mLock) {
+                // Only do this once per service death
+                if (mCameraService == null) return;
+
+                mCameraService = null;
+
+                // Tell listeners that the cameras and torch modes are unavailable and schedule a
+                // reconnection to camera service. When camera service is reconnected, the camera
+                // and torch statuses will be updated.
+                for (int i = 0; i < mDeviceStatus.size(); i++) {
+                    String cameraId = mDeviceStatus.keyAt(i);
+                    onStatusChangedLocked(ICameraServiceListener.STATUS_NOT_PRESENT, cameraId);
+                }
+                for (int i = 0; i < mTorchStatus.size(); i++) {
+                    String cameraId = mTorchStatus.keyAt(i);
+                    onTorchStatusChangedLocked(ICameraServiceListener.TORCH_STATUS_NOT_AVAILABLE,
+                            cameraId);
+                }
+
+                scheduleCameraServiceReconnectionLocked();
+            }

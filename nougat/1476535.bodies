@@ -1,0 +1,102 @@
+class GraphicsStatsService
+!!!32112951.java!!!	GraphicsStatsService(inout context : Context)
+        mContext = context;
+        mAppOps = context.getSystemService(AppOpsManager.class);
+!!!32113079.java!!!	requestBufferForProcess(inout packageName : String, inout token : IBinder) : ParcelFileDescriptor
+        int uid = Binder.getCallingUid();
+        int pid = Binder.getCallingPid();
+        ParcelFileDescriptor pfd = null;
+        long callingIdentity = Binder.clearCallingIdentity();
+        try {
+            mAppOps.checkPackage(uid, packageName);
+            synchronized (mLock) {
+                pfd = requestBufferForProcessLocked(token, uid, pid, packageName);
+            }
+        } finally {
+            Binder.restoreCallingIdentity(callingIdentity);
+        }
+        return pfd;
+!!!32113207.java!!!	getPfd(inout file : MemoryFile) : ParcelFileDescriptor
+        try {
+            return new ParcelFileDescriptor(file.getFileDescriptor());
+        } catch (IOException ex) {
+            throw new IllegalStateException("Failed to get PFD from memory file", ex);
+        }
+!!!32113335.java!!!	requestBufferForProcessLocked(inout token : IBinder, in uid : int, in pid : int, inout packageName : String) : ParcelFileDescriptor
+        ActiveBuffer buffer = fetchActiveBuffersLocked(token, uid, pid, packageName);
+        return getPfd(buffer.mProcessBuffer);
+!!!32113463.java!!!	processDied(inout buffer : GraphicsStatsService::ActiveBuffer) : void
+        synchronized (mLock) {
+            mActive.remove(buffer);
+            Log.d("GraphicsStats", "Buffer count: " + mActive.size());
+        }
+        HistoricalData data = buffer.mPreviousData;
+        buffer.mPreviousData = null;
+        if (data == null) {
+            data = mHistoricalLog[mNextHistoricalSlot];
+            if (data == null) {
+                data = new HistoricalData();
+            }
+        }
+        data.update(buffer.mPackageName, buffer.mUid, buffer.mProcessBuffer);
+        buffer.closeAllBuffers();
+
+        mHistoricalLog[mNextHistoricalSlot] = data;
+        mNextHistoricalSlot = (mNextHistoricalSlot + 1) % mHistoricalLog.length;
+!!!32113591.java!!!	fetchActiveBuffersLocked(inout token : IBinder, in uid : int, in pid : int, inout packageName : String) : GraphicsStatsService::ActiveBuffer
+        int size = mActive.size();
+        for (int i = 0; i < size; i++) {
+            ActiveBuffer buffers = mActive.get(i);
+            if (buffers.mPid == pid
+                    && buffers.mUid == uid) {
+                return buffers;
+            }
+        }
+        // Didn't find one, need to create it
+        try {
+            ActiveBuffer buffers = new ActiveBuffer(token, uid, pid, packageName);
+            mActive.add(buffers);
+            return buffers;
+        } catch (IOException ex) {
+            throw new RemoteException("Failed to allocate space");
+        }
+!!!32113719.java!!!	removeHistoricalDataLocked(in uid : int, inout packageName : String) : GraphicsStatsService::HistoricalData
+        for (int i = 0; i < mHistoricalLog.length; i++) {
+            final HistoricalData data = mHistoricalLog[i];
+            if (data != null && data.mUid == uid
+                    && data.mPackageName.equals(packageName)) {
+                if (i == mNextHistoricalSlot) {
+                    mHistoricalLog[i] = null;
+                } else {
+                    mHistoricalLog[i] = mHistoricalLog[mNextHistoricalSlot];
+                    mHistoricalLog[mNextHistoricalSlot] = null;
+                }
+                return data;
+            }
+        }
+        return null;
+!!!32113847.java!!!	dump(inout fd : FileDescriptor, inout fout : PrintWriter, inout args : String) : void
+        mContext.enforceCallingOrSelfPermission(android.Manifest.permission.DUMP, TAG);
+        synchronized (mLock) {
+            for (int i = 0; i < mActive.size(); i++) {
+                final ActiveBuffer buffer = mActive.get(i);
+                fout.print("Package: ");
+                fout.print(buffer.mPackageName);
+                fout.flush();
+                try {
+                    buffer.mProcessBuffer.readBytes(mTempBuffer, 0, 0, ASHMEM_SIZE);
+                    ThreadedRenderer.dumpProfileData(mTempBuffer, fd);
+                } catch (IOException e) {
+                    fout.println("Failed to dump");
+                }
+                fout.println();
+            }
+            for (HistoricalData buffer : mHistoricalLog) {
+                if (buffer == null) continue;
+                fout.print("Package: ");
+                fout.print(buffer.mPackageName);
+                fout.flush();
+                ThreadedRenderer.dumpProfileData(buffer.mBuffer, fd);
+                fout.println();
+            }
+        }

@@ -1,0 +1,304 @@
+class WifiBackgroundScanStateMachine
+!!!37107895.java!!!	WifiBackgroundScanStateMachine(inout looper : Looper)
+            super("WifiBackgroundScanStateMachine", looper);
+
+            setLogRecSize(512);
+            setLogOnlyTransitions(false);
+
+            // CHECKSTYLE:OFF IndentationCheck
+            addState(mDefaultState);
+                addState(mStartedState, mDefaultState);
+                addState(mPausedState, mDefaultState);
+            // CHECKSTYLE:ON IndentationCheck
+
+            setInitialState(mDefaultState);
+!!!37108023.java!!!	getBackgroundScanSettings(inout ci : WifiScanningServiceImpl::ClientInfo) : WifiScanner::ScanSettings
+            return mActiveBackgroundScans.getAllSettingsForClient(ci);
+!!!37108151.java!!!	removeBackgroundScanSettings(inout ci : WifiScanningServiceImpl::ClientInfo) : void
+            mActiveBackgroundScans.removeAllForClient(ci);
+            updateSchedule();
+!!!37108279.java!!!	removeHotlistSettings(inout ci : WifiScanningServiceImpl::ClientInfo) : void
+            mActiveHotlistSettings.removeAllForClient(ci);
+            resetHotlist();
+!!!37108407.java!!!	onScanStatus(in event : int) : void
+            if (DBG) localLog("onScanStatus event received, event=" + event);
+            switch(event) {
+                case WifiNative.WIFI_SCAN_RESULTS_AVAILABLE:
+                case WifiNative.WIFI_SCAN_THRESHOLD_NUM_SCANS:
+                case WifiNative.WIFI_SCAN_THRESHOLD_PERCENT:
+                    sendMessage(CMD_SCAN_RESULTS_AVAILABLE);
+                    break;
+                case WifiNative.WIFI_SCAN_FAILED:
+                    sendMessage(CMD_SCAN_FAILED);
+                    break;
+                default:
+                    Log.e(TAG, "Unknown scan status event: " + event);
+                    break;
+            }
+!!!37108535.java!!!	onFullScanResult(inout fullScanResult : ScanResult, in bucketsScanned : int) : void
+            if (DBG) localLog("onFullScanResult received");
+            sendMessage(CMD_FULL_SCAN_RESULTS, 0, bucketsScanned, fullScanResult);
+!!!37108663.java!!!	onScanPaused(inout scanData : WifiScanner::ScanData) : void
+            if (DBG) localLog("onScanPaused received");
+            sendMessage(CMD_SCAN_PAUSED, scanData);
+!!!37108791.java!!!	onScanRestarted() : void
+            if (DBG) localLog("onScanRestarted received");
+            sendMessage(CMD_SCAN_RESTARTED);
+!!!37108919.java!!!	onHotlistApFound(inout results : ScanResult) : void
+            if (DBG) localLog("onHotlistApFound event received");
+            sendMessage(CMD_HOTLIST_AP_FOUND, 0, 0, results);
+!!!37109047.java!!!	onHotlistApLost(inout results : ScanResult) : void
+            if (DBG) localLog("onHotlistApLost event received");
+            sendMessage(CMD_HOTLIST_AP_LOST, 0, 0, results);
+!!!37110071.java!!!	addBackgroundScanRequest(inout ci : WifiScanningServiceImpl::ClientInfo, in handler : int, inout settings : WifiScanner::ScanSettings, inout workSource : WorkSource) : boolean
+            // sanity check the input
+            if (ci == null) {
+                Log.d(TAG, "Failing scan request ClientInfo not found " + handler);
+                return false;
+            }
+            if (settings.periodInMs < WifiScanner.MIN_SCAN_PERIOD_MS) {
+                loge("Failing scan request because periodInMs is " + settings.periodInMs
+                        + ", min scan period is: " + WifiScanner.MIN_SCAN_PERIOD_MS);
+                return false;
+            }
+
+            if (settings.band == WifiScanner.WIFI_BAND_UNSPECIFIED && settings.channels == null) {
+                loge("Channels was null with unspecified band");
+                return false;
+            }
+
+            if (settings.band == WifiScanner.WIFI_BAND_UNSPECIFIED
+                    && settings.channels.length == 0) {
+                loge("No channels specified");
+                return false;
+            }
+
+            int minSupportedPeriodMs = mChannelHelper.estimateScanDuration(settings);
+            if (settings.periodInMs < minSupportedPeriodMs) {
+                loge("Failing scan request because minSupportedPeriodMs is "
+                        + minSupportedPeriodMs + " but the request wants " + settings.periodInMs);
+                return false;
+            }
+
+            // check truncated binary exponential back off scan settings
+            if (settings.maxPeriodInMs != 0 && settings.maxPeriodInMs != settings.periodInMs) {
+                if (settings.maxPeriodInMs < settings.periodInMs) {
+                    loge("Failing scan request because maxPeriodInMs is " + settings.maxPeriodInMs
+                            + " but less than periodInMs " + settings.periodInMs);
+                    return false;
+                }
+                if (settings.maxPeriodInMs > WifiScanner.MAX_SCAN_PERIOD_MS) {
+                    loge("Failing scan request because maxSupportedPeriodMs is "
+                            + WifiScanner.MAX_SCAN_PERIOD_MS + " but the request wants "
+                            + settings.maxPeriodInMs);
+                    return false;
+                }
+                if (settings.stepCount < 1) {
+                    loge("Failing scan request because stepCount is " + settings.stepCount
+                            + " which is less than 1");
+                    return false;
+                }
+            }
+
+            logScanRequest("addBackgroundScanRequest", ci, handler, null, settings, null);
+            mActiveBackgroundScans.addRequest(ci, handler, workSource, settings);
+
+            if (updateSchedule()) {
+                return true;
+            } else {
+                mActiveBackgroundScans.removeRequest(ci, handler);
+                localLog("Failing scan request because failed to reset scan");
+                return false;
+            }
+!!!37110199.java!!!	updateSchedule() : boolean
+            if (mChannelHelper == null || mBackgroundScheduler == null || mScannerImpl == null) {
+                loge("Failed to update schedule because WifiScanningService is not initialized");
+                return false;
+            }
+            mChannelHelper.updateChannels();
+            Collection<ScanSettings> settings = mActiveBackgroundScans.getAllSettings();
+
+            mBackgroundScheduler.updateSchedule(settings);
+            WifiNative.ScanSettings schedule = mBackgroundScheduler.getSchedule();
+
+            if (ScanScheduleUtil.scheduleEquals(mPreviousSchedule, schedule)) {
+                if (DBG) Log.d(TAG, "schedule updated with no change");
+                return true;
+            }
+
+            mPreviousSchedule = schedule;
+
+            if (schedule.num_buckets == 0) {
+                mScannerImpl.stopBatchedScan();
+                if (DBG) Log.d(TAG, "scan stopped");
+                return true;
+            } else {
+                Log.d(TAG, "starting scan: "
+                        + "base period=" + schedule.base_period_ms
+                        + ", max ap per scan=" + schedule.max_ap_per_scan
+                        + ", batched scans=" + schedule.report_threshold_num_scans);
+                for (int b = 0; b < schedule.num_buckets; b++) {
+                    WifiNative.BucketSettings bucket = schedule.buckets[b];
+                    Log.d(TAG, "bucket " + bucket.bucket + " (" + bucket.period_ms + "ms)"
+                            + "[" + bucket.report_events + "]: "
+                            + ChannelHelper.toString(bucket));
+                }
+
+                if (mScannerImpl.startBatchedScan(schedule, this)) {
+                    if (DBG) {
+                        Log.d(TAG, "scan restarted with " + schedule.num_buckets
+                                + " bucket(s) and base period: " + schedule.base_period_ms);
+                    }
+                    return true;
+                } else {
+                    mPreviousSchedule = null;
+                    loge("error starting scan: "
+                            + "base period=" + schedule.base_period_ms
+                            + ", max ap per scan=" + schedule.max_ap_per_scan
+                            + ", batched scans=" + schedule.report_threshold_num_scans);
+                    for (int b = 0; b < schedule.num_buckets; b++) {
+                        WifiNative.BucketSettings bucket = schedule.buckets[b];
+                        loge("bucket " + bucket.bucket + " (" + bucket.period_ms + "ms)"
+                                + "[" + bucket.report_events + "]: "
+                                + ChannelHelper.toString(bucket));
+                    }
+                    return false;
+                }
+            }
+!!!37110327.java!!!	removeBackgroundScanRequest(inout ci : WifiScanningServiceImpl::ClientInfo, in handler : int) : void
+            if (ci != null) {
+                ScanSettings settings = mActiveBackgroundScans.removeRequest(ci, handler);
+                logScanRequest("removeBackgroundScanRequest", ci, handler, null, settings, null);
+                updateSchedule();
+            }
+!!!37110455.java!!!	reportFullScanResult(inout result : ScanResult, in bucketsScanned : int) : void
+            for (RequestInfo<ScanSettings> entry : mActiveBackgroundScans) {
+                ClientInfo ci = entry.clientInfo;
+                int handler = entry.handlerId;
+                ScanSettings settings = entry.settings;
+                if (mBackgroundScheduler.shouldReportFullScanResultForSettings(
+                                result, bucketsScanned, settings)) {
+                    ScanResult newResult = new ScanResult(result);
+                    if (result.informationElements != null) {
+                        newResult.informationElements = result.informationElements.clone();
+                    }
+                    else {
+                        newResult.informationElements = null;
+                    }
+                    ci.reportEvent(WifiScanner.CMD_FULL_SCAN_RESULT, 0, handler, newResult);
+                }
+            }
+!!!37110583.java!!!	reportScanResults(inout results : WifiScanner::ScanData) : void
+            for (ScanData result : results) {
+                if (result != null && result.getResults() != null) {
+                    if (result.getResults().length > 0) {
+                        mWifiMetrics.incrementNonEmptyScanResultCount();
+                    } else {
+                        mWifiMetrics.incrementEmptyScanResultCount();
+                    }
+                }
+            }
+            for (RequestInfo<ScanSettings> entry : mActiveBackgroundScans) {
+                ClientInfo ci = entry.clientInfo;
+                int handler = entry.handlerId;
+                ScanSettings settings = entry.settings;
+                ScanData[] resultsToDeliver =
+                        mBackgroundScheduler.filterResultsForSettings(results, settings);
+                if (resultsToDeliver != null) {
+                    logCallback("backgroundScanResults", ci, handler,
+                            describeForLog(resultsToDeliver));
+                    WifiScanner.ParcelableScanData parcelableScanData =
+                            new WifiScanner.ParcelableScanData(resultsToDeliver);
+                    ci.reportEvent(WifiScanner.CMD_SCAN_RESULT, 0, handler, parcelableScanData);
+                }
+            }
+!!!37110711.java!!!	sendBackgroundScanFailedToAllAndClear(in reason : int, inout description : String) : void
+            for (RequestInfo<ScanSettings> entry : mActiveBackgroundScans) {
+                ClientInfo ci = entry.clientInfo;
+                int handler = entry.handlerId;
+                ci.reportEvent(WifiScanner.CMD_OP_FAILED, 0, handler,
+                        new WifiScanner.OperationResult(reason, description));
+            }
+            mActiveBackgroundScans.clear();
+!!!37110839.java!!!	addHotlist(inout ci : WifiScanningServiceImpl::ClientInfo, in handler : int, inout settings : WifiScanner::HotlistSettings) : void
+            mActiveHotlistSettings.addRequest(ci, handler, null, settings);
+            resetHotlist();
+!!!37110967.java!!!	removeHotlist(inout ci : WifiScanningServiceImpl::ClientInfo, in handler : int) : void
+            mActiveHotlistSettings.removeRequest(ci, handler);
+            resetHotlist();
+!!!37111095.java!!!	resetHotlist() : void
+            if (mScannerImpl == null) {
+                loge("Failed to update hotlist because WifiScanningService is not initialized");
+                return;
+            }
+
+            Collection<WifiScanner.HotlistSettings> settings =
+                    mActiveHotlistSettings.getAllSettings();
+            int num_hotlist_ap = 0;
+
+            for (WifiScanner.HotlistSettings s : settings) {
+                num_hotlist_ap +=  s.bssidInfos.length;
+            }
+
+            if (num_hotlist_ap == 0) {
+                mScannerImpl.resetHotlist();
+            } else {
+                BssidInfo[] bssidInfos = new BssidInfo[num_hotlist_ap];
+                int apLostThreshold = Integer.MAX_VALUE;
+                int index = 0;
+                for (WifiScanner.HotlistSettings s : settings) {
+                    for (int i = 0; i < s.bssidInfos.length; i++, index++) {
+                        bssidInfos[index] = s.bssidInfos[i];
+                    }
+                    if (s.apLostThreshold < apLostThreshold) {
+                        apLostThreshold = s.apLostThreshold;
+                    }
+                }
+
+                WifiScanner.HotlistSettings mergedSettings = new WifiScanner.HotlistSettings();
+                mergedSettings.bssidInfos = bssidInfos;
+                mergedSettings.apLostThreshold = apLostThreshold;
+                mScannerImpl.setHotlist(mergedSettings, this);
+            }
+!!!37111223.java!!!	reportHotlistResults(in what : int, inout results : ScanResult) : void
+            if (DBG) localLog("reportHotlistResults " + what + " results " + results.length);
+            for (RequestInfo<WifiScanner.HotlistSettings> entry : mActiveHotlistSettings) {
+                ClientInfo ci = entry.clientInfo;
+                int handler = entry.handlerId;
+                WifiScanner.HotlistSettings settings = entry.settings;
+                int num_results = 0;
+                for (ScanResult result : results) {
+                    for (BssidInfo BssidInfo : settings.bssidInfos) {
+                        if (result.BSSID.equalsIgnoreCase(BssidInfo.bssid)) {
+                            num_results++;
+                            break;
+                        }
+                    }
+                }
+                if (num_results == 0) {
+                    // nothing to report
+                    return;
+                }
+                ScanResult[] results2 = new ScanResult[num_results];
+                int index = 0;
+                for (ScanResult result : results) {
+                    for (BssidInfo BssidInfo : settings.bssidInfos) {
+                        if (result.BSSID.equalsIgnoreCase(BssidInfo.bssid)) {
+                            results2[index] = result;
+                            index++;
+                        }
+                    }
+                }
+                WifiScanner.ParcelableScanResults parcelableScanResults =
+                        new WifiScanner.ParcelableScanResults(results2);
+
+                ci.reportEvent(what, 0, handler, parcelableScanResults);
+            }
+!!!37111351.java!!!	sendHotlistFailedToAllAndClear(in reason : int, inout description : String) : void
+            for (RequestInfo<WifiScanner.HotlistSettings> entry : mActiveHotlistSettings) {
+                ClientInfo ci = entry.clientInfo;
+                int handler = entry.handlerId;
+                ci.reportEvent(WifiScanner.CMD_OP_FAILED, 0, handler,
+                        new WifiScanner.OperationResult(reason, description));
+            }
+            mActiveHotlistSettings.clear();

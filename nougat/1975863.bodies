@@ -1,0 +1,535 @@
+class Camera2Handler
+!!!36199735.java!!!	Camera2Handler(inout looper : Looper)
+            super(looper);
+!!!36199863.java!!!	handleMessage(in msg : Message) : void
+            super.handleMessage(msg);
+            Log.v(TAG, "handleMessage - action = '" + CameraActions.stringify(msg.what) + "'");
+            int cameraAction = msg.what;
+            try {
+                switch (cameraAction) {
+                    case CameraActions.OPEN_CAMERA:
+                    case CameraActions.RECONNECT: {
+                        CameraOpenCallback openCallback = (CameraOpenCallback) msg.obj;
+                        int cameraIndex = msg.arg1;
+
+                        if (mCameraState.getState() > AndroidCamera2StateHolder.CAMERA_UNOPENED) {
+                            openCallback.onDeviceOpenedAlready(cameraIndex,
+                                    generateHistoryString(cameraIndex));
+                            break;
+                        }
+
+                        mOpenCallback = openCallback;
+                        mCameraIndex = cameraIndex;
+                        mCameraId = mCameraDevices.get(mCameraIndex);
+                        Log.i(TAG, String.format("Opening camera index %d (id %s) with camera2 API",
+                                cameraIndex, mCameraId));
+
+                        if (mCameraId == null) {
+                            mOpenCallback.onCameraDisabled(msg.arg1);
+                            break;
+                        }
+                        mCameraManager.openCamera(mCameraId, mCameraDeviceStateCallback, this);
+
+                        break;
+                    }
+
+                    case CameraActions.RELEASE: {
+                        if (mCameraState.getState() == AndroidCamera2StateHolder.CAMERA_UNOPENED) {
+                            Log.w(TAG, "Ignoring release at inappropriate time");
+                            break;
+                        }
+
+                        if (mSession != null) {
+                            closePreviewSession();
+                            mSession = null;
+                        }
+                        if (mCamera != null) {
+                            mCamera.close();
+                            mCamera = null;
+                        }
+                        mCameraProxy = null;
+                        mPersistentSettings = null;
+                        mActiveArray = null;
+                        if (mPreviewSurface != null) {
+                            mPreviewSurface.release();
+                            mPreviewSurface = null;
+                        }
+                        mPreviewTexture = null;
+                        if (mCaptureReader != null) {
+                            mCaptureReader.close();
+                            mCaptureReader = null;
+                        }
+                        mPreviewSize = null;
+                        mPhotoSize = null;
+                        mCameraIndex = 0;
+                        mCameraId = null;
+                        changeState(AndroidCamera2StateHolder.CAMERA_UNOPENED);
+                        break;
+                    }
+
+                    /*case CameraActions.UNLOCK: {
+                        break;
+                    }
+
+                    case CameraActions.LOCK: {
+                        break;
+                    }*/
+
+                    case CameraActions.SET_PREVIEW_TEXTURE_ASYNC: {
+                        setPreviewTexture((SurfaceTexture) msg.obj);
+                        break;
+                    }
+
+                    case CameraActions.START_PREVIEW_ASYNC: {
+                        if (mCameraState.getState() !=
+                                        AndroidCamera2StateHolder.CAMERA_PREVIEW_READY) {
+                            // TODO: Provide better feedback here?
+                            Log.w(TAG, "Refusing to start preview at inappropriate time");
+                            break;
+                        }
+
+                        mOneshotPreviewingCallback = (CameraStartPreviewCallback) msg.obj;
+                        changeState(AndroidCamera2StateHolder.CAMERA_PREVIEW_ACTIVE);
+                        try {
+                            mSession.setRepeatingRequest(
+                                    mPersistentSettings.createRequest(mCamera,
+                                            CameraDevice.TEMPLATE_PREVIEW, mPreviewSurface),
+                                    /*listener*/mCameraResultStateCallback, /*handler*/this);
+                        } catch(CameraAccessException ex) {
+                            Log.w(TAG, "Unable to start preview", ex);
+                            changeState(AndroidCamera2StateHolder.CAMERA_PREVIEW_READY);
+                        }
+                        break;
+                    }
+
+                    // FIXME: We need to tear down the CameraCaptureSession here
+                    // (and unlock the CameraSettings object from our
+                    // CameraProxy) so that the preview/photo sizes can be
+                    // changed again while no preview is running.
+                    case CameraActions.STOP_PREVIEW: {
+                        if (mCameraState.getState() <
+                                        AndroidCamera2StateHolder.CAMERA_PREVIEW_ACTIVE) {
+                            Log.w(TAG, "Refusing to stop preview at inappropriate time");
+                            break;
+                        }
+
+                        mSession.stopRepeating();
+                        changeState(AndroidCamera2StateHolder.CAMERA_PREVIEW_READY);
+                        break;
+                    }
+
+                    /*case CameraActions.SET_PREVIEW_CALLBACK_WITH_BUFFER: {
+                        break;
+                    }
+
+                    case CameraActions.ADD_CALLBACK_BUFFER: {
+                        break;
+                    }
+
+                    case CameraActions.SET_PREVIEW_DISPLAY_ASYNC: {
+                        break;
+                    }
+
+                    case CameraActions.SET_PREVIEW_CALLBACK: {
+                        break;
+                    }
+
+                    case CameraActions.SET_ONE_SHOT_PREVIEW_CALLBACK: {
+                        break;
+                    }
+
+                    case CameraActions.SET_PARAMETERS: {
+                        break;
+                    }
+
+                    case CameraActions.GET_PARAMETERS: {
+                        break;
+                    }
+
+                    case CameraActions.REFRESH_PARAMETERS: {
+                        break;
+                    }*/
+
+                    case CameraActions.APPLY_SETTINGS: {
+                        AndroidCamera2Settings settings = (AndroidCamera2Settings) msg.obj;
+                        applyToRequest(settings);
+                        break;
+                    }
+
+                    case CameraActions.AUTO_FOCUS: {
+                        if (mCancelAfPending > 0) {
+                            Log.v(TAG, "handleMessage - Ignored AUTO_FOCUS because there was "
+                                    + mCancelAfPending + " pending CANCEL_AUTO_FOCUS messages");
+                            break; // ignore AF because a CANCEL_AF is queued after this
+                        }
+                        // We only support locking the focus while a preview is being displayed.
+                        // However, it can be requested multiple times in succession; the effect of
+                        // the subsequent invocations is determined by the focus mode defined in the
+                        // provided CameraSettings object. In passive (CONTINUOUS_*) mode, the
+                        // duplicate requests are no-ops and leave the lens locked at its current
+                        // position, but in active (AUTO) mode, they perform another scan and lock
+                        // once that is finished. In any manual focus mode, this call is a no-op,
+                        // and most notably, this is the only case where the callback isn't invoked.
+                        if (mCameraState.getState() <
+                                        AndroidCamera2StateHolder.CAMERA_PREVIEW_ACTIVE) {
+                            Log.w(TAG, "Ignoring attempt to autofocus without preview");
+                            break;
+                        }
+
+                        // The earliest we can reliably tell whether the autofocus has locked in
+                        // response to our latest request is when our one-time capture progresses.
+                        // However, it will probably take longer than that, so once that happens,
+                        // just start checking the repeating preview requests as they complete.
+                        final CameraAFCallback callback = (CameraAFCallback) msg.obj;
+                        CameraCaptureSession.CaptureCallback deferredCallbackSetter =
+                                new CameraCaptureSession.CaptureCallback() {
+                            private boolean mAlreadyDispatched = false;
+
+                            @Override
+                            public void onCaptureProgressed(CameraCaptureSession session,
+                                                            CaptureRequest request,
+                                                            CaptureResult result) {
+                                checkAfState(result);
+                            }
+
+                            @Override
+                            public void onCaptureCompleted(CameraCaptureSession session,
+                                                           CaptureRequest request,
+                                                           TotalCaptureResult result) {
+                                checkAfState(result);
+                            }
+
+                            private void checkAfState(CaptureResult result) {
+                                if (result.get(CaptureResult.CONTROL_AF_STATE) != null &&
+                                        !mAlreadyDispatched) {
+                                    // Now our mCameraResultStateCallback will invoke the callback
+                                    // the first time it finds the focus motor to be locked.
+                                    mAlreadyDispatched = true;
+                                    mOneshotAfCallback = callback;
+                                    // This is an optimization: check the AF state of this frame
+                                    // instead of simply waiting for the next.
+                                    mCameraResultStateCallback.monitorControlStates(result);
+                                }
+                            }
+
+                            @Override
+                            public void onCaptureFailed(CameraCaptureSession session,
+                                                        CaptureRequest request,
+                                                        CaptureFailure failure) {
+                                Log.e(TAG, "Focusing failed with reason " + failure.getReason());
+                                callback.onAutoFocus(false, mCameraProxy);
+                            }};
+
+                        // Send a one-time capture to trigger the camera driver to lock focus.
+                        changeState(AndroidCamera2StateHolder.CAMERA_FOCUS_LOCKED);
+                        Camera2RequestSettingsSet trigger =
+                                new Camera2RequestSettingsSet(mPersistentSettings);
+                        trigger.set(CaptureRequest.CONTROL_AF_TRIGGER,
+                                CaptureRequest.CONTROL_AF_TRIGGER_START);
+                        try {
+                            mSession.capture(
+                                    trigger.createRequest(mCamera, CameraDevice.TEMPLATE_PREVIEW,
+                                            mPreviewSurface),
+                                    /*listener*/deferredCallbackSetter, /*handler*/ this);
+                        } catch(CameraAccessException ex) {
+                            Log.e(TAG, "Unable to lock autofocus", ex);
+                            changeState(AndroidCamera2StateHolder.CAMERA_PREVIEW_ACTIVE);
+                        }
+                        break;
+                    }
+
+                    case CameraActions.CANCEL_AUTO_FOCUS: {
+                        // Ignore all AFs that were already queued until we see
+                        // a CANCEL_AUTO_FOCUS_FINISH
+                        mCancelAfPending++;
+                        // Why would you want to unlock the lens if it isn't already locked?
+                        if (mCameraState.getState() <
+                                AndroidCamera2StateHolder.CAMERA_PREVIEW_ACTIVE) {
+                            Log.w(TAG, "Ignoring attempt to release focus lock without preview");
+                            break;
+                        }
+
+                        // Send a one-time capture to trigger the camera driver to resume scanning.
+                        changeState(AndroidCamera2StateHolder.CAMERA_PREVIEW_ACTIVE);
+                        Camera2RequestSettingsSet cancel =
+                                new Camera2RequestSettingsSet(mPersistentSettings);
+                        cancel.set(CaptureRequest.CONTROL_AF_TRIGGER,
+                                CaptureRequest.CONTROL_AF_TRIGGER_CANCEL);
+                        try {
+                            mSession.capture(
+                                    cancel.createRequest(mCamera, CameraDevice.TEMPLATE_PREVIEW,
+                                            mPreviewSurface),
+                                    /*listener*/null, /*handler*/this);
+                        } catch(CameraAccessException ex) {
+                            Log.e(TAG, "Unable to cancel autofocus", ex);
+                            changeState(AndroidCamera2StateHolder.CAMERA_FOCUS_LOCKED);
+                        }
+                        break;
+                    }
+
+                    case CameraActions.CANCEL_AUTO_FOCUS_FINISH: {
+                        // Stop ignoring AUTO_FOCUS messages unless there are additional
+                        // CANCEL_AUTO_FOCUSes that were added
+                        mCancelAfPending--;
+                        break;
+                    }
+
+                    case CameraActions.SET_AUTO_FOCUS_MOVE_CALLBACK: {
+                        mPassiveAfCallback = (CameraAFMoveCallback) msg.obj;
+                        break;
+                    }
+
+                    /*case CameraActions.SET_ZOOM_CHANGE_LISTENER: {
+                        break;
+                    }
+
+                    case CameraActions.SET_FACE_DETECTION_LISTENER: {
+                        break;
+                    }
+
+                    case CameraActions.START_FACE_DETECTION: {
+                        break;
+                    }
+
+                    case CameraActions.STOP_FACE_DETECTION: {
+                        break;
+                    }
+
+                    case CameraActions.SET_ERROR_CALLBACK: {
+                        break;
+                    }
+
+                    case CameraActions.ENABLE_SHUTTER_SOUND: {
+                        break;
+                    }*/
+
+                    case CameraActions.SET_DISPLAY_ORIENTATION: {
+                        // Only set the JPEG capture orientation if requested to do so; otherwise,
+                        // capture in the sensor's physical orientation. (e.g., JPEG rotation is
+                        // necessary in auto-rotate mode.
+                        mPersistentSettings.set(CaptureRequest.JPEG_ORIENTATION, msg.arg2 > 0 ?
+                                mCameraProxy.getCharacteristics().getJpegOrientation(msg.arg1) : 0);
+                        break;
+                    }
+
+                    case CameraActions.SET_JPEG_ORIENTATION: {
+                        mPersistentSettings.set(CaptureRequest.JPEG_ORIENTATION, msg.arg1);
+                        break;
+                    }
+
+                    case CameraActions.CAPTURE_PHOTO: {
+                        if (mCameraState.getState() <
+                                        AndroidCamera2StateHolder.CAMERA_PREVIEW_ACTIVE) {
+                            Log.e(TAG, "Photos may only be taken when a preview is active");
+                            break;
+                        }
+                        if (mCameraState.getState() !=
+                                AndroidCamera2StateHolder.CAMERA_FOCUS_LOCKED) {
+                            Log.w(TAG, "Taking a (likely blurry) photo without the lens locked");
+                        }
+
+                        final CaptureAvailableListener listener =
+                                (CaptureAvailableListener) msg.obj;
+                        if (mLegacyDevice ||
+                                (mCurrentAeState == CaptureResult.CONTROL_AE_STATE_CONVERGED &&
+                                !mPersistentSettings.matches(CaptureRequest.CONTROL_AE_MODE,
+                                        CaptureRequest.CONTROL_AE_MODE_ON_ALWAYS_FLASH) &&
+                                !mPersistentSettings.matches(CaptureRequest.FLASH_MODE,
+                                        CaptureRequest.FLASH_MODE_SINGLE)))
+                                {
+                            // Legacy devices don't support the precapture state keys and instead
+                            // perform autoexposure convergence automatically upon capture.
+
+                            // On other devices, as long as it has already converged, it determined
+                            // that flash was not required, and we're not going to invalidate the
+                            // current exposure levels by forcing the force on, we can save
+                            // significant capture time by not forcing a recalculation.
+                            Log.i(TAG, "Skipping pre-capture autoexposure convergence");
+                            mCaptureReader.setOnImageAvailableListener(listener, /*handler*/this);
+                            try {
+                                mSession.capture(
+                                        mPersistentSettings.createRequest(mCamera,
+                                                CameraDevice.TEMPLATE_STILL_CAPTURE,
+                                                mCaptureReader.getSurface()),
+                                        listener, /*handler*/this);
+                            } catch (CameraAccessException ex) {
+                                Log.e(TAG, "Unable to initiate immediate capture", ex);
+                            }
+                        } else {
+                            // We need to let AE converge before capturing. Once our one-time
+                            // trigger capture has made it into the pipeline, we'll start checking
+                            // for the completion of that convergence, capturing when that happens.
+                            Log.i(TAG, "Forcing pre-capture autoexposure convergence");
+                            CameraCaptureSession.CaptureCallback deferredCallbackSetter =
+                                    new CameraCaptureSession.CaptureCallback() {
+                                private boolean mAlreadyDispatched = false;
+
+                                @Override
+                                public void onCaptureProgressed(CameraCaptureSession session,
+                                                                CaptureRequest request,
+                                                                CaptureResult result) {
+                                    checkAeState(result);
+                                }
+
+                                @Override
+                                public void onCaptureCompleted(CameraCaptureSession session,
+                                                               CaptureRequest request,
+                                                               TotalCaptureResult result) {
+                                    checkAeState(result);
+                                }
+
+                                private void checkAeState(CaptureResult result) {
+                                    if (result.get(CaptureResult.CONTROL_AE_STATE) != null &&
+                                            !mAlreadyDispatched) {
+                                        // Now our mCameraResultStateCallback will invoke the
+                                        // callback once the autoexposure routine has converged.
+                                        mAlreadyDispatched = true;
+                                        mOneshotCaptureCallback = listener;
+                                        // This is an optimization: check the AE state of this frame
+                                        // instead of simply waiting for the next.
+                                        mCameraResultStateCallback.monitorControlStates(result);
+                                    }
+                                }
+
+                                @Override
+                                public void onCaptureFailed(CameraCaptureSession session,
+                                                            CaptureRequest request,
+                                                            CaptureFailure failure) {
+                                    Log.e(TAG, "Autoexposure and capture failed with reason " +
+                                            failure.getReason());
+                                    // TODO: Make an error callback?
+                                }};
+
+                            // Set a one-time capture to trigger the camera driver's autoexposure:
+                            Camera2RequestSettingsSet expose =
+                                    new Camera2RequestSettingsSet(mPersistentSettings);
+                            expose.set(CaptureRequest.CONTROL_AE_PRECAPTURE_TRIGGER,
+                                    CaptureRequest.CONTROL_AE_PRECAPTURE_TRIGGER_START);
+                            try {
+                                mSession.capture(
+                                        expose.createRequest(mCamera, CameraDevice.TEMPLATE_PREVIEW,
+                                                mPreviewSurface),
+                                        /*listener*/deferredCallbackSetter, /*handler*/this);
+                            } catch (CameraAccessException ex) {
+                                Log.e(TAG, "Unable to run autoexposure and perform capture", ex);
+                            }
+                        }
+                        break;
+                    }
+
+                    default: {
+                        // TODO: Rephrase once everything has been implemented
+                        throw new RuntimeException("Unimplemented CameraProxy message=" + msg.what);
+                    }
+                }
+            } catch (final Exception ex) {
+                if (cameraAction != CameraActions.RELEASE && mCamera != null) {
+                    // TODO: Handle this better
+                    mCamera.close();
+                    mCamera = null;
+                } else if (mCamera == null) {
+                    if (cameraAction == CameraActions.OPEN_CAMERA) {
+                        if (mOpenCallback != null) {
+                            mOpenCallback.onDeviceOpenFailure(mCameraIndex,
+                                    generateHistoryString(mCameraIndex));
+                        }
+                    } else {
+                        Log.w(TAG, "Cannot handle message " + msg.what + ", mCamera is null");
+                    }
+                    return;
+                }
+
+                if (ex instanceof RuntimeException) {
+                    String commandHistory = generateHistoryString(Integer.parseInt(mCameraId));
+                    mExceptionHandler.onCameraException((RuntimeException) ex, commandHistory,
+                            cameraAction, mCameraState.getState());
+                }
+            } finally {
+                WaitDoneBundle.unblockSyncWaiters(msg);
+            }
+!!!36199991.java!!!	buildSettings(inout caps : AndroidCamera2Capabilities) : CameraSettings
+            try {
+                return new AndroidCamera2Settings(mCamera, CameraDevice.TEMPLATE_PREVIEW,
+                        mActiveArray, mPreviewSize, mPhotoSize);
+            } catch (CameraAccessException ex) {
+                Log.e(TAG, "Unable to query camera device to build settings representation");
+                return null;
+            }
+!!!36200119.java!!!	applyToRequest(inout settings : AndroidCamera2Settings) : void
+            // TODO: If invoked when in PREVIEW_READY state, a new preview size will not take effect
+
+            mPersistentSettings.union(settings.getRequestSettings());
+            mPreviewSize = settings.getCurrentPreviewSize();
+            mPhotoSize = settings.getCurrentPhotoSize();
+
+            if (mCameraState.getState() >= AndroidCamera2StateHolder.CAMERA_PREVIEW_ACTIVE) {
+                // If we're already previewing, reflect most settings immediately
+                try {
+                    mSession.setRepeatingRequest(
+                            mPersistentSettings.createRequest(mCamera,
+                                    CameraDevice.TEMPLATE_PREVIEW, mPreviewSurface),
+                            /*listener*/mCameraResultStateCallback, /*handler*/this);
+                } catch (CameraAccessException ex) {
+                    Log.e(TAG, "Failed to apply updated request settings", ex);
+                }
+            } else if (mCameraState.getState() < AndroidCamera2StateHolder.CAMERA_PREVIEW_READY) {
+                // If we're already ready to preview, this doesn't regress our state
+                changeState(AndroidCamera2StateHolder.CAMERA_CONFIGURED);
+            }
+!!!36200247.java!!!	setPreviewTexture(inout surfaceTexture : SurfaceTexture) : void
+            // TODO: Must be called after providing a .*Settings populated with sizes
+            // TODO: We don't technically offer a selection of sizes tailored to SurfaceTextures!
+
+            // TODO: Handle this error condition with a callback or exception
+            if (mCameraState.getState() < AndroidCamera2StateHolder.CAMERA_CONFIGURED) {
+                Log.w(TAG, "Ignoring texture setting at inappropriate time");
+                return;
+            }
+
+            // Avoid initializing another capture session unless we absolutely have to
+            if (surfaceTexture == mPreviewTexture) {
+                Log.i(TAG, "Optimizing out redundant preview texture setting");
+                return;
+            }
+
+            if (mSession != null) {
+                closePreviewSession();
+            }
+
+            mPreviewTexture = surfaceTexture;
+            surfaceTexture.setDefaultBufferSize(mPreviewSize.width(), mPreviewSize.height());
+
+            if (mPreviewSurface != null) {
+                mPreviewSurface.release();
+            }
+            mPreviewSurface = new Surface(surfaceTexture);
+
+            if (mCaptureReader != null) {
+                mCaptureReader.close();
+            }
+            mCaptureReader = ImageReader.newInstance(
+                    mPhotoSize.width(), mPhotoSize.height(), ImageFormat.JPEG, 1);
+
+            try {
+                mCamera.createCaptureSession(
+                        Arrays.asList(mPreviewSurface, mCaptureReader.getSurface()),
+                        mCameraPreviewStateCallback, this);
+            } catch (CameraAccessException ex) {
+                Log.e(TAG, "Failed to create camera capture session", ex);
+            }
+!!!36200375.java!!!	closePreviewSession() : void
+            try {
+                mSession.abortCaptures();
+                mSession = null;
+            } catch (CameraAccessException ex) {
+                Log.e(TAG, "Failed to close existing camera capture session", ex);
+            }
+            changeState(AndroidCamera2StateHolder.CAMERA_CONFIGURED);
+!!!36200503.java!!!	changeState(in newState : int) : void
+            if (mCameraState.getState() != newState) {
+                mCameraState.setState(newState);
+                if (newState < AndroidCamera2StateHolder.CAMERA_PREVIEW_ACTIVE) {
+                    mCurrentAeState = CaptureResult.CONTROL_AE_STATE_INACTIVE;
+                    mCameraResultStateCallback.resetState();
+                }
+            }

@@ -1,0 +1,84 @@
+class EvaluatingState
+!!!32655159.java!!!	enter() : void
+            // If we have already started to track time spent in EvaluatingState
+            // don't reset the timer due simply to, say, commands or events that
+            // cause us to exit and re-enter EvaluatingState.
+            if (!mEvaluationTimer.isStarted()) {
+                mEvaluationTimer.start();
+            }
+            sendMessage(CMD_REEVALUATE, ++mReevaluateToken, 0);
+            if (mUidResponsibleForReeval != INVALID_UID) {
+                TrafficStats.setThreadStatsUid(mUidResponsibleForReeval);
+                mUidResponsibleForReeval = INVALID_UID;
+            }
+            mReevaluateDelayMs = INITIAL_REEVALUATE_DELAY_MS;
+            mAttempts = 0;
+!!!32655287.java!!!	processMessage(inout message : Message) : boolean
+            switch (message.what) {
+                case CMD_REEVALUATE:
+                    if (message.arg1 != mReevaluateToken || mUserDoesNotWant)
+                        return HANDLED;
+                    // Don't bother validating networks that don't satisify the default request.
+                    // This includes:
+                    //  - VPNs which can be considered explicitly desired by the user and the
+                    //    user's desire trumps whether the network validates.
+                    //  - Networks that don't provide internet access.  It's unclear how to
+                    //    validate such networks.
+                    //  - Untrusted networks.  It's unsafe to prompt the user to sign-in to
+                    //    such networks and the user didn't express interest in connecting to
+                    //    such networks (an app did) so the user may be unhappily surprised when
+                    //    asked to sign-in to a network they didn't want to connect to in the
+                    //    first place.  Validation could be done to adjust the network scores
+                    //    however these networks are app-requested and may not be intended for
+                    //    general usage, in which case general validation may not be an accurate
+                    //    measure of the network's quality.  Only the app knows how to evaluate
+                    //    the network so don't bother validating here.  Furthermore sending HTTP
+                    //    packets over the network may be undesirable, for example an extremely
+                    //    expensive metered network, or unwanted leaking of the User Agent string.
+                    if (!mDefaultRequest.networkCapabilities.satisfiedByNetworkCapabilities(
+                            mNetworkAgentInfo.networkCapabilities)) {
+                        validationLog("Network would not satisfy default request, not validating");
+                        transitionTo(mValidatedState);
+                        return HANDLED;
+                    }
+                    mAttempts++;
+                    // Note: This call to isCaptivePortal() could take up to a minute. Resolving the
+                    // server's IP addresses could hit the DNS timeout, and attempting connections
+                    // to each of the server's several IP addresses (currently one IPv4 and one
+                    // IPv6) could each take SOCKET_TIMEOUT_MS.  During this time this StateMachine
+                    // will be unresponsive. isCaptivePortal() could be executed on another Thread
+                    // if this is found to cause problems.
+                    CaptivePortalProbeResult probeResult = isCaptivePortal();
+                    if (probeResult.isSuccessful()) {
+                        transitionTo(mValidatedState);
+                    } else if (probeResult.isPortal()) {
+                        mConnectivityServiceHandler.sendMessage(obtainMessage(EVENT_NETWORK_TESTED,
+                                NETWORK_TEST_RESULT_INVALID, mNetId, probeResult.mRedirectUrl));
+                        transitionTo(mCaptivePortalState);
+                    } else {
+                        final Message msg = obtainMessage(CMD_REEVALUATE, ++mReevaluateToken, 0);
+                        sendMessageDelayed(msg, mReevaluateDelayMs);
+                        NetworkEvent.logEvent(mNetId, NetworkEvent.NETWORK_VALIDATION_FAILED);
+                        mConnectivityServiceHandler.sendMessage(obtainMessage(
+                                EVENT_NETWORK_TESTED, NETWORK_TEST_RESULT_INVALID, mNetId,
+                                probeResult.mRedirectUrl));
+                        if (mAttempts >= BLAME_FOR_EVALUATION_ATTEMPTS) {
+                            // Don't continue to blame UID forever.
+                            TrafficStats.clearThreadStatsUid();
+                        }
+                        mReevaluateDelayMs *= 2;
+                        if (mReevaluateDelayMs > MAX_REEVALUATE_DELAY_MS) {
+                            mReevaluateDelayMs = MAX_REEVALUATE_DELAY_MS;
+                        }
+                    }
+                    return HANDLED;
+                case CMD_FORCE_REEVALUATION:
+                    // Before IGNORE_REEVALUATE_ATTEMPTS attempts are made,
+                    // ignore any re-evaluation requests. After, restart the
+                    // evaluation process via EvaluatingState#enter.
+                    return (mAttempts < IGNORE_REEVALUATE_ATTEMPTS) ? HANDLED : NOT_HANDLED;
+                default:
+                    return NOT_HANDLED;
+            }
+!!!32655415.java!!!	exit() : void
+            TrafficStats.clearThreadStatsUid();

@@ -1,0 +1,238 @@
+class P2pEnabledState
+!!!37064375.java!!!	enter() : void
+            if (DBG) logd(getName());
+            sendP2pStateChangedBroadcast(true);
+            mNetworkInfo.setIsAvailable(true);
+            sendP2pConnectionChangedBroadcast();
+            initializeP2pSettings();
+!!!37064503.java!!!	processMessage(inout message : Message) : boolean
+            if (DBG) logd(getName() + message.toString());
+            switch (message.what) {
+                case WifiMonitor.SUP_DISCONNECTION_EVENT:
+                    loge("Unexpected loss of p2p socket connection");
+                    transitionTo(mP2pDisabledState);
+                    break;
+                case WifiStateMachine.CMD_ENABLE_P2P:
+                    //Nothing to do
+                    break;
+                case WifiStateMachine.CMD_DISABLE_P2P_REQ:
+                    if (mPeers.clear()) {
+                        sendPeersChangedBroadcast();
+                    }
+                    if (mGroups.clear()) sendP2pPersistentGroupsChangedBroadcast();
+
+                    mWifiMonitor.stopMonitoring(mWifiNative.getInterfaceName());
+                    transitionTo(mP2pDisablingState);
+                    break;
+                case WifiP2pManager.SET_DEVICE_NAME:
+                {
+                    WifiP2pDevice d = (WifiP2pDevice) message.obj;
+                    if (d != null && setAndPersistDeviceName(d.deviceName)) {
+                        if (DBG) logd("set device name " + d.deviceName);
+                        replyToMessage(message, WifiP2pManager.SET_DEVICE_NAME_SUCCEEDED);
+                    } else {
+                        replyToMessage(message, WifiP2pManager.SET_DEVICE_NAME_FAILED,
+                                WifiP2pManager.ERROR);
+                    }
+                    break;
+                }
+                case WifiP2pManager.SET_WFD_INFO:
+                {
+                    WifiP2pWfdInfo d = (WifiP2pWfdInfo) message.obj;
+                    if (d != null && setWfdInfo(d)) {
+                        replyToMessage(message, WifiP2pManager.SET_WFD_INFO_SUCCEEDED);
+                    } else {
+                        replyToMessage(message, WifiP2pManager.SET_WFD_INFO_FAILED,
+                                WifiP2pManager.ERROR);
+                    }
+                    break;
+                }
+                case BLOCK_DISCOVERY:
+                    boolean blocked = (message.arg1 == ENABLED ? true : false);
+                    if (mDiscoveryBlocked == blocked) break;
+                    mDiscoveryBlocked = blocked;
+                    if (blocked && mDiscoveryStarted) {
+                        mWifiNative.p2pStopFind();
+                        mDiscoveryPostponed = true;
+                    }
+                    if (!blocked && mDiscoveryPostponed) {
+                        mDiscoveryPostponed = false;
+                        mWifiNative.p2pFind(DISCOVER_TIMEOUT_S);
+                    }
+                    if (blocked) {
+                        try {
+                            StateMachine m = (StateMachine)message.obj;
+                            m.sendMessage(message.arg2);
+                        } catch (Exception e) {
+                            loge("unable to send BLOCK_DISCOVERY response: " + e);
+                        }
+                    }
+                    break;
+                case WifiP2pManager.DISCOVER_PEERS:
+                    if (mDiscoveryBlocked) {
+                        replyToMessage(message, WifiP2pManager.DISCOVER_PEERS_FAILED,
+                                WifiP2pManager.BUSY);
+                        break;
+                    }
+                    // do not send service discovery request while normal find operation.
+                    clearSupplicantServiceRequest();
+                    if (mWifiNative.p2pFind(DISCOVER_TIMEOUT_S)) {
+                        replyToMessage(message, WifiP2pManager.DISCOVER_PEERS_SUCCEEDED);
+                        sendP2pDiscoveryChangedBroadcast(true);
+                    } else {
+                        replyToMessage(message, WifiP2pManager.DISCOVER_PEERS_FAILED,
+                                WifiP2pManager.ERROR);
+                    }
+                    break;
+                case WifiMonitor.P2P_FIND_STOPPED_EVENT:
+                    sendP2pDiscoveryChangedBroadcast(false);
+                    break;
+                case WifiP2pManager.STOP_DISCOVERY:
+                    if (mWifiNative.p2pStopFind()) {
+                        replyToMessage(message, WifiP2pManager.STOP_DISCOVERY_SUCCEEDED);
+                    } else {
+                        replyToMessage(message, WifiP2pManager.STOP_DISCOVERY_FAILED,
+                                WifiP2pManager.ERROR);
+                    }
+                    break;
+                case WifiP2pManager.DISCOVER_SERVICES:
+                    if (mDiscoveryBlocked) {
+                        replyToMessage(message, WifiP2pManager.DISCOVER_SERVICES_FAILED,
+                                WifiP2pManager.BUSY);
+                        break;
+                    }
+                    if (DBG) logd(getName() + " discover services");
+                    if (!updateSupplicantServiceRequest()) {
+                        replyToMessage(message, WifiP2pManager.DISCOVER_SERVICES_FAILED,
+                                WifiP2pManager.NO_SERVICE_REQUESTS);
+                        break;
+                    }
+                    if (mWifiNative.p2pFind(DISCOVER_TIMEOUT_S)) {
+                        replyToMessage(message, WifiP2pManager.DISCOVER_SERVICES_SUCCEEDED);
+                    } else {
+                        replyToMessage(message, WifiP2pManager.DISCOVER_SERVICES_FAILED,
+                                WifiP2pManager.ERROR);
+                    }
+                    break;
+                case WifiMonitor.P2P_DEVICE_FOUND_EVENT:
+                    WifiP2pDevice device = (WifiP2pDevice) message.obj;
+                    if (mThisDevice.deviceAddress.equals(device.deviceAddress)) break;
+                    mPeers.updateSupplicantDetails(device);
+                    sendPeersChangedBroadcast();
+                    break;
+                case WifiMonitor.P2P_DEVICE_LOST_EVENT:
+                    device = (WifiP2pDevice) message.obj;
+                    // Gets current details for the one removed
+                    device = mPeers.remove(device.deviceAddress);
+                    if (device != null) {
+                        sendPeersChangedBroadcast();
+                    }
+                    break;
+                case WifiP2pManager.ADD_LOCAL_SERVICE:
+                    if (DBG) logd(getName() + " add service");
+                    WifiP2pServiceInfo servInfo = (WifiP2pServiceInfo)message.obj;
+                    if (addLocalService(message.replyTo, servInfo)) {
+                        replyToMessage(message, WifiP2pManager.ADD_LOCAL_SERVICE_SUCCEEDED);
+                    } else {
+                        replyToMessage(message, WifiP2pManager.ADD_LOCAL_SERVICE_FAILED);
+                    }
+                    break;
+                case WifiP2pManager.REMOVE_LOCAL_SERVICE:
+                    if (DBG) logd(getName() + " remove service");
+                    servInfo = (WifiP2pServiceInfo)message.obj;
+                    removeLocalService(message.replyTo, servInfo);
+                    replyToMessage(message, WifiP2pManager.REMOVE_LOCAL_SERVICE_SUCCEEDED);
+                    break;
+                case WifiP2pManager.CLEAR_LOCAL_SERVICES:
+                    if (DBG) logd(getName() + " clear service");
+                    clearLocalServices(message.replyTo);
+                    replyToMessage(message, WifiP2pManager.CLEAR_LOCAL_SERVICES_SUCCEEDED);
+                    break;
+                case WifiP2pManager.ADD_SERVICE_REQUEST:
+                    if (DBG) logd(getName() + " add service request");
+                    if (!addServiceRequest(message.replyTo, (WifiP2pServiceRequest)message.obj)) {
+                        replyToMessage(message, WifiP2pManager.ADD_SERVICE_REQUEST_FAILED);
+                        break;
+                    }
+                    replyToMessage(message, WifiP2pManager.ADD_SERVICE_REQUEST_SUCCEEDED);
+                    break;
+                case WifiP2pManager.REMOVE_SERVICE_REQUEST:
+                    if (DBG) logd(getName() + " remove service request");
+                    removeServiceRequest(message.replyTo, (WifiP2pServiceRequest)message.obj);
+                    replyToMessage(message, WifiP2pManager.REMOVE_SERVICE_REQUEST_SUCCEEDED);
+                    break;
+                case WifiP2pManager.CLEAR_SERVICE_REQUESTS:
+                    if (DBG) logd(getName() + " clear service request");
+                    clearServiceRequests(message.replyTo);
+                    replyToMessage(message, WifiP2pManager.CLEAR_SERVICE_REQUESTS_SUCCEEDED);
+                    break;
+                case WifiMonitor.P2P_SERV_DISC_RESP_EVENT:
+                    if (DBG) logd(getName() + " receive service response");
+                    List<WifiP2pServiceResponse> sdRespList =
+                        (List<WifiP2pServiceResponse>) message.obj;
+                    for (WifiP2pServiceResponse resp : sdRespList) {
+                        WifiP2pDevice dev =
+                            mPeers.get(resp.getSrcDevice().deviceAddress);
+                        resp.setSrcDevice(dev);
+                        sendServiceResponse(resp);
+                    }
+                    break;
+                case WifiP2pManager.DELETE_PERSISTENT_GROUP:
+                   if (DBG) logd(getName() + " delete persistent group");
+                   mGroups.remove(message.arg1);
+                   replyToMessage(message, WifiP2pManager.DELETE_PERSISTENT_GROUP_SUCCEEDED);
+                   break;
+                case SET_MIRACAST_MODE:
+                    mWifiNative.setMiracastMode(message.arg1);
+                    break;
+                case WifiP2pManager.START_LISTEN:
+                    if (DBG) logd(getName() + " start listen mode");
+                    mWifiNative.p2pFlush();
+                    if (mWifiNative.p2pExtListen(true, 500, 500)) {
+                        replyToMessage(message, WifiP2pManager.START_LISTEN_SUCCEEDED);
+                    } else {
+                        replyToMessage(message, WifiP2pManager.START_LISTEN_FAILED);
+                    }
+                    break;
+                case WifiP2pManager.STOP_LISTEN:
+                    if (DBG) logd(getName() + " stop listen mode");
+                    if (mWifiNative.p2pExtListen(false, 0, 0)) {
+                        replyToMessage(message, WifiP2pManager.STOP_LISTEN_SUCCEEDED);
+                    } else {
+                        replyToMessage(message, WifiP2pManager.STOP_LISTEN_FAILED);
+                    }
+                    mWifiNative.p2pFlush();
+                    break;
+                case WifiP2pManager.SET_CHANNEL:
+                    Bundle p2pChannels = (Bundle) message.obj;
+                    int lc = p2pChannels.getInt("lc", 0);
+                    int oc = p2pChannels.getInt("oc", 0);
+                    if (DBG) logd(getName() + " set listen and operating channel");
+                    if (mWifiNative.p2pSetChannel(lc, oc)) {
+                        replyToMessage(message, WifiP2pManager.SET_CHANNEL_SUCCEEDED);
+                    } else {
+                        replyToMessage(message, WifiP2pManager.SET_CHANNEL_FAILED);
+                    }
+                    break;
+                case WifiP2pManager.GET_HANDOVER_REQUEST:
+                    Bundle requestBundle = new Bundle();
+                    requestBundle.putString(WifiP2pManager.EXTRA_HANDOVER_MESSAGE,
+                            mWifiNative.getNfcHandoverRequest());
+                    replyToMessage(message, WifiP2pManager.RESPONSE_GET_HANDOVER_MESSAGE,
+                            requestBundle);
+                    break;
+                case WifiP2pManager.GET_HANDOVER_SELECT:
+                    Bundle selectBundle = new Bundle();
+                    selectBundle.putString(WifiP2pManager.EXTRA_HANDOVER_MESSAGE,
+                            mWifiNative.getNfcHandoverSelect());
+                    replyToMessage(message, WifiP2pManager.RESPONSE_GET_HANDOVER_MESSAGE,
+                            selectBundle);
+                    break;
+                default:
+                   return NOT_HANDLED;
+            }
+            return HANDLED;
+!!!37064631.java!!!	exit() : void
+            sendP2pDiscoveryChangedBroadcast(false);
+            sendP2pStateChangedBroadcast(false);
+            mNetworkInfo.setIsAvailable(false);

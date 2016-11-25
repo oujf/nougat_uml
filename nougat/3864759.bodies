@@ -1,0 +1,275 @@
+class Watchdog
+!!!41528631.java!!!	getInstance() : Watchdog
+        if (sWatchdog == null) {
+            sWatchdog = new Watchdog();
+        }
+
+        return sWatchdog;
+!!!41528759.java!!!	Watchdog()
+        super("watchdog");
+        // Initialize handler checkers for each common thread we want to check.  Note
+        // that we are not currently checking the background thread, since it can
+        // potentially hold longer running operations with no guarantees about the timeliness
+        // of operations there.
+
+        // The shared foreground thread is the main checker.  It is where we
+        // will also dispatch monitor checks and do other work.
+        mMonitorChecker = new HandlerChecker(FgThread.getHandler(),
+                "foreground thread", DEFAULT_TIMEOUT);
+        mHandlerCheckers.add(mMonitorChecker);
+        // Add checker for main thread.  We only do a quick check since there
+        // can be UI running on the thread.
+        mHandlerCheckers.add(new HandlerChecker(new Handler(Looper.getMainLooper()),
+                "main thread", DEFAULT_TIMEOUT));
+        // Add checker for shared UI thread.
+        mHandlerCheckers.add(new HandlerChecker(UiThread.getHandler(),
+                "ui thread", DEFAULT_TIMEOUT));
+        // And also check IO thread.
+        mHandlerCheckers.add(new HandlerChecker(IoThread.getHandler(),
+                "i/o thread", DEFAULT_TIMEOUT));
+        // And the display thread.
+        mHandlerCheckers.add(new HandlerChecker(DisplayThread.getHandler(),
+                "display thread", DEFAULT_TIMEOUT));
+
+        // Initialize monitor for Binder threads.
+        addMonitor(new BinderThreadMonitor());
+!!!41528887.java!!!	init(inout context : Context, inout activity : ActivityManagerService) : void
+        mResolver = context.getContentResolver();
+        mActivity = activity;
+
+        context.registerReceiver(new RebootRequestReceiver(),
+                new IntentFilter(Intent.ACTION_REBOOT),
+                android.Manifest.permission.REBOOT, null);
+!!!41529015.java!!!	processStarted(inout name : String, in pid : int) : void
+        synchronized (this) {
+            if ("com.android.phone".equals(name)) {
+                mPhonePid = pid;
+            }
+        }
+!!!41529143.java!!!	setActivityController(inout controller : IActivityController) : void
+        synchronized (this) {
+            mController = controller;
+        }
+!!!41529271.java!!!	setAllowRestart(inout allowRestart : boolean) : void
+        synchronized (this) {
+            mAllowRestart = allowRestart;
+        }
+!!!41529399.java!!!	addMonitor(inout monitor : Watchdog::Monitor) : void
+        synchronized (this) {
+            if (isAlive()) {
+                throw new RuntimeException("Monitors can't be added once the Watchdog is running");
+            }
+            mMonitorChecker.addMonitor(monitor);
+        }
+!!!41529527.java!!!	addThread(inout thread : Handler) : void
+        addThread(thread, DEFAULT_TIMEOUT);
+!!!41529655.java!!!	addThread(inout thread : Handler, in timeoutMillis : long) : void
+        synchronized (this) {
+            if (isAlive()) {
+                throw new RuntimeException("Threads can't be added once the Watchdog is running");
+            }
+            final String name = thread.getLooper().getThread().getName();
+            mHandlerCheckers.add(new HandlerChecker(thread, name, timeoutMillis));
+        }
+!!!41529783.java!!!	rebootSystem(inout reason : String) : void
+        Slog.i(TAG, "Rebooting system because: " + reason);
+        IPowerManager pms = (IPowerManager)ServiceManager.getService(Context.POWER_SERVICE);
+        try {
+            pms.reboot(false, reason, false);
+        } catch (RemoteException ex) {
+        }
+!!!41529911.java!!!	evaluateCheckerCompletionLocked() : int
+        int state = COMPLETED;
+        for (int i=0; i<mHandlerCheckers.size(); i++) {
+            HandlerChecker hc = mHandlerCheckers.get(i);
+            state = Math.max(state, hc.getCompletionStateLocked());
+        }
+        return state;
+!!!41530039.java!!!	getBlockedCheckersLocked() : Watchdog::HandlerChecker
+        ArrayList<HandlerChecker> checkers = new ArrayList<HandlerChecker>();
+        for (int i=0; i<mHandlerCheckers.size(); i++) {
+            HandlerChecker hc = mHandlerCheckers.get(i);
+            if (hc.isOverdueLocked()) {
+                checkers.add(hc);
+            }
+        }
+        return checkers;
+!!!41530167.java!!!	describeCheckersLocked(inout checkers : ArrayList<HandlerChecker>) : String
+        StringBuilder builder = new StringBuilder(128);
+        for (int i=0; i<checkers.size(); i++) {
+            if (builder.length() > 0) {
+                builder.append(", ");
+            }
+            builder.append(checkers.get(i).describeBlockedStateLocked());
+        }
+        return builder.toString();
+!!!41530295.java!!!	run() : void
+        boolean waitedHalf = false;
+        while (true) {
+            final ArrayList<HandlerChecker> blockedCheckers;
+            final String subject;
+            final boolean allowRestart;
+            int debuggerWasConnected = 0;
+            synchronized (this) {
+                long timeout = CHECK_INTERVAL;
+                // Make sure we (re)spin the checkers that have become idle within
+                // this wait-and-check interval
+                for (int i=0; i<mHandlerCheckers.size(); i++) {
+                    HandlerChecker hc = mHandlerCheckers.get(i);
+                    hc.scheduleCheckLocked();
+                }
+
+                if (debuggerWasConnected > 0) {
+                    debuggerWasConnected--;
+                }
+
+                // NOTE: We use uptimeMillis() here because we do not want to increment the time we
+                // wait while asleep. If the device is asleep then the thing that we are waiting
+                // to timeout on is asleep as well and won't have a chance to run, causing a false
+                // positive on when to kill things.
+                long start = SystemClock.uptimeMillis();
+                while (timeout > 0) {
+                    if (Debug.isDebuggerConnected()) {
+                        debuggerWasConnected = 2;
+                    }
+                    try {
+                        wait(timeout);
+                    } catch (InterruptedException e) {
+                        Log.wtf(TAG, e);
+                    }
+                    if (Debug.isDebuggerConnected()) {
+                        debuggerWasConnected = 2;
+                    }
+                    timeout = CHECK_INTERVAL - (SystemClock.uptimeMillis() - start);
+                }
+
+                final int waitState = evaluateCheckerCompletionLocked();
+                if (waitState == COMPLETED) {
+                    // The monitors have returned; reset
+                    waitedHalf = false;
+                    continue;
+                } else if (waitState == WAITING) {
+                    // still waiting but within their configured intervals; back off and recheck
+                    continue;
+                } else if (waitState == WAITED_HALF) {
+                    if (!waitedHalf) {
+                        // We've waited half the deadlock-detection interval.  Pull a stack
+                        // trace and wait another half.
+                        ArrayList<Integer> pids = new ArrayList<Integer>();
+                        pids.add(Process.myPid());
+                        ActivityManagerService.dumpStackTraces(true, pids, null, null,
+                                NATIVE_STACKS_OF_INTEREST);
+                        waitedHalf = true;
+                    }
+                    continue;
+                }
+
+                // something is overdue!
+                blockedCheckers = getBlockedCheckersLocked();
+                subject = describeCheckersLocked(blockedCheckers);
+                allowRestart = mAllowRestart;
+            }
+
+            // If we got here, that means that the system is most likely hung.
+            // First collect stack traces from all threads of the system process.
+            // Then kill this process so that the system will restart.
+            EventLog.writeEvent(EventLogTags.WATCHDOG, subject);
+
+            ArrayList<Integer> pids = new ArrayList<Integer>();
+            pids.add(Process.myPid());
+            if (mPhonePid > 0) pids.add(mPhonePid);
+            // Pass !waitedHalf so that just in case we somehow wind up here without having
+            // dumped the halfway stacks, we properly re-initialize the trace file.
+            final File stack = ActivityManagerService.dumpStackTraces(
+                    !waitedHalf, pids, null, null, NATIVE_STACKS_OF_INTEREST);
+
+            // Give some extra time to make sure the stack traces get written.
+            // The system's been hanging for a minute, another second or two won't hurt much.
+            SystemClock.sleep(2000);
+
+            // Pull our own kernel thread stacks as well if we're configured for that
+            if (RECORD_KERNEL_THREADS) {
+                dumpKernelStackTraces();
+            }
+
+            // Trigger the kernel to dump all blocked threads, and backtraces on all CPUs to the kernel log
+            doSysRq('w');
+            doSysRq('l');
+
+            // Try to add the error to the dropbox, but assuming that the ActivityManager
+            // itself may be deadlocked.  (which has happened, causing this statement to
+            // deadlock and the watchdog as a whole to be ineffective)
+            Thread dropboxThread = new Thread("watchdogWriteToDropbox") {
+                    public void run() {
+                        mActivity.addErrorToDropBox(
+                                "watchdog", null, "system_server", null, null,
+                                subject, null, stack, null);
+                    }
+                };
+            dropboxThread.start();
+            try {
+                dropboxThread.join(2000);  // wait up to 2 seconds for it to return.
+            } catch (InterruptedException ignored) {}
+
+            IActivityController controller;
+            synchronized (this) {
+                controller = mController;
+            }
+            if (controller != null) {
+                Slog.i(TAG, "Reporting stuck state to activity controller");
+                try {
+                    Binder.setDumpDisabled("Service dumps disabled due to hung system process.");
+                    // 1 = keep waiting, -1 = kill system
+                    int res = controller.systemNotResponding(subject);
+                    if (res >= 0) {
+                        Slog.i(TAG, "Activity controller requested to coninue to wait");
+                        waitedHalf = false;
+                        continue;
+                    }
+                } catch (RemoteException e) {
+                }
+            }
+
+            // Only kill the process if the debugger is not attached.
+            if (Debug.isDebuggerConnected()) {
+                debuggerWasConnected = 2;
+            }
+            if (debuggerWasConnected >= 2) {
+                Slog.w(TAG, "Debugger connected: Watchdog is *not* killing the system process");
+            } else if (debuggerWasConnected > 0) {
+                Slog.w(TAG, "Debugger was connected: Watchdog is *not* killing the system process");
+            } else if (!allowRestart) {
+                Slog.w(TAG, "Restart not allowed: Watchdog is *not* killing the system process");
+            } else {
+                Slog.w(TAG, "*** WATCHDOG KILLING SYSTEM PROCESS: " + subject);
+                for (int i=0; i<blockedCheckers.size(); i++) {
+                    Slog.w(TAG, blockedCheckers.get(i).getName() + " stack trace:");
+                    StackTraceElement[] stackTrace
+                            = blockedCheckers.get(i).getThread().getStackTrace();
+                    for (StackTraceElement element: stackTrace) {
+                        Slog.w(TAG, "    at " + element);
+                    }
+                }
+                Slog.w(TAG, "*** GOODBYE!");
+                Process.killProcess(Process.myPid());
+                System.exit(10);
+            }
+
+            waitedHalf = false;
+        }
+!!!41530423.java!!!	doSysRq(in c : char) : void
+        try {
+            FileWriter sysrq_trigger = new FileWriter("/proc/sysrq-trigger");
+            sysrq_trigger.write(c);
+            sysrq_trigger.close();
+        } catch (IOException e) {
+            Slog.w(TAG, "Failed to write to /proc/sysrq-trigger", e);
+        }
+!!!41530551.java!!!	dumpKernelStackTraces() : File
+        String tracesPath = SystemProperties.get("dalvik.vm.stack-trace-file", null);
+        if (tracesPath == null || tracesPath.length() == 0) {
+            return null;
+        }
+
+        native_dumpKernelStacks(tracesPath);
+        return new File(tracesPath);

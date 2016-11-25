@@ -1,0 +1,153 @@
+class WifiSingleScanStateMachine
+!!!37105207.java!!!	WifiSingleScanStateMachine(inout looper : Looper)
+            super("WifiSingleScanStateMachine", looper);
+
+            setLogRecSize(128);
+            setLogOnlyTransitions(false);
+
+            // CHECKSTYLE:OFF IndentationCheck
+            addState(mDefaultState);
+                addState(mDriverStartedState, mDefaultState);
+                    addState(mIdleState, mDriverStartedState);
+                    addState(mScanningState, mDriverStartedState);
+            // CHECKSTYLE:ON IndentationCheck
+
+            setInitialState(mDefaultState);
+!!!37105335.java!!!	onScanStatus(in event : int) : void
+            if (DBG) localLog("onScanStatus event received, event=" + event);
+            switch(event) {
+                case WifiNative.WIFI_SCAN_RESULTS_AVAILABLE:
+                case WifiNative.WIFI_SCAN_THRESHOLD_NUM_SCANS:
+                case WifiNative.WIFI_SCAN_THRESHOLD_PERCENT:
+                    sendMessage(CMD_SCAN_RESULTS_AVAILABLE);
+                    break;
+                case WifiNative.WIFI_SCAN_FAILED:
+                    sendMessage(CMD_SCAN_FAILED);
+                    break;
+                default:
+                    Log.e(TAG, "Unknown scan status event: " + event);
+                    break;
+            }
+!!!37105463.java!!!	onFullScanResult(inout fullScanResult : ScanResult, in bucketsScanned : int) : void
+            if (DBG) localLog("onFullScanResult received");
+            sendMessage(CMD_FULL_SCAN_RESULTS, 0, bucketsScanned, fullScanResult);
+!!!37105591.java!!!	onScanPaused(inout scanData : WifiScanner::ScanData) : void
+            // should not happen for single scan
+            Log.e(TAG, "Got scan paused for single scan");
+!!!37105719.java!!!	onScanRestarted() : void
+            // should not happen for single scan
+            Log.e(TAG, "Got scan restarted for single scan");
+!!!37106999.java!!!	validateAndAddToScanQueue(inout ci : WifiScanningServiceImpl::ClientInfo, in handler : int, inout settings : WifiScanner::ScanSettings, inout workSource : WorkSource) : boolean
+            if (ci == null) {
+                Log.d(TAG, "Failing single scan request ClientInfo not found " + handler);
+                return false;
+            }
+            if (settings.band == WifiScanner.WIFI_BAND_UNSPECIFIED) {
+                if (settings.channels == null || settings.channels.length == 0) {
+                    Log.d(TAG, "Failing single scan because channel list was empty");
+                    return false;
+                }
+            }
+            logScanRequest("addSingleScanRequest", ci, handler, workSource, settings, null);
+            mPendingScans.addRequest(ci, handler, workSource, settings);
+            return true;
+!!!37107127.java!!!	removeSingleScanRequest(inout ci : WifiScanningServiceImpl::ClientInfo, in handler : int) : void
+            if (ci != null) {
+                logScanRequest("removeSingleScanRequest", ci, handler, null, null, null);
+                mPendingScans.removeRequest(ci, handler);
+                mActiveScans.removeRequest(ci, handler);
+            }
+!!!37107255.java!!!	removeSingleScanRequests(inout ci : WifiScanningServiceImpl::ClientInfo) : void
+            if (ci != null) {
+                logScanRequest("removeSingleScanRequests", ci, -1, null, null, null);
+                mPendingScans.removeAllForClient(ci);
+                mActiveScans.removeAllForClient(ci);
+            }
+!!!37107383.java!!!	tryToStartNewScan() : void
+            if (mPendingScans.size() == 0) { // no pending requests
+                return;
+            }
+            mChannelHelper.updateChannels();
+            // TODO move merging logic to a scheduler
+            WifiNative.ScanSettings settings = new WifiNative.ScanSettings();
+            settings.num_buckets = 1;
+            WifiNative.BucketSettings bucketSettings = new WifiNative.BucketSettings();
+            bucketSettings.bucket = 0;
+            bucketSettings.period_ms = 0;
+            bucketSettings.report_events = WifiScanner.REPORT_EVENT_AFTER_EACH_SCAN;
+
+            ChannelCollection channels = mChannelHelper.createChannelCollection();
+            HashSet<Integer> hiddenNetworkIdSet = new HashSet<>();
+            for (RequestInfo<ScanSettings> entry : mPendingScans) {
+                channels.addChannels(entry.settings);
+                if (entry.settings.hiddenNetworkIds != null) {
+                    for (int i = 0; i < entry.settings.hiddenNetworkIds.length; i++) {
+                        hiddenNetworkIdSet.add(entry.settings.hiddenNetworkIds[i]);
+                    }
+                }
+                if ((entry.settings.reportEvents & WifiScanner.REPORT_EVENT_FULL_SCAN_RESULT)
+                        != 0) {
+                    bucketSettings.report_events |= WifiScanner.REPORT_EVENT_FULL_SCAN_RESULT;
+                }
+            }
+            if (hiddenNetworkIdSet.size() > 0) {
+                settings.hiddenNetworkIds = new int[hiddenNetworkIdSet.size()];
+                int numHiddenNetworks = 0;
+                for (Integer hiddenNetworkId : hiddenNetworkIdSet) {
+                    settings.hiddenNetworkIds[numHiddenNetworks++] = hiddenNetworkId;
+                }
+            }
+
+            channels.fillBucketSettings(bucketSettings, Integer.MAX_VALUE);
+
+            settings.buckets = new WifiNative.BucketSettings[] {bucketSettings};
+            if (mScannerImpl.startSingleScan(settings, this)) {
+                // swap pending and active scan requests
+                RequestList<ScanSettings> tmp = mActiveScans;
+                mActiveScans = mPendingScans;
+                mPendingScans = tmp;
+                // make sure that the pending list is clear
+                mPendingScans.clear();
+                transitionTo(mScanningState);
+            } else {
+                mWifiMetrics.incrementScanReturnEntry(
+                        WifiMetricsProto.WifiLog.SCAN_UNKNOWN, mPendingScans.size());
+                // notify and cancel failed scans
+                sendOpFailedToAllAndClear(mPendingScans, WifiScanner.REASON_UNSPECIFIED,
+                        "Failed to start single scan");
+            }
+!!!37107511.java!!!	sendOpFailedToAllAndClear(inout clientHandlers : WifiScanningServiceImpl::RequestList, in reason : int, inout description : String) : void
+            for (RequestInfo<?> entry : clientHandlers) {
+                logCallback("singleScanFailed",  entry.clientInfo, entry.handlerId,
+                        "reason=" + reason + ", " + description);
+                entry.reportEvent(WifiScanner.CMD_OP_FAILED, 0,
+                        new WifiScanner.OperationResult(reason, description));
+            }
+            clientHandlers.clear();
+!!!37107639.java!!!	reportFullScanResult(inout result : ScanResult, in bucketsScanned : int) : void
+            for (RequestInfo<ScanSettings> entry : mActiveScans) {
+                if (ScanScheduleUtil.shouldReportFullScanResultForSettings(mChannelHelper,
+                                result, bucketsScanned, entry.settings, -1)) {
+                    entry.reportEvent(WifiScanner.CMD_FULL_SCAN_RESULT, 0, result);
+                }
+            }
+!!!37107767.java!!!	reportScanResults(inout results : WifiScanner::ScanData) : void
+            if (results != null && results.getResults() != null) {
+                if (results.getResults().length > 0) {
+                    mWifiMetrics.incrementNonEmptyScanResultCount();
+                } else {
+                    mWifiMetrics.incrementEmptyScanResultCount();
+                }
+            }
+            for (RequestInfo<ScanSettings> entry : mActiveScans) {
+                ScanData[] resultsArray = new ScanData[] {results};
+                ScanData[] resultsToDeliver = ScanScheduleUtil.filterResultsForSettings(
+                        mChannelHelper, resultsArray, entry.settings, -1);
+                WifiScanner.ParcelableScanData parcelableScanData =
+                        new WifiScanner.ParcelableScanData(resultsToDeliver);
+                logCallback("singleScanResults",  entry.clientInfo, entry.handlerId,
+                        describeForLog(resultsToDeliver));
+                entry.reportEvent(WifiScanner.CMD_SCAN_RESULT, 0, parcelableScanData);
+                // make sure the handler is removed
+                entry.reportEvent(WifiScanner.CMD_SINGLE_SCAN_COMPLETED, 0, null);
+            }

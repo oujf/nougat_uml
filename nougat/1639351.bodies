@@ -1,0 +1,181 @@
+class Device
+!!!33920567.java!!!	Device(inout server : IMidiDeviceServer, inout deviceInfo : MidiDeviceInfo, inout serviceInfo : ServiceInfo, in uid : int)
+            mDeviceInfo = deviceInfo;
+            mServiceInfo = serviceInfo;
+            mUid = uid;
+            mBluetoothDevice = (BluetoothDevice)deviceInfo.getProperties().getParcelable(
+                    MidiDeviceInfo.PROPERTY_BLUETOOTH_DEVICE);;
+            setDeviceServer(server);
+!!!33920695.java!!!	Device(inout bluetoothDevice : BluetoothDevice)
+            mBluetoothDevice = bluetoothDevice;
+            mServiceInfo = null;
+            mUid = mBluetoothServiceUid;
+!!!33920823.java!!!	setDeviceServer(inout server : IMidiDeviceServer) : void
+            if (server != null) {
+                if (mServer != null) {
+                    Log.e(TAG, "mServer already set in setDeviceServer");
+                    return;
+                }
+                IBinder binder = server.asBinder();
+                try {
+                    if (mDeviceInfo == null) {
+                        mDeviceInfo = server.getDeviceInfo();
+                    }
+                    binder.linkToDeath(this, 0);
+                    mServer = server;
+                } catch (RemoteException e) {
+                    mServer = null;
+                    return;
+                }
+                mDevicesByServer.put(binder, this);
+            } else if (mServer != null) {
+                server = mServer;
+                mServer = null;
+
+                IBinder binder = server.asBinder();
+                mDevicesByServer.remove(binder);
+
+                try {
+                    server.closeDevice();
+                    binder.unlinkToDeath(this, 0);
+                } catch (RemoteException e) {
+                    // nothing to do here
+                }
+            }
+
+            if (mDeviceConnections != null) {
+                for (DeviceConnection connection : mDeviceConnections) {
+                    connection.notifyClient(server);
+                }
+            }
+!!!33920951.java!!!	getDeviceInfo() : MidiDeviceInfo
+            return mDeviceInfo;
+!!!33921079.java!!!	setDeviceInfo(inout deviceInfo : MidiDeviceInfo) : void
+            mDeviceInfo = deviceInfo;
+!!!33921207.java!!!	getDeviceStatus() : MidiDeviceStatus
+            return mDeviceStatus;
+!!!33921335.java!!!	setDeviceStatus(inout status : MidiDeviceStatus) : void
+            mDeviceStatus = status;
+!!!33921463.java!!!	getDeviceServer() : IMidiDeviceServer
+            return mServer;
+!!!33921591.java!!!	getServiceInfo() : ServiceInfo
+            return mServiceInfo;
+!!!33921719.java!!!	getPackageName() : String
+            return (mServiceInfo == null ? null : mServiceInfo.packageName);
+!!!33921847.java!!!	getUid() : int
+            return mUid;
+!!!33921975.java!!!	isUidAllowed(in uid : int) : boolean
+            return (!mDeviceInfo.isPrivate() || mUid == uid);
+!!!33922103.java!!!	addDeviceConnection(inout connection : MidiService::DeviceConnection) : void
+            synchronized (mDeviceConnections) {
+                if (mServer != null) {
+                    mDeviceConnections.add(connection);
+                    connection.notifyClient(mServer);
+                } else if (mServiceConnection == null &&
+                    (mServiceInfo != null || mBluetoothDevice != null)) {
+                    mDeviceConnections.add(connection);
+
+                    mServiceConnection = new ServiceConnection() {
+                        @Override
+                        public void onServiceConnected(ComponentName name, IBinder service) {
+                            IMidiDeviceServer server = null;
+                            if (mBluetoothDevice != null) {
+                                IBluetoothMidiService mBluetoothMidiService = IBluetoothMidiService.Stub.asInterface(service);
+                                try {
+                                    // We need to explicitly add the device in a separate method
+                                    // because onBind() is only called once.
+                                    IBinder deviceBinder = mBluetoothMidiService.addBluetoothDevice(mBluetoothDevice);
+                                    server = IMidiDeviceServer.Stub.asInterface(deviceBinder);
+                                } catch(RemoteException e) {
+                                    Log.e(TAG, "Could not call addBluetoothDevice()", e);
+                                }
+                            } else {
+                                server = IMidiDeviceServer.Stub.asInterface(service);
+                            }
+                            setDeviceServer(server);
+                        }
+
+                        @Override
+                        public void onServiceDisconnected(ComponentName name) {
+                            setDeviceServer(null);
+                            mServiceConnection = null;
+                        }
+                    };
+
+                    Intent intent;
+                    if (mBluetoothDevice != null) {
+                        intent = new Intent(MidiManager.BLUETOOTH_MIDI_SERVICE_INTENT);
+                        intent.setComponent(new ComponentName(
+                                MidiManager.BLUETOOTH_MIDI_SERVICE_PACKAGE,
+                                MidiManager.BLUETOOTH_MIDI_SERVICE_CLASS));
+                    } else {
+                        intent = new Intent(MidiDeviceService.SERVICE_INTERFACE);
+                        intent.setComponent(
+                                new ComponentName(mServiceInfo.packageName, mServiceInfo.name));
+                    }
+
+                    if (!mContext.bindService(intent, mServiceConnection,
+                            Context.BIND_AUTO_CREATE)) {
+                        Log.e(TAG, "Unable to bind service: " + intent);
+                        setDeviceServer(null);
+                        mServiceConnection = null;
+                    }
+                } else {
+                    Log.e(TAG, "No way to connect to device in addDeviceConnection");
+                    connection.notifyClient(null);
+                }
+            }
+!!!33922231.java!!!	removeDeviceConnection(inout connection : MidiService::DeviceConnection) : void
+            synchronized (mDeviceConnections) {
+                mDeviceConnections.remove(connection);
+
+                if (mDeviceConnections.size() == 0 && mServiceConnection != null) {
+                    mContext.unbindService(mServiceConnection);
+                    mServiceConnection = null;
+                    if (mBluetoothDevice != null) {
+                        // Bluetooth devices are ephemeral - remove when no clients exist
+                        synchronized (mDevicesByInfo) {
+                            closeLocked();
+                        }
+                    } else {
+                        setDeviceServer(null);
+                    }
+                }
+            }
+!!!33922359.java!!!	closeLocked() : void
+            synchronized (mDeviceConnections) {
+                for (DeviceConnection connection : mDeviceConnections) {
+                    connection.getClient().removeDeviceConnection(connection);
+                }
+                mDeviceConnections.clear();
+            }
+            setDeviceServer(null);
+
+            // closed virtual devices should not be removed from mDevicesByInfo
+            // since they can be restarted on demand
+            if (mServiceInfo == null) {
+                removeDeviceLocked(this);
+            } else {
+                mDeviceStatus = new MidiDeviceStatus(mDeviceInfo);
+            }
+
+            if (mBluetoothDevice != null) {
+                mBluetoothDevices.remove(mBluetoothDevice);
+            }
+!!!33922487.java!!!	binderDied() : void
+            Log.d(TAG, "Device died: " + this);
+            synchronized (mDevicesByInfo) {
+                closeLocked();
+            }
+!!!33922615.java!!!	toString() : String
+            StringBuilder sb = new StringBuilder("Device Info: ");
+            sb.append(mDeviceInfo);
+            sb.append(" Status: ");
+            sb.append(mDeviceStatus);
+            sb.append(" UID: ");
+            sb.append(mUid);
+            sb.append(" DeviceConnection count: ");
+            sb.append(mDeviceConnections.size());
+            sb.append(" mServiceConnection: ");
+            sb.append(mServiceConnection);
+            return sb.toString();

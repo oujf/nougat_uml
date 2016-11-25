@@ -1,0 +1,223 @@
+class ClusterManager
+!!!36367159.java!!!	ClusterManager(inout context : Context)
+        mStorage = new AggregatorRecordStorage(context, SEMANTIC_TABLE, SEMANTIC_COLUMNS);
+
+        loadSemanticClusters();
+!!!36367287.java!!!	addSample(inout location : Location) : void
+        float bestClusterDistance = Float.MAX_VALUE;
+        int bestClusterIndex = -1;
+        long lastDuration;
+        long currentTime = location.getTime() / 1000; // measure time in seconds
+
+        if (mLastLocation != null) {
+            if (location.getTime() == mLastLocation.getTime()) {
+                return;
+            }
+            // get the duration spent in the last location
+            long duration = (location.getTime() - mLastLocation.getTime()) / 1000;
+            mClusterDuration += duration;
+
+            Log.v(TAG, "sample duration: " + duration +
+                  ", number of clusters: " + mLocationClusters.size());
+
+            synchronized (mLocationClusters) {
+                // add the last location to cluster.
+                // first find the cluster it belongs to.
+                for (int i = 0; i < mLocationClusters.size(); ++i) {
+                    float distance = mLocationClusters.get(i).distanceToCenter(mLastLocation);
+                    Log.v(TAG, "clulster " + i + " is within " + distance + " meters");
+                    if (distance < bestClusterDistance) {
+                        bestClusterDistance = distance;
+                        bestClusterIndex = i;
+                    }
+                }
+
+                // add the location to the selected cluster
+                if (bestClusterDistance < LOCATION_CLUSTER_RADIUS) {
+                    mLocationClusters.get(bestClusterIndex).addSample(mLastLocation, duration);
+                } else {
+                    // if it is far away from all existing clusters, create a new cluster.
+                  LocationCluster cluster = new LocationCluster(mLastLocation, duration);
+                  mLocationClusters.add(cluster);
+                }
+            }
+        } else {
+            mConsolidateRef = currentTime;
+            mRefreshRef = currentTime;
+
+            if (mLocationClusters.isEmpty()) {
+                mClusterDuration = 0;
+            }
+        }
+
+        long collectDuration = currentTime - mConsolidateRef;
+        Log.v(TAG, "collect duration: " + collectDuration);
+        if (collectDuration > CONSOLIDATE_INTERVAL) {
+            // TODO : conslidation takes time. move this to a separate thread later.
+            consolidateClusters();
+            mConsolidateRef = currentTime;
+
+            long refreshDuration = currentTime - mRefreshRef;
+            Log.v(TAG, "refresh duration: " + refreshDuration);
+            if (refreshDuration >  LOCATION_REFRESH_PERIOD) {
+                updateSemanticClusters();
+                mRefreshRef = currentTime;
+            }
+            saveSemanticClusters();
+        }
+
+        mLastLocation = location;
+!!!36367415.java!!!	consolidateClusters() : void
+        synchronized (mSemanticClusters) {
+            LocationCluster locationCluster;
+            for (int i = mLocationClusters.size() - 1; i >= 0; --i) {
+                locationCluster = mLocationClusters.get(i);
+                locationCluster.consolidate();
+            }
+
+            // merge clusters whose regions are overlapped. note that after merge
+            // cluster center changes but cluster size remains unchanged.
+            for (int i = mLocationClusters.size() - 1; i >= 0; --i) {
+                locationCluster = mLocationClusters.get(i);
+                for (int j = i - 1; j >= 0; --j) {
+                    float distance =
+                        mLocationClusters.get(j).distanceToCluster(locationCluster);
+                    if (distance < LOCATION_CLUSTER_RADIUS) {
+                        mLocationClusters.get(j).absorbCluster(locationCluster);
+                        mLocationClusters.remove(locationCluster);
+                    }
+                }
+            }
+            Log.v(TAG, mLocationClusters.size() + " location clusters after consolidate");
+
+            // assign each candidate to a semantic cluster and check if new semantic
+            // clusters are found
+            for (LocationCluster candidate : mLocationClusters) {
+                if (candidate.hasSemanticId() ||
+                    candidate.hasSemanticClusterId() ||
+                    !candidate.passThreshold(SEMANTIC_CLUSTER_THRESHOLD)) {
+                    continue;
+                }
+
+                // find the closest semantic cluster
+                float bestClusterDistance = Float.MAX_VALUE;
+                String bestClusterId = "Unused Id";
+                for (BaseCluster cluster : mSemanticClusters) {
+                    float distance = cluster.distanceToCluster(candidate);
+                    Log.v(TAG, distance + "distance to semantic cluster: " +
+                          cluster.getSemanticId());
+
+                    if (distance < bestClusterDistance) {
+                        bestClusterDistance = distance;
+                        bestClusterId = cluster.getSemanticId();
+                    }
+                }
+
+                // if candidate doesn't belong to any semantic cluster, create a new
+                // semantic cluster
+                if (bestClusterDistance > SEMANTIC_CLUSTER_RADIUS) {
+                    candidate.generateSemanticId(mSemanticClusterCount++);
+                    mSemanticClusters.add(candidate);
+                } else {
+                    candidate.setSemanticClusterId(bestClusterId);
+                }
+            }
+            Log.v(TAG, mSemanticClusters.size() + " semantic clusters after consolidate");
+        }
+!!!36367543.java!!!	updateSemanticClusters() : void
+        synchronized (mSemanticClusters) {
+            // create index to cluster map
+            HashMap<String, BaseCluster> semanticIdMap =
+                new HashMap<String, BaseCluster>();
+            for (BaseCluster cluster : mSemanticClusters) {
+                // TODO: apply forgetting factor on existing semantic cluster stats,
+                // duration, histogram, etc.
+                cluster.forgetPastHistory();
+                semanticIdMap.put(cluster.getSemanticId(), cluster);
+            }
+
+            // assign each candidate to a semantic cluster
+            for (LocationCluster cluster : mLocationClusters) {
+                if (cluster.hasSemanticClusterId()) {
+                    BaseCluster semanticCluster =
+                        semanticIdMap.get(cluster.getSemanticClusterId());
+                    semanticCluster.absorbCluster(cluster);
+                }
+            }
+            // reset location clusters.
+            mLocationClusters.clear();
+        }
+!!!36367671.java!!!	loadSemanticClusters() : void
+        List<Map<String, String> > allData = mStorage.getAllData();
+        HashMap<String, Long> histogram = new HashMap<String, Long>();
+
+        synchronized (mSemanticClusters) {
+            mSemanticClusters.clear();
+            for (Map<String, String> map : allData) {
+                String semanticId = map.get(SEMANTIC_ID);
+                double longitude = Double.valueOf(map.get(SEMANTIC_LONGITUDE));
+                double latitude = Double.valueOf(map.get(SEMANTIC_LATITUDE));
+                long duration = Long.valueOf(map.get(SEMANTIC_DURATION));
+                BaseCluster cluster =
+                    new BaseCluster(semanticId, longitude, latitude, duration);
+
+                histogram.clear();
+                for (int i = mFeatureValueStart; i <= mFeatureValueEnd; i++) {
+                    String featureValue = SEMANTIC_COLUMNS[i];
+                    if (map.containsKey(featureValue)) {
+                      histogram.put(featureValue, Long.valueOf(map.get(featureValue)));
+                    }
+                }
+                cluster.setHistogram(histogram);
+                mSemanticClusters.add(cluster);
+            }
+            mSemanticClusterCount = mSemanticClusters.size();
+            Log.e(TAG, "load " + mSemanticClusterCount + " semantic clusters.");
+        }
+!!!36367799.java!!!	saveSemanticClusters() : void
+        HashMap<String, String> rowFeatures = new HashMap<String, String>();
+
+        mStorage.removeAllData();
+        synchronized (mSemanticClusters) {
+            for (BaseCluster cluster : mSemanticClusters) {
+                rowFeatures.clear();
+                rowFeatures.put(SEMANTIC_ID, cluster.getSemanticId());
+
+                rowFeatures.put(SEMANTIC_LONGITUDE,
+                            String.valueOf(cluster.getCenterLongitude()));
+                rowFeatures.put(SEMANTIC_LATITUDE,
+                            String.valueOf(cluster.getCenterLatitude()));
+                rowFeatures.put(SEMANTIC_DURATION,
+                            String.valueOf(cluster.getDuration()));
+
+                HashMap<String, Long> histogram = cluster.getHistogram();
+                for (Map.Entry<String, Long> entry : histogram.entrySet()) {
+                    rowFeatures.put(entry.getKey(), String.valueOf(entry.getValue()));
+                }
+                mStorage.addData(rowFeatures);
+                Log.e(TAG, "saving semantic cluster: " + rowFeatures);
+            }
+        }
+!!!36367927.java!!!	getSemanticLocation() : String
+        String label = LocationStatsAggregator.UNKNOWN_LOCATION;
+
+        // instead of using the last location, try acquiring the latest location.
+        if (mLastLocation != null) {
+            // TODO: use fast neatest neighbor search speed up location search
+            synchronized (mSemanticClusters) {
+                for (BaseCluster cluster: mSemanticClusters) {
+                    if (cluster.distanceToCenter(mLastLocation) < SEMANTIC_CLUSTER_RADIUS) {
+                        return cluster.getSemanticId();
+                    }
+                }
+            }
+        }
+        return label;
+!!!36368055.java!!!	getClusterNames() : String
+        ArrayList<String> clusters = new ArrayList<String>();
+        synchronized (mSemanticClusters) {
+            for (BaseCluster cluster: mSemanticClusters) {
+                clusters.add(cluster.getSemanticId());
+            }
+        }
+        return clusters;

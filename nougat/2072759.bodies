@@ -1,0 +1,936 @@
+class ConnectModeState
+!!!36953015.java!!!	enter() : void
+            // Inform WifiConnectivityManager that Wifi is enabled
+            if (mWifiConnectivityManager != null) {
+                mWifiConnectivityManager.setWifiEnabled(true);
+            }
+            // Inform metrics that Wifi is Enabled (but not yet connected)
+            mWifiMetrics.setWifiState(WifiMetricsProto.WifiLog.WIFI_DISCONNECTED);
+
+
+!!!36953143.java!!!	exit() : void
+            // Inform WifiConnectivityManager that Wifi is disabled
+            if (mWifiConnectivityManager != null) {
+                mWifiConnectivityManager.setWifiEnabled(false);
+            }
+            // Inform metrics that Wifi is being disabled (Toggled, airplane enabled, etc)
+            mWifiMetrics.setWifiState(WifiMetricsProto.WifiLog.WIFI_DISABLED);
+!!!36953271.java!!!	processMessage(inout message : Message) : boolean
+            WifiConfiguration config;
+            int netId;
+            boolean ok;
+            boolean didDisconnect;
+            String bssid;
+            String ssid;
+            NetworkUpdateResult result;
+            logStateAndMessage(message, this);
+
+            switch (message.what) {
+                case WifiMonitor.ASSOCIATION_REJECTION_EVENT:
+                    mWifiLogger.captureBugReportData(WifiLogger.REPORT_REASON_ASSOC_FAILURE);
+                    didBlackListBSSID = false;
+                    bssid = (String) message.obj;
+                    if (bssid == null || TextUtils.isEmpty(bssid)) {
+                        // If BSSID is null, use the target roam BSSID
+                        bssid = mTargetRoamBSSID;
+                    }
+                    if (bssid != null) {
+                        // If we have a BSSID, tell configStore to black list it
+                        if (mWifiConnectivityManager != null) {
+                            didBlackListBSSID = mWifiConnectivityManager.trackBssid(bssid,
+                                    false);
+                        }
+                    }
+
+                    mWifiConfigManager.updateNetworkSelectionStatus(mTargetNetworkId,
+                            WifiConfiguration.NetworkSelectionStatus
+                            .DISABLED_ASSOCIATION_REJECTION);
+
+                    mSupplicantStateTracker.sendMessage(WifiMonitor.ASSOCIATION_REJECTION_EVENT);
+                    //If rejection occurred while Metrics is tracking a ConnnectionEvent, end it.
+                    reportConnectionAttemptEnd(
+                            WifiMetrics.ConnectionEvent.FAILURE_ASSOCIATION_REJECTION,
+                            WifiMetricsProto.ConnectionEvent.HLF_NONE);
+                    mWifiLastResortWatchdog.noteConnectionFailureAndTriggerIfNeeded(getTargetSsid(),
+                            bssid,
+                            WifiLastResortWatchdog.FAILURE_CODE_ASSOCIATION);
+                    break;
+                case WifiMonitor.AUTHENTICATION_FAILURE_EVENT:
+                    mWifiLogger.captureBugReportData(WifiLogger.REPORT_REASON_AUTH_FAILURE);
+                    mSupplicantStateTracker.sendMessage(WifiMonitor.AUTHENTICATION_FAILURE_EVENT);
+                    if (mTargetNetworkId != WifiConfiguration.INVALID_NETWORK_ID) {
+                        mWifiConfigManager.updateNetworkSelectionStatus(mTargetNetworkId,
+                                WifiConfiguration.NetworkSelectionStatus
+                                        .DISABLED_AUTHENTICATION_FAILURE);
+                    }
+                    //If failure occurred while Metrics is tracking a ConnnectionEvent, end it.
+                    reportConnectionAttemptEnd(
+                            WifiMetrics.ConnectionEvent.FAILURE_AUTHENTICATION_FAILURE,
+                            WifiMetricsProto.ConnectionEvent.HLF_NONE);
+                    mWifiLastResortWatchdog.noteConnectionFailureAndTriggerIfNeeded(getTargetSsid(),
+                            mTargetRoamBSSID,
+                            WifiLastResortWatchdog.FAILURE_CODE_AUTHENTICATION);
+                    break;
+                case WifiMonitor.SSID_TEMP_DISABLED:
+                    Log.e(TAG, "Supplicant SSID temporary disabled:"
+                            + mWifiConfigManager.getWifiConfiguration(message.arg1));
+                    mWifiConfigManager.updateNetworkSelectionStatus(
+                            message.arg1,
+                            WifiConfiguration.NetworkSelectionStatus
+                            .DISABLED_AUTHENTICATION_FAILURE);
+                    reportConnectionAttemptEnd(
+                            WifiMetrics.ConnectionEvent.FAILURE_SSID_TEMP_DISABLED,
+                            WifiMetricsProto.ConnectionEvent.HLF_NONE);
+                    mWifiLastResortWatchdog.noteConnectionFailureAndTriggerIfNeeded(getTargetSsid(),
+                            mTargetRoamBSSID,
+                            WifiLastResortWatchdog.FAILURE_CODE_AUTHENTICATION);
+                    break;
+                case WifiMonitor.SSID_REENABLED:
+                    Log.d(TAG, "Supplicant SSID reenable:"
+                            + mWifiConfigManager.getWifiConfiguration(message.arg1));
+                    // Do not re-enable it in Quality Network Selection since framework has its own
+                    // Algorithm of disable/enable
+                    break;
+                case WifiMonitor.SUPPLICANT_STATE_CHANGE_EVENT:
+                    SupplicantState state = handleSupplicantStateChange(message);
+                    // A driver/firmware hang can now put the interface in a down state.
+                    // We detect the interface going down and recover from it
+                    if (!SupplicantState.isDriverActive(state)) {
+                        if (mNetworkInfo.getState() != NetworkInfo.State.DISCONNECTED) {
+                            handleNetworkDisconnect();
+                        }
+                        log("Detected an interface down, restart driver");
+                        transitionTo(mDriverStoppedState);
+                        sendMessage(CMD_START_DRIVER);
+                        break;
+                    }
+
+                    // Supplicant can fail to report a NETWORK_DISCONNECTION_EVENT
+                    // when authentication times out after a successful connection,
+                    // we can figure this from the supplicant state. If supplicant
+                    // state is DISCONNECTED, but the mNetworkInfo says we are not
+                    // disconnected, we need to handle a disconnection
+                    if (!linkDebouncing && state == SupplicantState.DISCONNECTED &&
+                            mNetworkInfo.getState() != NetworkInfo.State.DISCONNECTED) {
+                        if (DBG) log("Missed CTRL-EVENT-DISCONNECTED, disconnect");
+                        handleNetworkDisconnect();
+                        transitionTo(mDisconnectedState);
+                    }
+
+                    // If we have COMPLETED a connection to a BSSID, start doing
+                    // DNAv4/DNAv6 -style probing for on-link neighbors of
+                    // interest (e.g. routers); harmless if none are configured.
+                    if (state == SupplicantState.COMPLETED) {
+                        mIpManager.confirmConfiguration();
+                    }
+                    break;
+                case WifiP2pServiceImpl.DISCONNECT_WIFI_REQUEST:
+                    if (message.arg1 == 1) {
+                        mWifiNative.disconnect();
+                        mTemporarilyDisconnectWifi = true;
+                    } else {
+                        mWifiNative.reconnect();
+                        mTemporarilyDisconnectWifi = false;
+                    }
+                    break;
+                case CMD_ADD_OR_UPDATE_NETWORK:
+                    // Only the current foreground user can modify networks.
+                    if (!mWifiConfigManager.isCurrentUserProfile(
+                            UserHandle.getUserId(message.sendingUid))) {
+                        loge("Only the current foreground user can modify networks "
+                                + " currentUserId=" + mWifiConfigManager.getCurrentUserId()
+                                + " sendingUserId=" + UserHandle.getUserId(message.sendingUid));
+                        replyToMessage(message, message.what, FAILURE);
+                        break;
+                    }
+
+                    config = (WifiConfiguration) message.obj;
+
+                    if (!recordUidIfAuthorized(config, message.sendingUid,
+                            /* onlyAnnotate */ false)) {
+                        logw("Not authorized to update network "
+                             + " config=" + config.SSID
+                             + " cnid=" + config.networkId
+                             + " uid=" + message.sendingUid);
+                        replyToMessage(message, message.what, FAILURE);
+                        break;
+                    }
+
+                    int res = mWifiConfigManager.addOrUpdateNetwork(config, message.sendingUid);
+                    if (res < 0) {
+                        messageHandlingStatus = MESSAGE_HANDLING_STATUS_FAIL;
+                    } else {
+                        WifiConfiguration curConfig = getCurrentWifiConfiguration();
+                        if (curConfig != null && config != null) {
+                            WifiConfiguration.NetworkSelectionStatus networkStatus =
+                                    config.getNetworkSelectionStatus();
+                            if (curConfig.priority < config.priority && networkStatus != null
+                                    && !networkStatus.isNetworkPermanentlyDisabled()) {
+                                // Interpret this as a connect attempt
+                                // Set the last selected configuration so as to allow the system to
+                                // stick the last user choice without persisting the choice
+                                mWifiConfigManager.setAndEnableLastSelectedConfiguration(res);
+                                mWifiConfigManager.updateLastConnectUid(config, message.sendingUid);
+                                boolean persist = mWifiConfigManager
+                                        .checkConfigOverridePermission(message.sendingUid);
+                                if (mWifiConnectivityManager != null) {
+                                    mWifiConnectivityManager.connectToUserSelectNetwork(res,
+                                            persist);
+                                }
+
+                                // Remember time of last connection attempt
+                                lastConnectAttemptTimestamp = System.currentTimeMillis();
+                                mWifiConnectionStatistics.numWifiManagerJoinAttempt++;
+
+                                // As a courtesy to the caller, trigger a scan now
+                                startScan(ADD_OR_UPDATE_SOURCE, 0, null, WIFI_WORK_SOURCE);
+                            }
+                        }
+                    }
+                    replyToMessage(message, CMD_ADD_OR_UPDATE_NETWORK, res);
+                    break;
+                case CMD_REMOVE_NETWORK:
+                    // Only the current foreground user can modify networks.
+                    if (!mWifiConfigManager.isCurrentUserProfile(
+                            UserHandle.getUserId(message.sendingUid))) {
+                        loge("Only the current foreground user can modify networks "
+                                + " currentUserId=" + mWifiConfigManager.getCurrentUserId()
+                                + " sendingUserId=" + UserHandle.getUserId(message.sendingUid));
+                        replyToMessage(message, message.what, FAILURE);
+                        break;
+                    }
+                    netId = message.arg1;
+
+                    if (!mWifiConfigManager.canModifyNetwork(message.sendingUid, netId,
+                            /* onlyAnnotate */ false)) {
+                        logw("Not authorized to remove network "
+                             + " cnid=" + netId
+                             + " uid=" + message.sendingUid);
+                        replyToMessage(message, message.what, FAILURE);
+                        break;
+                    }
+
+                    ok = mWifiConfigManager.removeNetwork(message.arg1);
+                    if (!ok) {
+                        messageHandlingStatus = MESSAGE_HANDLING_STATUS_FAIL;
+                    }
+                    replyToMessage(message, message.what, ok ? SUCCESS : FAILURE);
+                    break;
+                case CMD_ENABLE_NETWORK:
+                    // Only the current foreground user can modify networks.
+                    if (!mWifiConfigManager.isCurrentUserProfile(
+                            UserHandle.getUserId(message.sendingUid))) {
+                        loge("Only the current foreground user can modify networks "
+                                + " currentUserId=" + mWifiConfigManager.getCurrentUserId()
+                                + " sendingUserId=" + UserHandle.getUserId(message.sendingUid));
+                        replyToMessage(message, message.what, FAILURE);
+                        break;
+                    }
+
+                    boolean disableOthers = message.arg2 == 1;
+                    netId = message.arg1;
+                    config = mWifiConfigManager.getWifiConfiguration(netId);
+                    if (config == null) {
+                        loge("No network with id = " + netId);
+                        messageHandlingStatus = MESSAGE_HANDLING_STATUS_FAIL;
+                        replyToMessage(message, message.what, FAILURE);
+                        break;
+                    }
+                    // disable other only means select this network, does not mean all other
+                    // networks need to be disabled
+                    if (disableOthers) {
+                        // Remember time of last connection attempt
+                        lastConnectAttemptTimestamp = System.currentTimeMillis();
+                        mWifiConnectionStatistics.numWifiManagerJoinAttempt++;
+                    }
+                    // Cancel auto roam requests
+                    autoRoamSetBSSID(netId, "any");
+
+                    ok = mWifiConfigManager.enableNetwork(
+                            config, disableOthers, message.sendingUid);
+                    if (!ok) {
+                        messageHandlingStatus = MESSAGE_HANDLING_STATUS_FAIL;
+                    } else if (disableOthers) {
+                        mTargetNetworkId = netId;
+                    }
+
+                    replyToMessage(message, message.what, ok ? SUCCESS : FAILURE);
+                    break;
+                case CMD_ENABLE_ALL_NETWORKS:
+                    long time = android.os.SystemClock.elapsedRealtime();
+                    if (time - mLastEnableAllNetworksTime > MIN_INTERVAL_ENABLE_ALL_NETWORKS_MS) {
+                        mWifiConfigManager.enableAllNetworks();
+                        mLastEnableAllNetworksTime = time;
+                    }
+                    break;
+                case WifiManager.DISABLE_NETWORK:
+                    if (mWifiConfigManager.updateNetworkSelectionStatus(message.arg1,
+                            WifiConfiguration.NetworkSelectionStatus.DISABLED_BY_WIFI_MANAGER)) {
+                        replyToMessage(message, WifiManager.DISABLE_NETWORK_SUCCEEDED);
+                    } else {
+                        messageHandlingStatus = MESSAGE_HANDLING_STATUS_FAIL;
+                        replyToMessage(message, WifiManager.DISABLE_NETWORK_FAILED,
+                                WifiManager.ERROR);
+                    }
+                    break;
+                case CMD_DISABLE_EPHEMERAL_NETWORK:
+                    config = mWifiConfigManager.disableEphemeralNetwork((String)message.obj);
+                    if (config != null) {
+                        if (config.networkId == mLastNetworkId) {
+                            // Disconnect and let autojoin reselect a new network
+                            sendMessage(CMD_DISCONNECT);
+                        }
+                    }
+                    break;
+                case CMD_BLACKLIST_NETWORK:
+                    mWifiConfigManager.blackListBssid((String) message.obj);
+                    break;
+                case CMD_CLEAR_BLACKLIST:
+                    mWifiConfigManager.clearBssidBlacklist();
+                    break;
+                case CMD_SAVE_CONFIG:
+                    ok = mWifiConfigManager.saveConfig();
+
+                    if (DBG) logd("did save config " + ok);
+                    replyToMessage(message, CMD_SAVE_CONFIG, ok ? SUCCESS : FAILURE);
+
+                    // Inform the backup manager about a data change
+                    mBackupManagerProxy.notifyDataChanged();
+                    break;
+                case CMD_GET_CONFIGURED_NETWORKS:
+                    replyToMessage(message, message.what,
+                            mWifiConfigManager.getSavedNetworks());
+                    break;
+                case WifiMonitor.SUP_REQUEST_IDENTITY:
+                    int networkId = message.arg2;
+                    boolean identitySent = false;
+                    int eapMethod = WifiEnterpriseConfig.Eap.NONE;
+
+                    if (targetWificonfiguration != null
+                            && targetWificonfiguration.enterpriseConfig != null) {
+                        eapMethod = targetWificonfiguration.enterpriseConfig.getEapMethod();
+                    }
+
+                    // For SIM & AKA/AKA' EAP method Only, get identity from ICC
+                    if (targetWificonfiguration != null
+                            && targetWificonfiguration.networkId == networkId
+                            && targetWificonfiguration.allowedKeyManagement
+                                    .get(WifiConfiguration.KeyMgmt.IEEE8021X)
+                            &&  (eapMethod == WifiEnterpriseConfig.Eap.SIM
+                            || eapMethod == WifiEnterpriseConfig.Eap.AKA
+                            || eapMethod == WifiEnterpriseConfig.Eap.AKA_PRIME)) {
+                        TelephonyManager tm = (TelephonyManager)
+                                mContext.getSystemService(Context.TELEPHONY_SERVICE);
+                        if (tm != null) {
+                            String imsi = tm.getSubscriberId();
+                            String mccMnc = "";
+
+                            if (tm.getSimState() == TelephonyManager.SIM_STATE_READY)
+                                 mccMnc = tm.getSimOperator();
+
+                            String identity = buildIdentity(eapMethod, imsi, mccMnc);
+
+                            if (!identity.isEmpty()) {
+                                mWifiNative.simIdentityResponse(networkId, identity);
+                                identitySent = true;
+                            }
+                        }
+                    }
+                    if (!identitySent) {
+                        // Supplicant lacks credentials to connect to that network, hence black list
+                        ssid = (String) message.obj;
+                        if (targetWificonfiguration != null && ssid != null
+                                && targetWificonfiguration.SSID != null
+                                && targetWificonfiguration.SSID.equals("\"" + ssid + "\"")) {
+                            mWifiConfigManager.updateNetworkSelectionStatus(targetWificonfiguration,
+                                    WifiConfiguration.NetworkSelectionStatus
+                                            .DISABLED_AUTHENTICATION_NO_CREDENTIALS);
+                        }
+                        // Disconnect now, as we don't have any way to fullfill
+                        // the  supplicant request.
+                        mWifiConfigManager.setAndEnableLastSelectedConfiguration(
+                                WifiConfiguration.INVALID_NETWORK_ID);
+                        mWifiNative.disconnect();
+                    }
+                    break;
+                case WifiMonitor.SUP_REQUEST_SIM_AUTH:
+                    logd("Received SUP_REQUEST_SIM_AUTH");
+                    SimAuthRequestData requestData = (SimAuthRequestData) message.obj;
+                    if (requestData != null) {
+                        if (requestData.protocol == WifiEnterpriseConfig.Eap.SIM) {
+                            handleGsmAuthRequest(requestData);
+                        } else if (requestData.protocol == WifiEnterpriseConfig.Eap.AKA
+                            || requestData.protocol == WifiEnterpriseConfig.Eap.AKA_PRIME) {
+                            handle3GAuthRequest(requestData);
+                        }
+                    } else {
+                        loge("Invalid sim auth request");
+                    }
+                    break;
+                case CMD_GET_PRIVILEGED_CONFIGURED_NETWORKS:
+                    replyToMessage(message, message.what,
+                            mWifiConfigManager.getPrivilegedSavedNetworks());
+                    break;
+                case CMD_GET_MATCHING_CONFIG:
+                    replyToMessage(message, message.what,
+                            mWifiConfigManager.getMatchingConfig((ScanResult)message.obj));
+                    break;
+                /* Do a redundant disconnect without transition */
+                case CMD_DISCONNECT:
+                    mWifiConfigManager.setAndEnableLastSelectedConfiguration
+                            (WifiConfiguration.INVALID_NETWORK_ID);
+                    mWifiNative.disconnect();
+                    break;
+                case CMD_RECONNECT:
+                    if (mWifiConnectivityManager != null) {
+                        mWifiConnectivityManager.forceConnectivityScan();
+                    }
+                    break;
+                case CMD_REASSOCIATE:
+                    lastConnectAttemptTimestamp = System.currentTimeMillis();
+                    mWifiNative.reassociate();
+                    break;
+                case CMD_RELOAD_TLS_AND_RECONNECT:
+                    if (mWifiConfigManager.needsUnlockedKeyStore()) {
+                        logd("Reconnecting to give a chance to un-connected TLS networks");
+                        mWifiNative.disconnect();
+                        lastConnectAttemptTimestamp = System.currentTimeMillis();
+                        mWifiNative.reconnect();
+                    }
+                    break;
+                case CMD_AUTO_ROAM:
+                    messageHandlingStatus = MESSAGE_HANDLING_STATUS_DISCARD;
+                    return HANDLED;
+                case CMD_AUTO_CONNECT:
+                    /* Work Around: wpa_supplicant can get in a bad state where it returns a non
+                     * associated status to the STATUS command but somehow-someplace still thinks
+                     * it is associated and thus will ignore select/reconnect command with
+                     * following message:
+                     * "Already associated with the selected network - do nothing"
+                     *
+                     * Hence, sends a disconnect to supplicant first.
+                     */
+                    didDisconnect = false;
+                    if (getCurrentState() != mDisconnectedState) {
+                        /** Supplicant will ignore the reconnect if we are currently associated,
+                         * hence trigger a disconnect
+                         */
+                        didDisconnect = true;
+                        mWifiNative.disconnect();
+                    }
+
+                    /* connect command coming from auto-join */
+                    netId = message.arg1;
+                    mTargetNetworkId = netId;
+                    mTargetRoamBSSID = (String) message.obj;
+                    config = mWifiConfigManager.getWifiConfiguration(netId);
+                    logd("CMD_AUTO_CONNECT sup state "
+                            + mSupplicantStateTracker.getSupplicantStateName()
+                            + " my state " + getCurrentState().getName()
+                            + " nid=" + Integer.toString(netId)
+                            + " roam=" + Boolean.toString(mAutoRoaming));
+                    if (config == null) {
+                        loge("AUTO_CONNECT and no config, bail out...");
+                        break;
+                    }
+
+                    /* Make sure we cancel any previous roam request */
+                    setTargetBssid(config, mTargetRoamBSSID);
+
+                    /* Save the network config */
+                    logd("CMD_AUTO_CONNECT will save config -> " + config.SSID
+                            + " nid=" + Integer.toString(netId));
+                    result = mWifiConfigManager.saveNetwork(config, WifiConfiguration.UNKNOWN_UID);
+                    netId = result.getNetworkId();
+                    logd("CMD_AUTO_CONNECT did save config -> "
+                            + " nid=" + Integer.toString(netId));
+
+                    // Since we updated the config,read it back from config store:
+                    config = mWifiConfigManager.getWifiConfiguration(netId);
+                    if (config == null) {
+                        loge("CMD_AUTO_CONNECT couldn't update the config, got null config");
+                        break;
+                    }
+                    if (netId != config.networkId) {
+                        loge("CMD_AUTO_CONNECT couldn't update the config, want"
+                                + " nid=" + Integer.toString(netId) + " but got" + config.networkId);
+                        break;
+                    }
+
+                    if (deferForUserInput(message, netId, false)) {
+                        break;
+                    } else if (mWifiConfigManager.getWifiConfiguration(netId).userApproved ==
+                                                                   WifiConfiguration.USER_BANNED) {
+                        replyToMessage(message, WifiManager.CONNECT_NETWORK_FAILED,
+                                WifiManager.NOT_AUTHORIZED);
+                        break;
+                    }
+
+                    // If we're autojoining a network that the user or an app explicitly selected,
+                    // keep track of the UID that selected it.
+                    // TODO(b/26786318): Keep track of the lastSelectedConfiguration and the
+                    // lastConnectUid on a per-user basis.
+                    int lastConnectUid = WifiConfiguration.UNKNOWN_UID;
+
+                    //Start a new ConnectionEvent due to auto_connect, assume we are connecting
+                    //between different networks due to QNS, setting ROAM_UNRELATED
+                    mWifiMetrics.startConnectionEvent(config, mTargetRoamBSSID,
+                            WifiMetricsProto.ConnectionEvent.ROAM_UNRELATED);
+                    if (!didDisconnect) {
+                        //If we were originally disconnected, then this was not any kind of ROAM
+                        mWifiMetrics.setConnectionEventRoamType(
+                                WifiMetricsProto.ConnectionEvent.ROAM_NONE);
+                    }
+                    //Determine if this CONNECTION is for a user selection
+                    if (mWifiConfigManager.isLastSelectedConfiguration(config)
+                            && mWifiConfigManager.isCurrentUserProfile(
+                                    UserHandle.getUserId(config.lastConnectUid))) {
+                        lastConnectUid = config.lastConnectUid;
+                        mWifiMetrics.setConnectionEventRoamType(
+                                WifiMetricsProto.ConnectionEvent.ROAM_USER_SELECTED);
+                    }
+                    if (mWifiConfigManager.selectNetwork(config, /* updatePriorities = */ false,
+                            lastConnectUid) && mWifiNative.reconnect()) {
+                        lastConnectAttemptTimestamp = System.currentTimeMillis();
+                        targetWificonfiguration = mWifiConfigManager.getWifiConfiguration(netId);
+                        config = mWifiConfigManager.getWifiConfiguration(netId);
+                        if (config != null
+                                && !mWifiConfigManager.isLastSelectedConfiguration(config)) {
+                            // If we autojoined a different config than the user selected one,
+                            // it means we could not see the last user selection,
+                            // or that the last user selection was faulty and ended up blacklisted
+                            // for some reason (in which case the user is notified with an error
+                            // message in the Wifi picker), and thus we managed to auto-join away
+                            // from the selected  config. -> in that case we need to forget
+                            // the selection because we don't want to abruptly switch back to it.
+                            //
+                            // Note that the user selection is also forgotten after a period of time
+                            // during which the device has been disconnected.
+                            // The default value is 30 minutes : see the code path at bottom of
+                            // setScanResults() function.
+                            mWifiConfigManager.
+                                 setAndEnableLastSelectedConfiguration(
+                                         WifiConfiguration.INVALID_NETWORK_ID);
+                        }
+                        mAutoRoaming = false;
+                        if (isRoaming() || linkDebouncing) {
+                            transitionTo(mRoamingState);
+                        } else if (didDisconnect) {
+                            transitionTo(mDisconnectingState);
+                        }
+                    } else {
+                        loge("Failed to connect config: " + config + " netId: " + netId);
+                        replyToMessage(message, WifiManager.CONNECT_NETWORK_FAILED,
+                                WifiManager.ERROR);
+                        reportConnectionAttemptEnd(
+                                WifiMetrics.ConnectionEvent.FAILURE_CONNECT_NETWORK_FAILED,
+                                WifiMetricsProto.ConnectionEvent.HLF_NONE);
+                        break;
+                    }
+                    break;
+                case CMD_REMOVE_APP_CONFIGURATIONS:
+                    mWifiConfigManager.removeNetworksForApp((ApplicationInfo) message.obj);
+                    break;
+                case CMD_REMOVE_USER_CONFIGURATIONS:
+                    mWifiConfigManager.removeNetworksForUser(message.arg1);
+                    break;
+                case WifiManager.CONNECT_NETWORK:
+                    // Only the current foreground user and System UI (which runs as user 0 but acts
+                    // on behalf of the current foreground user) can modify networks.
+                    if (!mWifiConfigManager.isCurrentUserProfile(
+                            UserHandle.getUserId(message.sendingUid)) &&
+                            message.sendingUid != mSystemUiUid) {
+                        loge("Only the current foreground user can modify networks "
+                                + " currentUserId=" + mWifiConfigManager.getCurrentUserId()
+                                + " sendingUserId=" + UserHandle.getUserId(message.sendingUid));
+                        replyToMessage(message, WifiManager.CONNECT_NETWORK_FAILED,
+                                       WifiManager.NOT_AUTHORIZED);
+                        break;
+                    }
+
+                    /**
+                     *  The connect message can contain a network id passed as arg1 on message or
+                     * or a config passed as obj on message.
+                     * For a new network, a config is passed to create and connect.
+                     * For an existing network, a network id is passed
+                     */
+                    netId = message.arg1;
+                    config = (WifiConfiguration) message.obj;
+                    mWifiConnectionStatistics.numWifiManagerJoinAttempt++;
+                    boolean updatedExisting = false;
+
+                    /* Save the network config */
+                    if (config != null) {
+                        // When connecting to an access point, WifiStateMachine wants to update the
+                        // relevant config with administrative data. This update should not be
+                        // considered a 'real' update, therefore lockdown by Device Owner must be
+                        // disregarded.
+                        if (!recordUidIfAuthorized(config, message.sendingUid,
+                                /* onlyAnnotate */ true)) {
+                            logw("Not authorized to update network "
+                                 + " config=" + config.SSID
+                                 + " cnid=" + config.networkId
+                                 + " uid=" + message.sendingUid);
+                            replyToMessage(message, WifiManager.CONNECT_NETWORK_FAILED,
+                                           WifiManager.NOT_AUTHORIZED);
+                            break;
+                        }
+                        String configKey = config.configKey(true /* allowCached */);
+                        WifiConfiguration savedConfig =
+                                mWifiConfigManager.getWifiConfiguration(configKey);
+                        if (savedConfig != null) {
+                            // There is an existing config with this netId, but it wasn't exposed
+                            // (either AUTO_JOIN_DELETED or ephemeral; see WifiConfigManager#
+                            // getConfiguredNetworks). Remove those bits and update the config.
+                            config = savedConfig;
+                            logd("CONNECT_NETWORK updating existing config with id=" +
+                                    config.networkId + " configKey=" + configKey);
+                            config.ephemeral = false;
+                            mWifiConfigManager.updateNetworkSelectionStatus(config,
+                                    WifiConfiguration.NetworkSelectionStatus
+                                    .NETWORK_SELECTION_ENABLE);
+                            updatedExisting = true;
+                        }
+
+                        result = mWifiConfigManager.saveNetwork(config, message.sendingUid);
+                        netId = result.getNetworkId();
+                    }
+                    config = mWifiConfigManager.getWifiConfiguration(netId);
+                    if (config == null) {
+                        logd("CONNECT_NETWORK no config for id=" + Integer.toString(netId) + " "
+                                + mSupplicantStateTracker.getSupplicantStateName() + " my state "
+                                + getCurrentState().getName());
+                        replyToMessage(message, WifiManager.CONNECT_NETWORK_FAILED,
+                                WifiManager.ERROR);
+                        break;
+                    }
+                    mTargetNetworkId = netId;
+                    autoRoamSetBSSID(netId, "any");
+                    if (message.sendingUid == Process.WIFI_UID
+                        || message.sendingUid == Process.SYSTEM_UID) {
+                        // As a sanity measure, clear the BSSID in the supplicant network block.
+                        // If system or Wifi Settings want to connect, they will not
+                        // specify the BSSID.
+                        // If an app however had added a BSSID to this configuration, and the BSSID
+                        // was wrong, Then we would forever fail to connect until that BSSID
+                        // is cleaned up.
+                        clearConfigBSSID(config, "CONNECT_NETWORK");
+                    }
+
+                    if (deferForUserInput(message, netId, true)) {
+                        break;
+                    } else if (mWifiConfigManager.getWifiConfiguration(netId).userApproved ==
+                                                                    WifiConfiguration.USER_BANNED) {
+                        replyToMessage(message, WifiManager.CONNECT_NETWORK_FAILED,
+                                WifiManager.NOT_AUTHORIZED);
+                        break;
+                    }
+
+                    mAutoRoaming = false;
+
+                    /* Tell network selection the user did try to connect to that network if from
+                    settings */
+                    boolean persist =
+                        mWifiConfigManager.checkConfigOverridePermission(message.sendingUid);
+
+
+                    mWifiConfigManager.setAndEnableLastSelectedConfiguration(netId);
+                    if (mWifiConnectivityManager != null) {
+                        mWifiConnectivityManager.connectToUserSelectNetwork(netId, persist);
+                    }
+                    didDisconnect = false;
+                    if (mLastNetworkId != WifiConfiguration.INVALID_NETWORK_ID
+                            && mLastNetworkId != netId) {
+                        /** Supplicant will ignore the reconnect if we are currently associated,
+                         * hence trigger a disconnect
+                         */
+                        didDisconnect = true;
+                        mWifiNative.disconnect();
+                    }
+
+                    //Start a new ConnectionEvent due to connect_network, this is always user
+                    //selected
+                    mWifiMetrics.startConnectionEvent(config, mTargetRoamBSSID,
+                            WifiMetricsProto.ConnectionEvent.ROAM_USER_SELECTED);
+                    if (mWifiConfigManager.selectNetwork(config, /* updatePriorities = */ true,
+                            message.sendingUid) && mWifiNative.reconnect()) {
+                        lastConnectAttemptTimestamp = System.currentTimeMillis();
+                        targetWificonfiguration = mWifiConfigManager.getWifiConfiguration(netId);
+
+                        /* The state tracker handles enabling networks upon completion/failure */
+                        mSupplicantStateTracker.sendMessage(WifiManager.CONNECT_NETWORK);
+                        replyToMessage(message, WifiManager.CONNECT_NETWORK_SUCCEEDED);
+                        if (didDisconnect) {
+                            /* Expect a disconnection from the old connection */
+                            transitionTo(mDisconnectingState);
+                        } else if (updatedExisting && getCurrentState() == mConnectedState &&
+                                getCurrentWifiConfiguration().networkId == netId) {
+                            // Update the current set of network capabilities, but stay in the
+                            // current state.
+                            updateCapabilities(config);
+                        } else {
+                            /**
+                             * Directly go to disconnected state where we
+                             * process the connection events from supplicant
+                             */
+                            transitionTo(mDisconnectedState);
+                        }
+                    } else {
+                        loge("Failed to connect config: " + config + " netId: " + netId);
+                        replyToMessage(message, WifiManager.CONNECT_NETWORK_FAILED,
+                                WifiManager.ERROR);
+                        reportConnectionAttemptEnd(
+                                WifiMetrics.ConnectionEvent.FAILURE_CONNECT_NETWORK_FAILED,
+                                WifiMetricsProto.ConnectionEvent.HLF_NONE);
+                        break;
+                    }
+                    break;
+                case WifiManager.SAVE_NETWORK:
+                    mWifiConnectionStatistics.numWifiManagerJoinAttempt++;
+                    // Fall thru
+                case WifiStateMachine.CMD_AUTO_SAVE_NETWORK:
+                    // Only the current foreground user can modify networks.
+                    if (!mWifiConfigManager.isCurrentUserProfile(
+                            UserHandle.getUserId(message.sendingUid))) {
+                        loge("Only the current foreground user can modify networks "
+                                + " currentUserId=" + mWifiConfigManager.getCurrentUserId()
+                                + " sendingUserId=" + UserHandle.getUserId(message.sendingUid));
+                        replyToMessage(message, WifiManager.SAVE_NETWORK_FAILED,
+                                WifiManager.NOT_AUTHORIZED);
+                        break;
+                    }
+
+                    lastSavedConfigurationAttempt = null; // Used for debug
+                    config = (WifiConfiguration) message.obj;
+                    if (config == null) {
+                        loge("ERROR: SAVE_NETWORK with null configuration"
+                                + mSupplicantStateTracker.getSupplicantStateName()
+                                + " my state " + getCurrentState().getName());
+                        messageHandlingStatus = MESSAGE_HANDLING_STATUS_FAIL;
+                        replyToMessage(message, WifiManager.SAVE_NETWORK_FAILED,
+                                WifiManager.ERROR);
+                        break;
+                    }
+                    lastSavedConfigurationAttempt = new WifiConfiguration(config);
+                    int nid = config.networkId;
+                    logd("SAVE_NETWORK id=" + Integer.toString(nid)
+                                + " config=" + config.SSID
+                                + " nid=" + config.networkId
+                                + " supstate=" + mSupplicantStateTracker.getSupplicantStateName()
+                                + " my state " + getCurrentState().getName());
+
+                    // Only record the uid if this is user initiated
+                    boolean checkUid = (message.what == WifiManager.SAVE_NETWORK);
+                    if (checkUid && !recordUidIfAuthorized(config, message.sendingUid,
+                            /* onlyAnnotate */ false)) {
+                        logw("Not authorized to update network "
+                             + " config=" + config.SSID
+                             + " cnid=" + config.networkId
+                             + " uid=" + message.sendingUid);
+                        replyToMessage(message, WifiManager.SAVE_NETWORK_FAILED,
+                                       WifiManager.NOT_AUTHORIZED);
+                        break;
+                    }
+
+                    result = mWifiConfigManager.saveNetwork(config, WifiConfiguration.UNKNOWN_UID);
+                    if (result.getNetworkId() != WifiConfiguration.INVALID_NETWORK_ID) {
+                        if (mWifiInfo.getNetworkId() == result.getNetworkId()) {
+                            if (result.hasIpChanged()) {
+                                // The currently connection configuration was changed
+                                // We switched from DHCP to static or from static to DHCP, or the
+                                // static IP address has changed.
+                                log("Reconfiguring IP on connection");
+                                // TODO: clear addresses and disable IPv6
+                                // to simplify obtainingIpState.
+                                transitionTo(mObtainingIpState);
+                            }
+                            if (result.hasProxyChanged()) {
+                                log("Reconfiguring proxy on connection");
+                                mIpManager.setHttpProxy(
+                                        mWifiConfigManager.getProxyProperties(mLastNetworkId));
+                            }
+                        }
+                        replyToMessage(message, WifiManager.SAVE_NETWORK_SUCCEEDED);
+                        broadcastWifiCredentialChanged(WifiManager.WIFI_CREDENTIAL_SAVED, config);
+
+                        if (DBG) {
+                           logd("Success save network nid="
+                                    + Integer.toString(result.getNetworkId()));
+                        }
+
+                        /**
+                         * If the command comes from WifiManager, then
+                         * tell autojoin the user did try to modify and save that network,
+                         * and interpret the SAVE_NETWORK as a request to connect
+                         */
+                        boolean user = message.what == WifiManager.SAVE_NETWORK;
+
+                        // Did this connect come from settings
+                        boolean persistConnect =
+                                mWifiConfigManager.checkConfigOverridePermission(
+                                        message.sendingUid);
+
+                        if (user) {
+                            mWifiConfigManager.updateLastConnectUid(config, message.sendingUid);
+                            mWifiConfigManager.writeKnownNetworkHistory();
+                        }
+
+                        if (mWifiConnectivityManager != null) {
+                            mWifiConnectivityManager.connectToUserSelectNetwork(
+                                    result.getNetworkId(), persistConnect);
+                        }
+                    } else {
+                        loge("Failed to save network");
+                        messageHandlingStatus = MESSAGE_HANDLING_STATUS_FAIL;
+                        replyToMessage(message, WifiManager.SAVE_NETWORK_FAILED,
+                                WifiManager.ERROR);
+                    }
+                    break;
+                case WifiManager.FORGET_NETWORK:
+                    // Only the current foreground user can modify networks.
+                    if (!mWifiConfigManager.isCurrentUserProfile(
+                            UserHandle.getUserId(message.sendingUid))) {
+                        loge("Only the current foreground user can modify networks "
+                                + " currentUserId=" + mWifiConfigManager.getCurrentUserId()
+                                + " sendingUserId=" + UserHandle.getUserId(message.sendingUid));
+                        replyToMessage(message, WifiManager.FORGET_NETWORK_FAILED,
+                                WifiManager.NOT_AUTHORIZED);
+                        break;
+                    }
+
+                    // Debug only, remember last configuration that was forgotten
+                    WifiConfiguration toRemove
+                            = mWifiConfigManager.getWifiConfiguration(message.arg1);
+                    if (toRemove == null) {
+                        lastForgetConfigurationAttempt = null;
+                    } else {
+                        lastForgetConfigurationAttempt = new WifiConfiguration(toRemove);
+                    }
+                    // check that the caller owns this network
+                    netId = message.arg1;
+
+                    if (!mWifiConfigManager.canModifyNetwork(message.sendingUid, netId,
+                            /* onlyAnnotate */ false)) {
+                        logw("Not authorized to forget network "
+                             + " cnid=" + netId
+                             + " uid=" + message.sendingUid);
+                        replyToMessage(message, WifiManager.FORGET_NETWORK_FAILED,
+                                WifiManager.NOT_AUTHORIZED);
+                        break;
+                    }
+
+                    if (mWifiConfigManager.forgetNetwork(message.arg1)) {
+                        replyToMessage(message, WifiManager.FORGET_NETWORK_SUCCEEDED);
+                        broadcastWifiCredentialChanged(WifiManager.WIFI_CREDENTIAL_FORGOT,
+                                (WifiConfiguration) message.obj);
+                    } else {
+                        loge("Failed to forget network");
+                        replyToMessage(message, WifiManager.FORGET_NETWORK_FAILED,
+                                WifiManager.ERROR);
+                    }
+                    break;
+                case WifiManager.START_WPS:
+                    WpsInfo wpsInfo = (WpsInfo) message.obj;
+                    WpsResult wpsResult;
+                    switch (wpsInfo.setup) {
+                        case WpsInfo.PBC:
+                            wpsResult = mWifiConfigManager.startWpsPbc(wpsInfo);
+                            break;
+                        case WpsInfo.KEYPAD:
+                            wpsResult = mWifiConfigManager.startWpsWithPinFromAccessPoint(wpsInfo);
+                            break;
+                        case WpsInfo.DISPLAY:
+                            wpsResult = mWifiConfigManager.startWpsWithPinFromDevice(wpsInfo);
+                            break;
+                        default:
+                            wpsResult = new WpsResult(Status.FAILURE);
+                            loge("Invalid setup for WPS");
+                            break;
+                    }
+                    mWifiConfigManager.setAndEnableLastSelectedConfiguration
+                            (WifiConfiguration.INVALID_NETWORK_ID);
+                    if (wpsResult.status == Status.SUCCESS) {
+                        replyToMessage(message, WifiManager.START_WPS_SUCCEEDED, wpsResult);
+                        transitionTo(mWpsRunningState);
+                    } else {
+                        loge("Failed to start WPS with config " + wpsInfo.toString());
+                        replyToMessage(message, WifiManager.WPS_FAILED, WifiManager.ERROR);
+                    }
+                    break;
+                case CMD_ASSOCIATED_BSSID:
+                    // This is where we can confirm the connection BSSID. Use it to find the
+                    // right ScanDetail to populate metrics.
+                    String someBssid = (String) message.obj;
+                    if (someBssid != null) {
+                        //Get the config associated with this connection attempt
+                        WifiConfiguration someConf =
+                                mWifiConfigManager.getWifiConfiguration(mTargetNetworkId);
+                        // Get the ScanDetail associated with this BSSID
+                        ScanDetailCache scanDetailCache = mWifiConfigManager.getScanDetailCache(
+                                someConf);
+                        if (scanDetailCache != null) {
+                            mWifiMetrics.setConnectionScanDetail(scanDetailCache.getScanDetail(
+                                    someBssid));
+                        }
+                    }
+                    return NOT_HANDLED;
+                case WifiMonitor.NETWORK_CONNECTION_EVENT:
+                    if (DBG) log("Network connection established");
+                    mLastNetworkId = message.arg1;
+                    mLastBssid = (String) message.obj;
+
+                    mWifiInfo.setBSSID(mLastBssid);
+                    mWifiInfo.setNetworkId(mLastNetworkId);
+                    mWifiQualifiedNetworkSelector
+                            .enableBssidForQualityNetworkSelection(mLastBssid, true);
+                    sendNetworkStateChangeBroadcast(mLastBssid);
+                    transitionTo(mObtainingIpState);
+                    break;
+                case WifiMonitor.NETWORK_DISCONNECTION_EVENT:
+                    // Calling handleNetworkDisconnect here is redundant because we might already
+                    // have called it when leaving L2ConnectedState to go to disconnecting state
+                    // or thru other path
+                    // We should normally check the mWifiInfo or mLastNetworkId so as to check
+                    // if they are valid, and only in this case call handleNEtworkDisconnect,
+                    // TODO: this should be fixed for a L MR release
+                    // The side effect of calling handleNetworkDisconnect twice is that a bunch of
+                    // idempotent commands are executed twice (stopping Dhcp, enabling the SPS mode
+                    // at the chip etc...
+                    if (DBG) log("ConnectModeState: Network connection lost ");
+                    handleNetworkDisconnect();
+                    transitionTo(mDisconnectedState);
+                    break;
+                case CMD_ADD_PASSPOINT_MO:
+                    res = mWifiConfigManager.addPasspointManagementObject((String) message.obj);
+                    replyToMessage(message, message.what, res);
+                    break;
+                case CMD_MODIFY_PASSPOINT_MO:
+                    if (message.obj != null) {
+                        Bundle bundle = (Bundle) message.obj;
+                        ArrayList<PasspointManagementObjectDefinition> mos =
+                                bundle.getParcelableArrayList("MOS");
+                        res = mWifiConfigManager.modifyPasspointMo(bundle.getString("FQDN"), mos);
+                    } else {
+                        res = 0;
+                    }
+                    replyToMessage(message, message.what, res);
+
+                    break;
+                case CMD_QUERY_OSU_ICON:
+                    if (mWifiConfigManager.queryPasspointIcon(
+                            ((Bundle) message.obj).getLong("BSSID"),
+                            ((Bundle) message.obj).getString("FILENAME"))) {
+                        res = 1;
+                    } else {
+                        res = 0;
+                    }
+                    replyToMessage(message, message.what, res);
+                    break;
+                case CMD_MATCH_PROVIDER_NETWORK:
+                    res = mWifiConfigManager.matchProviderWithCurrentNetwork((String) message.obj);
+                    replyToMessage(message, message.what, res);
+                    break;
+                default:
+                    return NOT_HANDLED;
+            }
+            return HANDLED;

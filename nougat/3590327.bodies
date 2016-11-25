@@ -1,0 +1,138 @@
+class ACodec::UninitializedState
+!!!40158775.cpp!!!	stateEntered() : void
+    ALOGV("Now uninitialized");
+
+    if (mDeathNotifier != NULL) {
+        mCodec->mNodeBinder->unlinkToDeath(mDeathNotifier);
+        mDeathNotifier.clear();
+    }
+
+    mCodec->mUsingNativeWindow = false;
+    mCodec->mNativeWindow.clear();
+    mCodec->mNativeWindowUsageBits = 0;
+    mCodec->mNode = 0;
+    mCodec->mOMX.clear();
+    mCodec->mQuirks = 0;
+    mCodec->mFlags = 0;
+    mCodec->mInputMetadataType = kMetadataBufferTypeInvalid;
+    mCodec->mOutputMetadataType = kMetadataBufferTypeInvalid;
+    mCodec->mConverter[0].clear();
+    mCodec->mConverter[1].clear();
+    mCodec->mComponentName.clear();
+!!!40158903.cpp!!!	onSetup(in msg : sp<AMessage>) : void
+    if (onAllocateComponent(msg)
+            && mCodec->mLoadedState->onConfigureComponent(msg)) {
+        mCodec->mLoadedState->onStart();
+    }
+!!!40159031.cpp!!!	onAllocateComponent(in msg : sp<AMessage>) : bool
+    ALOGV("onAllocateComponent");
+
+    CHECK(mCodec->mNode == 0);
+
+    OMXClient client;
+    if (client.connect() != OK) {
+        mCodec->signalError(OMX_ErrorUndefined, NO_INIT);
+        return false;
+    }
+
+    sp<IOMX> omx = client.interface();
+
+    sp<AMessage> notify = new AMessage(kWhatOMXDied, mCodec);
+
+    Vector<AString> matchingCodecs;
+
+    AString mime;
+
+    AString componentName;
+    uint32_t quirks = 0;
+    int32_t encoder = false;
+    if (msg->findString("componentName", &componentName)) {
+        sp<IMediaCodecList> list = MediaCodecList::getInstance();
+        if (list != NULL && list->findCodecByName(componentName.c_str()) >= 0) {
+            matchingCodecs.add(componentName);
+        }
+    } else {
+        CHECK(msg->findString("mime", &mime));
+
+        if (!msg->findInt32("encoder", &encoder)) {
+            encoder = false;
+        }
+
+        MediaCodecList::findMatchingCodecs(
+                mime.c_str(),
+                encoder, // createEncoder
+                0,       // flags
+                &matchingCodecs);
+    }
+
+    sp<CodecObserver> observer = new CodecObserver;
+    IOMX::node_id node = 0;
+
+    status_t err = NAME_NOT_FOUND;
+    for (size_t matchIndex = 0; matchIndex < matchingCodecs.size();
+            ++matchIndex) {
+        componentName = matchingCodecs[matchIndex];
+        quirks = MediaCodecList::getQuirksFor(componentName.c_str());
+
+        pid_t tid = gettid();
+        int prevPriority = androidGetThreadPriority(tid);
+        androidSetThreadPriority(tid, ANDROID_PRIORITY_FOREGROUND);
+        err = omx->allocateNode(componentName.c_str(), observer, &mCodec->mNodeBinder, &node);
+        androidSetThreadPriority(tid, prevPriority);
+
+        if (err == OK) {
+            break;
+        } else {
+            ALOGW("Allocating component '%s' failed, try next one.", componentName.c_str());
+        }
+
+        node = 0;
+    }
+
+    if (node == 0) {
+        if (!mime.empty()) {
+            ALOGE("Unable to instantiate a %scoder for type '%s' with err %#x.",
+                    encoder ? "en" : "de", mime.c_str(), err);
+        } else {
+            ALOGE("Unable to instantiate codec '%s' with err %#x.", componentName.c_str(), err);
+        }
+
+        mCodec->signalError((OMX_ERRORTYPE)err, makeNoSideEffectStatus(err));
+        return false;
+    }
+
+    mDeathNotifier = new DeathNotifier(notify);
+    if (mCodec->mNodeBinder == NULL ||
+            mCodec->mNodeBinder->linkToDeath(mDeathNotifier) != OK) {
+        // This was a local binder, if it dies so do we, we won't care
+        // about any notifications in the afterlife.
+        mDeathNotifier.clear();
+    }
+
+    notify = new AMessage(kWhatOMXMessageList, mCodec);
+    observer->setNotificationMessage(notify);
+
+    mCodec->mComponentName = componentName;
+    mCodec->mRenderTracker.setComponentName(componentName);
+    mCodec->mFlags = 0;
+
+    if (componentName.endsWith(".secure")) {
+        mCodec->mFlags |= kFlagIsSecure;
+        mCodec->mFlags |= kFlagIsGrallocUsageProtected;
+        mCodec->mFlags |= kFlagPushBlankBuffersToNativeWindowOnShutdown;
+    }
+
+    mCodec->mQuirks = quirks;
+    mCodec->mOMX = omx;
+    mCodec->mNode = node;
+
+    {
+        sp<AMessage> notify = mCodec->mNotify->dup();
+        notify->setInt32("what", CodecBase::kWhatComponentAllocated);
+        notify->setString("componentName", mCodec->mComponentName.c_str());
+        notify->post();
+    }
+
+    mCodec->changeState(mCodec->mLoadedState);
+
+    return true;

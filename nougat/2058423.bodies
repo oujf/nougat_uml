@@ -1,0 +1,878 @@
+class WifiConfigStore
+!!!36821559.java!!!	WifiConfigStore(inout wifiNative : WifiNative, inout keyStore : KeyStore, inout localLog : LocalLog, inout showNetworks : boolean, inout verboseDebug : boolean)
+        mWifiNative = wifiNative;
+        mKeyStore = keyStore;
+        mShowNetworks = showNetworks;
+        mBackupManagerProxy = new BackupManagerProxy();
+
+        if (mShowNetworks) {
+            mLocalLog = localLog;
+            mFileObserver = new WpaConfigFileObserver();
+            mFileObserver.startWatching();
+        } else {
+            mLocalLog = null;
+            mFileObserver = null;
+        }
+        VDBG = verboseDebug;
+!!!36821687.java!!!	removeDoubleQuotes(inout string : String) : String
+        int length = string.length();
+        if ((length > 1) && (string.charAt(0) == '"')
+                && (string.charAt(length - 1) == '"')) {
+            return string.substring(1, length - 1);
+        }
+        return string;
+!!!36821815.java!!!	makeString(inout set : BitSet, inout strings : String) : String
+        return makeStringWithException(set, strings, null);
+!!!36821943.java!!!	makeStringWithException(inout set : BitSet, inout strings : String, inout exception : String) : String
+        StringBuilder result = new StringBuilder();
+
+        /* Make sure all set bits are in [0, strings.length) to avoid
+         * going out of bounds on strings.  (Shouldn't happen, but...) */
+        BitSet trimmedSet = set.get(0, strings.length);
+
+        List<String> valueSet = new ArrayList<>();
+        for (int bit = trimmedSet.nextSetBit(0);
+             bit >= 0;
+             bit = trimmedSet.nextSetBit(bit+1)) {
+            String currentName = strings[bit];
+            if (exception != null && currentName.equals(exception)) {
+                valueSet.add(currentName);
+            } else {
+                // Most wpa_supplicant strings use a dash whereas (for some bizarre
+                // reason) the strings are defined with underscore in the code...
+                valueSet.add(currentName.replace('_', '-'));
+            }
+        }
+        return TextUtils.join(" ", valueSet);
+!!!36822071.java!!!	encodeSSID(inout str : String) : String
+        return Utils.toHex(removeDoubleQuotes(str).getBytes(StandardCharsets.UTF_8));
+!!!36822199.java!!!	needsKeyStore(inout config : WifiEnterpriseConfig) : boolean
+        return (!(config.getClientCertificate() == null && config.getCaCertificate() == null));
+!!!36822327.java!!!	isHardwareBackedKey(inout key : PrivateKey) : boolean
+        return KeyChain.isBoundKeyAlgorithm(key.getAlgorithm());
+!!!36822455.java!!!	hasHardwareBackedKey(inout certificate : Certificate) : boolean
+        return KeyChain.isBoundKeyAlgorithm(certificate.getPublicKey().getAlgorithm());
+!!!36822583.java!!!	needsSoftwareBackedKeyStore(inout config : WifiEnterpriseConfig) : boolean
+        java.lang.String client = config.getClientCertificateAlias();
+        if (!TextUtils.isEmpty(client)) {
+            // a valid client certificate is configured
+
+            // BUGBUG: keyStore.get() never returns certBytes; because it is not
+            // taking WIFI_UID as a parameter. It always looks for certificate
+            // with SYSTEM_UID, and never finds any Wifi certificates. Assuming that
+            // all certificates need software keystore until we get the get() API
+            // fixed.
+            return true;
+        }
+        return false;
+!!!36822711.java!!!	lookupString(inout string : String, inout strings : String) : int
+        int size = strings.length;
+
+        string = string.replace('-', '_');
+
+        for (int i = 0; i < size; i++) {
+            if (string.equals(strings[i])) {
+                return i;
+            }
+        }
+        loge("Failed to look-up a string: " + string);
+        return -1;
+!!!36822839.java!!!	readNetworkBitsetVariable(in netId : int, inout variable : BitSet, inout varName : String, inout strings : String) : void
+        String value = mWifiNative.getNetworkVariable(netId, varName);
+        if (!TextUtils.isEmpty(value)) {
+            variable.clear();
+            String[] vals = value.split(" ");
+            for (String val : vals) {
+                int index = lookupString(val, strings);
+                if (0 <= index) {
+                    variable.set(index);
+                }
+            }
+        }
+!!!36822967.java!!!	readNetworkVariables(inout config : WifiConfiguration) : void
+        if (config == null) {
+            return;
+        }
+        if (VDBG) localLog("readNetworkVariables: " + config.networkId);
+        int netId = config.networkId;
+        if (netId < 0) {
+            return;
+        }
+        /*
+         * TODO: maybe should have a native method that takes an array of
+         * variable names and returns an array of values. But we'd still
+         * be doing a round trip to the supplicant daemon for each variable.
+         */
+        String value;
+
+        value = mWifiNative.getNetworkVariable(netId, WifiConfiguration.ssidVarName);
+        if (!TextUtils.isEmpty(value)) {
+            if (value.charAt(0) != '"') {
+                config.SSID = "\"" + WifiSsid.createFromHex(value).toString() + "\"";
+                //TODO: convert a hex string that is not UTF-8 decodable to a P-formatted
+                //supplicant string
+            } else {
+                config.SSID = value;
+            }
+        } else {
+            config.SSID = null;
+        }
+
+        value = mWifiNative.getNetworkVariable(netId, WifiConfiguration.bssidVarName);
+        if (!TextUtils.isEmpty(value)) {
+            config.getNetworkSelectionStatus().setNetworkSelectionBSSID(value);
+        } else {
+            config.getNetworkSelectionStatus().setNetworkSelectionBSSID(null);
+        }
+
+        value = mWifiNative.getNetworkVariable(netId, WifiConfiguration.priorityVarName);
+        config.priority = -1;
+        if (!TextUtils.isEmpty(value)) {
+            try {
+                config.priority = Integer.parseInt(value);
+            } catch (NumberFormatException ignore) {
+            }
+        }
+
+        value = mWifiNative.getNetworkVariable(netId, WifiConfiguration.hiddenSSIDVarName);
+        config.hiddenSSID = false;
+        if (!TextUtils.isEmpty(value)) {
+            try {
+                config.hiddenSSID = Integer.parseInt(value) != 0;
+            } catch (NumberFormatException ignore) {
+            }
+        }
+
+        value = mWifiNative.getNetworkVariable(netId, WifiConfiguration.pmfVarName);
+        config.requirePMF = false;
+        if (!TextUtils.isEmpty(value)) {
+            try {
+                config.requirePMF = Integer.parseInt(value) == STORED_VALUE_FOR_REQUIRE_PMF;
+            } catch (NumberFormatException ignore) {
+            }
+        }
+
+        value = mWifiNative.getNetworkVariable(netId, WifiConfiguration.wepTxKeyIdxVarName);
+        config.wepTxKeyIndex = -1;
+        if (!TextUtils.isEmpty(value)) {
+            try {
+                config.wepTxKeyIndex = Integer.parseInt(value);
+            } catch (NumberFormatException ignore) {
+            }
+        }
+
+        for (int i = 0; i < 4; i++) {
+            value = mWifiNative.getNetworkVariable(netId,
+                    WifiConfiguration.wepKeyVarNames[i]);
+            if (!TextUtils.isEmpty(value)) {
+                config.wepKeys[i] = value;
+            } else {
+                config.wepKeys[i] = null;
+            }
+        }
+
+        value = mWifiNative.getNetworkVariable(netId, WifiConfiguration.pskVarName);
+        if (!TextUtils.isEmpty(value)) {
+            config.preSharedKey = value;
+        } else {
+            config.preSharedKey = null;
+        }
+
+        readNetworkBitsetVariable(config.networkId, config.allowedProtocols,
+                WifiConfiguration.Protocol.varName, WifiConfiguration.Protocol.strings);
+
+        readNetworkBitsetVariable(config.networkId, config.allowedKeyManagement,
+                WifiConfiguration.KeyMgmt.varName, WifiConfiguration.KeyMgmt.strings);
+
+        readNetworkBitsetVariable(config.networkId, config.allowedAuthAlgorithms,
+                WifiConfiguration.AuthAlgorithm.varName, WifiConfiguration.AuthAlgorithm.strings);
+
+        readNetworkBitsetVariable(config.networkId, config.allowedPairwiseCiphers,
+                WifiConfiguration.PairwiseCipher.varName, WifiConfiguration.PairwiseCipher.strings);
+
+        readNetworkBitsetVariable(config.networkId, config.allowedGroupCiphers,
+                WifiConfiguration.GroupCipher.varName, WifiConfiguration.GroupCipher.strings);
+
+        if (config.enterpriseConfig == null) {
+            config.enterpriseConfig = new WifiEnterpriseConfig();
+        }
+        config.enterpriseConfig.loadFromSupplicant(new SupplicantLoader(netId));
+!!!36823095.java!!!	loadNetworks(inout configs : Map<String, WifiConfiguration>, inout networkExtras : SparseArray) : int
+        int lastPriority = 0;
+        int last_id = -1;
+        boolean done = false;
+        while (!done) {
+            String listStr = mWifiNative.listNetworks(last_id);
+            if (listStr == null) {
+                return lastPriority;
+            }
+            String[] lines = listStr.split("\n");
+            if (mShowNetworks) {
+                localLog("loadNetworks:  ");
+                for (String net : lines) {
+                    localLog(net);
+                }
+            }
+            // Skip the first line, which is a header
+            for (int i = 1; i < lines.length; i++) {
+                String[] result = lines[i].split("\t");
+                // network-id | ssid | bssid | flags
+                WifiConfiguration config = new WifiConfiguration();
+                try {
+                    config.networkId = Integer.parseInt(result[0]);
+                    last_id = config.networkId;
+                } catch (NumberFormatException e) {
+                    loge("Failed to read network-id '" + result[0] + "'");
+                    continue;
+                }
+                // Ignore the supplicant status, start all networks disabled.
+                config.status = WifiConfiguration.Status.DISABLED;
+                readNetworkVariables(config);
+                // Parse the serialized JSON dictionary in ID_STRING_VAR_NAME once and cache the
+                // result for efficiency.
+                Map<String, String> extras = mWifiNative.getNetworkExtra(config.networkId,
+                        ID_STRING_VAR_NAME);
+                if (extras == null) {
+                    extras = new HashMap<String, String>();
+                    // If ID_STRING_VAR_NAME did not contain a dictionary, assume that it contains
+                    // just a quoted FQDN. This is the legacy format that was used in Marshmallow.
+                    final String fqdn = Utils.unquote(mWifiNative.getNetworkVariable(
+                            config.networkId, ID_STRING_VAR_NAME));
+                    if (fqdn != null) {
+                        extras.put(ID_STRING_KEY_FQDN, fqdn);
+                        config.FQDN = fqdn;
+                        // Mark the configuration as a Hotspot 2.0 network.
+                        config.providerFriendlyName = "";
+                    }
+                }
+                networkExtras.put(config.networkId, extras);
+
+                if (config.priority > lastPriority) {
+                    lastPriority = config.priority;
+                }
+                config.setIpAssignment(IpAssignment.DHCP);
+                config.setProxySettings(ProxySettings.NONE);
+                if (!WifiServiceImpl.isValid(config)) {
+                    if (mShowNetworks) {
+                        localLog("Ignoring network " + config.networkId + " because configuration "
+                                + "loaded from wpa_supplicant.conf is not valid.");
+                    }
+                    continue;
+                }
+                // The configKey is explicitly stored in wpa_supplicant.conf, because config does
+                // not contain sufficient information to compute it at this point.
+                String configKey = extras.get(ID_STRING_KEY_CONFIG_KEY);
+                if (configKey == null) {
+                    // Handle the legacy case where the configKey is not stored in
+                    // wpa_supplicant.conf but can be computed straight away.
+                    // Force an update of this legacy network configuration by writing
+                    // the configKey for this network into wpa_supplicant.conf.
+                    configKey = config.configKey();
+                    saveNetworkMetadata(config);
+                }
+                final WifiConfiguration duplicateConfig = configs.put(configKey, config);
+                if (duplicateConfig != null) {
+                    // The network is already known. Overwrite the duplicate entry.
+                    if (mShowNetworks) {
+                        localLog("Replacing duplicate network " + duplicateConfig.networkId
+                                + " with " + config.networkId + ".");
+                    }
+                    // This can happen after the user manually connected to an AP and tried to use
+                    // WPS to connect the AP later. In this case, the supplicant will create a new
+                    // network for the AP although there is an existing network already.
+                    mWifiNative.removeNetwork(duplicateConfig.networkId);
+                }
+            }
+            done = (lines.length == 1);
+        }
+        return lastPriority;
+!!!36823223.java!!!	installKeys(inout existingConfig : WifiEnterpriseConfig, inout config : WifiEnterpriseConfig, inout name : String) : boolean
+        boolean ret = true;
+        String privKeyName = Credentials.USER_PRIVATE_KEY + name;
+        String userCertName = Credentials.USER_CERTIFICATE + name;
+        if (config.getClientCertificate() != null) {
+            byte[] privKeyData = config.getClientPrivateKey().getEncoded();
+            if (DBG) {
+                if (isHardwareBackedKey(config.getClientPrivateKey())) {
+                    Log.d(TAG, "importing keys " + name + " in hardware backed store");
+                } else {
+                    Log.d(TAG, "importing keys " + name + " in software backed store");
+                }
+            }
+            ret = mKeyStore.importKey(privKeyName, privKeyData, Process.WIFI_UID,
+                    KeyStore.FLAG_NONE);
+
+            if (!ret) {
+                return ret;
+            }
+
+            ret = putCertInKeyStore(userCertName, config.getClientCertificate());
+            if (!ret) {
+                // Remove private key installed
+                mKeyStore.delete(privKeyName, Process.WIFI_UID);
+                return ret;
+            }
+        }
+
+        X509Certificate[] caCertificates = config.getCaCertificates();
+        Set<String> oldCaCertificatesToRemove = new ArraySet<String>();
+        if (existingConfig != null && existingConfig.getCaCertificateAliases() != null) {
+            oldCaCertificatesToRemove.addAll(
+                    Arrays.asList(existingConfig.getCaCertificateAliases()));
+        }
+        List<String> caCertificateAliases = null;
+        if (caCertificates != null) {
+            caCertificateAliases = new ArrayList<String>();
+            for (int i = 0; i < caCertificates.length; i++) {
+                String alias = caCertificates.length == 1 ? name
+                        : String.format("%s_%d", name, i);
+
+                oldCaCertificatesToRemove.remove(alias);
+                ret = putCertInKeyStore(Credentials.CA_CERTIFICATE + alias, caCertificates[i]);
+                if (!ret) {
+                    // Remove client key+cert
+                    if (config.getClientCertificate() != null) {
+                        mKeyStore.delete(privKeyName, Process.WIFI_UID);
+                        mKeyStore.delete(userCertName, Process.WIFI_UID);
+                    }
+                    // Remove added CA certs.
+                    for (String addedAlias : caCertificateAliases) {
+                        mKeyStore.delete(Credentials.CA_CERTIFICATE + addedAlias, Process.WIFI_UID);
+                    }
+                    return ret;
+                } else {
+                    caCertificateAliases.add(alias);
+                }
+            }
+        }
+        // Remove old CA certs.
+        for (String oldAlias : oldCaCertificatesToRemove) {
+            mKeyStore.delete(Credentials.CA_CERTIFICATE + oldAlias, Process.WIFI_UID);
+        }
+        // Set alias names
+        if (config.getClientCertificate() != null) {
+            config.setClientCertificateAlias(name);
+            config.resetClientKeyEntry();
+        }
+
+        if (caCertificates != null) {
+            config.setCaCertificateAliases(
+                    caCertificateAliases.toArray(new String[caCertificateAliases.size()]));
+            config.resetCaCertificate();
+        }
+        return ret;
+!!!36823351.java!!!	putCertInKeyStore(inout name : String, inout cert : Certificate) : boolean
+        try {
+            byte[] certData = Credentials.convertToPem(cert);
+            if (DBG) Log.d(TAG, "putting certificate " + name + " in keystore");
+            return mKeyStore.put(name, certData, Process.WIFI_UID, KeyStore.FLAG_NONE);
+
+        } catch (IOException e1) {
+            return false;
+        } catch (CertificateException e2) {
+            return false;
+        }
+!!!36823479.java!!!	removeKeys(inout config : WifiEnterpriseConfig) : void
+        String client = config.getClientCertificateAlias();
+        // a valid client certificate is configured
+        if (!TextUtils.isEmpty(client)) {
+            if (DBG) Log.d(TAG, "removing client private key and user cert");
+            mKeyStore.delete(Credentials.USER_PRIVATE_KEY + client, Process.WIFI_UID);
+            mKeyStore.delete(Credentials.USER_CERTIFICATE + client, Process.WIFI_UID);
+        }
+
+        String[] aliases = config.getCaCertificateAliases();
+        // a valid ca certificate is configured
+        if (aliases != null) {
+            for (String ca : aliases) {
+                if (!TextUtils.isEmpty(ca)) {
+                    if (DBG) Log.d(TAG, "removing CA cert: " + ca);
+                    mKeyStore.delete(Credentials.CA_CERTIFICATE + ca, Process.WIFI_UID);
+                }
+            }
+        }
+!!!36823607.java!!!	saveNetworkMetadata(inout config : WifiConfiguration) : boolean
+        final Map<String, String> metadata = new HashMap<String, String>();
+        if (config.isPasspoint()) {
+            metadata.put(ID_STRING_KEY_FQDN, config.FQDN);
+        }
+        metadata.put(ID_STRING_KEY_CONFIG_KEY, config.configKey());
+        metadata.put(ID_STRING_KEY_CREATOR_UID, Integer.toString(config.creatorUid));
+        if (!mWifiNative.setNetworkExtra(config.networkId, ID_STRING_VAR_NAME, metadata)) {
+            loge("failed to set id_str: " + metadata.toString());
+            return false;
+        }
+        return true;
+!!!36823735.java!!!	saveNetwork(inout config : WifiConfiguration, in netId : int) : boolean
+        if (config == null) {
+            return false;
+        }
+        if (VDBG) localLog("saveNetwork: " + netId);
+        if (config.SSID != null && !mWifiNative.setNetworkVariable(
+                netId,
+                WifiConfiguration.ssidVarName,
+                encodeSSID(config.SSID))) {
+            loge("failed to set SSID: " + config.SSID);
+            return false;
+        }
+        if (!saveNetworkMetadata(config)) {
+            return false;
+        }
+        //set selected BSSID to supplicant
+        if (config.getNetworkSelectionStatus().getNetworkSelectionBSSID() != null) {
+            String bssid = config.getNetworkSelectionStatus().getNetworkSelectionBSSID();
+            if (!mWifiNative.setNetworkVariable(netId, WifiConfiguration.bssidVarName, bssid)) {
+                loge("failed to set BSSID: " + bssid);
+                return false;
+            }
+        }
+        String allowedKeyManagementString =
+                makeString(config.allowedKeyManagement, WifiConfiguration.KeyMgmt.strings);
+        if (config.allowedKeyManagement.cardinality() != 0 && !mWifiNative.setNetworkVariable(
+                netId,
+                WifiConfiguration.KeyMgmt.varName,
+                allowedKeyManagementString)) {
+            loge("failed to set key_mgmt: " + allowedKeyManagementString);
+            return false;
+        }
+        String allowedProtocolsString =
+                makeString(config.allowedProtocols, WifiConfiguration.Protocol.strings);
+        if (config.allowedProtocols.cardinality() != 0 && !mWifiNative.setNetworkVariable(
+                netId,
+                WifiConfiguration.Protocol.varName,
+                allowedProtocolsString)) {
+            loge("failed to set proto: " + allowedProtocolsString);
+            return false;
+        }
+        String allowedAuthAlgorithmsString =
+                makeString(config.allowedAuthAlgorithms,
+                        WifiConfiguration.AuthAlgorithm.strings);
+        if (config.allowedAuthAlgorithms.cardinality() != 0 && !mWifiNative.setNetworkVariable(
+                netId,
+                WifiConfiguration.AuthAlgorithm.varName,
+                allowedAuthAlgorithmsString)) {
+            loge("failed to set auth_alg: " + allowedAuthAlgorithmsString);
+            return false;
+        }
+        String allowedPairwiseCiphersString = makeString(config.allowedPairwiseCiphers,
+                WifiConfiguration.PairwiseCipher.strings);
+        if (config.allowedPairwiseCiphers.cardinality() != 0 && !mWifiNative.setNetworkVariable(
+                netId,
+                WifiConfiguration.PairwiseCipher.varName,
+                allowedPairwiseCiphersString)) {
+            loge("failed to set pairwise: " + allowedPairwiseCiphersString);
+            return false;
+        }
+        // Make sure that the string "GTK_NOT_USED" is /not/ transformed - wpa_supplicant
+        // uses this literal value and not the 'dashed' version.
+        String allowedGroupCiphersString =
+                makeStringWithException(config.allowedGroupCiphers,
+                        WifiConfiguration.GroupCipher.strings,
+                        WifiConfiguration.GroupCipher
+                                .strings[WifiConfiguration.GroupCipher.GTK_NOT_USED]);
+        if (config.allowedGroupCiphers.cardinality() != 0 && !mWifiNative.setNetworkVariable(
+                netId,
+                WifiConfiguration.GroupCipher.varName,
+                allowedGroupCiphersString)) {
+            loge("failed to set group: " + allowedGroupCiphersString);
+            return false;
+        }
+        // Prevent client screw-up by passing in a WifiConfiguration we gave it
+        // by preventing "*" as a key.
+        if (config.preSharedKey != null && !config.preSharedKey.equals("*")
+                && !mWifiNative.setNetworkVariable(
+                netId,
+                WifiConfiguration.pskVarName,
+                config.preSharedKey)) {
+            loge("failed to set psk");
+            return false;
+        }
+        boolean hasSetKey = false;
+        if (config.wepKeys != null) {
+            for (int i = 0; i < config.wepKeys.length; i++) {
+                // Prevent client screw-up by passing in a WifiConfiguration we gave it
+                // by preventing "*" as a key.
+                if (config.wepKeys[i] != null && !config.wepKeys[i].equals("*")) {
+                    if (!mWifiNative.setNetworkVariable(
+                            netId,
+                            WifiConfiguration.wepKeyVarNames[i],
+                            config.wepKeys[i])) {
+                        loge("failed to set wep_key" + i + ": " + config.wepKeys[i]);
+                        return false;
+                    }
+                    hasSetKey = true;
+                }
+            }
+        }
+        if (hasSetKey) {
+            if (!mWifiNative.setNetworkVariable(
+                    netId,
+                    WifiConfiguration.wepTxKeyIdxVarName,
+                    Integer.toString(config.wepTxKeyIndex))) {
+                loge("failed to set wep_tx_keyidx: " + config.wepTxKeyIndex);
+                return false;
+            }
+        }
+        if (!mWifiNative.setNetworkVariable(
+                netId,
+                WifiConfiguration.priorityVarName,
+                Integer.toString(config.priority))) {
+            loge(config.SSID + ": failed to set priority: " + config.priority);
+            return false;
+        }
+        if (config.hiddenSSID && !mWifiNative.setNetworkVariable(
+                netId,
+                WifiConfiguration.hiddenSSIDVarName,
+                Integer.toString(config.hiddenSSID ? 1 : 0))) {
+            loge(config.SSID + ": failed to set hiddenSSID: " + config.hiddenSSID);
+            return false;
+        }
+        if (config.requirePMF && !mWifiNative.setNetworkVariable(
+                netId,
+                WifiConfiguration.pmfVarName,
+                Integer.toString(STORED_VALUE_FOR_REQUIRE_PMF))) {
+            loge(config.SSID + ": failed to set requirePMF: " + config.requirePMF);
+            return false;
+        }
+        if (config.updateIdentifier != null && !mWifiNative.setNetworkVariable(
+                netId,
+                WifiConfiguration.updateIdentiferVarName,
+                config.updateIdentifier)) {
+            loge(config.SSID + ": failed to set updateIdentifier: " + config.updateIdentifier);
+            return false;
+        }
+        return true;
+!!!36823863.java!!!	updateNetworkKeys(inout config : WifiConfiguration, inout existingConfig : WifiConfiguration) : boolean
+        WifiEnterpriseConfig enterpriseConfig = config.enterpriseConfig;
+        if (needsKeyStore(enterpriseConfig)) {
+            try {
+                /* config passed may include only fields being updated.
+                 * In order to generate the key id, fetch uninitialized
+                 * fields from the currently tracked configuration
+                 */
+                String keyId = config.getKeyIdForCredentials(existingConfig);
+
+                if (!installKeys(existingConfig != null
+                        ? existingConfig.enterpriseConfig : null, enterpriseConfig, keyId)) {
+                    loge(config.SSID + ": failed to install keys");
+                    return false;
+                }
+            } catch (IllegalStateException e) {
+                loge(config.SSID + " invalid config for key installation: " + e.getMessage());
+                return false;
+            }
+        }
+        if (!enterpriseConfig.saveToSupplicant(
+                new SupplicantSaver(config.networkId, config.SSID))) {
+            removeKeys(enterpriseConfig);
+            return false;
+        }
+        return true;
+!!!36823991.java!!!	addOrUpdateNetwork(inout config : WifiConfiguration, inout existingConfig : WifiConfiguration) : boolean
+        if (config == null) {
+            return false;
+        }
+        if (VDBG) localLog("addOrUpdateNetwork: " + config.networkId);
+        int netId = config.networkId;
+        boolean newNetwork = false;
+        /*
+         * If the supplied networkId is INVALID_NETWORK_ID, we create a new empty
+         * network configuration. Otherwise, the networkId should
+         * refer to an existing configuration.
+         */
+        if (netId == WifiConfiguration.INVALID_NETWORK_ID) {
+            newNetwork = true;
+            netId = mWifiNative.addNetwork();
+            if (netId < 0) {
+                loge("Failed to add a network!");
+                return false;
+            } else {
+                logi("addOrUpdateNetwork created netId=" + netId);
+            }
+            // Save the new network ID to the config
+            config.networkId = netId;
+        }
+        if (!saveNetwork(config, netId)) {
+            if (newNetwork) {
+                mWifiNative.removeNetwork(netId);
+                loge("Failed to set a network variable, removed network: " + netId);
+            }
+            return false;
+        }
+        if (config.enterpriseConfig != null
+                && config.enterpriseConfig.getEapMethod() != WifiEnterpriseConfig.Eap.NONE) {
+            return updateNetworkKeys(config, existingConfig);
+        }
+        // Stage the backup of the SettingsProvider package which backs this up
+        mBackupManagerProxy.notifyDataChanged();
+        return true;
+!!!36824119.java!!!	removeNetwork(inout config : WifiConfiguration) : boolean
+        if (config == null) {
+            return false;
+        }
+        if (VDBG) localLog("removeNetwork: " + config.networkId);
+        if (!mWifiNative.removeNetwork(config.networkId)) {
+            loge("Remove network in wpa_supplicant failed on " + config.networkId);
+            return false;
+        }
+        // Remove any associated keys
+        if (config.enterpriseConfig != null) {
+            removeKeys(config.enterpriseConfig);
+        }
+        // Stage the backup of the SettingsProvider package which backs this up
+        mBackupManagerProxy.notifyDataChanged();
+        return true;
+!!!36824247.java!!!	selectNetwork(inout config : WifiConfiguration, inout configs : Collection<WifiConfiguration>) : boolean
+        if (config == null) {
+            return false;
+        }
+        if (VDBG) localLog("selectNetwork: " + config.networkId);
+        if (!mWifiNative.selectNetwork(config.networkId)) {
+            loge("Select network in wpa_supplicant failed on " + config.networkId);
+            return false;
+        }
+        config.status = Status.ENABLED;
+        markAllNetworksDisabledExcept(config.networkId, configs);
+        return true;
+!!!36824375.java!!!	disableNetwork(inout config : WifiConfiguration) : boolean
+        if (config == null) {
+            return false;
+        }
+        if (VDBG) localLog("disableNetwork: " + config.networkId);
+        if (!mWifiNative.disableNetwork(config.networkId)) {
+            loge("Disable network in wpa_supplicant failed on " + config.networkId);
+            return false;
+        }
+        config.status = Status.DISABLED;
+        return true;
+!!!36824503.java!!!	setNetworkPriority(inout config : WifiConfiguration, in priority : int) : boolean
+        if (config == null) {
+            return false;
+        }
+        if (VDBG) localLog("setNetworkPriority: " + config.networkId);
+        if (!mWifiNative.setNetworkVariable(config.networkId,
+                WifiConfiguration.priorityVarName, Integer.toString(priority))) {
+            loge("Set priority of network in wpa_supplicant failed on " + config.networkId);
+            return false;
+        }
+        config.priority = priority;
+        return true;
+!!!36824631.java!!!	setNetworkSSID(inout config : WifiConfiguration, inout ssid : String) : boolean
+        if (config == null) {
+            return false;
+        }
+        if (VDBG) localLog("setNetworkSSID: " + config.networkId);
+        if (!mWifiNative.setNetworkVariable(config.networkId, WifiConfiguration.ssidVarName,
+                encodeSSID(ssid))) {
+            loge("Set SSID of network in wpa_supplicant failed on " + config.networkId);
+            return false;
+        }
+        config.SSID = ssid;
+        return true;
+!!!36824759.java!!!	setNetworkBSSID(inout config : WifiConfiguration, inout bssid : String) : boolean
+        // Sanity check the config is valid
+        if (config == null
+                || (config.networkId == WifiConfiguration.INVALID_NETWORK_ID
+                && config.SSID == null)) {
+            return false;
+        }
+        if (VDBG) localLog("setNetworkBSSID: " + config.networkId);
+        if (!mWifiNative.setNetworkVariable(config.networkId, WifiConfiguration.bssidVarName,
+                bssid)) {
+            loge("Set BSSID of network in wpa_supplicant failed on " + config.networkId);
+            return false;
+        }
+        config.getNetworkSelectionStatus().setNetworkSelectionBSSID(bssid);
+        return true;
+!!!36824887.java!!!	enableHS20(inout enable : boolean) : void
+        mWifiNative.setHs20(enable);
+!!!36825015.java!!!	disableAllNetworks(inout configs : Collection<WifiConfiguration>) : boolean
+        if (VDBG) localLog("disableAllNetworks");
+        boolean networkDisabled = false;
+        for (WifiConfiguration enabled : configs) {
+            if (disableNetwork(enabled)) {
+                networkDisabled = true;
+            }
+        }
+        saveConfig();
+        return networkDisabled;
+!!!36825143.java!!!	saveConfig() : boolean
+        return mWifiNative.saveConfig();
+!!!36825271.java!!!	readNetworkVariablesFromSupplicantFile(inout key : String) : String
+        Map<String, String> result = new HashMap<>();
+        BufferedReader reader = null;
+        try {
+            reader = new BufferedReader(new FileReader(SUPPLICANT_CONFIG_FILE));
+            result = readNetworkVariablesFromReader(reader, key);
+        } catch (FileNotFoundException e) {
+            if (VDBG) loge("Could not open " + SUPPLICANT_CONFIG_FILE + ", " + e);
+        } catch (IOException e) {
+            if (VDBG) loge("Could not read " + SUPPLICANT_CONFIG_FILE + ", " + e);
+        } finally {
+            try {
+                if (reader != null) {
+                    reader.close();
+                }
+            } catch (IOException e) {
+                if (VDBG) {
+                    loge("Could not close reader for " + SUPPLICANT_CONFIG_FILE + ", " + e);
+                }
+            }
+        }
+        return result;
+!!!36825399.java!!!	readNetworkVariablesFromReader(inout reader : BufferedReader, inout key : String) : String
+        Map<String, String> result = new HashMap<>();
+        if (VDBG) localLog("readNetworkVariablesFromReader key=" + key);
+        boolean found = false;
+        String configKey = null;
+        String value = null;
+        for (String line = reader.readLine(); line != null; line = reader.readLine()) {
+            if (line.matches("[ \\t]*network=\\{")) {
+                found = true;
+                configKey = null;
+                value = null;
+            } else if (line.matches("[ \\t]*\\}")) {
+                found = false;
+                configKey = null;
+                value = null;
+            }
+            if (found) {
+                String trimmedLine = line.trim();
+                if (trimmedLine.startsWith(ID_STRING_VAR_NAME + "=")) {
+                    try {
+                        // Trim the quotes wrapping the id_str value.
+                        final String encodedExtras = trimmedLine.substring(
+                                8, trimmedLine.length() -1);
+                        final JSONObject json =
+                                new JSONObject(URLDecoder.decode(encodedExtras, "UTF-8"));
+                        if (json.has(WifiConfigStore.ID_STRING_KEY_CONFIG_KEY)) {
+                            final Object configKeyFromJson =
+                                    json.get(WifiConfigStore.ID_STRING_KEY_CONFIG_KEY);
+                            if (configKeyFromJson instanceof String) {
+                                configKey = (String) configKeyFromJson;
+                            }
+                        }
+                    } catch (JSONException e) {
+                        if (VDBG) {
+                            loge("Could not get "+ WifiConfigStore.ID_STRING_KEY_CONFIG_KEY
+                                    + ", " + e);
+                        }
+                    }
+                }
+                if (trimmedLine.startsWith(key + "=")) {
+                    value = trimmedLine.substring(key.length() + 1);
+                }
+                if (configKey != null && value != null) {
+                    result.put(configKey, value);
+                }
+            }
+        }
+        return result;
+!!!36825527.java!!!	isSimConfig(inout config : WifiConfiguration) : boolean
+        if (config == null) {
+            return false;
+        }
+
+        if (config.enterpriseConfig == null) {
+            return false;
+        }
+
+        int method = config.enterpriseConfig.getEapMethod();
+        return (method == WifiEnterpriseConfig.Eap.SIM
+                || method == WifiEnterpriseConfig.Eap.AKA
+                || method == WifiEnterpriseConfig.Eap.AKA_PRIME);
+!!!36825655.java!!!	resetSimNetworks(inout configs : Collection<WifiConfiguration>) : void
+        if (VDBG) localLog("resetSimNetworks");
+        for (WifiConfiguration config : configs) {
+            if (isSimConfig(config)) {
+                /* This configuration may have cached Pseudonym IDs; lets remove them */
+                mWifiNative.setNetworkVariable(config.networkId, "identity", "NULL");
+                mWifiNative.setNetworkVariable(config.networkId, "anonymous_identity", "NULL");
+            }
+        }
+!!!36825783.java!!!	clearBssidBlacklist() : void
+        if (VDBG) localLog("clearBlacklist");
+        mBssidBlacklist.clear();
+        mWifiNative.clearBlacklist();
+        mWifiNative.setBssidBlacklist(null);
+!!!36825911.java!!!	blackListBssid(inout bssid : String) : void
+        if (bssid == null) {
+            return;
+        }
+        if (VDBG) localLog("blackListBssid: " + bssid);
+        mBssidBlacklist.add(bssid);
+        // Blacklist at wpa_supplicant
+        mWifiNative.addToBlacklist(bssid);
+        // Blacklist at firmware
+        String[] list = mBssidBlacklist.toArray(new String[mBssidBlacklist.size()]);
+        mWifiNative.setBssidBlacklist(list);
+!!!36826039.java!!!	isBssidBlacklisted(inout bssid : String) : boolean
+        return mBssidBlacklist.contains(bssid);
+!!!36826167.java!!!	markAllNetworksDisabledExcept(in netId : int, inout configs : Collection<WifiConfiguration>) : void
+        for (WifiConfiguration config : configs) {
+            if (config != null && config.networkId != netId) {
+                if (config.status != Status.DISABLED) {
+                    config.status = Status.DISABLED;
+                }
+            }
+        }
+!!!36826295.java!!!	markAllNetworksDisabled(inout configs : Collection<WifiConfiguration>) : void
+        markAllNetworksDisabledExcept(WifiConfiguration.INVALID_NETWORK_ID, configs);
+!!!36826423.java!!!	startWpsWithPinFromAccessPoint(inout config : WpsInfo, inout configs : Collection<WifiConfiguration>) : WpsResult
+        WpsResult result = new WpsResult();
+        if (mWifiNative.startWpsRegistrar(config.BSSID, config.pin)) {
+            /* WPS leaves all networks disabled */
+            markAllNetworksDisabled(configs);
+            result.status = WpsResult.Status.SUCCESS;
+        } else {
+            loge("Failed to start WPS pin method configuration");
+            result.status = WpsResult.Status.FAILURE;
+        }
+        return result;
+!!!36826551.java!!!	startWpsWithPinFromDevice(inout config : WpsInfo, inout configs : Collection<WifiConfiguration>) : WpsResult
+        WpsResult result = new WpsResult();
+        result.pin = mWifiNative.startWpsPinDisplay(config.BSSID);
+        /* WPS leaves all networks disabled */
+        if (!TextUtils.isEmpty(result.pin)) {
+            markAllNetworksDisabled(configs);
+            result.status = WpsResult.Status.SUCCESS;
+        } else {
+            loge("Failed to start WPS pin method configuration");
+            result.status = WpsResult.Status.FAILURE;
+        }
+        return result;
+!!!36826679.java!!!	startWpsPbc(inout config : WpsInfo, inout configs : Collection<WifiConfiguration>) : WpsResult
+        WpsResult result = new WpsResult();
+        if (mWifiNative.startWpsPbc(config.BSSID)) {
+            /* WPS leaves all networks disabled */
+            markAllNetworksDisabled(configs);
+            result.status = WpsResult.Status.SUCCESS;
+        } else {
+            loge("Failed to start WPS push button configuration");
+            result.status = WpsResult.Status.FAILURE;
+        }
+        return result;
+!!!36826807.java!!!	logd(inout s : String) : void
+        Log.d(TAG, s);
+!!!36826935.java!!!	logi(inout s : String) : void
+        Log.i(TAG, s);
+!!!36827063.java!!!	loge(inout s : String) : void
+        loge(s, false);
+!!!36827191.java!!!	loge(inout s : String, inout stack : boolean) : void
+        if (stack) {
+            Log.e(TAG, s + " stack:" + Thread.currentThread().getStackTrace()[2].getMethodName()
+                    + " - " + Thread.currentThread().getStackTrace()[3].getMethodName()
+                    + " - " + Thread.currentThread().getStackTrace()[4].getMethodName()
+                    + " - " + Thread.currentThread().getStackTrace()[5].getMethodName());
+        } else {
+            Log.e(TAG, s);
+        }
+!!!36827319.java!!!	log(inout s : String) : void
+        Log.d(TAG, s);
+!!!36827447.java!!!	localLog(inout s : String) : void
+        if (mLocalLog != null) {
+            mLocalLog.log(TAG + ": " + s);
+        }
+!!!36827575.java!!!	localLogAndLogcat(inout s : String) : void
+        localLog(s);
+        Log.d(TAG, s);

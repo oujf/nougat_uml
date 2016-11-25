@@ -1,0 +1,143 @@
+class LoaderTask
+!!!29945015.java!!!	LoaderTask(inout manager : MtpManager, inout database : MtpDatabase, inout operationsSupported : int, inout identifier : Identifier)
+            assert operationsSupported != null;
+            assert identifier.mDocumentType != MtpDatabaseConstants.DOCUMENT_TYPE_DEVICE;
+            mManager = manager;
+            mDatabase = database;
+            mOperationsSupported = operationsSupported;
+            mIdentifier = identifier;
+            mObjectHandles = null;
+            mState = STATE_START;
+            mPosition = 0;
+            mLastNotified = new Date();
+!!!29945143.java!!!	loadObjectHandles() : void
+            assert mState == STATE_START;
+            mPosition = 0;
+            int parentHandle = mIdentifier.mObjectHandle;
+            // Need to pass the special value MtpManager.OBJECT_HANDLE_ROOT_CHILDREN to
+            // getObjectHandles if we would like to obtain children under the root.
+            if (mIdentifier.mDocumentType == MtpDatabaseConstants.DOCUMENT_TYPE_STORAGE) {
+                parentHandle = MtpManager.OBJECT_HANDLE_ROOT_CHILDREN;
+            }
+            try {
+                mObjectHandles = mManager.getObjectHandles(
+                        mIdentifier.mDeviceId, mIdentifier.mStorageId, parentHandle);
+                mState = STATE_LOADING;
+            } catch (IOException error) {
+                mError = error;
+                mState = STATE_ERROR;
+            }
+!!!29945271.java!!!	createCursor(inout resolver : ContentResolver, inout columnNames : String) : Cursor
+            final Bundle extras = new Bundle();
+            switch (getState()) {
+                case STATE_LOADING:
+                    extras.putBoolean(DocumentsContract.EXTRA_LOADING, true);
+                    break;
+                case STATE_ERROR:
+                    throw mError;
+            }
+            final Cursor cursor =
+                    mDatabase.queryChildDocuments(columnNames, mIdentifier.mDocumentId);
+            cursor.setExtras(extras);
+            cursor.setNotificationUri(resolver, createUri());
+            return cursor;
+!!!29945399.java!!!	loadObjectInfoList(in count : int) : void
+            synchronized (this) {
+                if (mState != STATE_LOADING) {
+                    return;
+                }
+                if (mPosition == 0) {
+                    try{
+                        mDatabase.getMapper().startAddingDocuments(mIdentifier.mDocumentId);
+                    } catch (FileNotFoundException error) {
+                        mError = error;
+                        mState = STATE_ERROR;
+                        return;
+                    }
+                }
+            }
+            final ArrayList<MtpObjectInfo> infoList = new ArrayList<>();
+            for (int chunkEnd = mPosition + count;
+                    mPosition < mObjectHandles.length && mPosition < chunkEnd;
+                    mPosition++) {
+                try {
+                    infoList.add(mManager.getObjectInfo(
+                            mIdentifier.mDeviceId, mObjectHandles[mPosition]));
+                } catch (IOException error) {
+                    Log.e(MtpDocumentsProvider.TAG, "Failed to load object info", error);
+                }
+            }
+            final long[] objectSizeList = new long[infoList.size()];
+            for (int i = 0; i < infoList.size(); i++) {
+                final MtpObjectInfo info = infoList.get(i);
+                // Compressed size is 32-bit unsigned integer but getCompressedSize returns the
+                // value in Java int (signed 32-bit integer). Use getCompressedSizeLong instead
+                // to get the value in Java long.
+                if (info.getCompressedSizeLong() != 0xffffffffl) {
+                    objectSizeList[i] = info.getCompressedSizeLong();
+                    continue;
+                }
+
+                if (!MtpDeviceRecord.isSupported(
+                        mOperationsSupported,
+                        MtpConstants.OPERATION_GET_OBJECT_PROP_DESC) ||
+                        !MtpDeviceRecord.isSupported(
+                                mOperationsSupported,
+                                MtpConstants.OPERATION_GET_OBJECT_PROP_VALUE)) {
+                    objectSizeList[i] = -1;
+                    continue;
+                }
+
+                // Object size is more than 4GB.
+                try {
+                    objectSizeList[i] = mManager.getObjectSizeLong(
+                            mIdentifier.mDeviceId,
+                            info.getObjectHandle(),
+                            info.getFormat());
+                } catch (IOException error) {
+                    Log.e(MtpDocumentsProvider.TAG, "Failed to get object size property.", error);
+                    objectSizeList[i] = -1;
+                }
+            }
+            synchronized (this) {
+                // Check if the task is cancelled or not.
+                if (mState != STATE_LOADING) {
+                    return;
+                }
+                try {
+                    mDatabase.getMapper().putChildDocuments(
+                            mIdentifier.mDeviceId,
+                            mIdentifier.mDocumentId,
+                            mOperationsSupported,
+                            infoList.toArray(new MtpObjectInfo[infoList.size()]),
+                            objectSizeList);
+                } catch (FileNotFoundException error) {
+                    // Looks like the parent document information is removed.
+                    // Adding documents has already cancelled in Mapper so we don't need to invoke
+                    // stopAddingDocuments.
+                    mError = error;
+                    mState = STATE_ERROR;
+                    return;
+                }
+                if (mPosition >= mObjectHandles.length) {
+                    try{
+                        mDatabase.getMapper().stopAddingDocuments(mIdentifier.mDocumentId);
+                        mState = STATE_COMPLETED;
+                    } catch (FileNotFoundException error) {
+                        mError = error;
+                        mState = STATE_ERROR;
+                        return;
+                    }
+                }
+            }
+!!!29945527.java!!!	cancel() : void
+            mDatabase.getMapper().cancelAddingDocuments(mIdentifier.mDocumentId);
+            mState = STATE_CANCELLED;
+!!!29945655.java!!!	getState() : int
+            return mState;
+!!!29945783.java!!!	notify(inout resolver : ContentResolver) : void
+            resolver.notifyChange(createUri(), null, false);
+            mLastNotified = new Date();
+!!!29945911.java!!!	createUri() : Uri
+            return DocumentsContract.buildChildDocumentsUri(
+                    MtpDocumentsProvider.AUTHORITY, mIdentifier.mDocumentId);

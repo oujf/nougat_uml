@@ -1,0 +1,232 @@
+class ResourceManagerService
+!!!41187767.cpp!!!	dump(in fd : int, in args : Vector<String16>) : status_t
+    String8 result;
+
+    if (checkCallingPermission(String16("android.permission.DUMP")) == false) {
+        result.format("Permission Denial: "
+                "can't dump ResourceManagerService from pid=%d, uid=%d\n",
+                IPCThreadState::self()->getCallingPid(),
+                IPCThreadState::self()->getCallingUid());
+        write(fd, result.string(), result.size());
+        return PERMISSION_DENIED;
+    }
+
+    PidResourceInfosMap mapCopy;
+    bool supportsMultipleSecureCodecs;
+    bool supportsSecureWithNonSecureCodec;
+    String8 serviceLog;
+    {
+        Mutex::Autolock lock(mLock);
+        mapCopy = mMap;  // Shadow copy, real copy will happen on write.
+        supportsMultipleSecureCodecs = mSupportsMultipleSecureCodecs;
+        supportsSecureWithNonSecureCodec = mSupportsSecureWithNonSecureCodec;
+        serviceLog = mServiceLog->toString("    " /* linePrefix */);
+    }
+
+    const size_t SIZE = 256;
+    char buffer[SIZE];
+    snprintf(buffer, SIZE, "ResourceManagerService: %p\n", this);
+    result.append(buffer);
+    result.append("  Policies:\n");
+    snprintf(buffer, SIZE, "    SupportsMultipleSecureCodecs: %d\n", supportsMultipleSecureCodecs);
+    result.append(buffer);
+    snprintf(buffer, SIZE, "    SupportsSecureWithNonSecureCodec: %d\n",
+            supportsSecureWithNonSecureCodec);
+    result.append(buffer);
+
+    result.append("  Processes:\n");
+    for (size_t i = 0; i < mapCopy.size(); ++i) {
+        snprintf(buffer, SIZE, "    Pid: %d\n", mapCopy.keyAt(i));
+        result.append(buffer);
+
+        const ResourceInfos &infos = mapCopy.valueAt(i);
+        for (size_t j = 0; j < infos.size(); ++j) {
+            result.append("      Client:\n");
+            snprintf(buffer, SIZE, "        Id: %lld\n", (long long)infos[j].clientId);
+            result.append(buffer);
+
+            snprintf(buffer, SIZE, "        Name: %s\n", infos[j].client->getName().string());
+            result.append(buffer);
+
+            Vector<MediaResource> resources = infos[j].resources;
+            result.append("        Resources:\n");
+            for (size_t k = 0; k < resources.size(); ++k) {
+                snprintf(buffer, SIZE, "          %s\n", resources[k].toString().string());
+                result.append(buffer);
+            }
+        }
+    }
+    result.append("  Events logs (most recent at top):\n");
+    result.append(serviceLog);
+
+    write(fd, result.string(), result.size());
+    return OK;
+!!!41188151.cpp!!!	config(in policies : Vector<MediaResourcePolicy>) : void
+    String8 log = String8::format("config(%s)", getString(policies).string());
+    mServiceLog->add(log);
+
+    Mutex::Autolock lock(mLock);
+    for (size_t i = 0; i < policies.size(); ++i) {
+        String8 type = policies[i].mType;
+        String8 value = policies[i].mValue;
+        if (type == kPolicySupportsMultipleSecureCodecs) {
+            mSupportsMultipleSecureCodecs = (value == "true");
+        } else if (type == kPolicySupportsSecureWithNonSecureCodec) {
+            mSupportsSecureWithNonSecureCodec = (value == "true");
+        }
+    }
+!!!41188279.cpp!!!	addResource(in pid : int, in clientId : int64_t, in client : sp<IResourceManagerClient>, in resources : Vector<MediaResource>) : void
+    String8 log = String8::format("addResource(pid %d, clientId %lld, resources %s)",
+            pid, (long long) clientId, getString(resources).string());
+    mServiceLog->add(log);
+
+    Mutex::Autolock lock(mLock);
+    if (!mProcessInfo->isValidPid(pid)) {
+        ALOGE("Rejected addResource call with invalid pid.");
+        return;
+    }
+    ResourceInfos& infos = getResourceInfosForEdit(pid, mMap);
+    ResourceInfo& info = getResourceInfoForEdit(clientId, client, infos);
+    // TODO: do the merge instead of append.
+    info.resources.appendVector(resources);
+    notifyResourceGranted(pid, resources);
+!!!41188407.cpp!!!	removeResource(in pid : int, in clientId : int64_t) : void
+    String8 log = String8::format(
+            "removeResource(pid %d, clientId %lld)",
+            pid, (long long) clientId);
+    mServiceLog->add(log);
+
+    Mutex::Autolock lock(mLock);
+    if (!mProcessInfo->isValidPid(pid)) {
+        ALOGE("Rejected removeResource call with invalid pid.");
+        return;
+    }
+    ssize_t index = mMap.indexOfKey(pid);
+    if (index < 0) {
+        ALOGV("removeResource: didn't find pid %d for clientId %lld", pid, (long long) clientId);
+        return;
+    }
+    bool found = false;
+    ResourceInfos &infos = mMap.editValueAt(index);
+    for (size_t j = 0; j < infos.size(); ++j) {
+        if (infos[j].clientId == clientId) {
+            j = infos.removeAt(j);
+            found = true;
+            break;
+        }
+    }
+    if (!found) {
+        ALOGV("didn't find client");
+    }
+!!!41188535.cpp!!!	reclaimResource(in callingPid : int, in resources : Vector<MediaResource>) : bool
+    String8 log = String8::format("reclaimResource(callingPid %d, resources %s)",
+            callingPid, getString(resources).string());
+    mServiceLog->add(log);
+
+    Vector<sp<IResourceManagerClient>> clients;
+    {
+        Mutex::Autolock lock(mLock);
+        if (!mProcessInfo->isValidPid(callingPid)) {
+            ALOGE("Rejected reclaimResource call with invalid callingPid.");
+            return false;
+        }
+        const MediaResource *secureCodec = NULL;
+        const MediaResource *nonSecureCodec = NULL;
+        const MediaResource *graphicMemory = NULL;
+        for (size_t i = 0; i < resources.size(); ++i) {
+            MediaResource::Type type = resources[i].mType;
+            if (resources[i].mType == MediaResource::kSecureCodec) {
+                secureCodec = &resources[i];
+            } else if (type == MediaResource::kNonSecureCodec) {
+                nonSecureCodec = &resources[i];
+            } else if (type == MediaResource::kGraphicMemory) {
+                graphicMemory = &resources[i];
+            }
+        }
+
+        // first pass to handle secure/non-secure codec conflict
+        if (secureCodec != NULL) {
+            if (!mSupportsMultipleSecureCodecs) {
+                if (!getAllClients_l(callingPid, MediaResource::kSecureCodec, &clients)) {
+                    return false;
+                }
+            }
+            if (!mSupportsSecureWithNonSecureCodec) {
+                if (!getAllClients_l(callingPid, MediaResource::kNonSecureCodec, &clients)) {
+                    return false;
+                }
+            }
+        }
+        if (nonSecureCodec != NULL) {
+            if (!mSupportsSecureWithNonSecureCodec) {
+                if (!getAllClients_l(callingPid, MediaResource::kSecureCodec, &clients)) {
+                    return false;
+                }
+            }
+        }
+
+        if (clients.size() == 0) {
+            // if no secure/non-secure codec conflict, run second pass to handle other resources.
+            getClientForResource_l(callingPid, graphicMemory, &clients);
+        }
+
+        if (clients.size() == 0) {
+            // if we are here, run the third pass to free one codec with the same type.
+            getClientForResource_l(callingPid, secureCodec, &clients);
+            getClientForResource_l(callingPid, nonSecureCodec, &clients);
+        }
+
+        if (clients.size() == 0) {
+            // if we are here, run the fourth pass to free one codec with the different type.
+            if (secureCodec != NULL) {
+                MediaResource temp(MediaResource::kNonSecureCodec, 1);
+                getClientForResource_l(callingPid, &temp, &clients);
+            }
+            if (nonSecureCodec != NULL) {
+                MediaResource temp(MediaResource::kSecureCodec, 1);
+                getClientForResource_l(callingPid, &temp, &clients);
+            }
+        }
+    }
+
+    if (clients.size() == 0) {
+        return false;
+    }
+
+    sp<IResourceManagerClient> failedClient;
+    for (size_t i = 0; i < clients.size(); ++i) {
+        log = String8::format("reclaimResource from client %p", clients[i].get());
+        mServiceLog->add(log);
+        if (!clients[i]->reclaimResource()) {
+            failedClient = clients[i];
+            break;
+        }
+    }
+
+    if (failedClient == NULL) {
+        return true;
+    }
+
+    {
+        Mutex::Autolock lock(mLock);
+        bool found = false;
+        for (size_t i = 0; i < mMap.size(); ++i) {
+            ResourceInfos &infos = mMap.editValueAt(i);
+            for (size_t j = 0; j < infos.size();) {
+                if (infos[j].client == failedClient) {
+                    j = infos.removeAt(j);
+                    found = true;
+                } else {
+                    ++j;
+                }
+            }
+            if (found) {
+                break;
+            }
+        }
+        if (!found) {
+            ALOGV("didn't find failed client");
+        }
+    }
+
+    return false;

@@ -1,0 +1,152 @@
+class StreamFeederThread
+!!!31991095.java!!!	StreamFeederThread()
+                mTransportPipes = ParcelFileDescriptor.createPipe();
+                mEnginePipes = ParcelFileDescriptor.createPipe();
+                setRunning(true);
+!!!31991223.java!!!	run() : void
+                UnifiedRestoreState nextState = UnifiedRestoreState.RUNNING_QUEUE;
+                int status = BackupTransport.TRANSPORT_OK;
+
+                EventLog.writeEvent(EventLogTags.FULL_RESTORE_PACKAGE,
+                        mCurrentPackage.packageName);
+
+                mEngine = new FullRestoreEngine(this, null, mCurrentPackage, false, false);
+                mEngineThread = new EngineThread(mEngine, mEnginePipes[0]);
+
+                ParcelFileDescriptor eWriteEnd = mEnginePipes[1];
+                ParcelFileDescriptor tReadEnd = mTransportPipes[0];
+                ParcelFileDescriptor tWriteEnd = mTransportPipes[1];
+
+                int bufferSize = 32 * 1024;
+                byte[] buffer = new byte[bufferSize];
+                FileOutputStream engineOut = new FileOutputStream(eWriteEnd.getFileDescriptor());
+                FileInputStream transportIn = new FileInputStream(tReadEnd.getFileDescriptor());
+
+                // spin up the engine and start moving data to it
+                new Thread(mEngineThread, "unified-restore-engine").start();
+
+                try {
+                    while (status == BackupTransport.TRANSPORT_OK) {
+                        // have the transport write some of the restoring data to us
+                        int result = mTransport.getNextFullRestoreDataChunk(tWriteEnd);
+                        if (result > 0) {
+                            // The transport wrote this many bytes of restore data to the
+                            // pipe, so pass it along to the engine.
+                            if (MORE_DEBUG) {
+                                Slog.v(TAG, "  <- transport provided chunk size " + result);
+                            }
+                            if (result > bufferSize) {
+                                bufferSize = result;
+                                buffer = new byte[bufferSize];
+                            }
+                            int toCopy = result;
+                            while (toCopy > 0) {
+                                int n = transportIn.read(buffer, 0, toCopy);
+                                engineOut.write(buffer, 0, n);
+                                toCopy -= n;
+                                if (MORE_DEBUG) {
+                                    Slog.v(TAG, "  -> wrote " + n + " to engine, left=" + toCopy);
+                                }
+                            }
+                        } else if (result == BackupTransport.NO_MORE_DATA) {
+                            // Clean finish.  Wind up and we're done!
+                            if (MORE_DEBUG) {
+                                Slog.i(TAG, "Got clean full-restore EOF for "
+                                        + mCurrentPackage.packageName);
+                            }
+                            status = BackupTransport.TRANSPORT_OK;
+                            break;
+                        } else {
+                            // Transport reported some sort of failure; the fall-through
+                            // handling will deal properly with that.
+                            Slog.e(TAG, "Error " + result + " streaming restore for "
+                                    + mCurrentPackage.packageName);
+                            EventLog.writeEvent(EventLogTags.RESTORE_TRANSPORT_FAILURE);
+                            status = result;
+                        }
+                    }
+                    if (MORE_DEBUG) Slog.v(TAG, "Done copying to engine, falling through");
+                } catch (IOException e) {
+                    // We lost our ability to communicate via the pipes.  That's worrying
+                    // but potentially recoverable; abandon this package's restore but
+                    // carry on with the next restore target.
+                    Slog.e(TAG, "Unable to route data for restore");
+                    EventLog.writeEvent(EventLogTags.RESTORE_AGENT_FAILURE,
+                            mCurrentPackage.packageName, "I/O error on pipes");
+                    status = BackupTransport.AGENT_ERROR;
+                } catch (RemoteException e) {
+                    // The transport went away; terminate the whole operation.  Closing
+                    // the sockets will wake up the engine and it will then tidy up the
+                    // remote end.
+                    Slog.e(TAG, "Transport failed during restore");
+                    EventLog.writeEvent(EventLogTags.RESTORE_TRANSPORT_FAILURE);
+                    status = BackupTransport.TRANSPORT_ERROR;
+                } finally {
+                    // Close the transport pipes and *our* end of the engine pipe,
+                    // but leave the engine thread's end open so that it properly
+                    // hits EOF and winds up its operations.
+                    IoUtils.closeQuietly(mEnginePipes[1]);
+                    IoUtils.closeQuietly(mTransportPipes[0]);
+                    IoUtils.closeQuietly(mTransportPipes[1]);
+
+                    // Don't proceed until the engine has wound up operations
+                    mEngineThread.waitForResult();
+
+                    // Now we're really done with this one too
+                    IoUtils.closeQuietly(mEnginePipes[0]);
+
+                    // In all cases we want to remember whether we launched
+                    // the target app as part of our work so far.
+                    mDidLaunch = (mEngine.getAgent() != null);
+
+                    // If we hit a transport-level error, we are done with everything;
+                    // if we hit an agent error we just go back to running the queue.
+                    if (status == BackupTransport.TRANSPORT_OK) {
+                        // Clean finish means we issue the restore-finished callback
+                        nextState = UnifiedRestoreState.RESTORE_FINISHED;
+
+                        // the engine bound the target's agent, so recover that binding
+                        // to use for the callback.
+                        mAgent = mEngine.getAgent();
+
+                        // and the restored widget data, if any
+                        mWidgetData = mEngine.getWidgetData();
+                    } else {
+                        // Something went wrong somewhere.  Whether it was at the transport
+                        // level is immaterial; we need to tell the transport to bail
+                        try {
+                            mTransport.abortFullRestore();
+                        } catch (RemoteException e) {
+                            // transport itself is dead; make sure we handle this as a
+                            // fatal error
+                            status = BackupTransport.TRANSPORT_ERROR;
+                        }
+
+                        // We also need to wipe the current target's data, as it's probably
+                        // in an incoherent state.
+                        clearApplicationDataSynchronous(mCurrentPackage.packageName);
+
+                        // Schedule the next state based on the nature of our failure
+                        if (status == BackupTransport.TRANSPORT_ERROR) {
+                            nextState = UnifiedRestoreState.FINAL;
+                        } else {
+                            nextState = UnifiedRestoreState.RUNNING_QUEUE;
+                        }
+                    }
+                    executeNextState(nextState);
+                    setRunning(false);
+                }
+!!!31991351.java!!!	execute() : void
+ /* intentionally empty */
+!!!31991479.java!!!	operationComplete(in result : long) : void
+ /* intentionally empty */
+!!!31991607.java!!!	handleTimeout() : void
+                if (DEBUG) {
+                    Slog.w(TAG, "Full-data restore target timed out; shutting down");
+                }
+                mEngineThread.handleTimeout();
+
+                IoUtils.closeQuietly(mEnginePipes[1]);
+                mEnginePipes[1] = null;
+                IoUtils.closeQuietly(mEnginePipes[0]);
+                mEnginePipes[0] = null;

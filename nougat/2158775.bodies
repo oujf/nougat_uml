@@ -1,0 +1,247 @@
+class PhoneSwitcher
+!!!37712951.java!!!	PhoneSwitcher(inout looper : Looper)
+        super(looper);
+        mMaxActivePhones = 0;
+        mSubscriptionController = null;
+        mPhoneSubscriptions = null;
+        mCommandsInterfaces = null;
+        mContext = null;
+        mPhoneStates = null;
+        mPhones = null;
+        mLocalLog = null;
+        mActivePhoneRegistrants = null;
+        mNumPhones = 0;
+!!!37713079.java!!!	PhoneSwitcher(in maxActivePhones : int, in numPhones : int, inout context : Context, inout subscriptionController : SubscriptionController, inout looper : Looper, inout tr : ITelephonyRegistry, inout cis : CommandsInterface, inout phones : Phone)
+        super(looper);
+        mContext = context;
+        mNumPhones = numPhones;
+        mPhones = phones;
+        mPhoneSubscriptions = new int[numPhones];
+        mMaxActivePhones = maxActivePhones;
+        mLocalLog = new LocalLog(MAX_LOCAL_LOG_LINES);
+
+        mSubscriptionController = subscriptionController;
+
+        mActivePhoneRegistrants = new RegistrantList[numPhones];
+        mPhoneStates = new PhoneState[numPhones];
+        for (int i = 0; i < numPhones; i++) {
+            mActivePhoneRegistrants[i] = new RegistrantList();
+            mPhoneStates[i] = new PhoneState();
+            if (mPhones[i] != null) {
+                mPhones[i].registerForEmergencyCallToggle(this, EVENT_EMERGENCY_TOGGLE, null);
+            }
+        }
+
+        mCommandsInterfaces = cis;
+
+        try {
+            tr.addOnSubscriptionsChangedListener("PhoneSwitcher", mSubscriptionsChangedListener);
+        } catch (RemoteException e) {
+        }
+
+        mContext.registerReceiver(mDefaultDataChangedReceiver,
+                new IntentFilter(TelephonyIntents.ACTION_DEFAULT_DATA_SUBSCRIPTION_CHANGED));
+
+        NetworkCapabilities netCap = new NetworkCapabilities();
+        netCap.addTransportType(NetworkCapabilities.TRANSPORT_CELLULAR);
+        netCap.addCapability(NetworkCapabilities.NET_CAPABILITY_MMS);
+        netCap.addCapability(NetworkCapabilities.NET_CAPABILITY_SUPL);
+        netCap.addCapability(NetworkCapabilities.NET_CAPABILITY_DUN);
+        netCap.addCapability(NetworkCapabilities.NET_CAPABILITY_FOTA);
+        netCap.addCapability(NetworkCapabilities.NET_CAPABILITY_IMS);
+        netCap.addCapability(NetworkCapabilities.NET_CAPABILITY_CBS);
+        netCap.addCapability(NetworkCapabilities.NET_CAPABILITY_IA);
+        netCap.addCapability(NetworkCapabilities.NET_CAPABILITY_RCS);
+        netCap.addCapability(NetworkCapabilities.NET_CAPABILITY_XCAP);
+        netCap.addCapability(NetworkCapabilities.NET_CAPABILITY_EIMS);
+        netCap.addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_RESTRICTED);
+        netCap.addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET);
+        netCap.setNetworkSpecifier(NetworkCapabilities.MATCH_ALL_REQUESTS_NETWORK_SPECIFIER);
+
+        NetworkFactory networkFactory = new PhoneSwitcherNetworkRequestListener(looper, context,
+                netCap, this);
+        // we want to see all requests
+        networkFactory.setScoreFilter(101);
+        networkFactory.register();
+
+        log("PhoneSwitcher started");
+!!!37713207.java!!!	handleMessage(inout msg : Message) : void
+        switch (msg.what) {
+            case EVENT_SUBSCRIPTION_CHANGED: {
+                onEvaluate(REQUESTS_UNCHANGED, "subChanged");
+                break;
+            }
+            case EVENT_DEFAULT_SUBSCRIPTION_CHANGED: {
+                onEvaluate(REQUESTS_UNCHANGED, "defaultChanged");
+                break;
+            }
+            case EVENT_REQUEST_NETWORK: {
+                onRequestNetwork((NetworkRequest)msg.obj);
+                break;
+            }
+            case EVENT_RELEASE_NETWORK: {
+                onReleaseNetwork((NetworkRequest)msg.obj);
+                break;
+            }
+            case EVENT_EMERGENCY_TOGGLE: {
+                onEvaluate(REQUESTS_CHANGED, "emergencyToggle");
+                break;
+            }
+            case EVENT_RESEND_DATA_ALLOWED: {
+                onResendDataAllowed(msg);
+                break;
+            }
+        }
+!!!37713335.java!!!	isEmergency() : boolean
+        for (Phone p : mPhones) {
+            if (p == null) continue;
+            if (p.isInEcm() || p.isInEmergencyCall()) return true;
+        }
+        return false;
+!!!37713847.java!!!	onRequestNetwork(inout networkRequest : NetworkRequest) : void
+        final DcRequest dcRequest = new DcRequest(networkRequest, mContext);
+        if (mPrioritizedDcRequests.contains(dcRequest) == false) {
+            mPrioritizedDcRequests.add(dcRequest);
+            Collections.sort(mPrioritizedDcRequests);
+            onEvaluate(REQUESTS_CHANGED, "netRequest");
+        }
+!!!37713975.java!!!	onReleaseNetwork(inout networkRequest : NetworkRequest) : void
+        final DcRequest dcRequest = new DcRequest(networkRequest, mContext);
+
+        if (mPrioritizedDcRequests.remove(dcRequest)) {
+            onEvaluate(REQUESTS_CHANGED, "netReleased");
+        }
+!!!37714103.java!!!	onEvaluate(inout requestsChanged : boolean, inout reason : String) : void
+        StringBuilder sb = new StringBuilder(reason);
+        if (isEmergency()) {
+            log("onEvalute aborted due to Emergency");
+            return;
+        }
+
+        boolean diffDetected = requestsChanged;
+        final int dataSub = mSubscriptionController.getDefaultDataSubId();
+        if (dataSub != mDefaultDataSubscription) {
+            sb.append(" default ").append(mDefaultDataSubscription).append("->").append(dataSub);
+            mDefaultDataSubscription = dataSub;
+            diffDetected = true;
+
+        }
+
+        for (int i = 0; i < mNumPhones; i++) {
+            int sub = mSubscriptionController.getSubIdUsingPhoneId(i);
+            if (sub != mPhoneSubscriptions[i]) {
+                sb.append(" phone[").append(i).append("] ").append(mPhoneSubscriptions[i]);
+                sb.append("->").append(sub);
+                mPhoneSubscriptions[i] = sub;
+                diffDetected = true;
+            }
+        }
+
+        if (diffDetected) {
+            log("evaluating due to " + sb.toString());
+
+            List<Integer> newActivePhones = new ArrayList<Integer>();
+
+            for (DcRequest dcRequest : mPrioritizedDcRequests) {
+                int phoneIdForRequest = phoneIdForRequest(dcRequest.networkRequest);
+                if (phoneIdForRequest == INVALID_PHONE_INDEX) continue;
+                if (newActivePhones.contains(phoneIdForRequest)) continue;
+                newActivePhones.add(phoneIdForRequest);
+                if (newActivePhones.size() >= mMaxActivePhones) break;
+            }
+
+            if (VDBG) {
+                log("default subId = " + mDefaultDataSubscription);
+                for (int i = 0; i < mNumPhones; i++) {
+                    log(" phone[" + i + "] using sub[" + mPhoneSubscriptions[i] + "]");
+                }
+                log(" newActivePhones:");
+                for (Integer i : newActivePhones) log("  " + i);
+            }
+
+            for (int phoneId = 0; phoneId < mNumPhones; phoneId++) {
+                if (newActivePhones.contains(phoneId) == false) {
+                    deactivate(phoneId);
+                }
+            }
+
+            // only activate phones up to the limit
+            for (int phoneId : newActivePhones) {
+                activate(phoneId);
+            }
+        }
+!!!37714231.java!!!	deactivate(in phoneId : int) : void
+        PhoneState state = mPhoneStates[phoneId];
+        if (state.active == false) return;
+        state.active = false;
+        log("deactivate " + phoneId);
+        state.lastRequested = System.currentTimeMillis();
+        mCommandsInterfaces[phoneId].setDataAllowed(false, null);
+        mActivePhoneRegistrants[phoneId].notifyRegistrants();
+!!!37714359.java!!!	activate(in phoneId : int) : void
+        PhoneState state = mPhoneStates[phoneId];
+        if (state.active == true) return;
+        state.active = true;
+        log("activate " + phoneId);
+        state.lastRequested = System.currentTimeMillis();
+        mCommandsInterfaces[phoneId].setDataAllowed(true, null);
+        mActivePhoneRegistrants[phoneId].notifyRegistrants();
+!!!37714487.java!!!	resendDataAllowed(in phoneId : int) : void
+        validatePhoneId(phoneId);
+        Message msg = obtainMessage(EVENT_RESEND_DATA_ALLOWED);
+        msg.arg1 = phoneId;
+        msg.sendToTarget();
+!!!37714615.java!!!	onResendDataAllowed(inout msg : Message) : void
+        final int phoneId = msg.arg1;
+        mCommandsInterfaces[phoneId].setDataAllowed(mPhoneStates[phoneId].active, null);
+!!!37714743.java!!!	phoneIdForRequest(inout netRequest : NetworkRequest) : int
+        String specifier = netRequest.networkCapabilities.getNetworkSpecifier();
+        int subId;
+
+        if (TextUtils.isEmpty(specifier)) {
+            subId = mDefaultDataSubscription;
+        } else {
+            subId = Integer.parseInt(specifier);
+        }
+        int phoneId = INVALID_PHONE_INDEX;
+        if (subId == INVALID_SUBSCRIPTION_ID) return phoneId;
+
+        for (int i = 0 ; i < mNumPhones; i++) {
+            if (mPhoneSubscriptions[i] == subId) {
+                phoneId = i;
+                break;
+            }
+        }
+        return phoneId;
+!!!37714871.java!!!	isPhoneActive(in phoneId : int) : boolean
+        validatePhoneId(phoneId);
+        return mPhoneStates[phoneId].active;
+!!!37714999.java!!!	registerForActivePhoneSwitch(in phoneId : int, inout h : Handler, in what : int, inout o : Object) : void
+        validatePhoneId(phoneId);
+        Registrant r = new Registrant(h, what, o);
+        mActivePhoneRegistrants[phoneId].add(r);
+        r.notifyRegistrant();
+!!!37715127.java!!!	unregisterForActivePhoneSwitch(in phoneId : int, inout h : Handler) : void
+        validatePhoneId(phoneId);
+        mActivePhoneRegistrants[phoneId].remove(h);
+!!!37715255.java!!!	validatePhoneId(in phoneId : int) : void
+        if (phoneId < 0 || phoneId >= mNumPhones) {
+            throw new IllegalArgumentException("Invalid PhoneId");
+        }
+!!!37715383.java!!!	log(inout l : String) : void
+        Rlog.d(LOG_TAG, l);
+        mLocalLog.log(l);
+!!!37715511.java!!!	dump(inout fd : FileDescriptor, inout writer : PrintWriter, inout args : String) : void
+        final IndentingPrintWriter pw = new IndentingPrintWriter(writer, "  ");
+        pw.println("PhoneSwitcher:");
+        Calendar c = Calendar.getInstance();
+        for (int i = 0; i < mNumPhones; i++) {
+            PhoneState ps = mPhoneStates[i];
+            c.setTimeInMillis(ps.lastRequested);
+            pw.println("PhoneId(" + i + ") active=" + ps.active + ", lastRequest=" +
+                    (ps.lastRequested == 0 ? "never" :
+                     String.format("%tm-%td %tH:%tM:%tS.%tL", c, c, c, c, c, c)));
+        }
+        pw.increaseIndent();
+        mLocalLog.dump(fd, pw, args);
+        pw.decreaseIndent();

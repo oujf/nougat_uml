@@ -1,0 +1,477 @@
+class AudioRecord
+!!!28315831.java!!!	AudioRecord(in audioSource : int, in sampleRateInHz : int, in channelConfig : int, in audioFormat : int, in bufferSizeInBytes : int)
+        this((new AudioAttributes.Builder())
+                    .setInternalCapturePreset(audioSource)
+                    .build(),
+                (new AudioFormat.Builder())
+                    .setChannelMask(getChannelMaskFromLegacyConfig(channelConfig,
+                                        true/*allow legacy configurations*/))
+                    .setEncoding(audioFormat)
+                    .setSampleRate(sampleRateInHz)
+                    .build(),
+                bufferSizeInBytes,
+                AudioManager.AUDIO_SESSION_ID_GENERATE);
+!!!28315959.java!!!	AudioRecord(inout attributes : AudioAttributes, inout format : AudioFormat, in bufferSizeInBytes : int, in sessionId : int)
+        mRecordingState = RECORDSTATE_STOPPED;
+
+        if (attributes == null) {
+            throw new IllegalArgumentException("Illegal null AudioAttributes");
+        }
+        if (format == null) {
+            throw new IllegalArgumentException("Illegal null AudioFormat");
+        }
+
+        // remember which looper is associated with the AudioRecord instanciation
+        if ((mInitializationLooper = Looper.myLooper()) == null) {
+            mInitializationLooper = Looper.getMainLooper();
+        }
+
+        // is this AudioRecord using REMOTE_SUBMIX at full volume?
+        if (attributes.getCapturePreset() == MediaRecorder.AudioSource.REMOTE_SUBMIX) {
+            final AudioAttributes.Builder filteredAttr = new AudioAttributes.Builder();
+            final Iterator<String> tagsIter = attributes.getTags().iterator();
+            while (tagsIter.hasNext()) {
+                final String tag = tagsIter.next();
+                if (tag.equalsIgnoreCase(SUBMIX_FIXED_VOLUME)) {
+                    mIsSubmixFullVolume = true;
+                    Log.v(TAG, "Will record from REMOTE_SUBMIX at full fixed volume");
+                } else { // SUBMIX_FIXED_VOLUME: is not to be propagated to the native layers
+                    filteredAttr.addTag(tag);
+                }
+            }
+            filteredAttr.setInternalCapturePreset(attributes.getCapturePreset());
+            mAudioAttributes = filteredAttr.build();
+        } else {
+            mAudioAttributes = attributes;
+        }
+
+        int rate = format.getSampleRate();
+        if (rate == AudioFormat.SAMPLE_RATE_UNSPECIFIED) {
+            rate = 0;
+        }
+
+        int encoding = AudioFormat.ENCODING_DEFAULT;
+        if ((format.getPropertySetMask() & AudioFormat.AUDIO_FORMAT_HAS_PROPERTY_ENCODING) != 0)
+        {
+            encoding = format.getEncoding();
+        }
+
+        audioParamCheck(attributes.getCapturePreset(), rate, encoding);
+
+        if ((format.getPropertySetMask()
+                & AudioFormat.AUDIO_FORMAT_HAS_PROPERTY_CHANNEL_INDEX_MASK) != 0) {
+            mChannelIndexMask = format.getChannelIndexMask();
+            mChannelCount = format.getChannelCount();
+        }
+        if ((format.getPropertySetMask()
+                & AudioFormat.AUDIO_FORMAT_HAS_PROPERTY_CHANNEL_MASK) != 0) {
+            mChannelMask = getChannelMaskFromLegacyConfig(format.getChannelMask(), false);
+            mChannelCount = format.getChannelCount();
+        } else if (mChannelIndexMask == 0) {
+            mChannelMask = getChannelMaskFromLegacyConfig(AudioFormat.CHANNEL_IN_DEFAULT, false);
+            mChannelCount =  AudioFormat.channelCountFromInChannelMask(mChannelMask);
+        }
+
+        audioBuffSizeCheck(bufferSizeInBytes);
+
+        int[] sampleRate = new int[] {mSampleRate};
+        int[] session = new int[1];
+        session[0] = sessionId;
+        //TODO: update native initialization when information about hardware init failure
+        //      due to capture device already open is available.
+        int initResult = native_setup( new WeakReference<AudioRecord>(this),
+                mAudioAttributes, sampleRate, mChannelMask, mChannelIndexMask,
+                mAudioFormat, mNativeBufferSizeInBytes,
+                session, ActivityThread.currentOpPackageName(), 0 /*nativeRecordInJavaObj*/);
+        if (initResult != SUCCESS) {
+            loge("Error code "+initResult+" when initializing native AudioRecord object.");
+            return; // with mState == STATE_UNINITIALIZED
+        }
+
+        mSampleRate = sampleRate[0];
+        mSessionId = session[0];
+
+        mState = STATE_INITIALIZED;
+!!!28316087.java!!!	AudioRecord(in nativeRecordInJavaObj : long)
+        mNativeRecorderInJavaObj = 0;
+        mNativeCallbackCookie = 0;
+        mNativeDeviceCallback = 0;
+
+        // other initialization...
+        if (nativeRecordInJavaObj != 0) {
+            deferred_connect(nativeRecordInJavaObj);
+        } else {
+            mState = STATE_UNINITIALIZED;
+        }
+!!!28316215.java!!!	deferred_connect(in nativeRecordInJavaObj : long) : void
+        if (mState != STATE_INITIALIZED) {
+            int[] session = { 0 };
+            int[] rates = { 0 };
+            //TODO: update native initialization when information about hardware init failure
+            //      due to capture device already open is available.
+            // Note that for this native_setup, we are providing an already created/initialized
+            // *Native* AudioRecord, so the attributes parameters to native_setup() are ignored.
+            int initResult = native_setup(new WeakReference<AudioRecord>(this),
+                    null /*mAudioAttributes*/,
+                    rates /*mSampleRates*/,
+                    0 /*mChannelMask*/,
+                    0 /*mChannelIndexMask*/,
+                    0 /*mAudioFormat*/,
+                    0 /*mNativeBufferSizeInBytes*/,
+                    session,
+                    ActivityThread.currentOpPackageName(),
+                    nativeRecordInJavaObj);
+            if (initResult != SUCCESS) {
+                loge("Error code "+initResult+" when initializing native AudioRecord object.");
+                return; // with mState == STATE_UNINITIALIZED
+            }
+
+            mSessionId = session[0];
+
+            mState = STATE_INITIALIZED;
+        }
+!!!28317239.java!!!	getChannelMaskFromLegacyConfig(in inChannelConfig : int, inout allowLegacyConfig : boolean) : int
+        int mask;
+        switch (inChannelConfig) {
+        case AudioFormat.CHANNEL_IN_DEFAULT: // AudioFormat.CHANNEL_CONFIGURATION_DEFAULT
+        case AudioFormat.CHANNEL_IN_MONO:
+        case AudioFormat.CHANNEL_CONFIGURATION_MONO:
+            mask = AudioFormat.CHANNEL_IN_MONO;
+            break;
+        case AudioFormat.CHANNEL_IN_STEREO:
+        case AudioFormat.CHANNEL_CONFIGURATION_STEREO:
+            mask = AudioFormat.CHANNEL_IN_STEREO;
+            break;
+        case (AudioFormat.CHANNEL_IN_FRONT | AudioFormat.CHANNEL_IN_BACK):
+            mask = inChannelConfig;
+            break;
+        default:
+            throw new IllegalArgumentException("Unsupported channel configuration.");
+        }
+
+        if (!allowLegacyConfig && ((inChannelConfig == AudioFormat.CHANNEL_CONFIGURATION_MONO)
+                || (inChannelConfig == AudioFormat.CHANNEL_CONFIGURATION_STEREO))) {
+            // only happens with the constructor that uses AudioAttributes and AudioFormat
+            throw new IllegalArgumentException("Unsupported deprecated configuration.");
+        }
+
+        return mask;
+!!!28317367.java!!!	audioParamCheck(in audioSource : int, in sampleRateInHz : int, in audioFormat : int) : void
+
+        //--------------
+        // audio source
+        if ( (audioSource < MediaRecorder.AudioSource.DEFAULT) ||
+             ((audioSource > MediaRecorder.getAudioSourceMax()) &&
+              (audioSource != MediaRecorder.AudioSource.RADIO_TUNER) &&
+              (audioSource != MediaRecorder.AudioSource.HOTWORD)) )  {
+            throw new IllegalArgumentException("Invalid audio source.");
+        }
+        mRecordSource = audioSource;
+
+        //--------------
+        // sample rate
+        if ((sampleRateInHz < AudioFormat.SAMPLE_RATE_HZ_MIN ||
+                sampleRateInHz > AudioFormat.SAMPLE_RATE_HZ_MAX) &&
+                sampleRateInHz != AudioFormat.SAMPLE_RATE_UNSPECIFIED) {
+            throw new IllegalArgumentException(sampleRateInHz
+                    + "Hz is not a supported sample rate.");
+        }
+        mSampleRate = sampleRateInHz;
+
+        //--------------
+        // audio format
+        switch (audioFormat) {
+        case AudioFormat.ENCODING_DEFAULT:
+            mAudioFormat = AudioFormat.ENCODING_PCM_16BIT;
+            break;
+        case AudioFormat.ENCODING_PCM_FLOAT:
+        case AudioFormat.ENCODING_PCM_16BIT:
+        case AudioFormat.ENCODING_PCM_8BIT:
+            mAudioFormat = audioFormat;
+            break;
+        default:
+            throw new IllegalArgumentException("Unsupported sample encoding."
+                    + " Should be ENCODING_PCM_8BIT, ENCODING_PCM_16BIT, or ENCODING_PCM_FLOAT.");
+        }
+!!!28317495.java!!!	audioBuffSizeCheck(in audioBufferSize : int) : void
+        // NB: this section is only valid with PCM data.
+        // To update when supporting compressed formats
+        int frameSizeInBytes = mChannelCount
+            * (AudioFormat.getBytesPerSample(mAudioFormat));
+        if ((audioBufferSize % frameSizeInBytes != 0) || (audioBufferSize < 1)) {
+            throw new IllegalArgumentException("Invalid audio buffer size.");
+        }
+
+        mNativeBufferSizeInBytes = audioBufferSize;
+!!!28317623.java!!!	release() : void
+        try {
+            stop();
+        } catch(IllegalStateException ise) {
+            // don't raise an exception, we're releasing the resources.
+        }
+        native_release();
+        mState = STATE_UNINITIALIZED;
+!!!28317751.java!!!	finalize() : void
+        // will cause stop() to be called, and if appropriate, will handle fixed volume recording
+        release();
+!!!28317879.java!!!	getSampleRate() : int
+        return mSampleRate;
+!!!28318007.java!!!	getAudioSource() : int
+        return mRecordSource;
+!!!28318135.java!!!	getAudioFormat() : int
+        return mAudioFormat;
+!!!28318263.java!!!	getChannelConfiguration() : int
+        return mChannelMask;
+!!!28318391.java!!!	getFormat() : AudioFormat
+        AudioFormat.Builder builder = new AudioFormat.Builder()
+            .setSampleRate(mSampleRate)
+            .setEncoding(mAudioFormat);
+        if (mChannelMask != AudioFormat.CHANNEL_INVALID) {
+            builder.setChannelMask(mChannelMask);
+        }
+        if (mChannelIndexMask != AudioFormat.CHANNEL_INVALID  /* 0 */) {
+            builder.setChannelIndexMask(mChannelIndexMask);
+        }
+        return builder.build();
+!!!28318519.java!!!	getChannelCount() : int
+        return mChannelCount;
+!!!28318647.java!!!	getState() : int
+        return mState;
+!!!28318775.java!!!	getRecordingState() : int
+        synchronized (mRecordingStateLock) {
+            return mRecordingState;
+        }
+!!!28318903.java!!!	getBufferSizeInFrames() : int
+        return native_get_buffer_size_in_frames();
+!!!28319031.java!!!	getNotificationMarkerPosition() : int
+        return native_get_marker_pos();
+!!!28319159.java!!!	getPositionNotificationPeriod() : int
+        return native_get_pos_update_period();
+!!!28319287.java!!!	getTimestamp(inout outTimestamp : AudioTimestamp, in timebase : int) : int
+         if (outTimestamp == null ||
+                 (timebase != AudioTimestamp.TIMEBASE_BOOTTIME
+                 && timebase != AudioTimestamp.TIMEBASE_MONOTONIC)) {
+             throw new IllegalArgumentException();
+         }
+         return native_get_timestamp(outTimestamp, timebase);
+!!!28319415.java!!!	getMinBufferSize(in sampleRateInHz : int, in channelConfig : int, in audioFormat : int) : int
+        int channelCount = 0;
+        switch (channelConfig) {
+        case AudioFormat.CHANNEL_IN_DEFAULT: // AudioFormat.CHANNEL_CONFIGURATION_DEFAULT
+        case AudioFormat.CHANNEL_IN_MONO:
+        case AudioFormat.CHANNEL_CONFIGURATION_MONO:
+            channelCount = 1;
+            break;
+        case AudioFormat.CHANNEL_IN_STEREO:
+        case AudioFormat.CHANNEL_CONFIGURATION_STEREO:
+        case (AudioFormat.CHANNEL_IN_FRONT | AudioFormat.CHANNEL_IN_BACK):
+            channelCount = 2;
+            break;
+        case AudioFormat.CHANNEL_INVALID:
+        default:
+            loge("getMinBufferSize(): Invalid channel configuration.");
+            return ERROR_BAD_VALUE;
+        }
+
+        int size = native_get_min_buff_size(sampleRateInHz, channelCount, audioFormat);
+        if (size == 0) {
+            return ERROR_BAD_VALUE;
+        }
+        else if (size == -1) {
+            return ERROR;
+        }
+        else {
+            return size;
+        }
+!!!28319543.java!!!	getAudioSessionId() : int
+        return mSessionId;
+!!!28319671.java!!!	startRecording() : void
+        if (mState != STATE_INITIALIZED) {
+            throw new IllegalStateException("startRecording() called on an "
+                    + "uninitialized AudioRecord.");
+        }
+
+        // start recording
+        synchronized(mRecordingStateLock) {
+            if (native_start(MediaSyncEvent.SYNC_EVENT_NONE, 0) == SUCCESS) {
+                handleFullVolumeRec(true);
+                mRecordingState = RECORDSTATE_RECORDING;
+            }
+        }
+!!!28319799.java!!!	startRecording(inout syncEvent : MediaSyncEvent) : void
+        if (mState != STATE_INITIALIZED) {
+            throw new IllegalStateException("startRecording() called on an "
+                    + "uninitialized AudioRecord.");
+        }
+
+        // start recording
+        synchronized(mRecordingStateLock) {
+            if (native_start(syncEvent.getType(), syncEvent.getAudioSessionId()) == SUCCESS) {
+                handleFullVolumeRec(true);
+                mRecordingState = RECORDSTATE_RECORDING;
+            }
+        }
+!!!28319927.java!!!	stop() : void
+        if (mState != STATE_INITIALIZED) {
+            throw new IllegalStateException("stop() called on an uninitialized AudioRecord.");
+        }
+
+        // stop recording
+        synchronized(mRecordingStateLock) {
+            handleFullVolumeRec(false);
+            native_stop();
+            mRecordingState = RECORDSTATE_STOPPED;
+        }
+!!!28320055.java!!!	handleFullVolumeRec(inout starting : boolean) : void
+        if (!mIsSubmixFullVolume) {
+            return;
+        }
+        final IBinder b = ServiceManager.getService(android.content.Context.AUDIO_SERVICE);
+        final IAudioService ias = IAudioService.Stub.asInterface(b);
+        try {
+            ias.forceRemoteSubmixFullVolume(starting, mICallBack);
+        } catch (RemoteException e) {
+            Log.e(TAG, "Error talking to AudioService when handling full submix volume", e);
+        }
+!!!28320183.java!!!	read(inout audioData : byte, in offsetInBytes : int, in sizeInBytes : int) : int
+        return read(audioData, offsetInBytes, sizeInBytes, READ_BLOCKING);
+!!!28320311.java!!!	read(inout audioData : byte, in offsetInBytes : int, in sizeInBytes : int, in readMode : int) : int
+        if (mState != STATE_INITIALIZED  || mAudioFormat == AudioFormat.ENCODING_PCM_FLOAT) {
+            return ERROR_INVALID_OPERATION;
+        }
+
+        if ((readMode != READ_BLOCKING) && (readMode != READ_NON_BLOCKING)) {
+            Log.e(TAG, "AudioRecord.read() called with invalid blocking mode");
+            return ERROR_BAD_VALUE;
+        }
+
+        if ( (audioData == null) || (offsetInBytes < 0 ) || (sizeInBytes < 0)
+                || (offsetInBytes + sizeInBytes < 0)  // detect integer overflow
+                || (offsetInBytes + sizeInBytes > audioData.length)) {
+            return ERROR_BAD_VALUE;
+        }
+
+        return native_read_in_byte_array(audioData, offsetInBytes, sizeInBytes,
+                readMode == READ_BLOCKING);
+!!!28320439.java!!!	read(inout audioData : short, in offsetInShorts : int, in sizeInShorts : int) : int
+        return read(audioData, offsetInShorts, sizeInShorts, READ_BLOCKING);
+!!!28320567.java!!!	read(inout audioData : short, in offsetInShorts : int, in sizeInShorts : int, in readMode : int) : int
+        if (mState != STATE_INITIALIZED || mAudioFormat == AudioFormat.ENCODING_PCM_FLOAT) {
+            return ERROR_INVALID_OPERATION;
+        }
+
+        if ((readMode != READ_BLOCKING) && (readMode != READ_NON_BLOCKING)) {
+            Log.e(TAG, "AudioRecord.read() called with invalid blocking mode");
+            return ERROR_BAD_VALUE;
+        }
+
+        if ( (audioData == null) || (offsetInShorts < 0 ) || (sizeInShorts < 0)
+                || (offsetInShorts + sizeInShorts < 0)  // detect integer overflow
+                || (offsetInShorts + sizeInShorts > audioData.length)) {
+            return ERROR_BAD_VALUE;
+        }
+
+        return native_read_in_short_array(audioData, offsetInShorts, sizeInShorts,
+                readMode == READ_BLOCKING);
+!!!28320695.java!!!	read(inout audioData : float, in offsetInFloats : int, in sizeInFloats : int, in readMode : int) : int
+        if (mState == STATE_UNINITIALIZED) {
+            Log.e(TAG, "AudioRecord.read() called in invalid state STATE_UNINITIALIZED");
+            return ERROR_INVALID_OPERATION;
+        }
+
+        if (mAudioFormat != AudioFormat.ENCODING_PCM_FLOAT) {
+            Log.e(TAG, "AudioRecord.read(float[] ...) requires format ENCODING_PCM_FLOAT");
+            return ERROR_INVALID_OPERATION;
+        }
+
+        if ((readMode != READ_BLOCKING) && (readMode != READ_NON_BLOCKING)) {
+            Log.e(TAG, "AudioRecord.read() called with invalid blocking mode");
+            return ERROR_BAD_VALUE;
+        }
+
+        if ((audioData == null) || (offsetInFloats < 0) || (sizeInFloats < 0)
+                || (offsetInFloats + sizeInFloats < 0)  // detect integer overflow
+                || (offsetInFloats + sizeInFloats > audioData.length)) {
+            return ERROR_BAD_VALUE;
+        }
+
+        return native_read_in_float_array(audioData, offsetInFloats, sizeInFloats,
+                readMode == READ_BLOCKING);
+!!!28320823.java!!!	read(inout audioBuffer : ByteBuffer, in sizeInBytes : int) : int
+        return read(audioBuffer, sizeInBytes, READ_BLOCKING);
+!!!28320951.java!!!	read(inout audioBuffer : ByteBuffer, in sizeInBytes : int, in readMode : int) : int
+        if (mState != STATE_INITIALIZED) {
+            return ERROR_INVALID_OPERATION;
+        }
+
+        if ((readMode != READ_BLOCKING) && (readMode != READ_NON_BLOCKING)) {
+            Log.e(TAG, "AudioRecord.read() called with invalid blocking mode");
+            return ERROR_BAD_VALUE;
+        }
+
+        if ( (audioBuffer == null) || (sizeInBytes < 0) ) {
+            return ERROR_BAD_VALUE;
+        }
+
+        return native_read_in_direct_buffer(audioBuffer, sizeInBytes, readMode == READ_BLOCKING);
+!!!28321079.java!!!	setRecordPositionUpdateListener(inout listener : OnRecordPositionUpdateListener) : void
+        setRecordPositionUpdateListener(listener, null);
+!!!28321207.java!!!	setRecordPositionUpdateListener(inout listener : OnRecordPositionUpdateListener, inout handler : Handler) : void
+        synchronized (mPositionListenerLock) {
+
+            mPositionListener = listener;
+
+            if (listener != null) {
+                if (handler != null) {
+                    mEventHandler = new NativeEventHandler(this, handler.getLooper());
+                } else {
+                    // no given handler, use the looper the AudioRecord was created in
+                    mEventHandler = new NativeEventHandler(this, mInitializationLooper);
+                }
+            } else {
+                mEventHandler = null;
+            }
+        }
+
+!!!28321335.java!!!	setNotificationMarkerPosition(in markerInFrames : int) : int
+        if (mState == STATE_UNINITIALIZED) {
+            return ERROR_INVALID_OPERATION;
+        }
+        return native_set_marker_pos(markerInFrames);
+!!!28321463.java!!!	getRoutedDevice() : AudioDeviceInfo
+        int deviceId = native_getRoutedDeviceId();
+        if (deviceId == 0) {
+            return null;
+        }
+        AudioDeviceInfo[] devices =
+                AudioManager.getDevicesStatic(AudioManager.GET_DEVICES_INPUTS);
+        for (int i = 0; i < devices.length; i++) {
+            if (devices[i].getId() == deviceId) {
+                return devices[i];
+            }
+        }
+        return null;
+!!!28321591.java!!!	testEnableNativeRoutingCallbacksLocked() : void
+        if (mRoutingChangeListeners.size() == 0) {
+            native_enableDeviceCallback();
+        }
+!!!28321719.java!!!	testDisableNativeRoutingCallbacksLocked() : void
+        if (mRoutingChangeListeners.size() == 0) {
+            native_disableDeviceCallback();
+        }
+!!!28321847.java!!!	addOnRoutingChangedListener(inout listener : AudioRouting::OnRoutingChangedListener, inout handler : Handler) : void
+        synchronized (mRoutingChangeListeners) {
+            if (listener != null && !mRoutingChangeListeners.containsKey(listener)) {
+                testEnableNativeRoutingCallbacksLocked();
+                mRoutingChangeListeners.put(
+                        listener, new NativeRoutingEventHandlerDelegate(this, listener,
+                                handler != null ? handler : new Handler(mInitializationLooper)));
+            }
+        }
+!!!28321975.java!!!	removeOnRoutingChangedListener(inout listener : AudioRouting::OnRoutingChangedListener) : void
+        synchronized (mRoutingChangeListeners) {
+            if (mRoutingChangeListeners.containsKey(listener)) {
+                mRoutingChangeListeners.remove(listener);
+                testDisableNativeRoutingCallbacksLocked();
+            }
+        }

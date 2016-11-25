@@ -1,0 +1,178 @@
+class PermissionMonitor
+!!!42012343.java!!!	PermissionMonitor(inout context : Context, inout netd : INetworkManagementService)
+        mContext = context;
+        mPackageManager = context.getPackageManager();
+        mUserManager = UserManager.get(context);
+        mNetd = netd;
+        mIntentReceiver = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                String action = intent.getAction();
+                int user = intent.getIntExtra(Intent.EXTRA_USER_HANDLE, UserHandle.USER_NULL);
+                int appUid = intent.getIntExtra(Intent.EXTRA_UID, -1);
+                Uri appData = intent.getData();
+                String appName = appData != null ? appData.getSchemeSpecificPart() : null;
+
+                if (Intent.ACTION_USER_ADDED.equals(action)) {
+                    onUserAdded(user);
+                } else if (Intent.ACTION_USER_REMOVED.equals(action)) {
+                    onUserRemoved(user);
+                } else if (Intent.ACTION_PACKAGE_ADDED.equals(action)) {
+                    onAppAdded(appName, appUid);
+                } else if (Intent.ACTION_PACKAGE_REMOVED.equals(action)) {
+                    onAppRemoved(appUid);
+                }
+            }
+        };
+!!!42012471.java!!!	startMonitoring() : void
+        log("Monitoring");
+
+        IntentFilter intentFilter = new IntentFilter();
+        intentFilter.addAction(Intent.ACTION_USER_ADDED);
+        intentFilter.addAction(Intent.ACTION_USER_REMOVED);
+        mContext.registerReceiverAsUser(mIntentReceiver, UserHandle.ALL, intentFilter, null, null);
+
+        intentFilter = new IntentFilter();
+        intentFilter.addAction(Intent.ACTION_PACKAGE_ADDED);
+        intentFilter.addAction(Intent.ACTION_PACKAGE_REMOVED);
+        intentFilter.addDataScheme("package");
+        mContext.registerReceiverAsUser(mIntentReceiver, UserHandle.ALL, intentFilter, null, null);
+
+        List<PackageInfo> apps = mPackageManager.getInstalledPackages(GET_PERMISSIONS);
+        if (apps == null) {
+            loge("No apps");
+            return;
+        }
+
+        for (PackageInfo app : apps) {
+            int uid = app.applicationInfo != null ? app.applicationInfo.uid : -1;
+            if (uid < 0) {
+                continue;
+            }
+
+            boolean isNetwork = hasNetworkPermission(app);
+            boolean isSystem = hasSystemPermission(app);
+
+            if (isNetwork || isSystem) {
+                Boolean permission = mApps.get(uid);
+                // If multiple packages share a UID (cf: android:sharedUserId) and ask for different
+                // permissions, don't downgrade (i.e., if it's already SYSTEM, leave it as is).
+                if (permission == null || permission == NETWORK) {
+                    mApps.put(uid, isSystem);
+                }
+            }
+        }
+
+        List<UserInfo> users = mUserManager.getUsers(true);  // exclude dying users
+        if (users != null) {
+            for (UserInfo user : users) {
+                mUsers.add(user.id);
+            }
+        }
+
+        log("Users: " + mUsers.size() + ", Apps: " + mApps.size());
+        update(mUsers, mApps, true);
+!!!42012599.java!!!	hasPermission(inout app : PackageInfo, inout permission : String) : boolean
+        if (app.requestedPermissions != null) {
+            for (String p : app.requestedPermissions) {
+                if (permission.equals(p)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+!!!42012727.java!!!	hasNetworkPermission(inout app : PackageInfo) : boolean
+        return hasPermission(app, CHANGE_NETWORK_STATE);
+!!!42012855.java!!!	hasSystemPermission(inout app : PackageInfo) : boolean
+        int flags = app.applicationInfo != null ? app.applicationInfo.flags : 0;
+        if ((flags & FLAG_SYSTEM) != 0 || (flags & FLAG_UPDATED_SYSTEM_APP) != 0) {
+            return true;
+        }
+        return hasPermission(app, CONNECTIVITY_INTERNAL);
+!!!42012983.java!!!	toIntArray(inout list : List<Integer>) : int
+        int[] array = new int[list.size()];
+        for (int i = 0; i < list.size(); i++) {
+            array[i] = list.get(i);
+        }
+        return array;
+!!!42013111.java!!!	update(inout users : Set<Integer>, inout apps : Map<Integer, Boolean>, inout add : boolean) : void
+        List<Integer> network = new ArrayList<Integer>();
+        List<Integer> system = new ArrayList<Integer>();
+        for (Entry<Integer, Boolean> app : apps.entrySet()) {
+            List<Integer> list = app.getValue() ? system : network;
+            for (int user : users) {
+                list.add(UserHandle.getUid(user, app.getKey()));
+            }
+        }
+        try {
+            if (add) {
+                mNetd.setPermission("NETWORK", toIntArray(network));
+                mNetd.setPermission("SYSTEM", toIntArray(system));
+            } else {
+                mNetd.clearPermission(toIntArray(network));
+                mNetd.clearPermission(toIntArray(system));
+            }
+        } catch (RemoteException e) {
+            loge("Exception when updating permissions: " + e);
+        }
+!!!42013239.java!!!	onUserAdded(in user : int) : void
+        if (user < 0) {
+            loge("Invalid user in onUserAdded: " + user);
+            return;
+        }
+        mUsers.add(user);
+
+        Set<Integer> users = new HashSet<Integer>();
+        users.add(user);
+        update(users, mApps, true);
+!!!42013367.java!!!	onUserRemoved(in user : int) : void
+        if (user < 0) {
+            loge("Invalid user in onUserRemoved: " + user);
+            return;
+        }
+        mUsers.remove(user);
+
+        Set<Integer> users = new HashSet<Integer>();
+        users.add(user);
+        update(users, mApps, false);
+!!!42013495.java!!!	onAppAdded(inout appName : String, in appUid : int) : void
+        if (TextUtils.isEmpty(appName) || appUid < 0) {
+            loge("Invalid app in onAppAdded: " + appName + " | " + appUid);
+            return;
+        }
+
+        try {
+            PackageInfo app = mPackageManager.getPackageInfo(appName, GET_PERMISSIONS);
+            boolean isNetwork = hasNetworkPermission(app);
+            boolean isSystem = hasSystemPermission(app);
+            if (isNetwork || isSystem) {
+                Boolean permission = mApps.get(appUid);
+                // If multiple packages share a UID (cf: android:sharedUserId) and ask for different
+                // permissions, don't downgrade (i.e., if it's already SYSTEM, leave it as is).
+                if (permission == null || permission == NETWORK) {
+                    mApps.put(appUid, isSystem);
+
+                    Map<Integer, Boolean> apps = new HashMap<Integer, Boolean>();
+                    apps.put(appUid, isSystem);
+                    update(mUsers, apps, true);
+                }
+            }
+        } catch (NameNotFoundException e) {
+            loge("NameNotFoundException in onAppAdded: " + e);
+        }
+!!!42013623.java!!!	onAppRemoved(in appUid : int) : void
+        if (appUid < 0) {
+            loge("Invalid app in onAppRemoved: " + appUid);
+            return;
+        }
+        mApps.remove(appUid);
+
+        Map<Integer, Boolean> apps = new HashMap<Integer, Boolean>();
+        apps.put(appUid, NETWORK);  // doesn't matter which permission we pick here
+        update(mUsers, apps, false);
+!!!42013751.java!!!	log(inout s : String) : void
+        if (DBG) {
+            Log.d(TAG, s);
+        }
+!!!42013879.java!!!	loge(inout s : String) : void
+        Log.e(TAG, s);

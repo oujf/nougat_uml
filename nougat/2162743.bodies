@@ -1,0 +1,119 @@
+class SmsBroadcastUndelivered
+!!!37775287.java!!!	initialize(inout context : Context, inout gsmInboundSmsHandler : GsmInboundSmsHandler, inout cdmaInboundSmsHandler : CdmaInboundSmsHandler) : void
+        if (instance == null) {
+            instance = new SmsBroadcastUndelivered(
+                context, gsmInboundSmsHandler, cdmaInboundSmsHandler);
+        }
+
+        // Tell handlers to start processing new messages and transit from the startup state to the
+        // idle state. This method may be called multiple times for multi-sim devices. We must make
+        // sure the state transition happen to all inbound sms handlers.
+        if (gsmInboundSmsHandler != null) {
+            gsmInboundSmsHandler.sendMessage(InboundSmsHandler.EVENT_START_ACCEPTING_SMS);
+        }
+        if (cdmaInboundSmsHandler != null) {
+            cdmaInboundSmsHandler.sendMessage(InboundSmsHandler.EVENT_START_ACCEPTING_SMS);
+        }
+!!!37775415.java!!!	SmsBroadcastUndelivered(inout context : Context, inout gsmInboundSmsHandler : GsmInboundSmsHandler, inout cdmaInboundSmsHandler : CdmaInboundSmsHandler)
+        mResolver = context.getContentResolver();
+        mGsmInboundSmsHandler = gsmInboundSmsHandler;
+        mCdmaInboundSmsHandler = cdmaInboundSmsHandler;
+
+        UserManager userManager = (UserManager) context.getSystemService(Context.USER_SERVICE);
+
+        if (userManager.isUserUnlocked()) {
+            new ScanRawTableThread(context).start();
+        } else {
+            IntentFilter userFilter = new IntentFilter();
+            userFilter.addAction(Intent.ACTION_USER_UNLOCKED);
+            context.registerReceiver(mBroadcastReceiver, userFilter);
+        }
+!!!37775543.java!!!	scanRawTable() : void
+        if (DBG) Rlog.d(TAG, "scanning raw table for undelivered messages");
+        long startTime = System.nanoTime();
+        HashMap<SmsReferenceKey, Integer> multiPartReceivedCount =
+                new HashMap<SmsReferenceKey, Integer>(4);
+        HashSet<SmsReferenceKey> oldMultiPartMessages = new HashSet<SmsReferenceKey>(4);
+        Cursor cursor = null;
+        try {
+            // query only non-deleted ones
+            cursor = mResolver.query(InboundSmsHandler.sRawUri, PDU_PENDING_MESSAGE_PROJECTION,
+                    "deleted = 0", null,
+                    null);
+            if (cursor == null) {
+                Rlog.e(TAG, "error getting pending message cursor");
+                return;
+            }
+
+            boolean isCurrentFormat3gpp2 = InboundSmsHandler.isCurrentFormat3gpp2();
+            while (cursor.moveToNext()) {
+                InboundSmsTracker tracker;
+                try {
+                    tracker = TelephonyComponentFactory.getInstance().makeInboundSmsTracker(cursor,
+                            isCurrentFormat3gpp2);
+                } catch (IllegalArgumentException e) {
+                    Rlog.e(TAG, "error loading SmsTracker: " + e);
+                    continue;
+                }
+
+                if (tracker.getMessageCount() == 1) {
+                    // deliver single-part message
+                    broadcastSms(tracker);
+                } else {
+                    SmsReferenceKey reference = new SmsReferenceKey(tracker);
+                    Integer receivedCount = multiPartReceivedCount.get(reference);
+                    if (receivedCount == null) {
+                        multiPartReceivedCount.put(reference, 1);    // first segment seen
+                        if (tracker.getTimestamp() <
+                                (System.currentTimeMillis() - PARTIAL_SEGMENT_EXPIRE_AGE)) {
+                            // older than 30 days; delete if we don't find all the segments
+                            oldMultiPartMessages.add(reference);
+                        }
+                    } else {
+                        int newCount = receivedCount + 1;
+                        if (newCount == tracker.getMessageCount()) {
+                            // looks like we've got all the pieces; send a single tracker
+                            // to state machine which will find the other pieces to broadcast
+                            if (DBG) Rlog.d(TAG, "found complete multi-part message");
+                            broadcastSms(tracker);
+                            // don't delete this old message until after we broadcast it
+                            oldMultiPartMessages.remove(reference);
+                        } else {
+                            multiPartReceivedCount.put(reference, newCount);
+                        }
+                    }
+                }
+            }
+            // Delete old incomplete message segments
+            for (SmsReferenceKey message : oldMultiPartMessages) {
+                // delete permanently
+                int rows = mResolver.delete(InboundSmsHandler.sRawUriPermanentDelete,
+                        InboundSmsHandler.SELECT_BY_REFERENCE, message.getDeleteWhereArgs());
+                if (rows == 0) {
+                    Rlog.e(TAG, "No rows were deleted from raw table!");
+                } else if (DBG) {
+                    Rlog.d(TAG, "Deleted " + rows + " rows from raw table for incomplete "
+                            + message.mMessageCount + " part message");
+                }
+            }
+        } catch (SQLException e) {
+            Rlog.e(TAG, "error reading pending SMS messages", e);
+        } finally {
+            if (cursor != null) {
+                cursor.close();
+            }
+            if (DBG) Rlog.d(TAG, "finished scanning raw table in "
+                    + ((System.nanoTime() - startTime) / 1000000) + " ms");
+        }
+!!!37775671.java!!!	broadcastSms(inout tracker : InboundSmsTracker) : void
+        InboundSmsHandler handler;
+        if (tracker.is3gpp2()) {
+            handler = mCdmaInboundSmsHandler;
+        } else {
+            handler = mGsmInboundSmsHandler;
+        }
+        if (handler != null) {
+            handler.sendMessage(InboundSmsHandler.EVENT_BROADCAST_SMS, tracker);
+        } else {
+            Rlog.e(TAG, "null handler for " + tracker.getFormat() + " format, can't deliver.");
+        }

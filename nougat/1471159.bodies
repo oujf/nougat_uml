@@ -1,0 +1,892 @@
+class Vpn
+!!!32673463.java!!!	Vpn(inout looper : Looper, inout context : Context, inout netService : INetworkManagementService, in userHandle : int)
+        mContext = context;
+        mNetd = netService;
+        mUserHandle = userHandle;
+        mLooper = looper;
+
+        mPackage = VpnConfig.LEGACY_VPN;
+        mOwnerUID = getAppUid(mPackage, mUserHandle);
+
+        try {
+            netService.registerObserver(mObserver);
+        } catch (RemoteException e) {
+            Log.wtf(TAG, "Problem registering observer", e);
+        }
+
+        mNetworkInfo = new NetworkInfo(ConnectivityManager.TYPE_VPN, 0, NETWORKTYPE, "");
+        // TODO: Copy metered attribute and bandwidths from physical transport, b/16207332
+        mNetworkCapabilities = new NetworkCapabilities();
+        mNetworkCapabilities.addTransportType(NetworkCapabilities.TRANSPORT_VPN);
+        mNetworkCapabilities.removeCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN);
+!!!32673591.java!!!	setEnableTeardown(inout enableTeardown : boolean) : void
+        mEnableTeardown = enableTeardown;
+!!!32673719.java!!!	updateState(inout detailedState : NetworkInfo::DetailedState, inout reason : String) : void
+        if (LOGD) Log.d(TAG, "setting state=" + detailedState + ", reason=" + reason);
+        mNetworkInfo.setDetailedState(detailedState, reason, null);
+        if (mNetworkAgent != null) {
+            mNetworkAgent.sendNetworkInfo(mNetworkInfo);
+        }
+!!!32673847.java!!!	setAlwaysOnPackage(inout packageName : String, inout lockdown : boolean) : boolean
+        enforceControlPermissionOrInternalCaller();
+        if (VpnConfig.LEGACY_VPN.equals(packageName)) {
+            Log.w(TAG, "Not setting legacy VPN \"" + packageName + "\" as always-on.");
+            return false;
+        }
+
+        if (packageName != null) {
+            // Pre-authorize new always-on VPN package.
+            if (!setPackageAuthorization(packageName, true)) {
+                return false;
+            }
+            mAlwaysOn = true;
+        } else {
+            packageName = VpnConfig.LEGACY_VPN;
+            mAlwaysOn = false;
+        }
+
+        mLockdown = (mAlwaysOn && lockdown);
+        if (!isCurrentPreparedPackage(packageName)) {
+            prepareInternal(packageName);
+        }
+        maybeRegisterPackageChangeReceiverLocked(packageName);
+        setVpnForcedLocked(mLockdown);
+        return true;
+!!!32673975.java!!!	isNullOrLegacyVpn(inout packageName : String) : boolean
+        return packageName == null || VpnConfig.LEGACY_VPN.equals(packageName);
+!!!32674103.java!!!	unregisterPackageChangeReceiverLocked() : void
+        // register previous intent filter
+        if (mIsPackageIntentReceiverRegistered) {
+            mContext.unregisterReceiver(mPackageIntentReceiver);
+            mIsPackageIntentReceiverRegistered = false;
+        }
+!!!32674231.java!!!	maybeRegisterPackageChangeReceiverLocked(inout packageName : String) : void
+        // Unregister IntentFilter listening for previous always-on package change
+        unregisterPackageChangeReceiverLocked();
+
+        if (!isNullOrLegacyVpn(packageName)) {
+            mIsPackageIntentReceiverRegistered = true;
+
+            IntentFilter intentFilter = new IntentFilter();
+            // Protected intent can only be sent by system. No permission required in register.
+            intentFilter.addAction(Intent.ACTION_PACKAGE_REPLACED);
+            intentFilter.addAction(Intent.ACTION_PACKAGE_REMOVED);
+            intentFilter.addDataScheme("package");
+            intentFilter.addDataSchemeSpecificPart(packageName, PatternMatcher.PATTERN_LITERAL);
+            mContext.registerReceiverAsUser(
+                    mPackageIntentReceiver, UserHandle.of(mUserHandle), intentFilter, null, null);
+        }
+!!!32674359.java!!!	getAlwaysOnPackage() : String
+        enforceControlPermissionOrInternalCaller();
+        return (mAlwaysOn ? mPackage : null);
+!!!32674487.java!!!	saveAlwaysOnPackage() : void
+        final long token = Binder.clearCallingIdentity();
+        try {
+            final ContentResolver cr = mContext.getContentResolver();
+            Settings.Secure.putStringForUser(cr, Settings.Secure.ALWAYS_ON_VPN_APP,
+                    getAlwaysOnPackage(), mUserHandle);
+            Settings.Secure.putIntForUser(cr, Settings.Secure.ALWAYS_ON_VPN_LOCKDOWN,
+                    (mLockdown ? 1 : 0), mUserHandle);
+        } finally {
+            Binder.restoreCallingIdentity(token);
+        }
+!!!32674615.java!!!	setAndSaveAlwaysOnPackage(inout packageName : String, inout lockdown : boolean) : boolean
+        if (setAlwaysOnPackage(packageName, lockdown)) {
+            saveAlwaysOnPackage();
+            return true;
+        } else {
+            return false;
+        }
+!!!32674743.java!!!	startAlwaysOnVpn() : boolean
+        final String alwaysOnPackage;
+        synchronized (this) {
+            alwaysOnPackage = getAlwaysOnPackage();
+            // Skip if there is no service to start.
+            if (alwaysOnPackage == null) {
+                return true;
+            }
+            // Skip if the service is already established. This isn't bulletproof: it's not bound
+            // until after establish(), so if it's mid-setup onStartCommand will be sent twice,
+            // which may restart the connection.
+            if (getNetworkInfo().isConnected()) {
+                return true;
+            }
+        }
+
+        // Start the VPN service declared in the app's manifest.
+        Intent serviceIntent = new Intent(VpnConfig.SERVICE_INTERFACE);
+        serviceIntent.setPackage(alwaysOnPackage);
+        try {
+            return mContext.startServiceAsUser(serviceIntent, UserHandle.of(mUserHandle)) != null;
+        } catch (RuntimeException e) {
+            Log.e(TAG, "VpnService " + serviceIntent + " failed to start", e);
+            return false;
+        }
+!!!32674871.java!!!	prepare(inout oldPackage : String, inout newPackage : String) : boolean
+        if (oldPackage != null) {
+            // Stop an existing always-on VPN from being dethroned by other apps.
+            if (mAlwaysOn && !isCurrentPreparedPackage(oldPackage)) {
+                return false;
+            }
+
+            // Package is not same or old package was reinstalled.
+            if (!isCurrentPreparedPackage(oldPackage)) {
+                // The package doesn't match. We return false (to obtain user consent) unless the
+                // user has already consented to that VPN package.
+                if (!oldPackage.equals(VpnConfig.LEGACY_VPN) && isVpnUserPreConsented(oldPackage)) {
+                    prepareInternal(oldPackage);
+                    return true;
+                }
+                return false;
+            } else if (!oldPackage.equals(VpnConfig.LEGACY_VPN)
+                    && !isVpnUserPreConsented(oldPackage)) {
+                // Currently prepared VPN is revoked, so unprepare it and return false.
+                prepareInternal(VpnConfig.LEGACY_VPN);
+                return false;
+            }
+        }
+
+        // Return true if we do not need to revoke.
+        if (newPackage == null || (!newPackage.equals(VpnConfig.LEGACY_VPN) &&
+                isCurrentPreparedPackage(newPackage))) {
+            return true;
+        }
+
+        // Check that the caller is authorized.
+        enforceControlPermission();
+
+        // Stop an existing always-on VPN from being dethroned by other apps.
+        if (mAlwaysOn && !isCurrentPreparedPackage(newPackage)) {
+            return false;
+        }
+
+        prepareInternal(newPackage);
+        return true;
+!!!32674999.java!!!	isCurrentPreparedPackage(inout packageName : String) : boolean
+        // We can't just check that packageName matches mPackage, because if the app was uninstalled
+        // and reinstalled it will no longer be prepared. Instead check the UID.
+        return getAppUid(packageName, mUserHandle) == mOwnerUID;
+!!!32675127.java!!!	prepareInternal(inout newPackage : String) : void
+        long token = Binder.clearCallingIdentity();
+        try {
+            // Reset the interface.
+            if (mInterface != null) {
+                mStatusIntent = null;
+                agentDisconnect();
+                jniReset(mInterface);
+                mInterface = null;
+                mVpnUsers = null;
+            }
+
+            // Revoke the connection or stop LegacyVpnRunner.
+            if (mConnection != null) {
+                try {
+                    mConnection.mService.transact(IBinder.LAST_CALL_TRANSACTION,
+                            Parcel.obtain(), null, IBinder.FLAG_ONEWAY);
+                } catch (Exception e) {
+                    // ignore
+                }
+                mContext.unbindService(mConnection);
+                mConnection = null;
+            } else if (mLegacyVpnRunner != null) {
+                mLegacyVpnRunner.exit();
+                mLegacyVpnRunner = null;
+            }
+
+            try {
+                mNetd.denyProtect(mOwnerUID);
+            } catch (Exception e) {
+                Log.wtf(TAG, "Failed to disallow UID " + mOwnerUID + " to call protect() " + e);
+            }
+
+            Log.i(TAG, "Switched from " + mPackage + " to " + newPackage);
+            mPackage = newPackage;
+            mOwnerUID = getAppUid(newPackage, mUserHandle);
+            try {
+                mNetd.allowProtect(mOwnerUID);
+            } catch (Exception e) {
+                Log.wtf(TAG, "Failed to allow UID " + mOwnerUID + " to call protect() " + e);
+            }
+            mConfig = null;
+
+            updateState(DetailedState.IDLE, "prepare");
+        } finally {
+            Binder.restoreCallingIdentity(token);
+        }
+!!!32675255.java!!!	setPackageAuthorization(inout packageName : String, inout authorized : boolean) : boolean
+        // Check if the caller is authorized.
+        enforceControlPermissionOrInternalCaller();
+
+        int uid = getAppUid(packageName, mUserHandle);
+        if (uid == -1 || VpnConfig.LEGACY_VPN.equals(packageName)) {
+            // Authorization for nonexistent packages (or fake ones) can't be updated.
+            return false;
+        }
+
+        long token = Binder.clearCallingIdentity();
+        try {
+            AppOpsManager appOps =
+                    (AppOpsManager) mContext.getSystemService(Context.APP_OPS_SERVICE);
+            appOps.setMode(AppOpsManager.OP_ACTIVATE_VPN, uid, packageName,
+                    authorized ? AppOpsManager.MODE_ALLOWED : AppOpsManager.MODE_IGNORED);
+            return true;
+        } catch (Exception e) {
+            Log.wtf(TAG, "Failed to set app ops for package " + packageName + ", uid " + uid, e);
+        } finally {
+            Binder.restoreCallingIdentity(token);
+        }
+        return false;
+!!!32675383.java!!!	isVpnUserPreConsented(inout packageName : String) : boolean
+        AppOpsManager appOps =
+                (AppOpsManager) mContext.getSystemService(Context.APP_OPS_SERVICE);
+
+        // Verify that the caller matches the given package and has permission to activate VPNs.
+        return appOps.noteOpNoThrow(AppOpsManager.OP_ACTIVATE_VPN, Binder.getCallingUid(),
+                packageName) == AppOpsManager.MODE_ALLOWED;
+!!!32675511.java!!!	getAppUid(inout app : String, in userHandle : int) : int
+        if (VpnConfig.LEGACY_VPN.equals(app)) {
+            return Process.myUid();
+        }
+        PackageManager pm = mContext.getPackageManager();
+        int result;
+        try {
+            result = pm.getPackageUidAsUser(app, userHandle);
+        } catch (NameNotFoundException e) {
+            result = -1;
+        }
+        return result;
+!!!32675639.java!!!	getNetworkInfo() : NetworkInfo
+        return mNetworkInfo;
+!!!32675767.java!!!	getNetId() : int
+        return mNetworkAgent != null ? mNetworkAgent.netId : NETID_UNSET;
+!!!32675895.java!!!	makeLinkProperties() : LinkProperties
+        boolean allowIPv4 = mConfig.allowIPv4;
+        boolean allowIPv6 = mConfig.allowIPv6;
+
+        LinkProperties lp = new LinkProperties();
+
+        lp.setInterfaceName(mInterface);
+
+        if (mConfig.addresses != null) {
+            for (LinkAddress address : mConfig.addresses) {
+                lp.addLinkAddress(address);
+                allowIPv4 |= address.getAddress() instanceof Inet4Address;
+                allowIPv6 |= address.getAddress() instanceof Inet6Address;
+            }
+        }
+
+        if (mConfig.routes != null) {
+            for (RouteInfo route : mConfig.routes) {
+                lp.addRoute(route);
+                InetAddress address = route.getDestination().getAddress();
+                allowIPv4 |= address instanceof Inet4Address;
+                allowIPv6 |= address instanceof Inet6Address;
+            }
+        }
+
+        if (mConfig.dnsServers != null) {
+            for (String dnsServer : mConfig.dnsServers) {
+                InetAddress address = InetAddress.parseNumericAddress(dnsServer);
+                lp.addDnsServer(address);
+                allowIPv4 |= address instanceof Inet4Address;
+                allowIPv6 |= address instanceof Inet6Address;
+            }
+        }
+
+        if (!allowIPv4) {
+            lp.addRoute(new RouteInfo(new IpPrefix(Inet4Address.ANY, 0), RTN_UNREACHABLE));
+        }
+        if (!allowIPv6) {
+            lp.addRoute(new RouteInfo(new IpPrefix(Inet6Address.ANY, 0), RTN_UNREACHABLE));
+        }
+
+        // Concatenate search domains into a string.
+        StringBuilder buffer = new StringBuilder();
+        if (mConfig.searchDomains != null) {
+            for (String domain : mConfig.searchDomains) {
+                buffer.append(domain).append(' ');
+            }
+        }
+        lp.setDomains(buffer.toString().trim());
+
+        // TODO: Stop setting the MTU in jniCreate and set it here.
+
+        return lp;
+!!!32676023.java!!!	agentConnect() : void
+        LinkProperties lp = makeLinkProperties();
+
+        if (lp.hasIPv4DefaultRoute() || lp.hasIPv6DefaultRoute()) {
+            mNetworkCapabilities.addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET);
+        } else {
+            mNetworkCapabilities.removeCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET);
+        }
+
+        mNetworkInfo.setDetailedState(DetailedState.CONNECTING, null, null);
+
+        NetworkMisc networkMisc = new NetworkMisc();
+        networkMisc.allowBypass = mConfig.allowBypass && !mLockdown;
+
+        long token = Binder.clearCallingIdentity();
+        try {
+            mNetworkAgent = new NetworkAgent(mLooper, mContext, NETWORKTYPE,
+                    mNetworkInfo, mNetworkCapabilities, lp, 0, networkMisc) {
+                            @Override
+                            public void unwanted() {
+                                // We are user controlled, not driven by NetworkRequest.
+                            }
+                        };
+        } finally {
+            Binder.restoreCallingIdentity(token);
+        }
+
+        mVpnUsers = createUserAndRestrictedProfilesRanges(mUserHandle,
+                mConfig.allowedApplications, mConfig.disallowedApplications);
+        mNetworkAgent.addUidRanges(mVpnUsers.toArray(new UidRange[mVpnUsers.size()]));
+
+        mNetworkInfo.setIsAvailable(true);
+        updateState(DetailedState.CONNECTED, "agentConnect");
+!!!32676151.java!!!	canHaveRestrictedProfile(in userId : int) : boolean
+        long token = Binder.clearCallingIdentity();
+        try {
+            return UserManager.get(mContext).canHaveRestrictedProfile(userId);
+        } finally {
+            Binder.restoreCallingIdentity(token);
+        }
+!!!32676279.java!!!	agentDisconnect(inout networkInfo : NetworkInfo, inout networkAgent : NetworkAgent) : void
+        networkInfo.setIsAvailable(false);
+        networkInfo.setDetailedState(DetailedState.DISCONNECTED, null, null);
+        if (networkAgent != null) {
+            networkAgent.sendNetworkInfo(networkInfo);
+        }
+!!!32676407.java!!!	agentDisconnect(inout networkAgent : NetworkAgent) : void
+        NetworkInfo networkInfo = new NetworkInfo(mNetworkInfo);
+        agentDisconnect(networkInfo, networkAgent);
+!!!32676535.java!!!	agentDisconnect() : void
+        if (mNetworkInfo.isConnected()) {
+            agentDisconnect(mNetworkInfo, mNetworkAgent);
+            mNetworkAgent = null;
+        }
+!!!32676663.java!!!	establish(inout config : VpnConfig) : ParcelFileDescriptor
+        // Check if the caller is already prepared.
+        UserManager mgr = UserManager.get(mContext);
+        if (Binder.getCallingUid() != mOwnerUID) {
+            return null;
+        }
+        // Check to ensure consent hasn't been revoked since we were prepared.
+        if (!isVpnUserPreConsented(mPackage)) {
+            return null;
+        }
+        // Check if the service is properly declared.
+        Intent intent = new Intent(VpnConfig.SERVICE_INTERFACE);
+        intent.setClassName(mPackage, config.user);
+        long token = Binder.clearCallingIdentity();
+        try {
+            // Restricted users are not allowed to create VPNs, they are tied to Owner
+            UserInfo user = mgr.getUserInfo(mUserHandle);
+            if (user.isRestricted()) {
+                throw new SecurityException("Restricted users cannot establish VPNs");
+            }
+
+            ResolveInfo info = AppGlobals.getPackageManager().resolveService(intent,
+                                                                        null, 0, mUserHandle);
+            if (info == null) {
+                throw new SecurityException("Cannot find " + config.user);
+            }
+            if (!BIND_VPN_SERVICE.equals(info.serviceInfo.permission)) {
+                throw new SecurityException(config.user + " does not require " + BIND_VPN_SERVICE);
+            }
+        } catch (RemoteException e) {
+                throw new SecurityException("Cannot find " + config.user);
+        } finally {
+            Binder.restoreCallingIdentity(token);
+        }
+
+        // Save the old config in case we need to go back.
+        VpnConfig oldConfig = mConfig;
+        String oldInterface = mInterface;
+        Connection oldConnection = mConnection;
+        NetworkAgent oldNetworkAgent = mNetworkAgent;
+        mNetworkAgent = null;
+        Set<UidRange> oldUsers = mVpnUsers;
+
+        // Configure the interface. Abort if any of these steps fails.
+        ParcelFileDescriptor tun = ParcelFileDescriptor.adoptFd(jniCreate(config.mtu));
+        try {
+            updateState(DetailedState.CONNECTING, "establish");
+            String interfaze = jniGetName(tun.getFd());
+
+            // TEMP use the old jni calls until there is support for netd address setting
+            StringBuilder builder = new StringBuilder();
+            for (LinkAddress address : config.addresses) {
+                builder.append(" " + address);
+            }
+            if (jniSetAddresses(interfaze, builder.toString()) < 1) {
+                throw new IllegalArgumentException("At least one address must be specified");
+            }
+            Connection connection = new Connection();
+            if (!mContext.bindServiceAsUser(intent, connection,
+                    Context.BIND_AUTO_CREATE | Context.BIND_FOREGROUND_SERVICE,
+                    new UserHandle(mUserHandle))) {
+                throw new IllegalStateException("Cannot bind " + config.user);
+            }
+
+            mConnection = connection;
+            mInterface = interfaze;
+
+            // Fill more values.
+            config.user = mPackage;
+            config.interfaze = mInterface;
+            config.startTime = SystemClock.elapsedRealtime();
+            mConfig = config;
+
+            // Set up forwarding and DNS rules.
+            agentConnect();
+
+            if (oldConnection != null) {
+                mContext.unbindService(oldConnection);
+            }
+            // Remove the old tun's user forwarding rules
+            // The new tun's user rules have already been added so they will take over
+            // as rules are deleted. This prevents data leakage as the rules are moved over.
+            agentDisconnect(oldNetworkAgent);
+            if (oldInterface != null && !oldInterface.equals(interfaze)) {
+                jniReset(oldInterface);
+            }
+
+            try {
+                IoUtils.setBlocking(tun.getFileDescriptor(), config.blocking);
+            } catch (IOException e) {
+                throw new IllegalStateException(
+                        "Cannot set tunnel's fd as blocking=" + config.blocking, e);
+            }
+        } catch (RuntimeException e) {
+            IoUtils.closeQuietly(tun);
+            agentDisconnect();
+            // restore old state
+            mConfig = oldConfig;
+            mConnection = oldConnection;
+            mVpnUsers = oldUsers;
+            mNetworkAgent = oldNetworkAgent;
+            mInterface = oldInterface;
+            throw e;
+        }
+        Log.i(TAG, "Established by " + config.user + " on " + mInterface);
+        return tun;
+!!!32676791.java!!!	isRunningLocked() : boolean
+        return mNetworkAgent != null && mInterface != null;
+!!!32676919.java!!!	isCallerEstablishedOwnerLocked() : boolean
+        return isRunningLocked() && Binder.getCallingUid() == mOwnerUID;
+!!!32677047.java!!!	getAppsUids(inout packageNames : List<String>, in userHandle : int) : SortedSet<Integer>
+        SortedSet<Integer> uids = new TreeSet<Integer>();
+        for (String app : packageNames) {
+            int uid = getAppUid(app, userHandle);
+            if (uid != -1) uids.add(uid);
+        }
+        return uids;
+!!!32677175.java!!!	createUserAndRestrictedProfilesRanges(in userHandle : int, inout allowedApplications : List<String>, inout disallowedApplications : List<String>) : UidRange
+        final Set<UidRange> ranges = new ArraySet<>();
+
+        // Assign the top-level user to the set of ranges
+        addUserToRanges(ranges, userHandle, allowedApplications, disallowedApplications);
+
+        // If the user can have restricted profiles, assign all its restricted profiles too
+        if (canHaveRestrictedProfile(userHandle)) {
+            final long token = Binder.clearCallingIdentity();
+            List<UserInfo> users;
+            try {
+                users = UserManager.get(mContext).getUsers(true);
+            } finally {
+                Binder.restoreCallingIdentity(token);
+            }
+            for (UserInfo user : users) {
+                if (user.isRestricted() && (user.restrictedProfileParentId == userHandle)) {
+                    addUserToRanges(ranges, user.id, allowedApplications, disallowedApplications);
+                }
+            }
+        }
+        return ranges;
+!!!32677303.java!!!	addUserToRanges(inout ranges : Set<UidRange>, in userHandle : int, inout allowedApplications : List<String>, inout disallowedApplications : List<String>) : void
+        if (allowedApplications != null) {
+            // Add ranges covering all UIDs for allowedApplications.
+            int start = -1, stop = -1;
+            for (int uid : getAppsUids(allowedApplications, userHandle)) {
+                if (start == -1) {
+                    start = uid;
+                } else if (uid != stop + 1) {
+                    ranges.add(new UidRange(start, stop));
+                    start = uid;
+                }
+                stop = uid;
+            }
+            if (start != -1) ranges.add(new UidRange(start, stop));
+        } else if (disallowedApplications != null) {
+            // Add all ranges for user skipping UIDs for disallowedApplications.
+            final UidRange userRange = UidRange.createForUser(userHandle);
+            int start = userRange.start;
+            for (int uid : getAppsUids(disallowedApplications, userHandle)) {
+                if (uid == start) {
+                    start++;
+                } else {
+                    ranges.add(new UidRange(start, uid - 1));
+                    start = uid + 1;
+                }
+            }
+            if (start <= userRange.stop) ranges.add(new UidRange(start, userRange.stop));
+        } else {
+            // Add all UIDs for the user.
+            ranges.add(UidRange.createForUser(userHandle));
+        }
+!!!32677431.java!!!	uidRangesForUser(in userHandle : int) : UidRange
+        final UidRange userRange = UidRange.createForUser(userHandle);
+        final List<UidRange> ranges = new ArrayList<UidRange>();
+        for (UidRange range : mVpnUsers) {
+            if (userRange.containsRange(range)) {
+                ranges.add(range);
+            }
+        }
+        return ranges;
+!!!32677559.java!!!	removeVpnUserLocked(in userHandle : int) : void
+        if (mVpnUsers == null) {
+            throw new IllegalStateException("VPN is not active");
+        }
+        final List<UidRange> ranges = uidRangesForUser(userHandle);
+        if (mNetworkAgent != null) {
+            mNetworkAgent.removeUidRanges(ranges.toArray(new UidRange[ranges.size()]));
+        }
+        mVpnUsers.removeAll(ranges);
+!!!32677687.java!!!	onUserAdded(in userHandle : int) : void
+        // If the user is restricted tie them to the parent user's VPN
+        UserInfo user = UserManager.get(mContext).getUserInfo(userHandle);
+        if (user.isRestricted() && user.restrictedProfileParentId == mUserHandle) {
+            synchronized(Vpn.this) {
+                if (mVpnUsers != null) {
+                    try {
+                        addUserToRanges(mVpnUsers, userHandle, mConfig.allowedApplications,
+                                mConfig.disallowedApplications);
+                        if (mNetworkAgent != null) {
+                            final List<UidRange> ranges = uidRangesForUser(userHandle);
+                            mNetworkAgent.addUidRanges(ranges.toArray(new UidRange[ranges.size()]));
+                        }
+                    } catch (Exception e) {
+                        Log.wtf(TAG, "Failed to add restricted user to owner", e);
+                    }
+                }
+                if (mAlwaysOn) {
+                    setVpnForcedLocked(mLockdown);
+                }
+            }
+        }
+!!!32677815.java!!!	onUserRemoved(in userHandle : int) : void
+        // clean up if restricted
+        UserInfo user = UserManager.get(mContext).getUserInfo(userHandle);
+        if (user.isRestricted() && user.restrictedProfileParentId == mUserHandle) {
+            synchronized(Vpn.this) {
+                if (mVpnUsers != null) {
+                    try {
+                        removeVpnUserLocked(userHandle);
+                    } catch (Exception e) {
+                        Log.wtf(TAG, "Failed to remove restricted user to owner", e);
+                    }
+                }
+                if (mAlwaysOn) {
+                    setVpnForcedLocked(mLockdown);
+                }
+            }
+        }
+!!!32677943.java!!!	onUserStopped() : void
+        // Switch off networking lockdown (if it was enabled)
+        setVpnForcedLocked(false);
+        mAlwaysOn = false;
+
+        unregisterPackageChangeReceiverLocked();
+        // Quit any active connections
+        agentDisconnect();
+!!!32678071.java!!!	setVpnForcedLocked(inout enforce : boolean) : void
+        final Set<UidRange> removedRanges = new ArraySet<>(mBlockedUsers);
+        if (enforce) {
+            final Set<UidRange> addedRanges = createUserAndRestrictedProfilesRanges(mUserHandle,
+                    /* allowedApplications */ null,
+                    /* disallowedApplications */ Collections.singletonList(mPackage));
+
+            removedRanges.removeAll(addedRanges);
+            addedRanges.removeAll(mBlockedUsers);
+
+            setAllowOnlyVpnForUids(false, removedRanges);
+            setAllowOnlyVpnForUids(true, addedRanges);
+        } else {
+            setAllowOnlyVpnForUids(false, removedRanges);
+        }
+!!!32678199.java!!!	setAllowOnlyVpnForUids(inout enforce : boolean, inout ranges : Collection<UidRange>) : boolean
+        if (ranges.size() == 0) {
+            return true;
+        }
+        final UidRange[] rangesArray = ranges.toArray(new UidRange[ranges.size()]);
+        try {
+            mNetd.setAllowOnlyVpnForUids(enforce, rangesArray);
+        } catch (RemoteException | RuntimeException e) {
+            Log.e(TAG, "Updating blocked=" + enforce
+                    + " for UIDs " + Arrays.toString(ranges.toArray()) + " failed", e);
+            return false;
+        }
+        if (enforce) {
+            mBlockedUsers.addAll(ranges);
+        } else {
+            mBlockedUsers.removeAll(ranges);
+        }
+        return true;
+!!!32678327.java!!!	getVpnConfig() : VpnConfig
+        enforceControlPermission();
+        return mConfig;
+!!!32678455.java!!!	interfaceStatusChanged(inout iface : String, inout up : boolean) : void
+        try {
+            mObserver.interfaceStatusChanged(iface, up);
+        } catch (RemoteException e) {
+            // ignored; target is local
+        }
+!!!32678583.java!!!	enforceControlPermission() : void
+        mContext.enforceCallingPermission(Manifest.permission.CONTROL_VPN, "Unauthorized Caller");
+!!!32678711.java!!!	enforceControlPermissionOrInternalCaller() : void
+        // Require caller to be either an application with CONTROL_VPN permission or a process
+        // in the system server.
+        mContext.enforceCallingOrSelfPermission(Manifest.permission.CONTROL_VPN,
+                "Unauthorized Caller");
+!!!32679095.java!!!	prepareStatusIntent() : void
+        final long token = Binder.clearCallingIdentity();
+        try {
+            mStatusIntent = VpnConfig.getIntentForStatusPanel(mContext);
+        } finally {
+            Binder.restoreCallingIdentity(token);
+        }
+!!!32679223.java!!!	addAddress(inout address : String, in prefixLength : int) : boolean
+        if (!isCallerEstablishedOwnerLocked()) {
+            return false;
+        }
+        boolean success = jniAddAddress(mInterface, address, prefixLength);
+        mNetworkAgent.sendLinkProperties(makeLinkProperties());
+        return success;
+!!!32679351.java!!!	removeAddress(inout address : String, in prefixLength : int) : boolean
+        if (!isCallerEstablishedOwnerLocked()) {
+            return false;
+        }
+        boolean success = jniDelAddress(mInterface, address, prefixLength);
+        mNetworkAgent.sendLinkProperties(makeLinkProperties());
+        return success;
+!!!32679479.java!!!	setUnderlyingNetworks(inout networks : Network) : boolean
+        if (!isCallerEstablishedOwnerLocked()) {
+            return false;
+        }
+        if (networks == null) {
+            mConfig.underlyingNetworks = null;
+        } else {
+            mConfig.underlyingNetworks = new Network[networks.length];
+            for (int i = 0; i < networks.length; ++i) {
+                if (networks[i] == null) {
+                    mConfig.underlyingNetworks[i] = null;
+                } else {
+                    mConfig.underlyingNetworks[i] = new Network(networks[i].netId);
+                }
+            }
+        }
+        return true;
+!!!32679607.java!!!	getUnderlyingNetworks() : Network
+        if (!isRunningLocked()) {
+            return null;
+        }
+        return mConfig.underlyingNetworks;
+!!!32679735.java!!!	getVpnInfo() : VpnInfo
+        if (!isRunningLocked()) {
+            return null;
+        }
+
+        VpnInfo info = new VpnInfo();
+        info.ownerUid = mOwnerUID;
+        info.vpnIface = mInterface;
+        return info;
+!!!32679863.java!!!	appliesToUid(in uid : int) : boolean
+        if (!isRunningLocked()) {
+            return false;
+        }
+        for (UidRange uidRange : mVpnUsers) {
+            if (uidRange.contains(uid)) {
+                return true;
+            }
+        }
+        return false;
+!!!32679991.java!!!	isBlockingUid(in uid : int) : boolean
+        if (!mLockdown) {
+            return false;
+        }
+
+        if (mNetworkInfo.isConnected()) {
+            return !appliesToUid(uid);
+        } else {
+            for (UidRange uidRange : mBlockedUsers) {
+                if (uidRange.contains(uid)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+!!!32681015.java!!!	findIPv4DefaultRoute(inout prop : LinkProperties) : RouteInfo
+        for (RouteInfo route : prop.getAllRoutes()) {
+            // Currently legacy VPN only works on IPv4.
+            if (route.isDefaultRoute() && route.getGateway() instanceof Inet4Address) {
+                return route;
+            }
+        }
+
+        throw new IllegalStateException("Unable to find IPv4 default gateway");
+!!!32681143.java!!!	startLegacyVpn(inout profile : VpnProfile, inout keyStore : KeyStore, inout egress : LinkProperties) : void
+        enforceControlPermission();
+        long token = Binder.clearCallingIdentity();
+        try {
+            startLegacyVpnPrivileged(profile, keyStore, egress);
+        } finally {
+            Binder.restoreCallingIdentity(token);
+        }
+!!!32681271.java!!!	startLegacyVpnPrivileged(inout profile : VpnProfile, inout keyStore : KeyStore, inout egress : LinkProperties) : void
+        UserManager mgr = UserManager.get(mContext);
+        UserInfo user = mgr.getUserInfo(mUserHandle);
+        if (user.isRestricted() || mgr.hasUserRestriction(UserManager.DISALLOW_CONFIG_VPN,
+                    new UserHandle(mUserHandle))) {
+            throw new SecurityException("Restricted users cannot establish VPNs");
+        }
+
+        final RouteInfo ipv4DefaultRoute = findIPv4DefaultRoute(egress);
+        final String gateway = ipv4DefaultRoute.getGateway().getHostAddress();
+        final String iface = ipv4DefaultRoute.getInterface();
+
+        // Load certificates.
+        String privateKey = "";
+        String userCert = "";
+        String caCert = "";
+        String serverCert = "";
+        if (!profile.ipsecUserCert.isEmpty()) {
+            privateKey = Credentials.USER_PRIVATE_KEY + profile.ipsecUserCert;
+            byte[] value = keyStore.get(Credentials.USER_CERTIFICATE + profile.ipsecUserCert);
+            userCert = (value == null) ? null : new String(value, StandardCharsets.UTF_8);
+        }
+        if (!profile.ipsecCaCert.isEmpty()) {
+            byte[] value = keyStore.get(Credentials.CA_CERTIFICATE + profile.ipsecCaCert);
+            caCert = (value == null) ? null : new String(value, StandardCharsets.UTF_8);
+        }
+        if (!profile.ipsecServerCert.isEmpty()) {
+            byte[] value = keyStore.get(Credentials.USER_CERTIFICATE + profile.ipsecServerCert);
+            serverCert = (value == null) ? null : new String(value, StandardCharsets.UTF_8);
+        }
+        if (privateKey == null || userCert == null || caCert == null || serverCert == null) {
+            throw new IllegalStateException("Cannot load credentials");
+        }
+
+        // Prepare arguments for racoon.
+        String[] racoon = null;
+        switch (profile.type) {
+            case VpnProfile.TYPE_L2TP_IPSEC_PSK:
+                racoon = new String[] {
+                    iface, profile.server, "udppsk", profile.ipsecIdentifier,
+                    profile.ipsecSecret, "1701",
+                };
+                break;
+            case VpnProfile.TYPE_L2TP_IPSEC_RSA:
+                racoon = new String[] {
+                    iface, profile.server, "udprsa", privateKey, userCert,
+                    caCert, serverCert, "1701",
+                };
+                break;
+            case VpnProfile.TYPE_IPSEC_XAUTH_PSK:
+                racoon = new String[] {
+                    iface, profile.server, "xauthpsk", profile.ipsecIdentifier,
+                    profile.ipsecSecret, profile.username, profile.password, "", gateway,
+                };
+                break;
+            case VpnProfile.TYPE_IPSEC_XAUTH_RSA:
+                racoon = new String[] {
+                    iface, profile.server, "xauthrsa", privateKey, userCert,
+                    caCert, serverCert, profile.username, profile.password, "", gateway,
+                };
+                break;
+            case VpnProfile.TYPE_IPSEC_HYBRID_RSA:
+                racoon = new String[] {
+                    iface, profile.server, "hybridrsa",
+                    caCert, serverCert, profile.username, profile.password, "", gateway,
+                };
+                break;
+        }
+
+        // Prepare arguments for mtpd.
+        String[] mtpd = null;
+        switch (profile.type) {
+            case VpnProfile.TYPE_PPTP:
+                mtpd = new String[] {
+                    iface, "pptp", profile.server, "1723",
+                    "name", profile.username, "password", profile.password,
+                    "linkname", "vpn", "refuse-eap", "nodefaultroute",
+                    "usepeerdns", "idle", "1800", "mtu", "1400", "mru", "1400",
+                    (profile.mppe ? "+mppe" : "nomppe"),
+                };
+                break;
+            case VpnProfile.TYPE_L2TP_IPSEC_PSK:
+            case VpnProfile.TYPE_L2TP_IPSEC_RSA:
+                mtpd = new String[] {
+                    iface, "l2tp", profile.server, "1701", profile.l2tpSecret,
+                    "name", profile.username, "password", profile.password,
+                    "linkname", "vpn", "refuse-eap", "nodefaultroute",
+                    "usepeerdns", "idle", "1800", "mtu", "1400", "mru", "1400",
+                };
+                break;
+        }
+
+        VpnConfig config = new VpnConfig();
+        config.legacy = true;
+        config.user = profile.key;
+        config.interfaze = iface;
+        config.session = profile.name;
+
+        config.addLegacyRoutes(profile.routes);
+        if (!profile.dnsServers.isEmpty()) {
+            config.dnsServers = Arrays.asList(profile.dnsServers.split(" +"));
+        }
+        if (!profile.searchDomains.isEmpty()) {
+            config.searchDomains = Arrays.asList(profile.searchDomains.split(" +"));
+        }
+        startLegacyVpn(config, racoon, mtpd);
+!!!32681399.java!!!	startLegacyVpn(inout config : VpnConfig, inout racoon : String, inout mtpd : String) : void
+        stopLegacyVpnPrivileged();
+
+        // Prepare for the new request.
+        prepareInternal(VpnConfig.LEGACY_VPN);
+        updateState(DetailedState.CONNECTING, "startLegacyVpn");
+
+        // Start a new LegacyVpnRunner and we are done!
+        mLegacyVpnRunner = new LegacyVpnRunner(config, racoon, mtpd);
+        mLegacyVpnRunner.start();
+!!!32681527.java!!!	stopLegacyVpnPrivileged() : void
+        if (mLegacyVpnRunner != null) {
+            mLegacyVpnRunner.exit();
+            mLegacyVpnRunner = null;
+
+            synchronized (LegacyVpnRunner.TAG) {
+                // wait for old thread to completely finish before spinning up
+                // new instance, otherwise state updates can be out of order.
+            }
+        }
+!!!32681655.java!!!	getLegacyVpnInfo() : LegacyVpnInfo
+        // Check if the caller is authorized.
+        enforceControlPermission();
+        return getLegacyVpnInfoPrivileged();
+!!!32681783.java!!!	getLegacyVpnInfoPrivileged() : LegacyVpnInfo
+        if (mLegacyVpnRunner == null) return null;
+
+        final LegacyVpnInfo info = new LegacyVpnInfo();
+        info.key = mConfig.user;
+        info.state = LegacyVpnInfo.stateFromNetworkInfo(mNetworkInfo);
+        if (mNetworkInfo.isConnected()) {
+            info.intent = mStatusIntent;
+        }
+        return info;
+!!!32681911.java!!!	getLegacyVpnConfig() : VpnConfig
+        if (mLegacyVpnRunner != null) {
+            return mConfig;
+        } else {
+            return null;
+        }

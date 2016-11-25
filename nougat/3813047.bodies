@@ -1,0 +1,223 @@
+class Module
+!!!41190583.cpp!!!	~Module()
+    mModuleClients.clear();
+!!!41190711.cpp!!!	addClient(in client : sp<IRadioClient>, in config : radio_band_config, in audio : bool) : sp<ModuleClient>
+    ALOGV("addClient() %p config %p product %s", this, config, mProperties.product);
+    AutoMutex lock(mLock);
+    sp<ModuleClient> moduleClient;
+    int ret;
+
+    for (size_t i = 0; i < mModuleClients.size(); i++) {
+        if (mModuleClients[i]->client() == client) {
+            // client already connected: reject
+            return moduleClient;
+        }
+    }
+    moduleClient = new ModuleClient(this, client, config, audio);
+
+    struct radio_hal_band_config halConfig;
+    halConfig = config->band;
+
+    // Tuner preemption logic:
+    // There is a limited amount of tuners and a limited amount of radio audio sources per module.
+    // The minimum is one tuner and one audio source.
+    // The numbers of tuners and sources are indicated in the module properties.
+    // NOTE: current framework implementation only supports one radio audio source.
+    // It is possible to open more than one tuner at a time but only one tuner can be connected
+    // to the radio audio source (AUDIO_DEVICE_IN_FM_TUNER).
+    // The base rule is that a newly connected tuner always wins, i.e. always gets a tuner
+    // and can use the audio source if requested.
+    // If another client is preempted, it is notified by a callback with RADIO_EVENT_CONTROL
+    // indicating loss of control.
+    // - If the newly connected client requests the audio source (audio == true):
+    //    - if an audio source is available
+    //          no problem
+    //    - if not:
+    //          the oldest client in the list using audio is preempted.
+    // - If the newly connected client does not request the audio source (audio == false):
+    //    - if a tuner is available
+    //          no problem
+    //    - if not:
+    //          The oldest client not using audio is preempted first and if none is found the
+    //          the oldest client using audio is preempted.
+    // Each time a tuner using the audio source is opened or closed, the audio policy manager is
+    // notified of the connection or disconnection of AUDIO_DEVICE_IN_FM_TUNER.
+
+    sp<ModuleClient> oldestTuner;
+    sp<ModuleClient> oldestAudio;
+    size_t allocatedTuners = 0;
+    size_t allocatedAudio = 0;
+    for (size_t i = 0; i < mModuleClients.size(); i++) {
+        if (mModuleClients[i]->getTuner() != NULL) {
+            if (mModuleClients[i]->audio()) {
+                if (oldestAudio == 0) {
+                    oldestAudio = mModuleClients[i];
+                }
+                allocatedAudio++;
+            } else {
+                if (oldestTuner == 0) {
+                    oldestTuner = mModuleClients[i];
+                }
+                allocatedTuners++;
+            }
+        }
+    }
+
+    const struct radio_tuner *halTuner;
+    sp<ModuleClient> preemtedClient;
+    if (audio) {
+        if (allocatedAudio >= mProperties.num_audio_sources) {
+            ALOG_ASSERT(oldestAudio != 0, "addClient() allocatedAudio/oldestAudio mismatch");
+            preemtedClient = oldestAudio;
+        }
+    } else {
+        if (allocatedAudio + allocatedTuners >= mProperties.num_tuners) {
+            if (allocatedTuners != 0) {
+                ALOG_ASSERT(oldestTuner != 0, "addClient() allocatedTuners/oldestTuner mismatch");
+                preemtedClient = oldestTuner;
+            } else {
+                ALOG_ASSERT(oldestAudio != 0, "addClient() allocatedAudio/oldestAudio mismatch");
+                preemtedClient = oldestAudio;
+            }
+        }
+    }
+    if (preemtedClient != 0) {
+        halTuner = preemtedClient->getTuner();
+        preemtedClient->setTuner(NULL);
+        mHwDevice->close_tuner(mHwDevice, halTuner);
+        if (preemtedClient->audio()) {
+            notifyDeviceConnection(false, "");
+        }
+    }
+
+    ret = mHwDevice->open_tuner(mHwDevice, &halConfig, audio,
+                                RadioService::callback, moduleClient->callbackThread().get(),
+                                &halTuner);
+    if (ret == 0) {
+        ALOGV("addClient() setTuner %p", halTuner);
+        moduleClient->setTuner(halTuner);
+        mModuleClients.add(moduleClient);
+        if (audio) {
+            notifyDeviceConnection(true, "");
+        }
+        ALOGV("addClient() DONE moduleClient %p", moduleClient.get());
+    } else {
+        ALOGW("%s open_tuner failed with error %d", __FUNCTION__, ret);
+        moduleClient.clear();
+    }
+
+    return moduleClient;
+!!!41190839.cpp!!!	removeClient(in moduleClient : sp<ModuleClient>) : void
+    ALOGV("removeClient()");
+    AutoMutex lock(mLock);
+    int ret;
+    ssize_t index = -1;
+
+    for (size_t i = 0; i < mModuleClients.size(); i++) {
+        if (mModuleClients[i] == moduleClient) {
+            index = i;
+            break;
+        }
+    }
+    if (index == -1) {
+        return;
+    }
+
+    mModuleClients.removeAt(index);
+    const struct radio_tuner *halTuner = moduleClient->getTuner();
+    if (halTuner == NULL) {
+        return;
+    }
+
+    mHwDevice->close_tuner(mHwDevice, halTuner);
+    if (moduleClient->audio()) {
+        notifyDeviceConnection(false, "");
+    }
+
+    mMute = true;
+
+    if (mModuleClients.isEmpty()) {
+        return;
+    }
+
+    // Tuner reallocation logic:
+    // When a client is removed and was controlling a tuner, this tuner will be allocated to a
+    // previously preempted client. This client will be notified by a callback with
+    // RADIO_EVENT_CONTROL indicating gain of control.
+    // - If a preempted client is waiting for an audio source and one becomes available:
+    //    Allocate the tuner to the most recently added client waiting for an audio source
+    // - If not:
+    //    Allocate the tuner to the most recently added client.
+    // Each time a tuner using the audio source is opened or closed, the audio policy manager is
+    // notified of the connection or disconnection of AUDIO_DEVICE_IN_FM_TUNER.
+
+    sp<ModuleClient> youngestClient;
+    sp<ModuleClient> youngestClientAudio;
+    size_t allocatedTuners = 0;
+    size_t allocatedAudio = 0;
+    for (ssize_t i = mModuleClients.size() - 1; i >= 0; i--) {
+        if (mModuleClients[i]->getTuner() == NULL) {
+            if (mModuleClients[i]->audio()) {
+                if (youngestClientAudio == 0) {
+                    youngestClientAudio = mModuleClients[i];
+                }
+            } else {
+                if (youngestClient == 0) {
+                    youngestClient = mModuleClients[i];
+                }
+            }
+        } else {
+            if (mModuleClients[i]->audio()) {
+                allocatedAudio++;
+            } else {
+                allocatedTuners++;
+            }
+        }
+    }
+
+    ALOG_ASSERT(allocatedTuners + allocatedAudio < mProperties.num_tuners,
+                "removeClient() removed client but no tuner available");
+
+    ALOG_ASSERT(!moduleClient->audio() || allocatedAudio < mProperties.num_audio_sources,
+                "removeClient() removed audio client but no tuner with audio available");
+
+    if (allocatedAudio < mProperties.num_audio_sources && youngestClientAudio != 0) {
+        youngestClient = youngestClientAudio;
+    }
+
+    ALOG_ASSERT(youngestClient != 0, "removeClient() removed client no candidate found for tuner");
+
+    struct radio_hal_band_config halConfig = youngestClient->halConfig();
+    ret = mHwDevice->open_tuner(mHwDevice, &halConfig, youngestClient->audio(),
+                                RadioService::callback, moduleClient->callbackThread().get(),
+                                &halTuner);
+
+    if (ret == 0) {
+        youngestClient->setTuner(halTuner);
+        if (youngestClient->audio()) {
+            notifyDeviceConnection(true, "");
+        }
+    }
+!!!41190967.cpp!!!	setMute(in mute : bool) : status_t
+    Mutex::Autolock _l(mLock);
+    if (mute != mMute) {
+        mMute = mute;
+        //TODO notifify audio policy manager of media activity on radio audio device
+    }
+    return NO_ERROR;
+!!!41191095.cpp!!!	getMute(inout mute : bool) : status_t
+    Mutex::Autolock _l(mLock);
+    *mute = mMute;
+    return NO_ERROR;
+!!!41191607.cpp!!!	getDefaultConfig() : radio_band_config
+    if (mProperties.num_bands == 0) {
+        return NULL;
+    }
+    return &mProperties.bands[0];
+!!!41191735.cpp!!!	notifyDeviceConnection(in connected : bool, in address : char) : void
+    int64_t token = IPCThreadState::self()->clearCallingIdentity();
+    AudioSystem::setDeviceConnectionState(AUDIO_DEVICE_IN_FM_TUNER,
+                                          connected ? AUDIO_POLICY_DEVICE_STATE_AVAILABLE :
+                                                  AUDIO_POLICY_DEVICE_STATE_UNAVAILABLE,
+                                          address, kRadioTunerAudioDeviceName);
+    IPCThreadState::self()->restoreCallingIdentity(token);

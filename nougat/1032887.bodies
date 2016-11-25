@@ -1,0 +1,184 @@
+class AudioPolicy
+!!!28620087.java!!!	getConfig() : AudioPolicyConfig
+ return mConfig;
+!!!28620215.java!!!	hasFocusListener() : boolean
+ return mFocusListener != null;
+!!!28620343.java!!!	AudioPolicy(inout config : AudioPolicyConfig, inout context : Context, inout looper : Looper, inout fl : AudioPolicy::AudioPolicyFocusListener, inout sl : AudioPolicy::AudioPolicyStatusListener)
+        mConfig = config;
+        mStatus = POLICY_STATUS_UNREGISTERED;
+        mContext = context;
+        if (looper == null) {
+            looper = Looper.getMainLooper();
+        }
+        if (looper != null) {
+            mEventHandler = new EventHandler(this, looper);
+        } else {
+            mEventHandler = null;
+            Log.e(TAG, "No event handler due to looper without a thread");
+        }
+        mFocusListener = fl;
+        mStatusListener = sl;
+!!!28621239.java!!!	setRegistration(inout regId : String) : void
+        synchronized (mLock) {
+            mRegistrationId = regId;
+            mConfig.setRegistration(regId);
+            if (regId != null) {
+                mStatus = POLICY_STATUS_REGISTERED;
+            } else {
+                mStatus = POLICY_STATUS_UNREGISTERED;
+            }
+        }
+        sendMsg(MSG_POLICY_STATUS_CHANGE);
+!!!28621367.java!!!	policyReadyToUse() : boolean
+        synchronized (mLock) {
+            if (mStatus != POLICY_STATUS_REGISTERED) {
+                Log.e(TAG, "Cannot use unregistered AudioPolicy");
+                return false;
+            }
+            if (mContext == null) {
+                Log.e(TAG, "Cannot use AudioPolicy without context");
+                return false;
+            }
+            if (mRegistrationId == null) {
+                Log.e(TAG, "Cannot use unregistered AudioPolicy");
+                return false;
+            }
+        }
+        if (!(PackageManager.PERMISSION_GRANTED == mContext.checkCallingOrSelfPermission(
+                        android.Manifest.permission.MODIFY_AUDIO_ROUTING))) {
+            Slog.w(TAG, "Cannot use AudioPolicy for pid " + Binder.getCallingPid() + " / uid "
+                    + Binder.getCallingUid() + ", needs MODIFY_AUDIO_ROUTING");
+            return false;
+        }
+        return true;
+!!!28621495.java!!!	checkMixReadyToUse(inout mix : AudioMix, inout forTrack : boolean) : void
+        if (mix == null) {
+            String msg = forTrack ? "Invalid null AudioMix for AudioTrack creation"
+                    : "Invalid null AudioMix for AudioRecord creation";
+            throw new IllegalArgumentException(msg);
+        }
+        if (!mConfig.mMixes.contains(mix)) {
+            throw new IllegalArgumentException("Invalid mix: not part of this policy");
+        }
+        if ((mix.getRouteFlags() & AudioMix.ROUTE_FLAG_LOOP_BACK) != AudioMix.ROUTE_FLAG_LOOP_BACK)
+        {
+            throw new IllegalArgumentException("Invalid AudioMix: not defined for loop back");
+        }
+        if (forTrack && (mix.getMixType() != AudioMix.MIX_TYPE_RECORDERS)) {
+            throw new IllegalArgumentException(
+                    "Invalid AudioMix: not defined for being a recording source");
+        }
+        if (!forTrack && (mix.getMixType() != AudioMix.MIX_TYPE_PLAYERS)) {
+            throw new IllegalArgumentException(
+                    "Invalid AudioMix: not defined for capturing playback");
+        }
+!!!28621623.java!!!	getFocusDuckingBehavior() : int
+        return mConfig.mDuckingPolicy;
+!!!28621751.java!!!	setFocusDuckingBehavior(in behavior : int) : int
+        if ((behavior != FOCUS_POLICY_DUCKING_IN_APP)
+                && (behavior != FOCUS_POLICY_DUCKING_IN_POLICY)) {
+            throw new IllegalArgumentException("Invalid ducking behavior " + behavior);
+        }
+        synchronized (mLock) {
+            if (mStatus != POLICY_STATUS_REGISTERED) {
+                throw new IllegalStateException(
+                        "Cannot change ducking behavior for unregistered policy");
+            }
+            if ((behavior == FOCUS_POLICY_DUCKING_IN_POLICY)
+                    && (mFocusListener == null)) {
+                // there must be a focus listener if the policy handles ducking
+                throw new IllegalStateException(
+                        "Cannot handle ducking without an audio focus listener");
+            }
+            IAudioService service = getService();
+            try {
+                final int status = service.setFocusPropertiesForPolicy(behavior /*duckingBehavior*/,
+                        this.cb());
+                if (status == AudioManager.SUCCESS) {
+                    mConfig.mDuckingPolicy = behavior;
+                }
+                return status;
+            } catch (RemoteException e) {
+                Log.e(TAG, "Dead object in setFocusPropertiesForPolicy for behavior", e);
+                return AudioManager.ERROR;
+            }
+        }
+!!!28621879.java!!!	createAudioRecordSink(inout mix : AudioMix) : AudioRecord
+        if (!policyReadyToUse()) {
+            Log.e(TAG, "Cannot create AudioRecord sink for AudioMix");
+            return null;
+        }
+        checkMixReadyToUse(mix, false/*not for an AudioTrack*/);
+        // create an AudioFormat from the mix format compatible with recording, as the mix
+        // was defined for playback
+        AudioFormat mixFormat = new AudioFormat.Builder(mix.getFormat())
+                .setChannelMask(AudioFormat.inChannelMaskFromOutChannelMask(
+                        mix.getFormat().getChannelMask()))
+                .build();
+        // create the AudioRecord, configured for loop back, using the same format as the mix
+        AudioRecord ar = new AudioRecord(
+                new AudioAttributes.Builder()
+                        .setInternalCapturePreset(MediaRecorder.AudioSource.REMOTE_SUBMIX)
+                        .addTag(addressForTag(mix))
+                        .build(),
+                mixFormat,
+                AudioRecord.getMinBufferSize(mix.getFormat().getSampleRate(),
+                        // using stereo for buffer size to avoid the current poor support for masks
+                        AudioFormat.CHANNEL_IN_STEREO, mix.getFormat().getEncoding()),
+                AudioManager.AUDIO_SESSION_ID_GENERATE
+                );
+        return ar;
+!!!28622007.java!!!	createAudioTrackSource(inout mix : AudioMix) : AudioTrack
+        if (!policyReadyToUse()) {
+            Log.e(TAG, "Cannot create AudioTrack source for AudioMix");
+            return null;
+        }
+        checkMixReadyToUse(mix, true/*for an AudioTrack*/);
+        // create the AudioTrack, configured for loop back, using the same format as the mix
+        AudioTrack at = new AudioTrack(
+                new AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_VIRTUAL_SOURCE)
+                        .addTag(addressForTag(mix))
+                        .build(),
+                mix.getFormat(),
+                AudioTrack.getMinBufferSize(mix.getFormat().getSampleRate(),
+                        mix.getFormat().getChannelMask(), mix.getFormat().getEncoding()),
+                AudioTrack.MODE_STREAM,
+                AudioManager.AUDIO_SESSION_ID_GENERATE
+                );
+        return at;
+!!!28622135.java!!!	getStatus() : int
+        return mStatus;
+!!!28622775.java!!!	onPolicyStatusChange() : void
+        AudioPolicyStatusListener l;
+        synchronized (mLock) {
+            if (mStatusListener == null) {
+                return;
+            }
+            l = mStatusListener;
+        }
+        l.onStatusChange();
+!!!28622903.java!!!	cb() : IAudioPolicyCallback
+ return mPolicyCb;
+!!!28623287.java!!!	addressForTag(inout mix : AudioMix) : String
+        return "addr=" + mix.getRegistration();
+!!!28623415.java!!!	sendMsg(in msg : int) : void
+        if (mEventHandler != null) {
+            mEventHandler.sendEmptyMessage(msg);
+        }
+!!!28623543.java!!!	sendMsg(in msg : int, inout obj : Object, in i : int) : void
+        if (mEventHandler != null) {
+            mEventHandler.sendMessage(
+                    mEventHandler.obtainMessage(msg, i /*arg1*/, 0 /*arg2, ignored*/, obj));
+        }
+!!!28623671.java!!!	getService() : IAudioService
+        if (sService != null) {
+            return sService;
+        }
+        IBinder b = ServiceManager.getService(Context.AUDIO_SERVICE);
+        sService = IAudioService.Stub.asInterface(b);
+        return sService;
+!!!28623799.java!!!	toLogFriendlyString() : String
+        String textDump = new String("android.media.audiopolicy.AudioPolicy:\n");
+        textDump += "config=" + mConfig.toLogFriendlyString();
+        return (textDump);

@@ -1,0 +1,362 @@
+class EthernetNetworkFactory
+!!!36630711.java!!!	EthernetNetworkFactory(inout listeners : RemoteCallbackList)
+        mNetworkInfo = new NetworkInfo(ConnectivityManager.TYPE_ETHERNET, 0, NETWORK_TYPE, "");
+        mLinkProperties = new LinkProperties();
+        initNetworkCapabilities();
+        mListeners = listeners;
+!!!36631223.java!!!	stopIpManagerLocked() : void
+        if (mIpManager != null) {
+            mIpManager.shutdown();
+            mIpManager = null;
+        }
+!!!36631351.java!!!	stopIpProvisioningThreadLocked() : void
+        stopIpManagerLocked();
+
+        if (mIpProvisioningThread != null) {
+            mIpProvisioningThread.interrupt();
+            mIpProvisioningThread = null;
+        }
+!!!36631479.java!!!	updateInterfaceState(inout iface : String, inout up : boolean) : void
+        if (!mIface.equals(iface)) {
+            return;
+        }
+        Log.d(TAG, "updateInterface: " + iface + " link " + (up ? "up" : "down"));
+
+        synchronized(this) {
+            mLinkUp = up;
+            mNetworkInfo.setIsAvailable(up);
+            if (!up) {
+                // Tell the agent we're disconnected. It will call disconnect().
+                mNetworkInfo.setDetailedState(DetailedState.DISCONNECTED, null, mHwAddr);
+                stopIpProvisioningThreadLocked();
+            }
+            updateAgent();
+            // set our score lower than any network could go
+            // so we get dropped.  TODO - just unregister the factory
+            // when link goes down.
+            mFactory.setScoreFilter(up ? NETWORK_SCORE : -1);
+        }
+!!!36631991.java!!!	setInterfaceUp(inout iface : String) : void
+        // Bring up the interface so we get link status indications.
+        try {
+            mNMService.setInterfaceUp(iface);
+            String hwAddr = null;
+            InterfaceConfiguration config = mNMService.getInterfaceConfig(iface);
+
+            if (config == null) {
+                Log.e(TAG, "Null iterface config for " + iface + ". Bailing out.");
+                return;
+            }
+
+            synchronized (this) {
+                if (!isTrackingInterface()) {
+                    setInterfaceInfoLocked(iface, config.getHardwareAddress());
+                    mNetworkInfo.setIsAvailable(true);
+                    mNetworkInfo.setExtraInfo(mHwAddr);
+                } else {
+                    Log.e(TAG, "Interface unexpectedly changed from " + iface + " to " + mIface);
+                    mNMService.setInterfaceDown(iface);
+                }
+            }
+        } catch (RemoteException e) {
+            Log.e(TAG, "Error upping interface " + mIface + ": " + e);
+        }
+!!!36632119.java!!!	maybeTrackInterface(inout iface : String) : boolean
+        // If we don't already have an interface, and if this interface matches
+        // our regex, start tracking it.
+        if (!iface.matches(mIfaceMatch) || isTrackingInterface())
+            return false;
+
+        Log.d(TAG, "Started tracking interface " + iface);
+        setInterfaceUp(iface);
+        return true;
+!!!36632247.java!!!	stopTrackingInterface(inout iface : String) : void
+        if (!iface.equals(mIface))
+            return;
+
+        Log.d(TAG, "Stopped tracking interface " + iface);
+        // TODO: Unify this codepath with stop().
+        synchronized (this) {
+            stopIpProvisioningThreadLocked();
+            setInterfaceInfoLocked("", null);
+            mNetworkInfo.setExtraInfo(null);
+            mLinkUp = false;
+            mNetworkInfo.setDetailedState(DetailedState.DISCONNECTED, null, mHwAddr);
+            updateAgent();
+            mNetworkAgent = null;
+            mNetworkInfo = new NetworkInfo(ConnectivityManager.TYPE_ETHERNET, 0, NETWORK_TYPE, "");
+            mLinkProperties = new LinkProperties();
+        }
+!!!36632375.java!!!	setStaticIpAddress(inout staticConfig : StaticIpConfiguration) : boolean
+        if (staticConfig.ipAddress != null &&
+                staticConfig.gateway != null &&
+                staticConfig.dnsServers.size() > 0) {
+            try {
+                Log.i(TAG, "Applying static IPv4 configuration to " + mIface + ": " + staticConfig);
+                InterfaceConfiguration config = mNMService.getInterfaceConfig(mIface);
+                config.setLinkAddress(staticConfig.ipAddress);
+                mNMService.setInterfaceConfig(mIface, config);
+                return true;
+            } catch(RemoteException|IllegalStateException e) {
+               Log.e(TAG, "Setting static IP address failed: " + e.getMessage());
+            }
+        } else {
+            Log.e(TAG, "Invalid static IP configuration.");
+        }
+        return false;
+!!!36632503.java!!!	updateAgent() : void
+        synchronized (EthernetNetworkFactory.this) {
+            if (mNetworkAgent == null) return;
+            if (DBG) {
+                Log.i(TAG, "Updating mNetworkAgent with: " +
+                      mNetworkCapabilities + ", " +
+                      mNetworkInfo + ", " +
+                      mLinkProperties);
+            }
+            mNetworkAgent.sendNetworkCapabilities(mNetworkCapabilities);
+            mNetworkAgent.sendNetworkInfo(mNetworkInfo);
+            mNetworkAgent.sendLinkProperties(mLinkProperties);
+            // never set the network score below 0.
+            mNetworkAgent.sendNetworkScore(mLinkUp? NETWORK_SCORE : 0);
+        }
+!!!36632631.java!!!	onRequestNetwork() : void
+        synchronized(EthernetNetworkFactory.this) {
+            if (mIpProvisioningThread != null) {
+                return;
+            }
+        }
+
+        final Thread ipProvisioningThread = new Thread(new Runnable() {
+            public void run() {
+                if (DBG) {
+                    Log.d(TAG, String.format("starting ipProvisioningThread(%s): mNetworkInfo=%s",
+                            mIface, mNetworkInfo));
+                }
+
+                LinkProperties linkProperties;
+
+                IpConfiguration config = mEthernetManager.getConfiguration();
+
+                if (config.getIpAssignment() == IpAssignment.STATIC) {
+                    if (!setStaticIpAddress(config.getStaticIpConfiguration())) {
+                        // We've already logged an error.
+                        return;
+                    }
+                    linkProperties = config.getStaticIpConfiguration().toLinkProperties(mIface);
+                } else {
+                    mNetworkInfo.setDetailedState(DetailedState.OBTAINING_IPADDR, null, mHwAddr);
+                    WaitForProvisioningCallback ipmCallback = new WaitForProvisioningCallback() {
+                        @Override
+                        public void onLinkPropertiesChange(LinkProperties newLp) {
+                            synchronized(EthernetNetworkFactory.this) {
+                                if (mNetworkAgent != null && mNetworkInfo.isConnected()) {
+                                    mLinkProperties = newLp;
+                                    mNetworkAgent.sendLinkProperties(newLp);
+                                }
+                            }
+                        }
+                    };
+
+                    synchronized(EthernetNetworkFactory.this) {
+                        stopIpManagerLocked();
+                        mIpManager = new IpManager(mContext, mIface, ipmCallback);
+
+                        if (config.getProxySettings() == ProxySettings.STATIC ||
+                                config.getProxySettings() == ProxySettings.PAC) {
+                            mIpManager.setHttpProxy(config.getHttpProxy());
+                        }
+
+                        final String tcpBufferSizes = mContext.getResources().getString(
+                                com.android.internal.R.string.config_ethernet_tcp_buffers);
+                        if (!TextUtils.isEmpty(tcpBufferSizes)) {
+                            mIpManager.setTcpBufferSizes(tcpBufferSizes);
+                        }
+
+                        final ProvisioningConfiguration provisioningConfiguration =
+                                mIpManager.buildProvisioningConfiguration()
+                                        .withProvisioningTimeoutMs(0)
+                                        .build();
+                        mIpManager.startProvisioning(provisioningConfiguration);
+                    }
+
+                    linkProperties = ipmCallback.waitForProvisioning();
+                    if (linkProperties == null) {
+                        Log.e(TAG, "IP provisioning error");
+                        // set our score lower than any network could go
+                        // so we get dropped.
+                        mFactory.setScoreFilter(-1);
+                        synchronized(EthernetNetworkFactory.this) {
+                            stopIpManagerLocked();
+                        }
+                        return;
+                    }
+                }
+
+                synchronized(EthernetNetworkFactory.this) {
+                    if (mNetworkAgent != null) {
+                        Log.e(TAG, "Already have a NetworkAgent - aborting new request");
+                        stopIpManagerLocked();
+                        mIpProvisioningThread = null;
+                        return;
+                    }
+                    mLinkProperties = linkProperties;
+                    mNetworkInfo.setIsAvailable(true);
+                    mNetworkInfo.setDetailedState(DetailedState.CONNECTED, null, mHwAddr);
+
+                    // Create our NetworkAgent.
+                    mNetworkAgent = new NetworkAgent(mFactory.getLooper(), mContext,
+                            NETWORK_TYPE, mNetworkInfo, mNetworkCapabilities, mLinkProperties,
+                            NETWORK_SCORE) {
+                        public void unwanted() {
+                            synchronized(EthernetNetworkFactory.this) {
+                                if (this == mNetworkAgent) {
+                                    stopIpManagerLocked();
+
+                                    mLinkProperties.clear();
+                                    mNetworkInfo.setDetailedState(DetailedState.DISCONNECTED, null,
+                                            mHwAddr);
+                                    updateAgent();
+                                    mNetworkAgent = null;
+                                    try {
+                                        mNMService.clearInterfaceAddresses(mIface);
+                                    } catch (Exception e) {
+                                        Log.e(TAG, "Failed to clear addresses or disable ipv6" + e);
+                                    }
+                                } else {
+                                    Log.d(TAG, "Ignoring unwanted as we have a more modern " +
+                                            "instance");
+                                }
+                            }
+                        };
+                    };
+
+                    mIpProvisioningThread = null;
+                }
+
+                if (DBG) {
+                    Log.d(TAG, String.format("exiting ipProvisioningThread(%s): mNetworkInfo=%s",
+                            mIface, mNetworkInfo));
+                }
+            }
+        });
+
+        synchronized(EthernetNetworkFactory.this) {
+            if (mIpProvisioningThread == null) {
+                mIpProvisioningThread = ipProvisioningThread;
+                mIpProvisioningThread.start();
+            }
+        }
+!!!36632759.java!!!	start(inout context : Context, inout target : Handler) : void
+        // The services we use.
+        IBinder b = ServiceManager.getService(Context.NETWORKMANAGEMENT_SERVICE);
+        mNMService = INetworkManagementService.Stub.asInterface(b);
+        mEthernetManager = (EthernetManager) context.getSystemService(Context.ETHERNET_SERVICE);
+
+        // Interface match regex.
+        mIfaceMatch = context.getResources().getString(
+                com.android.internal.R.string.config_ethernet_iface_regex);
+
+        // Create and register our NetworkFactory.
+        mFactory = new LocalNetworkFactory(NETWORK_TYPE, context, target.getLooper());
+        mFactory.setCapabilityFilter(mNetworkCapabilities);
+        mFactory.setScoreFilter(-1); // this set high when we have an iface
+        mFactory.register();
+
+        mContext = context;
+
+        // Start tracking interface change events.
+        mInterfaceObserver = new InterfaceObserver();
+        try {
+            mNMService.registerObserver(mInterfaceObserver);
+        } catch (RemoteException e) {
+            Log.e(TAG, "Could not register InterfaceObserver " + e);
+        }
+
+        // If an Ethernet interface is already connected, start tracking that.
+        // Otherwise, the first Ethernet interface to appear will be tracked.
+        try {
+            final String[] ifaces = mNMService.listInterfaces();
+            for (String iface : ifaces) {
+                synchronized(this) {
+                    if (maybeTrackInterface(iface)) {
+                        // We have our interface. Track it.
+                        // Note: if the interface already has link (e.g., if we
+                        // crashed and got restarted while it was running),
+                        // we need to fake a link up notification so we start
+                        // configuring it. Since we're already holding the lock,
+                        // any real link up/down notification will only arrive
+                        // after we've done this.
+                        if (mNMService.getInterfaceConfig(iface).hasFlag("running")) {
+                            updateInterfaceState(iface, true);
+                        }
+                        break;
+                    }
+                }
+            }
+        } catch (RemoteException|IllegalStateException e) {
+            Log.e(TAG, "Could not get list of interfaces " + e);
+        }
+!!!36632887.java!!!	stop() : void
+        stopIpProvisioningThreadLocked();
+        // ConnectivityService will only forget our NetworkAgent if we send it a NetworkInfo object
+        // with a state of DISCONNECTED or SUSPENDED. So we can't simply clear our NetworkInfo here:
+        // that sets the state to IDLE, and ConnectivityService will still think we're connected.
+        //
+        // TODO: stop using explicit comparisons to DISCONNECTED / SUSPENDED in ConnectivityService,
+        // and instead use isConnectedOrConnecting().
+        mNetworkInfo.setDetailedState(DetailedState.DISCONNECTED, null, mHwAddr);
+        mLinkUp = false;
+        updateAgent();
+        mLinkProperties = new LinkProperties();
+        mNetworkAgent = null;
+        setInterfaceInfoLocked("", null);
+        mNetworkInfo = new NetworkInfo(ConnectivityManager.TYPE_ETHERNET, 0, NETWORK_TYPE, "");
+        mFactory.unregister();
+!!!36633015.java!!!	initNetworkCapabilities() : void
+        mNetworkCapabilities = new NetworkCapabilities();
+        mNetworkCapabilities.addTransportType(NetworkCapabilities.TRANSPORT_ETHERNET);
+        mNetworkCapabilities.addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET);
+        mNetworkCapabilities.addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_RESTRICTED);
+        // We have no useful data on bandwidth. Say 100M up and 100M down. :-(
+        mNetworkCapabilities.setLinkUpstreamBandwidthKbps(100 * 1000);
+        mNetworkCapabilities.setLinkDownstreamBandwidthKbps(100 * 1000);
+!!!36633143.java!!!	isTrackingInterface() : boolean
+        return !TextUtils.isEmpty(mIface);
+!!!36633271.java!!!	setInterfaceInfoLocked(inout iface : String, inout hwAddr : String) : void
+        boolean oldAvailable = isTrackingInterface();
+        mIface = iface;
+        mHwAddr = hwAddr;
+        boolean available = isTrackingInterface();
+
+        if (oldAvailable != available) {
+            int n = mListeners.beginBroadcast();
+            for (int i = 0; i < n; i++) {
+                try {
+                    mListeners.getBroadcastItem(i).onAvailabilityChanged(available);
+                } catch (RemoteException e) {
+                    // Do nothing here.
+                }
+            }
+            mListeners.finishBroadcast();
+        }
+!!!36633399.java!!!	dump(inout fd : FileDescriptor, inout pw : IndentingPrintWriter, inout args : String) : void
+        if (isTrackingInterface()) {
+            pw.println("Tracking interface: " + mIface);
+            pw.increaseIndent();
+            pw.println("MAC address: " + mHwAddr);
+            pw.println("Link state: " + (mLinkUp ? "up" : "down"));
+            pw.decreaseIndent();
+        } else {
+            pw.println("Not tracking any interface");
+        }
+
+        pw.println();
+        pw.println("NetworkInfo: " + mNetworkInfo);
+        pw.println("LinkProperties: " + mLinkProperties);
+        pw.println("NetworkAgent: " + mNetworkAgent);
+        if (mIpManager != null) {
+            pw.println("IpManager:");
+            pw.increaseIndent();
+            mIpManager.dump(fd, pw, args);
+            pw.decreaseIndent();
+        }

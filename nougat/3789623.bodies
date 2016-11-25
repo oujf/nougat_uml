@@ -1,0 +1,186 @@
+class BasicClient
+!!!41087671.cpp!!!	disconnect() : binder::Status
+    binder::Status res = Status::ok();
+    if (mDisconnected) {
+        return res;
+    }
+    mDisconnected = true;
+
+    mCameraService->removeByClient(this);
+    mCameraService->logDisconnected(String8::format("%d", mCameraId), mClientPid,
+            String8(mClientPackageName));
+
+    sp<IBinder> remote = getRemote();
+    if (remote != nullptr) {
+        remote->unlinkToDeath(mCameraService);
+    }
+
+    finishCameraOps();
+    ALOGI("%s: Disconnected client for camera %d for PID %d", __FUNCTION__, mCameraId, mClientPid);
+
+    // client shouldn't be able to call into us anymore
+    mClientPid = 0;
+
+    return res;
+!!!41088055.cpp!!!	dump(in fd : int, in args : Vector<String16>) : status_t
+    // No dumping of clients directly over Binder,
+    // must go through CameraService::dump
+    android_errorWriteWithInfoLog(SN_EVENT_LOG_ID, "26265403",
+            IPCThreadState::self()->getCallingUid(), NULL, 0);
+    return OK;
+!!!41088311.cpp!!!	getPackageName() : String16
+    return mClientPackageName;
+!!!41088567.cpp!!!	getClientUid() : uid_t
+    return mClientUid;
+!!!41088695.cpp!!!	getClientPid() : int
+    return mClientPid;
+!!!41088823.cpp!!!	canCastToApiClient(in level : CameraService::apiLevel) : bool
+    // Defaults to API2.
+    return level == API_2;
+!!!41088951.cpp!!!	BasicClient(in cameraService : sp<CameraService>, in remoteCallback : sp<IBinder>, in clientPackageName : String16, in cameraId : int, in cameraFacing : int, in clientPid : int, in clientUid : uid_t, in servicePid : int)
+    mCameraService = cameraService;
+    mRemoteBinder = remoteCallback;
+    mCameraId = cameraId;
+    mCameraFacing = cameraFacing;
+    mClientPid = clientPid;
+    mClientUid = clientUid;
+    mServicePid = servicePid;
+    mOpsActive = false;
+    mDestructionStarted = false;
+
+    // In some cases the calling code has no access to the package it runs under.
+    // For example, NDK camera API.
+    // In this case we will get the packages for the calling UID and pick the first one
+    // for attributing the app op. This will work correctly for runtime permissions
+    // as for legacy apps we will toggle the app op for all packages in the UID.
+    // The caveat is that the operation may be attributed to the wrong package and
+    // stats based on app ops may be slightly off.
+    if (mClientPackageName.size() <= 0) {
+        sp<IServiceManager> sm = defaultServiceManager();
+        sp<IBinder> binder = sm->getService(String16(kPermissionServiceName));
+        if (binder == 0) {
+            ALOGE("Cannot get permission service");
+            // Leave mClientPackageName unchanged (empty) and the further interaction
+            // with camera will fail in BasicClient::startCameraOps
+            return;
+        }
+
+        sp<IPermissionController> permCtrl = interface_cast<IPermissionController>(binder);
+        Vector<String16> packages;
+
+        permCtrl->getPackagesForUid(mClientUid, packages);
+
+        if (packages.isEmpty()) {
+            ALOGE("No packages for calling UID");
+            // Leave mClientPackageName unchanged (empty) and the further interaction
+            // with camera will fail in BasicClient::startCameraOps
+            return;
+        }
+        mClientPackageName = packages[0];
+    }
+!!!41089079.cpp!!!	~BasicClient()
+    ALOGV("~BasicClient");
+    mDestructionStarted = true;
+!!!41089207.cpp!!!	startCameraOps() : status_t
+    ATRACE_CALL();
+
+    int32_t res;
+    // Notify app ops that the camera is not available
+    mOpsCallback = new OpsCallback(this);
+
+    {
+        ALOGV("%s: Start camera ops, package name = %s, client UID = %d",
+              __FUNCTION__, String8(mClientPackageName).string(), mClientUid);
+    }
+
+    mAppOpsManager.startWatchingMode(AppOpsManager::OP_CAMERA,
+            mClientPackageName, mOpsCallback);
+    res = mAppOpsManager.startOp(AppOpsManager::OP_CAMERA,
+            mClientUid, mClientPackageName);
+
+    if (res == AppOpsManager::MODE_ERRORED) {
+        ALOGI("Camera %d: Access for \"%s\" has been revoked",
+                mCameraId, String8(mClientPackageName).string());
+        return PERMISSION_DENIED;
+    }
+
+    if (res == AppOpsManager::MODE_IGNORED) {
+        ALOGI("Camera %d: Access for \"%s\" has been restricted",
+                mCameraId, String8(mClientPackageName).string());
+        // Return the same error as for device policy manager rejection
+        return -EACCES;
+    }
+
+    mOpsActive = true;
+
+    // Transition device availability listeners from PRESENT -> NOT_AVAILABLE
+    mCameraService->updateStatus(ICameraServiceListener::STATUS_NOT_AVAILABLE,
+            String8::format("%d", mCameraId));
+
+    // Transition device state to OPEN
+    mCameraService->updateProxyDeviceState(ICameraServiceProxy::CAMERA_STATE_OPEN,
+            String8::format("%d", mCameraId));
+
+    return OK;
+!!!41089335.cpp!!!	finishCameraOps() : status_t
+    ATRACE_CALL();
+
+    // Check if startCameraOps succeeded, and if so, finish the camera op
+    if (mOpsActive) {
+        // Notify app ops that the camera is available again
+        mAppOpsManager.finishOp(AppOpsManager::OP_CAMERA, mClientUid,
+                mClientPackageName);
+        mOpsActive = false;
+
+        std::initializer_list<int32_t> rejected = {ICameraServiceListener::STATUS_NOT_PRESENT,
+                ICameraServiceListener::STATUS_ENUMERATING};
+
+        // Transition to PRESENT if the camera is not in either of the rejected states
+        mCameraService->updateStatus(ICameraServiceListener::STATUS_PRESENT,
+                String8::format("%d", mCameraId), rejected);
+
+        // Transition device state to CLOSED
+        mCameraService->updateProxyDeviceState(ICameraServiceProxy::CAMERA_STATE_CLOSED,
+                String8::format("%d", mCameraId));
+
+        // Notify flashlight that a camera device is closed.
+        mCameraService->mFlashlight->deviceClosed(
+                String8::format("%d", mCameraId));
+    }
+    // Always stop watching, even if no camera op is active
+    if (mOpsCallback != NULL) {
+        mAppOpsManager.stopWatchingMode(mOpsCallback);
+    }
+    mOpsCallback.clear();
+
+    return OK;
+!!!41089719.cpp!!!	opChanged(in op : int32_t, in packageName : String16) : void
+    ATRACE_CALL();
+
+    String8 name(packageName);
+    String8 myName(mClientPackageName);
+
+    if (op != AppOpsManager::OP_CAMERA) {
+        ALOGW("Unexpected app ops notification received: %d", op);
+        return;
+    }
+
+    int32_t res;
+    res = mAppOpsManager.checkOp(AppOpsManager::OP_CAMERA,
+            mClientUid, mClientPackageName);
+    ALOGV("checkOp returns: %d, %s ", res,
+            res == AppOpsManager::MODE_ALLOWED ? "ALLOWED" :
+            res == AppOpsManager::MODE_IGNORED ? "IGNORED" :
+            res == AppOpsManager::MODE_ERRORED ? "ERRORED" :
+            "UNKNOWN");
+
+    if (res != AppOpsManager::MODE_ALLOWED) {
+        ALOGI("Camera %d: Access for \"%s\" revoked", mCameraId,
+                myName.string());
+        // Reset the client PID to allow server-initiated disconnect,
+        // and to prevent further calls by client.
+        mClientPid = getCallingPid();
+        CaptureResultExtras resultExtras; // a dummy result (invalid)
+        notifyError(hardware::camera2::ICameraDeviceCallbacks::ERROR_CAMERA_SERVICE, resultExtras);
+        disconnect();
+    }

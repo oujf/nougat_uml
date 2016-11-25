@@ -1,0 +1,259 @@
+class BaseEmailAddressAdapter
+!!!36274743.java!!!	BaseEmailAddressAdapter(inout context : Context)
+        this(context, DEFAULT_PREFERRED_MAX_RESULT_COUNT);
+!!!36274871.java!!!	BaseEmailAddressAdapter(inout context : Context, in preferredMaxResultCount : int)
+        super(context);
+        mContentResolver = context.getContentResolver();
+        mPreferredMaxResultCount = preferredMaxResultCount;
+
+        mHandler = new Handler() {
+
+            @Override
+            public void handleMessage(Message msg) {
+                showSearchPendingIfNotComplete(msg.arg1);
+            }
+        };
+!!!36274999.java!!!	setAccount(inout account : Account) : void
+        mAccount = account;
+!!!36275639.java!!!	getItemViewType(in partitionIndex : int, in position : int) : int
+        DirectoryPartition partition = (DirectoryPartition)getPartition(partitionIndex);
+        return partition.loading ? 1 : 0;
+!!!36275767.java!!!	newView(inout context : Context, in partitionIndex : int, inout cursor : Cursor, in position : int, inout parent : ViewGroup) : View
+        DirectoryPartition partition = (DirectoryPartition)getPartition(partitionIndex);
+        if (partition.loading) {
+            return inflateItemViewLoading(parent);
+        } else {
+            return inflateItemView(parent);
+        }
+!!!36275895.java!!!	bindView(inout v : View, in partition : int, inout cursor : Cursor, in position : int) : void
+        DirectoryPartition directoryPartition = (DirectoryPartition)getPartition(partition);
+        String directoryType = directoryPartition.directoryType;
+        String directoryName = directoryPartition.displayName;
+        if (directoryPartition.loading) {
+            bindViewLoading(v, directoryType, directoryName);
+        } else {
+            String displayName = cursor.getString(EmailQuery.NAME);
+            String emailAddress = cursor.getString(EmailQuery.ADDRESS);
+            if (TextUtils.isEmpty(displayName) || TextUtils.equals(displayName, emailAddress)) {
+                displayName = emailAddress;
+                emailAddress = null;
+            }
+            bindView(v, directoryType, directoryName, displayName, emailAddress);
+        }
+!!!36276023.java!!!	areAllItemsEnabled() : boolean
+        return false;
+!!!36276151.java!!!	isEnabled(in partitionIndex : int, in position : int) : boolean
+        // The "Searching..." item should not be selectable
+        return !isLoading(partitionIndex);
+!!!36276279.java!!!	isLoading(in partitionIndex : int) : boolean
+        return ((DirectoryPartition)getPartition(partitionIndex)).loading;
+!!!36276407.java!!!	getFilter() : Filter
+        return new DefaultPartitionFilter();
+!!!36276535.java!!!	onDirectoryLoadFinished(inout constraint : CharSequence, inout directoryCursor : Cursor, inout defaultPartitionCursor : Cursor) : void
+        if (directoryCursor != null) {
+            PackageManager packageManager = getContext().getPackageManager();
+            DirectoryPartition preferredDirectory = null;
+            List<DirectoryPartition> directories = new ArrayList<DirectoryPartition>();
+            while (directoryCursor.moveToNext()) {
+                long id = directoryCursor.getLong(DirectoryListQuery.ID);
+
+                // Skip the local invisible directory, because the default directory
+                // already includes all local results.
+                if (id == DIRECTORY_LOCAL_INVISIBLE) {
+                    continue;
+                }
+
+                DirectoryPartition partition = new DirectoryPartition();
+                partition.directoryId = id;
+                partition.displayName = directoryCursor.getString(DirectoryListQuery.DISPLAY_NAME);
+                partition.accountName = directoryCursor.getString(DirectoryListQuery.ACCOUNT_NAME);
+                partition.accountType = directoryCursor.getString(DirectoryListQuery.ACCOUNT_TYPE);
+                String packageName = directoryCursor.getString(DirectoryListQuery.PACKAGE_NAME);
+                int resourceId = directoryCursor.getInt(DirectoryListQuery.TYPE_RESOURCE_ID);
+                if (packageName != null && resourceId != 0) {
+                    try {
+                        Resources resources =
+                                packageManager.getResourcesForApplication(packageName);
+                        partition.directoryType = resources.getString(resourceId);
+                        if (partition.directoryType == null) {
+                            Log.e(TAG, "Cannot resolve directory name: "
+                                    + resourceId + "@" + packageName);
+                        }
+                    } catch (NameNotFoundException e) {
+                        Log.e(TAG, "Cannot resolve directory name: "
+                                + resourceId + "@" + packageName, e);
+                    }
+                }
+
+                // If an account has been provided and we found a directory that
+                // corresponds to that account, place that directory second, directly
+                // underneath the local contacts.
+                if (mAccount != null && mAccount.name.equals(partition.accountName) &&
+                        mAccount.type.equals(partition.accountType)) {
+                    preferredDirectory = partition;
+                } else {
+                    directories.add(partition);
+                }
+            }
+
+            if (preferredDirectory != null) {
+                directories.add(1, preferredDirectory);
+            }
+
+            for (DirectoryPartition partition : directories) {
+                addPartition(partition);
+            }
+        }
+
+        int count = getPartitionCount();
+        int limit = 0;
+
+        // Since we will be changing several partitions at once, hold the data change
+        // notifications
+        setNotificationsEnabled(false);
+        try {
+            // The filter has loaded results for the default partition too.
+            if (defaultPartitionCursor != null && getPartitionCount() > 0) {
+                changeCursor(0, defaultPartitionCursor);
+            }
+
+            int defaultPartitionCount = (defaultPartitionCursor == null ? 0
+                    : defaultPartitionCursor.getCount());
+
+            limit = mPreferredMaxResultCount - defaultPartitionCount;
+
+            // Show non-default directories as "loading"
+            // Note: skipping the default partition (index 0), which has already been loaded
+            for (int i = 1; i < count; i++) {
+                DirectoryPartition partition = (DirectoryPartition) getPartition(i);
+                partition.constraint = constraint;
+
+                if (limit > 0) {
+                    if (!partition.loading) {
+                        partition.loading = true;
+                        changeCursor(i, null);
+                    }
+                } else {
+                    partition.loading = false;
+                    changeCursor(i, null);
+                }
+            }
+        } finally {
+            setNotificationsEnabled(true);
+        }
+
+        // Start search in other directories
+        // Note: skipping the default partition (index 0), which has already been loaded
+        for (int i = 1; i < count; i++) {
+            DirectoryPartition partition = (DirectoryPartition) getPartition(i);
+            if (partition.loading) {
+                mHandler.removeMessages(MESSAGE_SEARCH_PENDING, partition);
+                Message msg = mHandler.obtainMessage(MESSAGE_SEARCH_PENDING, i, 0, partition);
+                mHandler.sendMessageDelayed(msg, MESSAGE_SEARCH_PENDING_DELAY);
+                if (partition.filter == null) {
+                    partition.filter = new DirectoryPartitionFilter(i, partition.directoryId);
+                }
+                partition.filter.setLimit(limit);
+                partition.filter.filter(constraint);
+            } else {
+                if (partition.filter != null) {
+                    // Cancel any previous loading request
+                    partition.filter.filter(null);
+                }
+            }
+        }
+!!!36276663.java!!!	showSearchPendingIfNotComplete(in partitionIndex : int) : void
+        if (partitionIndex < getPartitionCount()) {
+            DirectoryPartition partition = (DirectoryPartition) getPartition(partitionIndex);
+            if (partition.loading) {
+                changeCursor(partitionIndex, createLoadingCursor());
+            }
+        }
+!!!36276791.java!!!	createLoadingCursor() : Cursor
+        MatrixCursor cursor = new MatrixCursor(new String[]{SEARCHING_CURSOR_MARKER});
+        cursor.addRow(new Object[]{""});
+        return cursor;
+!!!36276919.java!!!	onPartitionLoadFinished(inout constraint : CharSequence, in partitionIndex : int, inout cursor : Cursor) : void
+        if (partitionIndex < getPartitionCount()) {
+            DirectoryPartition partition = (DirectoryPartition) getPartition(partitionIndex);
+
+            // Check if the received result matches the current constraint
+            // If not - the user must have continued typing after the request
+            // was issued
+            if (partition.loading && TextUtils.equals(constraint, partition.constraint)) {
+                partition.loading = false;
+                mHandler.removeMessages(MESSAGE_SEARCH_PENDING, partition);
+                changeCursor(partitionIndex, removeDuplicatesAndTruncate(partitionIndex, cursor));
+            } else {
+                // We got the result for an unexpected query (the user is still typing)
+                // Just ignore this result
+                if (cursor != null) {
+                    cursor.close();
+                }
+            }
+        } else if (cursor != null) {
+            cursor.close();
+        }
+!!!36277047.java!!!	removeDuplicatesAndTruncate(in partition : int, inout cursor : Cursor) : Cursor
+        if (cursor == null) {
+            return null;
+        }
+
+        if (cursor.getCount() <= DEFAULT_PREFERRED_MAX_RESULT_COUNT
+                && !hasDuplicates(cursor, partition)) {
+            return cursor;
+        }
+
+        int count = 0;
+        MatrixCursor newCursor = new MatrixCursor(EmailQuery.PROJECTION);
+        cursor.moveToPosition(-1);
+        while (cursor.moveToNext() && count < DEFAULT_PREFERRED_MAX_RESULT_COUNT) {
+            String displayName = cursor.getString(EmailQuery.NAME);
+            String emailAddress = cursor.getString(EmailQuery.ADDRESS);
+            if (!isDuplicate(emailAddress, partition)) {
+                newCursor.addRow(new Object[]{displayName, emailAddress});
+                count++;
+            }
+        }
+        cursor.close();
+
+        return newCursor;
+!!!36277175.java!!!	hasDuplicates(inout cursor : Cursor, in partition : int) : boolean
+        cursor.moveToPosition(-1);
+        while (cursor.moveToNext()) {
+            String emailAddress = cursor.getString(EmailQuery.ADDRESS);
+            if (isDuplicate(emailAddress, partition)) {
+                return true;
+            }
+        }
+        return false;
+!!!36277303.java!!!	isDuplicate(inout emailAddress : String, in excludePartition : int) : boolean
+        int partitionCount = getPartitionCount();
+        for (int partition = 0; partition < partitionCount; partition++) {
+            if (partition != excludePartition && !isLoading(partition)) {
+                Cursor cursor = getCursor(partition);
+                if (cursor != null) {
+                    cursor.moveToPosition(-1);
+                    while (cursor.moveToNext()) {
+                        String address = cursor.getString(EmailQuery.ADDRESS);
+                        if (TextUtils.equals(emailAddress, address)) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+
+        return false;
+!!!36277431.java!!!	makeDisplayString(inout cursor : Cursor) : String
+        if (cursor.getColumnName(0).equals(SEARCHING_CURSOR_MARKER)) {
+            return "";
+        }
+
+        String displayName = cursor.getString(EmailQuery.NAME);
+        String emailAddress = cursor.getString(EmailQuery.ADDRESS);
+        if (TextUtils.isEmpty(displayName) || TextUtils.equals(displayName, emailAddress)) {
+             return emailAddress;
+        } else {
+            return new Rfc822Token(displayName, emailAddress, null).toString();
+        }

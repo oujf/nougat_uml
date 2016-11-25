@@ -1,0 +1,416 @@
+class IpManager
+!!!33962551.java!!!	IpManager(inout context : Context, inout ifName : String, inout callback : IpManager::Callback)
+        this(context, ifName, callback, INetworkManagementService.Stub.asInterface(
+                ServiceManager.getService(Context.NETWORKMANAGEMENT_SERVICE)));
+!!!33962679.java!!!	IpManager(inout context : Context, inout ifName : String, inout callback : IpManager::Callback, inout nwService : INetworkManagementService)
+        super(IpManager.class.getSimpleName() + "." + ifName);
+        mTag = getName();
+
+        mContext = context;
+        mInterfaceName = ifName;
+        mClatInterfaceName = CLAT_PREFIX + ifName;
+        mCallback = new LoggingCallbackWrapper(callback);
+        mNwService = nwService;
+
+        mNetlinkTracker = new NetlinkTracker(
+                mInterfaceName,
+                new NetlinkTracker.Callback() {
+                    @Override
+                    public void update() {
+                        sendMessage(EVENT_NETLINK_LINKPROPERTIES_CHANGED);
+                    }
+                }) {
+            @Override
+            public void interfaceAdded(String iface) {
+                super.interfaceAdded(iface);
+                if (mClatInterfaceName.equals(iface)) {
+                    mCallback.setNeighborDiscoveryOffload(false);
+                }
+            }
+
+            @Override
+            public void interfaceRemoved(String iface) {
+                super.interfaceRemoved(iface);
+                if (mClatInterfaceName.equals(iface)) {
+                    // TODO: consider sending a message to the IpManager main
+                    // StateMachine thread, in case "NDO enabled" state becomes
+                    // tied to more things that 464xlat operation.
+                    mCallback.setNeighborDiscoveryOffload(true);
+                }
+            }
+        };
+
+        try {
+            mNwService.registerObserver(mNetlinkTracker);
+        } catch (RemoteException e) {
+            Log.e(mTag, "Couldn't register NetlinkTracker: " + e.toString());
+        }
+
+        resetLinkProperties();
+
+        mProvisioningTimeoutAlarm = new WakeupMessage(mContext, getHandler(),
+                mTag + ".EVENT_PROVISIONING_TIMEOUT", EVENT_PROVISIONING_TIMEOUT);
+        mDhcpActionTimeoutAlarm = new WakeupMessage(mContext, getHandler(),
+                mTag + ".EVENT_DHCPACTION_TIMEOUT", EVENT_DHCPACTION_TIMEOUT);
+
+        // Super simple StateMachine.
+        addState(mStoppedState);
+        addState(mStartedState);
+        addState(mStoppingState);
+
+        setInitialState(mStoppedState);
+        mLocalLog = new LocalLog(MAX_LOG_RECORDS);
+        super.start();
+!!!33962807.java!!!	onQuitting() : void
+        mCallback.onQuit();
+!!!33962935.java!!!	shutdown() : void
+        stop();
+        quit();
+!!!33963063.java!!!	buildProvisioningConfiguration() : IpManager::ProvisioningConfiguration::Builder
+        return new ProvisioningConfiguration.Builder();
+!!!33963191.java!!!	startProvisioning(inout req : IpManager::ProvisioningConfiguration) : void
+        getNetworkInterface();
+
+        mCallback.setNeighborDiscoveryOffload(true);
+        sendMessage(CMD_START, new ProvisioningConfiguration(req));
+!!!33963319.java!!!	startProvisioning(inout staticIpConfig : StaticIpConfiguration) : void
+        startProvisioning(buildProvisioningConfiguration()
+                .withStaticConfiguration(staticIpConfig)
+                .build());
+!!!33963447.java!!!	startProvisioning() : void
+        startProvisioning(new ProvisioningConfiguration());
+!!!33963575.java!!!	stop() : void
+        sendMessage(CMD_STOP);
+!!!33963703.java!!!	confirmConfiguration() : void
+        sendMessage(CMD_CONFIRM);
+!!!33963831.java!!!	completedPreDhcpAction() : void
+        sendMessage(EVENT_PRE_DHCP_ACTION_COMPLETE);
+!!!33963959.java!!!	setTcpBufferSizes(inout tcpBufferSizes : String) : void
+        sendMessage(CMD_UPDATE_TCP_BUFFER_SIZES, tcpBufferSizes);
+!!!33964087.java!!!	setHttpProxy(inout proxyInfo : ProxyInfo) : void
+        sendMessage(CMD_UPDATE_HTTP_PROXY, proxyInfo);
+!!!33964215.java!!!	setMulticastFilter(inout enabled : boolean) : void
+        sendMessage(CMD_SET_MULTICAST_FILTER, enabled);
+!!!33964343.java!!!	dump(inout fd : FileDescriptor, inout writer : PrintWriter, inout args : String) : void
+        IndentingPrintWriter pw = new IndentingPrintWriter(writer, "  ");
+        pw.println("APF dump:");
+        pw.increaseIndent();
+        // Thread-unsafe access to mApfFilter but just used for debugging.
+        ApfFilter apfFilter = mApfFilter;
+        if (apfFilter != null) {
+            apfFilter.dump(pw);
+        } else {
+            pw.println("No apf support");
+        }
+        pw.decreaseIndent();
+
+        pw.println();
+        pw.println("StateMachine dump:");
+        pw.increaseIndent();
+        mLocalLog.readOnlyLocalLog().dump(fd, pw, args);
+        pw.decreaseIndent();
+!!!33964471.java!!!	getWhatToString(in what : int) : String
+        return sWhatToString.get(what, "UNKNOWN: " + Integer.toString(what));
+!!!33964599.java!!!	getLogRecString(inout msg : Message) : String
+        final String logLine = String.format(
+                "%s/%d %d %d %s",
+                mInterfaceName, mNetworkInterface == null ? -1 : mNetworkInterface.getIndex(),
+                msg.arg1, msg.arg2, Objects.toString(msg.obj));
+
+        final String richerLogLine = getWhatToString(msg.what) + " " + logLine;
+        mLocalLog.log(richerLogLine);
+        if (VDBG) {
+            Log.d(mTag, richerLogLine);
+        }
+
+        return logLine;
+!!!33964727.java!!!	recordLogRec(inout msg : Message) : boolean
+        // Don't log EVENT_NETLINK_LINKPROPERTIES_CHANGED. They can be noisy,
+        // and we already log any LinkProperties change that results in an
+        // invocation of IpManager.Callback#onLinkPropertiesChange().
+        return (msg.what != EVENT_NETLINK_LINKPROPERTIES_CHANGED);
+!!!33964855.java!!!	getNetworkInterface() : void
+        try {
+            mNetworkInterface = NetworkInterface.getByName(mInterfaceName);
+        } catch (SocketException | NullPointerException e) {
+            // TODO: throw new IllegalStateException.
+            Log.e(mTag, "ALERT: Failed to get interface object: ", e);
+        }
+!!!33964983.java!!!	resetLinkProperties() : void
+        mNetlinkTracker.clearLinkProperties();
+        mConfiguration = null;
+        mDhcpResults = null;
+        mTcpBufferSizes = "";
+        mHttpProxy = null;
+
+        mLinkProperties = new LinkProperties();
+        mLinkProperties.setInterfaceName(mInterfaceName);
+!!!33965111.java!!!	recordMetric(in type : int) : void
+        if (mStartTimeMillis <= 0) { Log.wtf(mTag, "Start time undefined!"); }
+        IpManagerEvent.logEvent(type, mInterfaceName,
+                SystemClock.elapsedRealtime() - mStartTimeMillis);
+!!!33965239.java!!!	isProvisioned(inout lp : LinkProperties) : boolean
+        // For historical reasons, we should connect even if all we have is
+        // an IPv4 address and nothing else.
+        return lp.isProvisioned() || lp.hasIPv4Address();
+!!!33965367.java!!!	compareProvisioning(inout oldLp : LinkProperties, inout newLp : LinkProperties) : LinkProperties::ProvisioningChange
+        ProvisioningChange delta;
+
+        final boolean wasProvisioned = isProvisioned(oldLp);
+        final boolean isProvisioned = isProvisioned(newLp);
+
+        if (!wasProvisioned && isProvisioned) {
+            delta = ProvisioningChange.GAINED_PROVISIONING;
+        } else if (wasProvisioned && isProvisioned) {
+            delta = ProvisioningChange.STILL_PROVISIONED;
+        } else if (!wasProvisioned && !isProvisioned) {
+            delta = ProvisioningChange.STILL_NOT_PROVISIONED;
+        } else {
+            // (wasProvisioned && !isProvisioned)
+            //
+            // Note that this is true even if we lose a configuration element
+            // (e.g., a default gateway) that would not be required to advance
+            // into provisioned state. This is intended: if we have a default
+            // router and we lose it, that's a sure sign of a problem, but if
+            // we connect to a network with no IPv4 DNS servers, we consider
+            // that to be a network without DNS servers and connect anyway.
+            //
+            // See the comment below.
+            delta = ProvisioningChange.LOST_PROVISIONING;
+        }
+
+        // Additionally:
+        //
+        // Partial configurations (e.g., only an IPv4 address with no DNS
+        // servers and no default route) are accepted as long as DHCPv4
+        // succeeds. On such a network, isProvisioned() will always return
+        // false, because the configuration is not complete, but we want to
+        // connect anyway. It might be a disconnected network such as a
+        // Chromecast or a wireless printer, for example.
+        //
+        // Because on such a network isProvisioned() will always return false,
+        // delta will never be LOST_PROVISIONING. So check for loss of
+        // provisioning here too.
+        if ((oldLp.hasIPv4Address() && !newLp.hasIPv4Address()) ||
+                (oldLp.isIPv6Provisioned() && !newLp.isIPv6Provisioned())) {
+            delta = ProvisioningChange.LOST_PROVISIONING;
+        }
+
+        // Additionally:
+        //
+        // If the previous link properties had a global IPv6 address and an
+        // IPv6 default route then also consider the loss of that default route
+        // to be a loss of provisioning. See b/27962810.
+        if (oldLp.hasGlobalIPv6Address() && oldLp.hasIPv6DefaultRoute() &&
+                !newLp.hasIPv6DefaultRoute()) {
+            delta = ProvisioningChange.LOST_PROVISIONING;
+        }
+
+        return delta;
+!!!33965495.java!!!	dispatchCallback(inout delta : LinkProperties::ProvisioningChange, inout newLp : LinkProperties) : void
+        switch (delta) {
+            case GAINED_PROVISIONING:
+                if (VDBG) { Log.d(mTag, "onProvisioningSuccess()"); }
+                recordMetric(IpManagerEvent.PROVISIONING_OK);
+                mCallback.onProvisioningSuccess(newLp);
+                break;
+
+            case LOST_PROVISIONING:
+                if (VDBG) { Log.d(mTag, "onProvisioningFailure()"); }
+                recordMetric(IpManagerEvent.PROVISIONING_FAIL);
+                mCallback.onProvisioningFailure(newLp);
+                break;
+
+            default:
+                if (VDBG) { Log.d(mTag, "onLinkPropertiesChange()"); }
+                mCallback.onLinkPropertiesChange(newLp);
+                break;
+        }
+!!!33965623.java!!!	setLinkProperties(inout newLp : LinkProperties) : LinkProperties::ProvisioningChange
+        if (mApfFilter != null) {
+            mApfFilter.setLinkProperties(newLp);
+        }
+        if (mIpReachabilityMonitor != null) {
+            mIpReachabilityMonitor.updateLinkProperties(newLp);
+        }
+
+        ProvisioningChange delta = compareProvisioning(mLinkProperties, newLp);
+        mLinkProperties = new LinkProperties(newLp);
+
+        if (delta == ProvisioningChange.GAINED_PROVISIONING) {
+            // TODO: Add a proper ProvisionedState and cancel the alarm in
+            // its enter() method.
+            mProvisioningTimeoutAlarm.cancel();
+        }
+
+        return delta;
+!!!33965751.java!!!	linkPropertiesUnchanged(inout newLp : LinkProperties) : boolean
+        return Objects.equals(newLp, mLinkProperties);
+!!!33965879.java!!!	assembleLinkProperties() : LinkProperties
+        // [1] Create a new LinkProperties object to populate.
+        LinkProperties newLp = new LinkProperties();
+        newLp.setInterfaceName(mInterfaceName);
+
+        // [2] Pull in data from netlink:
+        //         - IPv4 addresses
+        //         - IPv6 addresses
+        //         - IPv6 routes
+        //         - IPv6 DNS servers
+        LinkProperties netlinkLinkProperties = mNetlinkTracker.getLinkProperties();
+        newLp.setLinkAddresses(netlinkLinkProperties.getLinkAddresses());
+        for (RouteInfo route : netlinkLinkProperties.getRoutes()) {
+            newLp.addRoute(route);
+        }
+        for (InetAddress dns : netlinkLinkProperties.getDnsServers()) {
+            // Only add likely reachable DNS servers.
+            // TODO: investigate deleting this.
+            if (newLp.isReachable(dns)) {
+                newLp.addDnsServer(dns);
+            }
+        }
+
+        // [3] Add in data from DHCPv4, if available.
+        //
+        // mDhcpResults is never shared with any other owner so we don't have
+        // to worry about concurrent modification.
+        if (mDhcpResults != null) {
+            for (RouteInfo route : mDhcpResults.getRoutes(mInterfaceName)) {
+                newLp.addRoute(route);
+            }
+            for (InetAddress dns : mDhcpResults.dnsServers) {
+                // Only add likely reachable DNS servers.
+                // TODO: investigate deleting this.
+                if (newLp.isReachable(dns)) {
+                    newLp.addDnsServer(dns);
+                }
+            }
+            newLp.setDomains(mDhcpResults.domains);
+
+            if (mDhcpResults.mtu != 0) {
+                newLp.setMtu(mDhcpResults.mtu);
+            }
+        }
+
+        // [4] Add in TCP buffer sizes and HTTP Proxy config, if available.
+        if (!TextUtils.isEmpty(mTcpBufferSizes)) {
+            newLp.setTcpBufferSizes(mTcpBufferSizes);
+        }
+        if (mHttpProxy != null) {
+            newLp.setHttpProxy(mHttpProxy);
+        }
+
+        if (VDBG) {
+            Log.d(mTag, "newLp{" + newLp + "}");
+        }
+        return newLp;
+!!!33966007.java!!!	handleLinkPropertiesUpdate(inout sendCallbacks : boolean) : boolean
+        final LinkProperties newLp = assembleLinkProperties();
+        if (linkPropertiesUnchanged(newLp)) {
+            return true;
+        }
+        final ProvisioningChange delta = setLinkProperties(newLp);
+        if (sendCallbacks) {
+            dispatchCallback(delta, newLp);
+        }
+        return (delta != ProvisioningChange.LOST_PROVISIONING);
+!!!33966135.java!!!	setIPv4Address(inout address : LinkAddress) : boolean
+        final InterfaceConfiguration ifcg = new InterfaceConfiguration();
+        ifcg.setLinkAddress(address);
+        try {
+            mNwService.setInterfaceConfig(mInterfaceName, ifcg);
+            if (VDBG) Log.d(mTag, "IPv4 configuration succeeded");
+        } catch (IllegalStateException | RemoteException e) {
+            Log.e(mTag, "IPv4 configuration failed: ", e);
+            return false;
+        }
+        return true;
+!!!33966263.java!!!	clearIPv4Address() : void
+        try {
+            final InterfaceConfiguration ifcg = new InterfaceConfiguration();
+            ifcg.setLinkAddress(new LinkAddress("0.0.0.0/0"));
+            mNwService.setInterfaceConfig(mInterfaceName, ifcg);
+        } catch (IllegalStateException | RemoteException e) {
+            Log.e(mTag, "ALERT: Failed to clear IPv4 address on interface " + mInterfaceName, e);
+        }
+!!!33966391.java!!!	handleIPv4Success(inout dhcpResults : DhcpResults) : void
+        mDhcpResults = new DhcpResults(dhcpResults);
+        final LinkProperties newLp = assembleLinkProperties();
+        final ProvisioningChange delta = setLinkProperties(newLp);
+
+        if (VDBG) {
+            Log.d(mTag, "onNewDhcpResults(" + Objects.toString(dhcpResults) + ")");
+        }
+        mCallback.onNewDhcpResults(dhcpResults);
+        dispatchCallback(delta, newLp);
+!!!33966519.java!!!	handleIPv4Failure() : void
+        // TODO: Investigate deleting this clearIPv4Address() call.
+        //
+        // DhcpClient will send us CMD_CLEAR_LINKADDRESS in all circumstances
+        // that could trigger a call to this function. If we missed handling
+        // that message in StartedState for some reason we would still clear
+        // any addresses upon entry to StoppedState.
+        clearIPv4Address();
+        mDhcpResults = null;
+        if (VDBG) { Log.d(mTag, "onNewDhcpResults(null)"); }
+        mCallback.onNewDhcpResults(null);
+
+        handleProvisioningFailure();
+!!!33966647.java!!!	handleProvisioningFailure() : void
+        final LinkProperties newLp = assembleLinkProperties();
+        ProvisioningChange delta = setLinkProperties(newLp);
+        // If we've gotten here and we're still not provisioned treat that as
+        // a total loss of provisioning.
+        //
+        // Either (a) static IP configuration failed or (b) DHCPv4 failed AND
+        // there was no usable IPv6 obtained before a non-zero provisioning
+        // timeout expired.
+        //
+        // Regardless: GAME OVER.
+        if (delta == ProvisioningChange.STILL_NOT_PROVISIONED) {
+            delta = ProvisioningChange.LOST_PROVISIONING;
+        }
+
+        dispatchCallback(delta, newLp);
+        if (delta == ProvisioningChange.LOST_PROVISIONING) {
+            transitionTo(mStoppingState);
+        }
+!!!33966775.java!!!	startIPv4() : boolean
+        // If we have a StaticIpConfiguration attempt to apply it and
+        // handle the result accordingly.
+        if (mConfiguration.mStaticIpConfig != null) {
+            if (setIPv4Address(mConfiguration.mStaticIpConfig.ipAddress)) {
+                handleIPv4Success(new DhcpResults(mConfiguration.mStaticIpConfig));
+            } else {
+                if (VDBG) { Log.d(mTag, "onProvisioningFailure()"); }
+                recordMetric(IpManagerEvent.PROVISIONING_FAIL);
+                mCallback.onProvisioningFailure(new LinkProperties(mLinkProperties));
+                return false;
+            }
+        } else {
+            // Start DHCPv4.
+            mDhcpClient = DhcpClient.makeDhcpClient(mContext, IpManager.this, mInterfaceName);
+            mDhcpClient.registerForPreDhcpNotification();
+            mDhcpClient.sendMessage(DhcpClient.CMD_START_DHCP);
+
+            if (mConfiguration.mProvisioningTimeoutMs > 0) {
+                final long alarmTime = SystemClock.elapsedRealtime() +
+                        mConfiguration.mProvisioningTimeoutMs;
+                mProvisioningTimeoutAlarm.schedule(alarmTime);
+            }
+        }
+
+        return true;
+!!!33966903.java!!!	startIPv6() : boolean
+        // Set privacy extensions.
+        try {
+            mNwService.setInterfaceIpv6PrivacyExtensions(mInterfaceName, true);
+            mNwService.enableIpv6(mInterfaceName);
+        } catch (RemoteException re) {
+            Log.e(mTag, "Unable to change interface settings: " + re);
+            return false;
+        } catch (IllegalStateException ie) {
+            Log.e(mTag, "Unable to change interface settings: " + ie);
+            return false;
+        }
+
+        return true;

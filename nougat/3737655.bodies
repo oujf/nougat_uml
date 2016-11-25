@@ -1,0 +1,344 @@
+class AudioMixer
+!!!40864823.cpp!!!	AudioMixer(in frameCount : size_t, in sampleRate : uint32_t, in maxNumTracks : uint32_t = MAX_NUM_TRACKS)
+    ALOG_ASSERT(maxNumTracks <= MAX_NUM_TRACKS, "maxNumTracks %u > MAX_NUM_TRACKS %u",
+            maxNumTracks, MAX_NUM_TRACKS);
+
+    // AudioMixer is not yet capable of more than 32 active track inputs
+    ALOG_ASSERT(32 >= MAX_NUM_TRACKS, "bad MAX_NUM_TRACKS %d", MAX_NUM_TRACKS);
+
+    pthread_once(&sOnceControl, &sInitRoutine);
+
+    mState.enabledTracks= 0;
+    mState.needsChanged = 0;
+    mState.frameCount   = frameCount;
+    mState.hook         = process__nop;
+    mState.outputTemp   = NULL;
+    mState.resampleTemp = NULL;
+    mState.mLog         = &mDummyLog;
+    // mState.reserved
+
+    // FIXME Most of the following initialization is probably redundant since
+    // tracks[i] should only be referenced if (mTrackNames & (1 << i)) != 0
+    // and mTrackNames is initially 0.  However, leave it here until that's verified.
+    track_t* t = mState.tracks;
+    for (unsigned i=0 ; i < MAX_NUM_TRACKS ; i++) {
+        t->resampler = NULL;
+        t->downmixerBufferProvider = NULL;
+        t->mReformatBufferProvider = NULL;
+        t->mTimestretchBufferProvider = NULL;
+        t++;
+    }
+
+!!!40864951.cpp!!!	~AudioMixer()
+    track_t* t = mState.tracks;
+    for (unsigned i=0 ; i < MAX_NUM_TRACKS ; i++) {
+        delete t->resampler;
+        delete t->downmixerBufferProvider;
+        delete t->mReformatBufferProvider;
+        delete t->mTimestretchBufferProvider;
+        t++;
+    }
+    delete [] mState.outputTemp;
+    delete [] mState.resampleTemp;
+!!!40865079.cpp!!!	getTrackName(in channelMask : audio_channel_mask_t, in format : audio_format_t, in sessionId : int) : int
+    if (!isValidPcmTrackFormat(format)) {
+        ALOGE("AudioMixer::getTrackName invalid format (%#x)", format);
+        return -1;
+    }
+    uint32_t names = (~mTrackNames) & mConfiguredNames;
+    if (names != 0) {
+        int n = __builtin_ctz(names);
+        ALOGV("add track (%d)", n);
+        // assume default parameters for the track, except where noted below
+        track_t* t = &mState.tracks[n];
+        t->needs = 0;
+
+        // Integer volume.
+        // Currently integer volume is kept for the legacy integer mixer.
+        // Will be removed when the legacy mixer path is removed.
+        t->volume[0] = UNITY_GAIN_INT;
+        t->volume[1] = UNITY_GAIN_INT;
+        t->prevVolume[0] = UNITY_GAIN_INT << 16;
+        t->prevVolume[1] = UNITY_GAIN_INT << 16;
+        t->volumeInc[0] = 0;
+        t->volumeInc[1] = 0;
+        t->auxLevel = 0;
+        t->auxInc = 0;
+        t->prevAuxLevel = 0;
+
+        // Floating point volume.
+        t->mVolume[0] = UNITY_GAIN_FLOAT;
+        t->mVolume[1] = UNITY_GAIN_FLOAT;
+        t->mPrevVolume[0] = UNITY_GAIN_FLOAT;
+        t->mPrevVolume[1] = UNITY_GAIN_FLOAT;
+        t->mVolumeInc[0] = 0.;
+        t->mVolumeInc[1] = 0.;
+        t->mAuxLevel = 0.;
+        t->mAuxInc = 0.;
+        t->mPrevAuxLevel = 0.;
+
+        // no initialization needed
+        // t->frameCount
+        t->channelCount = audio_channel_count_from_out_mask(channelMask);
+        t->enabled = false;
+        ALOGV_IF(audio_channel_mask_get_bits(channelMask) != AUDIO_CHANNEL_OUT_STEREO,
+                "Non-stereo channel mask: %d\n", channelMask);
+        t->channelMask = channelMask;
+        t->sessionId = sessionId;
+        // setBufferProvider(name, AudioBufferProvider *) is required before enable(name)
+        t->bufferProvider = NULL;
+        t->buffer.raw = NULL;
+        // no initialization needed
+        // t->buffer.frameCount
+        t->hook = NULL;
+        t->in = NULL;
+        t->resampler = NULL;
+        t->sampleRate = mSampleRate;
+        // setParameter(name, TRACK, MAIN_BUFFER, mixBuffer) is required before enable(name)
+        t->mainBuffer = NULL;
+        t->auxBuffer = NULL;
+        t->mInputBufferProvider = NULL;
+        t->mReformatBufferProvider = NULL;
+        t->downmixerBufferProvider = NULL;
+        t->mPostDownmixReformatBufferProvider = NULL;
+        t->mTimestretchBufferProvider = NULL;
+        t->mMixerFormat = AUDIO_FORMAT_PCM_16_BIT;
+        t->mFormat = format;
+        t->mMixerInFormat = selectMixerInFormat(format);
+        t->mDownmixRequiresFormat = AUDIO_FORMAT_INVALID; // no format required
+        t->mMixerChannelMask = audio_channel_mask_from_representation_and_bits(
+                AUDIO_CHANNEL_REPRESENTATION_POSITION, AUDIO_CHANNEL_OUT_STEREO);
+        t->mMixerChannelCount = audio_channel_count_from_out_mask(t->mMixerChannelMask);
+        t->mPlaybackRate = AUDIO_PLAYBACK_RATE_DEFAULT;
+        // Check the downmixing (or upmixing) requirements.
+        status_t status = t->prepareForDownmix();
+        if (status != OK) {
+            ALOGE("AudioMixer::getTrackName invalid channelMask (%#x)", channelMask);
+            return -1;
+        }
+        // prepareForDownmix() may change mDownmixRequiresFormat
+        ALOGVV("mMixerFormat:%#x  mMixerInFormat:%#x\n", t->mMixerFormat, t->mMixerInFormat);
+        t->prepareForReformat();
+        mTrackNames |= 1 << n;
+        return TRACK0 + n;
+    }
+    ALOGE("AudioMixer::getTrackName out of available tracks");
+    return -1;
+!!!40865207.cpp!!!	deleteTrackName(in name : int) : void
+    ALOGV("AudioMixer::deleteTrackName(%d)", name);
+    name -= TRACK0;
+    ALOG_ASSERT(uint32_t(name) < MAX_NUM_TRACKS, "bad track name %d", name);
+    ALOGV("deleteTrackName(%d)", name);
+    track_t& track(mState.tracks[ name ]);
+    if (track.enabled) {
+        track.enabled = false;
+        invalidateState(1<<name);
+    }
+    // delete the resampler
+    delete track.resampler;
+    track.resampler = NULL;
+    // delete the downmixer
+    mState.tracks[name].unprepareForDownmix();
+    // delete the reformatter
+    mState.tracks[name].unprepareForReformat();
+    // delete the timestretch provider
+    delete track.mTimestretchBufferProvider;
+    track.mTimestretchBufferProvider = NULL;
+    mTrackNames &= ~(1<<name);
+!!!40865335.cpp!!!	enable(in name : int) : void
+    name -= TRACK0;
+    ALOG_ASSERT(uint32_t(name) < MAX_NUM_TRACKS, "bad track name %d", name);
+    track_t& track = mState.tracks[name];
+
+    if (!track.enabled) {
+        track.enabled = true;
+        ALOGV("enable(%d)", name);
+        invalidateState(1 << name);
+    }
+!!!40865463.cpp!!!	disable(in name : int) : void
+    name -= TRACK0;
+    ALOG_ASSERT(uint32_t(name) < MAX_NUM_TRACKS, "bad track name %d", name);
+    track_t& track = mState.tracks[name];
+
+    if (track.enabled) {
+        track.enabled = false;
+        ALOGV("disable(%d)", name);
+        invalidateState(1 << name);
+    }
+!!!40865591.cpp!!!	setParameter(in name : int, in target : int, in param : int, inout value : void) : void
+    name -= TRACK0;
+    ALOG_ASSERT(uint32_t(name) < MAX_NUM_TRACKS, "bad track name %d", name);
+    track_t& track = mState.tracks[name];
+
+    int valueInt = static_cast<int>(reinterpret_cast<uintptr_t>(value));
+    int32_t *valueBuf = reinterpret_cast<int32_t*>(value);
+
+    switch (target) {
+
+    case TRACK:
+        switch (param) {
+        case CHANNEL_MASK: {
+            const audio_channel_mask_t trackChannelMask =
+                static_cast<audio_channel_mask_t>(valueInt);
+            if (setChannelMasks(name, trackChannelMask, track.mMixerChannelMask)) {
+                ALOGV("setParameter(TRACK, CHANNEL_MASK, %x)", trackChannelMask);
+                invalidateState(1 << name);
+            }
+            } break;
+        case MAIN_BUFFER:
+            if (track.mainBuffer != valueBuf) {
+                track.mainBuffer = valueBuf;
+                ALOGV("setParameter(TRACK, MAIN_BUFFER, %p)", valueBuf);
+                invalidateState(1 << name);
+            }
+            break;
+        case AUX_BUFFER:
+            if (track.auxBuffer != valueBuf) {
+                track.auxBuffer = valueBuf;
+                ALOGV("setParameter(TRACK, AUX_BUFFER, %p)", valueBuf);
+                invalidateState(1 << name);
+            }
+            break;
+        case FORMAT: {
+            audio_format_t format = static_cast<audio_format_t>(valueInt);
+            if (track.mFormat != format) {
+                ALOG_ASSERT(audio_is_linear_pcm(format), "Invalid format %#x", format);
+                track.mFormat = format;
+                ALOGV("setParameter(TRACK, FORMAT, %#x)", format);
+                track.prepareForReformat();
+                invalidateState(1 << name);
+            }
+            } break;
+        // FIXME do we want to support setting the downmix type from AudioFlinger?
+        //         for a specific track? or per mixer?
+        /* case DOWNMIX_TYPE:
+            break          */
+        case MIXER_FORMAT: {
+            audio_format_t format = static_cast<audio_format_t>(valueInt);
+            if (track.mMixerFormat != format) {
+                track.mMixerFormat = format;
+                ALOGV("setParameter(TRACK, MIXER_FORMAT, %#x)", format);
+            }
+            } break;
+        case MIXER_CHANNEL_MASK: {
+            const audio_channel_mask_t mixerChannelMask =
+                    static_cast<audio_channel_mask_t>(valueInt);
+            if (setChannelMasks(name, track.channelMask, mixerChannelMask)) {
+                ALOGV("setParameter(TRACK, MIXER_CHANNEL_MASK, %#x)", mixerChannelMask);
+                invalidateState(1 << name);
+            }
+            } break;
+        default:
+            LOG_ALWAYS_FATAL("setParameter track: bad param %d", param);
+        }
+        break;
+
+    case RESAMPLE:
+        switch (param) {
+        case SAMPLE_RATE:
+            ALOG_ASSERT(valueInt > 0, "bad sample rate %d", valueInt);
+            if (track.setResampler(uint32_t(valueInt), mSampleRate)) {
+                ALOGV("setParameter(RESAMPLE, SAMPLE_RATE, %u)",
+                        uint32_t(valueInt));
+                invalidateState(1 << name);
+            }
+            break;
+        case RESET:
+            track.resetResampler();
+            invalidateState(1 << name);
+            break;
+        case REMOVE:
+            delete track.resampler;
+            track.resampler = NULL;
+            track.sampleRate = mSampleRate;
+            invalidateState(1 << name);
+            break;
+        default:
+            LOG_ALWAYS_FATAL("setParameter resample: bad param %d", param);
+        }
+        break;
+
+    case RAMP_VOLUME:
+    case VOLUME:
+        switch (param) {
+        case AUXLEVEL:
+            if (setVolumeRampVariables(*reinterpret_cast<float*>(value),
+                    target == RAMP_VOLUME ? mState.frameCount : 0,
+                    &track.auxLevel, &track.prevAuxLevel, &track.auxInc,
+                    &track.mAuxLevel, &track.mPrevAuxLevel, &track.mAuxInc)) {
+                ALOGV("setParameter(%s, AUXLEVEL: %04x)",
+                        target == VOLUME ? "VOLUME" : "RAMP_VOLUME", track.auxLevel);
+                invalidateState(1 << name);
+            }
+            break;
+        default:
+            if ((unsigned)param >= VOLUME0 && (unsigned)param < VOLUME0 + MAX_NUM_VOLUMES) {
+                if (setVolumeRampVariables(*reinterpret_cast<float*>(value),
+                        target == RAMP_VOLUME ? mState.frameCount : 0,
+                        &track.volume[param - VOLUME0], &track.prevVolume[param - VOLUME0],
+                        &track.volumeInc[param - VOLUME0],
+                        &track.mVolume[param - VOLUME0], &track.mPrevVolume[param - VOLUME0],
+                        &track.mVolumeInc[param - VOLUME0])) {
+                    ALOGV("setParameter(%s, VOLUME%d: %04x)",
+                            target == VOLUME ? "VOLUME" : "RAMP_VOLUME", param - VOLUME0,
+                                    track.volume[param - VOLUME0]);
+                    invalidateState(1 << name);
+                }
+            } else {
+                LOG_ALWAYS_FATAL("setParameter volume: bad param %d", param);
+            }
+        }
+        break;
+        case TIMESTRETCH:
+            switch (param) {
+            case PLAYBACK_RATE: {
+                const AudioPlaybackRate *playbackRate =
+                        reinterpret_cast<AudioPlaybackRate*>(value);
+                ALOGW_IF(!isAudioPlaybackRateValid(*playbackRate),
+                        "bad parameters speed %f, pitch %f",playbackRate->mSpeed,
+                        playbackRate->mPitch);
+                if (track.setPlaybackRate(*playbackRate)) {
+                    ALOGV("setParameter(TIMESTRETCH, PLAYBACK_RATE, STRETCH_MODE, FALLBACK_MODE "
+                            "%f %f %d %d",
+                            playbackRate->mSpeed,
+                            playbackRate->mPitch,
+                            playbackRate->mStretchMode,
+                            playbackRate->mFallbackMode);
+                    // invalidateState(1 << name);
+                }
+            } break;
+            default:
+                LOG_ALWAYS_FATAL("setParameter timestretch: bad param %d", param);
+            }
+            break;
+
+    default:
+        LOG_ALWAYS_FATAL("setParameter: bad target %d", target);
+    }
+!!!40865719.cpp!!!	setBufferProvider(in name : int, inout bufferProvider : AudioBufferProvider) : void
+    name -= TRACK0;
+    ALOG_ASSERT(uint32_t(name) < MAX_NUM_TRACKS, "bad track name %d", name);
+
+    if (mState.tracks[name].mInputBufferProvider == bufferProvider) {
+        return; // don't reset any buffer providers if identical.
+    }
+    if (mState.tracks[name].mReformatBufferProvider != NULL) {
+        mState.tracks[name].mReformatBufferProvider->reset();
+    } else if (mState.tracks[name].downmixerBufferProvider != NULL) {
+        mState.tracks[name].downmixerBufferProvider->reset();
+    } else if (mState.tracks[name].mPostDownmixReformatBufferProvider != NULL) {
+        mState.tracks[name].mPostDownmixReformatBufferProvider->reset();
+    } else if (mState.tracks[name].mTimestretchBufferProvider != NULL) {
+        mState.tracks[name].mTimestretchBufferProvider->reset();
+    }
+
+    mState.tracks[name].mInputBufferProvider = bufferProvider;
+    mState.tracks[name].reconfigureBufferProviders();
+!!!40865847.cpp!!!	process() : void
+    mState.hook(&mState);
+!!!40866103.cpp!!!	getUnreleasedFrames(in name : int) : size_t
+    name -= TRACK0;
+    if (uint32_t(name) < MAX_NUM_TRACKS) {
+        return mState.tracks[name].getUnreleasedFrames();
+    }
+    return 0;

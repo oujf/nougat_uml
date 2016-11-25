@@ -1,0 +1,411 @@
+class RequestThreadManager
+!!!3168951.java!!!	createDummySurface() : void
+        if (mDummyTexture == null || mDummySurface == null) {
+            mDummyTexture = new SurfaceTexture(/*ignored*/0);
+            // TODO: use smallest default sizes
+            mDummyTexture.setDefaultBufferSize(640, 480);
+            mDummySurface = new Surface(mDummyTexture);
+        }
+!!!3169079.java!!!	stopPreview() : void
+        if (VERBOSE) {
+            Log.v(TAG, "stopPreview - preview running? " + mPreviewRunning);
+        }
+        if (mPreviewRunning) {
+            mCamera.stopPreview();
+            mPreviewRunning = false;
+        }
+!!!3169207.java!!!	startPreview() : void
+        if (VERBOSE) {
+            Log.v(TAG, "startPreview - preview running? " + mPreviewRunning);
+        }
+        if (!mPreviewRunning) {
+            // XX: CameraClient:;startPreview is not getting called after a stop
+            mCamera.startPreview();
+            mPreviewRunning = true;
+        }
+!!!3169335.java!!!	doJpegCapturePrepare(inout request : RequestHolder) : void
+        if (DEBUG) Log.d(TAG, "doJpegCapturePrepare - preview running? " + mPreviewRunning);
+
+        if (!mPreviewRunning) {
+            if (DEBUG) Log.d(TAG, "doJpegCapture - create fake surface");
+
+            createDummySurface();
+            mCamera.setPreviewTexture(mDummyTexture);
+            startPreview();
+        }
+!!!3169463.java!!!	doJpegCapture(inout request : RequestHolder) : void
+        if (DEBUG) Log.d(TAG, "doJpegCapturePrepare");
+
+        mCamera.takePicture(mJpegShutterCallback, /*raw*/null, mJpegCallback);
+        mPreviewRunning = false;
+!!!3169591.java!!!	doPreviewCapture(inout request : RequestHolder) : void
+        if (VERBOSE) {
+            Log.v(TAG, "doPreviewCapture - preview running? " + mPreviewRunning);
+        }
+
+        if (mPreviewRunning) {
+            return; // Already running
+        }
+
+        if (mPreviewTexture == null) {
+            throw new IllegalStateException(
+                    "Preview capture called with no preview surfaces configured.");
+        }
+
+        mPreviewTexture.setDefaultBufferSize(mIntermediateBufferSize.getWidth(),
+                mIntermediateBufferSize.getHeight());
+        mCamera.setPreviewTexture(mPreviewTexture);
+
+        startPreview();
+!!!3169719.java!!!	configureOutputs(inout outputs : Collection<Pair<Surface, Size>>) : void
+        if (DEBUG) {
+            String outputsStr = outputs == null ? "null" : (outputs.size() + " surfaces");
+            Log.d(TAG, "configureOutputs with " + outputsStr);
+        }
+
+        try {
+            stopPreview();
+        }  catch (RuntimeException e) {
+            Log.e(TAG, "Received device exception in configure call: ", e);
+            mDeviceState.setError(
+                    CameraDeviceImpl.CameraDeviceCallbacks.ERROR_CAMERA_DEVICE);
+            return;
+        }
+
+        /*
+         * Try to release the previous preview's surface texture earlier if we end up
+         * using a different one; this also reduces the likelihood of getting into a deadlock
+         * when disconnecting from the old previous texture at a later time.
+         */
+        try {
+            mCamera.setPreviewTexture(/*surfaceTexture*/null);
+        } catch (IOException e) {
+            Log.w(TAG, "Failed to clear prior SurfaceTexture, may cause GL deadlock: ", e);
+        } catch (RuntimeException e) {
+            Log.e(TAG, "Received device exception in configure call: ", e);
+            mDeviceState.setError(
+                    CameraDeviceImpl.CameraDeviceCallbacks.ERROR_CAMERA_DEVICE);
+            return;
+        }
+
+        if (mGLThreadManager != null) {
+            mGLThreadManager.waitUntilStarted();
+            mGLThreadManager.ignoreNewFrames();
+            mGLThreadManager.waitUntilIdle();
+        }
+        resetJpegSurfaceFormats(mCallbackOutputs);
+
+        for (Surface s : mCallbackOutputs) {
+            try {
+                LegacyCameraDevice.disconnectSurface(s);
+            } catch (LegacyExceptionUtils.BufferQueueAbandonedException e) {
+                Log.w(TAG, "Surface abandoned, skipping...", e);
+            }
+        }
+        mPreviewOutputs.clear();
+        mCallbackOutputs.clear();
+        mJpegSurfaceIds.clear();
+        mPreviewTexture = null;
+
+        List<Size> previewOutputSizes = new ArrayList<>();
+        List<Size> callbackOutputSizes = new ArrayList<>();
+
+        int facing = mCharacteristics.get(CameraCharacteristics.LENS_FACING);
+        int orientation = mCharacteristics.get(CameraCharacteristics.SENSOR_ORIENTATION);
+        if (outputs != null) {
+            for (Pair<Surface, Size> outPair : outputs) {
+                Surface s = outPair.first;
+                Size outSize = outPair.second;
+                try {
+                    int format = LegacyCameraDevice.detectSurfaceType(s);
+                    LegacyCameraDevice.setSurfaceOrientation(s, facing, orientation);
+                    switch (format) {
+                        case CameraMetadataNative.NATIVE_JPEG_FORMAT:
+                            if (USE_BLOB_FORMAT_OVERRIDE) {
+                                // Override to RGBA_8888 format.
+                                LegacyCameraDevice.setSurfaceFormat(s,
+                                        LegacyMetadataMapper.HAL_PIXEL_FORMAT_RGBA_8888);
+                            }
+                            mJpegSurfaceIds.add(LegacyCameraDevice.getSurfaceId(s));
+                            mCallbackOutputs.add(s);
+                            callbackOutputSizes.add(outSize);
+
+                            // LegacyCameraDevice is the producer of JPEG output surfaces
+                            // so LegacyCameraDevice needs to connect to the surfaces.
+                            LegacyCameraDevice.connectSurface(s);
+                            break;
+                        default:
+                            LegacyCameraDevice.setScalingMode(s, LegacyCameraDevice.
+                                    NATIVE_WINDOW_SCALING_MODE_SCALE_TO_WINDOW);
+                            mPreviewOutputs.add(s);
+                            previewOutputSizes.add(outSize);
+                            break;
+                    }
+                } catch (LegacyExceptionUtils.BufferQueueAbandonedException e) {
+                    Log.w(TAG, "Surface abandoned, skipping...", e);
+                }
+            }
+        }
+        try {
+            mParams = mCamera.getParameters();
+        } catch (RuntimeException e) {
+            Log.e(TAG, "Received device exception: ", e);
+            mDeviceState.setError(
+                CameraDeviceImpl.CameraDeviceCallbacks.ERROR_CAMERA_DEVICE);
+            return;
+        }
+
+        List<int[]> supportedFpsRanges = mParams.getSupportedPreviewFpsRange();
+        int[] bestRange = getPhotoPreviewFpsRange(supportedFpsRanges);
+        if (DEBUG) {
+            Log.d(TAG, "doPreviewCapture - Selected range [" +
+                    bestRange[Camera.Parameters.PREVIEW_FPS_MIN_INDEX] + "," +
+                    bestRange[Camera.Parameters.PREVIEW_FPS_MAX_INDEX] + "]");
+        }
+        mParams.setPreviewFpsRange(bestRange[Camera.Parameters.PREVIEW_FPS_MIN_INDEX],
+                bestRange[Camera.Parameters.PREVIEW_FPS_MAX_INDEX]);
+
+        Size smallestSupportedJpegSize = calculatePictureSize(mCallbackOutputs,
+                callbackOutputSizes, mParams);
+
+        if (previewOutputSizes.size() > 0) {
+
+            Size largestOutput = SizeAreaComparator.findLargestByArea(previewOutputSizes);
+
+            // Find largest jpeg dimension - assume to have the same aspect ratio as sensor.
+            Size largestJpegDimen = ParameterUtils.getLargestSupportedJpegSizeByArea(mParams);
+
+            Size chosenJpegDimen = (smallestSupportedJpegSize != null) ? smallestSupportedJpegSize
+                    : largestJpegDimen;
+
+            List<Size> supportedPreviewSizes = ParameterUtils.convertSizeList(
+                    mParams.getSupportedPreviewSizes());
+
+            // Use smallest preview dimension with same aspect ratio as sensor that is >= than all
+            // of the configured output dimensions.  If none exists, fall back to using the largest
+            // supported preview size.
+            long largestOutputArea = largestOutput.getHeight() * (long) largestOutput.getWidth();
+            Size bestPreviewDimen = SizeAreaComparator.findLargestByArea(supportedPreviewSizes);
+            for (Size s : supportedPreviewSizes) {
+                long currArea = s.getWidth() * s.getHeight();
+                long bestArea = bestPreviewDimen.getWidth() * bestPreviewDimen.getHeight();
+                if (checkAspectRatiosMatch(chosenJpegDimen, s) && (currArea < bestArea &&
+                        currArea >= largestOutputArea)) {
+                    bestPreviewDimen = s;
+                }
+            }
+
+            mIntermediateBufferSize = bestPreviewDimen;
+            mParams.setPreviewSize(mIntermediateBufferSize.getWidth(),
+                    mIntermediateBufferSize.getHeight());
+
+            if (DEBUG) {
+                Log.d(TAG, "Intermediate buffer selected with dimens: " +
+                        bestPreviewDimen.toString());
+            }
+        } else {
+            mIntermediateBufferSize = null;
+            if (DEBUG) {
+                Log.d(TAG, "No Intermediate buffer selected, no preview outputs were configured");
+            }
+        }
+
+        if (smallestSupportedJpegSize != null) {
+            /*
+             * Set takePicture size to the smallest supported JPEG size large enough
+             * to scale/crop out of for the bounding rectangle of the configured JPEG sizes.
+             */
+
+            Log.i(TAG, "configureOutputs - set take picture size to " + smallestSupportedJpegSize);
+            mParams.setPictureSize(
+                    smallestSupportedJpegSize.getWidth(), smallestSupportedJpegSize.getHeight());
+        }
+
+        // TODO: Detect and optimize single-output paths here to skip stream teeing.
+        if (mGLThreadManager == null) {
+            mGLThreadManager = new GLThreadManager(mCameraId, facing, mDeviceState);
+            mGLThreadManager.start();
+        }
+        mGLThreadManager.waitUntilStarted();
+        List<Pair<Surface, Size>> previews = new ArrayList<>();
+        Iterator<Size> previewSizeIter = previewOutputSizes.iterator();
+        for (Surface p : mPreviewOutputs) {
+            previews.add(new Pair<>(p, previewSizeIter.next()));
+        }
+        mGLThreadManager.setConfigurationAndWait(previews, mCaptureCollector);
+        mGLThreadManager.allowNewFrames();
+        mPreviewTexture = mGLThreadManager.getCurrentSurfaceTexture();
+        if (mPreviewTexture != null) {
+            mPreviewTexture.setOnFrameAvailableListener(mPreviewCallback);
+        }
+
+        try {
+            mCamera.setParameters(mParams);
+        } catch (RuntimeException e) {
+                Log.e(TAG, "Received device exception while configuring: ", e);
+                mDeviceState.setError(
+                        CameraDeviceImpl.CameraDeviceCallbacks.ERROR_CAMERA_DEVICE);
+
+        }
+!!!3169847.java!!!	resetJpegSurfaceFormats(inout surfaces : Collection<Surface>) : void
+        if (!USE_BLOB_FORMAT_OVERRIDE || surfaces == null) {
+            return;
+        }
+        for(Surface s : surfaces) {
+            if (s == null || !s.isValid()) {
+                Log.w(TAG, "Jpeg surface is invalid, skipping...");
+                continue;
+            }
+            try {
+                LegacyCameraDevice.setSurfaceFormat(s, LegacyMetadataMapper.HAL_PIXEL_FORMAT_BLOB);
+            } catch (LegacyExceptionUtils.BufferQueueAbandonedException e) {
+                Log.w(TAG, "Surface abandoned, skipping...", e);
+            }
+        }
+!!!3169975.java!!!	calculatePictureSize(inout callbackOutputs : List<Surface>, inout callbackSizes : List<Size>, inout params : Camera::Parameters) : Size
+        /*
+         * Find the largest JPEG size (if any), from the configured outputs:
+         * - the api1 picture size should be set to the smallest legal size that's at least as large
+         *   as the largest configured JPEG size
+         */
+        if (callbackOutputs.size() != callbackSizes.size()) {
+            throw new IllegalStateException("Input collections must be same length");
+        }
+        List<Size> configuredJpegSizes = new ArrayList<>();
+        Iterator<Size> sizeIterator = callbackSizes.iterator();
+        for (Surface callbackSurface : callbackOutputs) {
+            Size jpegSize = sizeIterator.next();
+                if (!LegacyCameraDevice.containsSurfaceId(callbackSurface, mJpegSurfaceIds)) {
+                    continue; // Ignore non-JPEG callback formats
+                }
+
+                configuredJpegSizes.add(jpegSize);
+        }
+        if (!configuredJpegSizes.isEmpty()) {
+            /*
+             * Find the largest configured JPEG width, and height, independently
+             * of the rest.
+             *
+             * The rest of the JPEG streams can be cropped out of this smallest bounding
+             * rectangle.
+             */
+            int maxConfiguredJpegWidth = -1;
+            int maxConfiguredJpegHeight = -1;
+            for (Size jpegSize : configuredJpegSizes) {
+                maxConfiguredJpegWidth = jpegSize.getWidth() > maxConfiguredJpegWidth ?
+                        jpegSize.getWidth() : maxConfiguredJpegWidth;
+                maxConfiguredJpegHeight = jpegSize.getHeight() > maxConfiguredJpegHeight ?
+                        jpegSize.getHeight() : maxConfiguredJpegHeight;
+            }
+            Size smallestBoundJpegSize = new Size(maxConfiguredJpegWidth, maxConfiguredJpegHeight);
+
+            List<Size> supportedJpegSizes = ParameterUtils.convertSizeList(
+                    params.getSupportedPictureSizes());
+
+            /*
+             * Find the smallest supported JPEG size that can fit the smallest bounding
+             * rectangle for the configured JPEG sizes.
+             */
+            List<Size> candidateSupportedJpegSizes = new ArrayList<>();
+            for (Size supportedJpegSize : supportedJpegSizes) {
+                if (supportedJpegSize.getWidth() >= maxConfiguredJpegWidth &&
+                    supportedJpegSize.getHeight() >= maxConfiguredJpegHeight) {
+                    candidateSupportedJpegSizes.add(supportedJpegSize);
+                }
+            }
+
+            if (candidateSupportedJpegSizes.isEmpty()) {
+                throw new AssertionError(
+                        "Could not find any supported JPEG sizes large enough to fit " +
+                        smallestBoundJpegSize);
+            }
+
+            Size smallestSupportedJpegSize = Collections.min(candidateSupportedJpegSizes,
+                    new SizeAreaComparator());
+
+            if (!smallestSupportedJpegSize.equals(smallestBoundJpegSize)) {
+                Log.w(TAG,
+                        String.format(
+                                "configureOutputs - Will need to crop picture %s into "
+                                + "smallest bound size %s",
+                                smallestSupportedJpegSize, smallestBoundJpegSize));
+            }
+
+            return smallestSupportedJpegSize;
+        }
+
+        return null;
+!!!3170103.java!!!	checkAspectRatiosMatch(inout a : Size, inout b : Size) : boolean
+        float aAspect = a.getWidth() / (float) a.getHeight();
+        float bAspect = b.getWidth() / (float) b.getHeight();
+
+        return Math.abs(aAspect - bAspect) < ASPECT_RATIO_TOLERANCE;
+!!!3170231.java!!!	getPhotoPreviewFpsRange(inout frameRates : List<int[]>) : int
+        if (frameRates.size() == 0) {
+            Log.e(TAG, "No supported frame rates returned!");
+            return null;
+        }
+
+        int bestMin = 0;
+        int bestMax = 0;
+        int bestIndex = 0;
+        int index = 0;
+        for (int[] rate : frameRates) {
+            int minFps = rate[Camera.Parameters.PREVIEW_FPS_MIN_INDEX];
+            int maxFps = rate[Camera.Parameters.PREVIEW_FPS_MAX_INDEX];
+            if (maxFps > bestMax || (maxFps == bestMax && minFps > bestMin)) {
+                bestMin = minFps;
+                bestMax = maxFps;
+                bestIndex = index;
+            }
+            index++;
+        }
+
+        return frameRates.get(bestIndex);
+!!!3170359.java!!!	RequestThreadManager(in cameraId : int, inout camera : Camera, inout characteristics : CameraCharacteristics, inout deviceState : CameraDeviceState)
+        mCamera = checkNotNull(camera, "camera must not be null");
+        mCameraId = cameraId;
+        mCharacteristics = checkNotNull(characteristics, "characteristics must not be null");
+        String name = String.format("RequestThread-%d", cameraId);
+        TAG = name;
+        mDeviceState = checkNotNull(deviceState, "deviceState must not be null");
+        mFocusStateMapper = new LegacyFocusStateMapper(mCamera);
+        mFaceDetectMapper = new LegacyFaceDetectMapper(mCamera, mCharacteristics);
+        mCaptureCollector = new CaptureCollector(MAX_IN_FLIGHT_REQUESTS, mDeviceState);
+        mRequestThread = new RequestHandlerThread(name, mRequestHandlerCb);
+        mCamera.setErrorCallback(mErrorCallback);
+!!!3170487.java!!!	start() : void
+        mRequestThread.start();
+!!!3170615.java!!!	flush() : long
+        Log.i(TAG, "Flushing all pending requests.");
+        long lastFrame = mRequestQueue.stopRepeating();
+        mCaptureCollector.failAll();
+        return lastFrame;
+!!!3170743.java!!!	quit() : void
+        if (!mQuit.getAndSet(true)) {  // Avoid sending messages on dead thread's handler.
+            Handler handler = mRequestThread.waitAndGetHandler();
+            handler.sendMessageAtFrontOfQueue(handler.obtainMessage(MSG_CLEANUP));
+            mRequestThread.quitSafely();
+            try {
+                mRequestThread.join();
+            } catch (InterruptedException e) {
+                Log.e(TAG, String.format("Thread %s (%d) interrupted while quitting.",
+                        mRequestThread.getName(), mRequestThread.getId()));
+            }
+        }
+!!!3170871.java!!!	submitCaptureRequests(inout requests : CaptureRequest, inout repeating : boolean) : SubmitInfo
+        Handler handler = mRequestThread.waitAndGetHandler();
+        SubmitInfo info;
+        synchronized (mIdleLock) {
+            info = mRequestQueue.submit(requests, repeating);
+            handler.sendEmptyMessage(MSG_SUBMIT_CAPTURE_REQUEST);
+        }
+        return info;
+!!!3170999.java!!!	cancelRepeating(in requestId : int) : long
+        return mRequestQueue.stopRepeating(requestId);
+!!!3171127.java!!!	configure(inout outputs : Collection<Pair<Surface, Size>>) : void
+        Handler handler = mRequestThread.waitAndGetHandler();
+        final ConditionVariable condition = new ConditionVariable(/*closed*/false);
+        ConfigureHolder holder = new ConfigureHolder(condition, outputs);
+        handler.sendMessage(handler.obtainMessage(MSG_CONFIGURE_OUTPUTS, 0, 0, holder));
+        condition.block();

@@ -1,0 +1,237 @@
+class L2ConnectedState
+!!!36955319.java!!!	enter() : void
+            mRssiPollToken++;
+            if (mEnableRssiPolling) {
+                sendMessage(CMD_RSSI_POLL, mRssiPollToken, 0);
+            }
+            if (mNetworkAgent != null) {
+                loge("Have NetworkAgent when entering L2Connected");
+                setNetworkDetailedState(DetailedState.DISCONNECTED);
+            }
+            setNetworkDetailedState(DetailedState.CONNECTING);
+
+            mNetworkAgent = new WifiNetworkAgent(getHandler().getLooper(), mContext,
+                    "WifiNetworkAgent", mNetworkInfo, mNetworkCapabilitiesFilter,
+                    mLinkProperties, 60, mNetworkMisc);
+
+            // We must clear the config BSSID, as the wifi chipset may decide to roam
+            // from this point on and having the BSSID specified in the network block would
+            // cause the roam to faile and the device to disconnect
+            clearCurrentConfigBSSID("L2ConnectedState");
+            mCountryCode.setReadyForChange(false);
+            mWifiMetrics.setWifiState(WifiMetricsProto.WifiLog.WIFI_ASSOCIATED);
+!!!36955447.java!!!	exit() : void
+            mIpManager.stop();
+
+            // This is handled by receiving a NETWORK_DISCONNECTION_EVENT in ConnectModeState
+            // Bug: 15347363
+            // For paranoia's sake, call handleNetworkDisconnect
+            // only if BSSID is null or last networkId
+            // is not invalid.
+            if (DBG) {
+                StringBuilder sb = new StringBuilder();
+                sb.append("leaving L2ConnectedState state nid=" + Integer.toString(mLastNetworkId));
+                if (mLastBssid !=null) {
+                    sb.append(" ").append(mLastBssid);
+                }
+            }
+            if (mLastBssid != null || mLastNetworkId != WifiConfiguration.INVALID_NETWORK_ID) {
+                handleNetworkDisconnect();
+            }
+            mCountryCode.setReadyForChange(true);
+            mWifiMetrics.setWifiState(WifiMetricsProto.WifiLog.WIFI_DISCONNECTED);
+!!!36955575.java!!!	processMessage(inout message : Message) : boolean
+            logStateAndMessage(message, this);
+
+            switch (message.what) {
+                case DhcpClient.CMD_PRE_DHCP_ACTION:
+                    handlePreDhcpSetup();
+                    break;
+                case DhcpClient.CMD_PRE_DHCP_ACTION_COMPLETE:
+                    mIpManager.completedPreDhcpAction();
+                    break;
+                case DhcpClient.CMD_POST_DHCP_ACTION:
+                    handlePostDhcpSetup();
+                    // We advance to mConnectedState because IpManager will also send a
+                    // CMD_IPV4_PROVISIONING_SUCCESS message, which calls handleIPv4Success(),
+                    // which calls updateLinkProperties, which then sends
+                    // CMD_IP_CONFIGURATION_SUCCESSFUL.
+                    //
+                    // In the event of failure, we transition to mDisconnectingState
+                    // similarly--via messages sent back from IpManager.
+                    break;
+                case CMD_IPV4_PROVISIONING_SUCCESS: {
+                    handleIPv4Success((DhcpResults) message.obj);
+                    sendNetworkStateChangeBroadcast(mLastBssid);
+                    break;
+                }
+                case CMD_IPV4_PROVISIONING_FAILURE: {
+                    handleIPv4Failure();
+                    break;
+                }
+                case CMD_IP_CONFIGURATION_SUCCESSFUL:
+                    handleSuccessfulIpConfiguration();
+                    reportConnectionAttemptEnd(
+                            WifiMetrics.ConnectionEvent.FAILURE_NONE,
+                            WifiMetricsProto.ConnectionEvent.HLF_NONE);
+                    sendConnectedState();
+                    transitionTo(mConnectedState);
+                    break;
+                case CMD_IP_CONFIGURATION_LOST:
+                    // Get Link layer stats so that we get fresh tx packet counters.
+                    getWifiLinkLayerStats(true);
+                    handleIpConfigurationLost();
+                    transitionTo(mDisconnectingState);
+                    break;
+                case CMD_IP_REACHABILITY_LOST:
+                    if (DBG && message.obj != null) log((String) message.obj);
+                    handleIpReachabilityLost();
+                    transitionTo(mDisconnectingState);
+                    break;
+                case CMD_DISCONNECT:
+                    mWifiNative.disconnect();
+                    transitionTo(mDisconnectingState);
+                    break;
+                case WifiP2pServiceImpl.DISCONNECT_WIFI_REQUEST:
+                    if (message.arg1 == 1) {
+                        mWifiNative.disconnect();
+                        mTemporarilyDisconnectWifi = true;
+                        transitionTo(mDisconnectingState);
+                    }
+                    break;
+                case CMD_SET_OPERATIONAL_MODE:
+                    if (message.arg1 != CONNECT_MODE) {
+                        sendMessage(CMD_DISCONNECT);
+                        deferMessage(message);
+                        if (message.arg1 == SCAN_ONLY_WITH_WIFI_OFF_MODE) {
+                            noteWifiDisabledWhileAssociated();
+                        }
+                    }
+                    mWifiConfigManager.
+                                setAndEnableLastSelectedConfiguration(
+                                        WifiConfiguration.INVALID_NETWORK_ID);
+                    break;
+                    /* Ignore connection to same network */
+                case WifiManager.CONNECT_NETWORK:
+                    int netId = message.arg1;
+                    if (mWifiInfo.getNetworkId() == netId) {
+                        break;
+                    }
+                    return NOT_HANDLED;
+                case WifiMonitor.NETWORK_CONNECTION_EVENT:
+                    mWifiInfo.setBSSID((String) message.obj);
+                    mLastNetworkId = message.arg1;
+                    mWifiInfo.setNetworkId(mLastNetworkId);
+                    if(!mLastBssid.equals((String) message.obj)) {
+                        mLastBssid = (String) message.obj;
+                        sendNetworkStateChangeBroadcast(mLastBssid);
+                    }
+                    break;
+                case CMD_RSSI_POLL:
+                    if (message.arg1 == mRssiPollToken) {
+                        if (mWifiConfigManager.mEnableChipWakeUpWhenAssociated.get()) {
+                            if (DBG) log(" get link layer stats " + mWifiLinkLayerStatsSupported);
+                            WifiLinkLayerStats stats = getWifiLinkLayerStats(DBG);
+                            if (stats != null) {
+                                // Sanity check the results provided by driver
+                                if (mWifiInfo.getRssi() != WifiInfo.INVALID_RSSI
+                                        && (stats.rssi_mgmt == 0
+                                        || stats.beacon_rx == 0)) {
+                                    stats = null;
+                                }
+                            }
+                            // Get Info and continue polling
+                            fetchRssiLinkSpeedAndFrequencyNative();
+                            mWifiScoreReport =
+                                    WifiScoreReport.calculateScore(mWifiInfo,
+                                                                   getCurrentWifiConfiguration(),
+                                                                   mWifiConfigManager,
+                                                                   mNetworkAgent,
+                                                                   mWifiScoreReport,
+                                                                   mAggressiveHandover);
+                        }
+                        sendMessageDelayed(obtainMessage(CMD_RSSI_POLL,
+                                mRssiPollToken, 0), POLL_RSSI_INTERVAL_MSECS);
+                        if (DBG) sendRssiChangeBroadcast(mWifiInfo.getRssi());
+                    } else {
+                        // Polling has completed
+                    }
+                    break;
+                case CMD_ENABLE_RSSI_POLL:
+                    cleanWifiScore();
+                    if (mWifiConfigManager.mEnableRssiPollWhenAssociated.get()) {
+                        mEnableRssiPolling = (message.arg1 == 1);
+                    } else {
+                        mEnableRssiPolling = false;
+                    }
+                    mRssiPollToken++;
+                    if (mEnableRssiPolling) {
+                        // First poll
+                        fetchRssiLinkSpeedAndFrequencyNative();
+                        sendMessageDelayed(obtainMessage(CMD_RSSI_POLL,
+                                mRssiPollToken, 0), POLL_RSSI_INTERVAL_MSECS);
+                    }
+                    break;
+                case WifiManager.RSSI_PKTCNT_FETCH:
+                    RssiPacketCountInfo info = new RssiPacketCountInfo();
+                    fetchRssiLinkSpeedAndFrequencyNative();
+                    info.rssi = mWifiInfo.getRssi();
+                    fetchPktcntNative(info);
+                    replyToMessage(message, WifiManager.RSSI_PKTCNT_FETCH_SUCCEEDED, info);
+                    break;
+                case CMD_DELAYED_NETWORK_DISCONNECT:
+                    if (!linkDebouncing && mWifiConfigManager.mEnableLinkDebouncing) {
+
+                        // Ignore if we are not debouncing
+                        logd("CMD_DELAYED_NETWORK_DISCONNECT and not debouncing - ignore "
+                                + message.arg1);
+                        return HANDLED;
+                    } else {
+                        logd("CMD_DELAYED_NETWORK_DISCONNECT and debouncing - disconnect "
+                                + message.arg1);
+
+                        linkDebouncing = false;
+                        // If we are still debouncing while this message comes,
+                        // it means we were not able to reconnect within the alloted time
+                        // = LINK_FLAPPING_DEBOUNCE_MSEC
+                        // and thus, trigger a real disconnect
+                        handleNetworkDisconnect();
+                        transitionTo(mDisconnectedState);
+                    }
+                    break;
+                case CMD_ASSOCIATED_BSSID:
+                    if ((String) message.obj == null) {
+                        logw("Associated command w/o BSSID");
+                        break;
+                    }
+                    mLastBssid = (String) message.obj;
+                    if (mLastBssid != null && (mWifiInfo.getBSSID() == null
+                            || !mLastBssid.equals(mWifiInfo.getBSSID()))) {
+                        mWifiInfo.setBSSID((String) message.obj);
+                        sendNetworkStateChangeBroadcast(mLastBssid);
+                    }
+                    break;
+                case CMD_START_RSSI_MONITORING_OFFLOAD:
+                case CMD_RSSI_THRESHOLD_BREACH:
+                    byte currRssi = (byte) message.arg1;
+                    processRssiThreshold(currRssi, message.what);
+                    break;
+                case CMD_STOP_RSSI_MONITORING_OFFLOAD:
+                    stopRssiMonitoringOffload();
+                    break;
+                case CMD_RESET_SIM_NETWORKS:
+                    if (mLastNetworkId != WifiConfiguration.INVALID_NETWORK_ID) {
+                        WifiConfiguration config =
+                                mWifiConfigManager.getWifiConfiguration(mLastNetworkId);
+                        if (mWifiConfigManager.isSimConfig(config)) {
+                            mWifiNative.disconnect();
+                            transitionTo(mDisconnectingState);
+                        }
+                    }
+                    /* allow parent state to reset data for other networks */
+                    return NOT_HANDLED;
+                default:
+                    return NOT_HANDLED;
+            }
+
+            return HANDLED;

@@ -1,0 +1,119 @@
+class DownmixerBufferProvider
+!!!40879159.cpp!!!	DownmixerBufferProvider(in inputChannelMask : audio_channel_mask_t, in outputChannelMask : audio_channel_mask_t, in format : audio_format_t, in sampleRate : uint32_t, in sessionId : int32_t, in bufferFrameCount : size_t)
+    ALOGV("DownmixerBufferProvider(%p)(%#x, %#x, %#x %u %d)",
+            this, inputChannelMask, outputChannelMask, format,
+            sampleRate, sessionId);
+    if (!sIsMultichannelCapable
+            || EffectCreate(&sDwnmFxDesc.uuid,
+                    sessionId,
+                    SESSION_ID_INVALID_AND_IGNORED,
+                    &mDownmixHandle) != 0) {
+         ALOGE("DownmixerBufferProvider() error creating downmixer effect");
+         mDownmixHandle = NULL;
+         return;
+     }
+     // channel input configuration will be overridden per-track
+     mDownmixConfig.inputCfg.channels = inputChannelMask;   // FIXME: Should be bits
+     mDownmixConfig.outputCfg.channels = outputChannelMask; // FIXME: should be bits
+     mDownmixConfig.inputCfg.format = format;
+     mDownmixConfig.outputCfg.format = format;
+     mDownmixConfig.inputCfg.samplingRate = sampleRate;
+     mDownmixConfig.outputCfg.samplingRate = sampleRate;
+     mDownmixConfig.inputCfg.accessMode = EFFECT_BUFFER_ACCESS_READ;
+     mDownmixConfig.outputCfg.accessMode = EFFECT_BUFFER_ACCESS_WRITE;
+     // input and output buffer provider, and frame count will not be used as the downmix effect
+     // process() function is called directly (see DownmixerBufferProvider::getNextBuffer())
+     mDownmixConfig.inputCfg.mask = EFFECT_CONFIG_SMP_RATE | EFFECT_CONFIG_CHANNELS |
+             EFFECT_CONFIG_FORMAT | EFFECT_CONFIG_ACC_MODE;
+     mDownmixConfig.outputCfg.mask = mDownmixConfig.inputCfg.mask;
+
+     int cmdStatus;
+     uint32_t replySize = sizeof(int);
+
+     // Configure downmixer
+     status_t status = (*mDownmixHandle)->command(mDownmixHandle,
+             EFFECT_CMD_SET_CONFIG /*cmdCode*/, sizeof(effect_config_t) /*cmdSize*/,
+             &mDownmixConfig /*pCmdData*/,
+             &replySize, &cmdStatus /*pReplyData*/);
+     if (status != 0 || cmdStatus != 0) {
+         ALOGE("DownmixerBufferProvider() error %d cmdStatus %d while configuring downmixer",
+                 status, cmdStatus);
+         EffectRelease(mDownmixHandle);
+         mDownmixHandle = NULL;
+         return;
+     }
+
+     // Enable downmixer
+     replySize = sizeof(int);
+     status = (*mDownmixHandle)->command(mDownmixHandle,
+             EFFECT_CMD_ENABLE /*cmdCode*/, 0 /*cmdSize*/, NULL /*pCmdData*/,
+             &replySize, &cmdStatus /*pReplyData*/);
+     if (status != 0 || cmdStatus != 0) {
+         ALOGE("DownmixerBufferProvider() error %d cmdStatus %d while enabling downmixer",
+                 status, cmdStatus);
+         EffectRelease(mDownmixHandle);
+         mDownmixHandle = NULL;
+         return;
+     }
+
+     // Set downmix type
+     // parameter size rounded for padding on 32bit boundary
+     const int psizePadded = ((sizeof(downmix_params_t) - 1)/sizeof(int) + 1) * sizeof(int);
+     const int downmixParamSize =
+             sizeof(effect_param_t) + psizePadded + sizeof(downmix_type_t);
+     effect_param_t * const param = (effect_param_t *) malloc(downmixParamSize);
+     param->psize = sizeof(downmix_params_t);
+     const downmix_params_t downmixParam = DOWNMIX_PARAM_TYPE;
+     memcpy(param->data, &downmixParam, param->psize);
+     const downmix_type_t downmixType = DOWNMIX_TYPE_FOLD;
+     param->vsize = sizeof(downmix_type_t);
+     memcpy(param->data + psizePadded, &downmixType, param->vsize);
+     replySize = sizeof(int);
+     status = (*mDownmixHandle)->command(mDownmixHandle,
+             EFFECT_CMD_SET_PARAM /* cmdCode */, downmixParamSize /* cmdSize */,
+             param /*pCmdData*/, &replySize, &cmdStatus /*pReplyData*/);
+     free(param);
+     if (status != 0 || cmdStatus != 0) {
+         ALOGE("DownmixerBufferProvider() error %d cmdStatus %d while setting downmix type",
+                 status, cmdStatus);
+         EffectRelease(mDownmixHandle);
+         mDownmixHandle = NULL;
+         return;
+     }
+     ALOGV("DownmixerBufferProvider() downmix type set to %d", (int) downmixType);
+!!!40879287.cpp!!!	~DownmixerBufferProvider()
+    ALOGV("~DownmixerBufferProvider (%p)", this);
+    EffectRelease(mDownmixHandle);
+    mDownmixHandle = NULL;
+!!!40879415.cpp!!!	copyFrames(inout dst : void, in src : void, in frames : size_t) : void
+    mDownmixConfig.inputCfg.buffer.frameCount = frames;
+    mDownmixConfig.inputCfg.buffer.raw = const_cast<void *>(src);
+    mDownmixConfig.outputCfg.buffer.frameCount = frames;
+    mDownmixConfig.outputCfg.buffer.raw = dst;
+    // may be in-place if src == dst.
+    status_t res = (*mDownmixHandle)->process(mDownmixHandle,
+            &mDownmixConfig.inputCfg.buffer, &mDownmixConfig.outputCfg.buffer);
+    ALOGE_IF(res != OK, "DownmixBufferProvider error %d", res);
+!!!40879671.cpp!!!	init() : status_t
+    // find multichannel downmix effect if we have to play multichannel content
+    uint32_t numEffects = 0;
+    int ret = EffectQueryNumberEffects(&numEffects);
+    if (ret != 0) {
+        ALOGE("AudioMixer() error %d querying number of effects", ret);
+        return NO_INIT;
+    }
+    ALOGV("EffectQueryNumberEffects() numEffects=%d", numEffects);
+
+    for (uint32_t i = 0 ; i < numEffects ; i++) {
+        if (EffectQueryEffect(i, &sDwnmFxDesc) == 0) {
+            ALOGV("effect %d is called %s", i, sDwnmFxDesc.name);
+            if (memcmp(&sDwnmFxDesc.type, EFFECT_UIID_DOWNMIX, sizeof(effect_uuid_t)) == 0) {
+                ALOGI("found effect \"%s\" from %s",
+                        sDwnmFxDesc.name, sDwnmFxDesc.implementor);
+                sIsMultichannelCapable = true;
+                break;
+            }
+        }
+    }
+    ALOGW_IF(!sIsMultichannelCapable, "unable to find downmix effect");
+    return NO_INIT;

@@ -1,0 +1,345 @@
+class SinkActivity
+!!!34685623.java!!!	onCreate(inout savedInstanceState : Bundle) : void
+        super.onCreate(savedInstanceState);
+
+        mUsbManager = (UsbManager)getSystemService(Context.USB_SERVICE);
+
+        setContentView(R.layout.sink_activity);
+
+        mLogTextView = (TextView) findViewById(R.id.logTextView);
+        mLogTextView.setMovementMethod(ScrollingMovementMethod.getInstance());
+        mLogger = new TextLogger();
+
+        mFpsTextView = (TextView) findViewById(R.id.fpsTextView);
+
+        mSurfaceView = (SurfaceView) findViewById(R.id.surfaceView);
+        mSurfaceView.setOnTouchListener(new View.OnTouchListener() {
+            @Override
+            public boolean onTouch(View v, MotionEvent event) {
+                sendHidTouch(event);
+                return true;
+            }
+        });
+
+        mLogger.log("Waiting for accessory display source to be attached to USB...");
+
+        IntentFilter filter = new IntentFilter();
+        filter.addAction(UsbManager.ACTION_USB_DEVICE_ATTACHED);
+        filter.addAction(UsbManager.ACTION_USB_DEVICE_DETACHED);
+        filter.addAction(ACTION_USB_DEVICE_PERMISSION);
+        mReceiver = new DeviceReceiver();
+        registerReceiver(mReceiver, filter);
+
+        Intent intent = getIntent();
+        if (intent.getAction().equals(UsbManager.ACTION_USB_DEVICE_ATTACHED)) {
+            UsbDevice device = intent.<UsbDevice>getParcelableExtra(UsbManager.EXTRA_DEVICE);
+            if (device != null) {
+                onDeviceAttached(device);
+            }
+        } else {
+            Map<String, UsbDevice> devices = mUsbManager.getDeviceList();
+            if (devices != null) {
+                for (UsbDevice device : devices.values()) {
+                    onDeviceAttached(device);
+                }
+            }
+        }
+!!!34685751.java!!!	onDestroy() : void
+        super.onDestroy();
+
+        unregisterReceiver(mReceiver);
+!!!34685879.java!!!	onDeviceAttached(inout device : UsbDevice) : void
+        mLogger.log("USB device attached: " + device);
+        if (!mConnected) {
+            connect(device);
+        }
+!!!34686007.java!!!	onDeviceDetached(inout device : UsbDevice) : void
+        mLogger.log("USB device detached: " + device);
+        if (mConnected && device.equals(mDevice)) {
+            disconnect();
+        }
+!!!34686135.java!!!	connect(inout device : UsbDevice) : void
+        if (mConnected) {
+            disconnect();
+        }
+
+        // Check whether we have permission to access the device.
+        if (!mUsbManager.hasPermission(device)) {
+            mLogger.log("Prompting the user for access to the device.");
+            Intent intent = new Intent(ACTION_USB_DEVICE_PERMISSION);
+            intent.setPackage(getPackageName());
+            PendingIntent pendingIntent = PendingIntent.getBroadcast(
+                    this, 0, intent, PendingIntent.FLAG_ONE_SHOT);
+            mUsbManager.requestPermission(device, pendingIntent);
+            return;
+        }
+
+        // Claim the device.
+        UsbDeviceConnection conn = mUsbManager.openDevice(device);
+        if (conn == null) {
+            mLogger.logError("Could not obtain device connection.");
+            return;
+        }
+        UsbInterface iface = device.getInterface(0);
+        UsbEndpoint controlEndpoint = iface.getEndpoint(0);
+        if (!conn.claimInterface(iface, true)) {
+            mLogger.logError("Could not claim interface.");
+            return;
+        }
+        try {
+            // If already in accessory mode, then connect to the device.
+            if (isAccessory(device)) {
+                mLogger.log("Connecting to accessory...");
+
+                int protocolVersion = getProtocol(conn);
+                if (protocolVersion < 1) {
+                    mLogger.logError("Device does not support accessory protocol.");
+                    return;
+                }
+                mLogger.log("Protocol version: " + protocolVersion);
+
+                // Setup bulk endpoints.
+                UsbEndpoint bulkIn = null;
+                UsbEndpoint bulkOut = null;
+                for (int i = 0; i < iface.getEndpointCount(); i++) {
+                    UsbEndpoint ep = iface.getEndpoint(i);
+                    if (ep.getDirection() == UsbConstants.USB_DIR_IN) {
+                        if (bulkIn == null) {
+                            mLogger.log(String.format("Bulk IN endpoint: %d", i));
+                            bulkIn = ep;
+                        }
+                    } else {
+                        if (bulkOut == null) {
+                            mLogger.log(String.format("Bulk OUT endpoint: %d", i));
+                            bulkOut = ep;
+                        }
+                    }
+                }
+                if (bulkIn == null || bulkOut == null) {
+                    mLogger.logError("Unable to find bulk endpoints");
+                    return;
+                }
+
+                mLogger.log("Connected");
+                mConnected = true;
+                mDevice = device;
+                mProtocolVersion = protocolVersion;
+                mAccessoryInterface = iface;
+                mAccessoryConnection = conn;
+                mControlEndpoint = controlEndpoint;
+                mTransport = new UsbAccessoryBulkTransport(mLogger, conn, bulkIn, bulkOut);
+                if (mProtocolVersion >= 2) {
+                    registerHid();
+                }
+                startServices();
+                mTransport.startReading();
+                return;
+            }
+
+            // Do accessory negotiation.
+            mLogger.log("Attempting to switch device to accessory mode...");
+
+            // Send get protocol.
+            int protocolVersion = getProtocol(conn);
+            if (protocolVersion < 1) {
+                mLogger.logError("Device does not support accessory protocol.");
+                return;
+            }
+            mLogger.log("Protocol version: " + protocolVersion);
+
+            // Send identifying strings.
+            sendString(conn, UsbAccessoryConstants.ACCESSORY_STRING_MANUFACTURER, MANUFACTURER);
+            sendString(conn, UsbAccessoryConstants.ACCESSORY_STRING_MODEL, MODEL);
+            sendString(conn, UsbAccessoryConstants.ACCESSORY_STRING_DESCRIPTION, DESCRIPTION);
+            sendString(conn, UsbAccessoryConstants.ACCESSORY_STRING_VERSION, VERSION);
+            sendString(conn, UsbAccessoryConstants.ACCESSORY_STRING_URI, URI);
+            sendString(conn, UsbAccessoryConstants.ACCESSORY_STRING_SERIAL, SERIAL);
+
+            // Send start.
+            // The device should re-enumerate as an accessory.
+            mLogger.log("Sending accessory start request.");
+            int len = conn.controlTransfer(UsbConstants.USB_DIR_OUT | UsbConstants.USB_TYPE_VENDOR,
+                    UsbAccessoryConstants.ACCESSORY_START, 0, 0, null, 0, 10000);
+            if (len != 0) {
+                mLogger.logError("Device refused to switch to accessory mode.");
+            } else {
+                mLogger.log("Waiting for device to re-enumerate...");
+            }
+        } finally {
+            if (!mConnected) {
+                conn.releaseInterface(iface);
+            }
+        }
+!!!34686263.java!!!	disconnect() : void
+        mLogger.log("Disconnecting from device: " + mDevice);
+        stopServices();
+        unregisterHid();
+
+        mLogger.log("Disconnected.");
+        mConnected = false;
+        mDevice = null;
+        mAccessoryConnection = null;
+        mAccessoryInterface = null;
+        mControlEndpoint = null;
+        if (mTransport != null) {
+            mTransport.close();
+            mTransport = null;
+        }
+!!!34686391.java!!!	registerHid() : void
+        mLogger.log("Registering HID multitouch device.");
+
+        mMultitouch = new UsbHid.Multitouch(MULTITOUCH_REPORT_ID, MULTITOUCH_MAX_CONTACTS,
+                mSurfaceView.getWidth(), mSurfaceView.getHeight());
+
+        mHidBuffer.clear();
+        mMultitouch.generateDescriptor(mHidBuffer);
+        mHidBuffer.flip();
+
+        mLogger.log("HID descriptor size: " + mHidBuffer.limit());
+        mLogger.log("HID report size: " + mMultitouch.getReportSize());
+
+        final int maxPacketSize = mControlEndpoint.getMaxPacketSize();
+        mLogger.log("Control endpoint max packet size: " + maxPacketSize);
+        if (mMultitouch.getReportSize() > maxPacketSize) {
+            mLogger.logError("HID report is too big for this accessory.");
+            return;
+        }
+
+        int len = mAccessoryConnection.controlTransfer(
+                UsbConstants.USB_DIR_OUT | UsbConstants.USB_TYPE_VENDOR,
+                UsbAccessoryConstants.ACCESSORY_REGISTER_HID,
+                MULTITOUCH_DEVICE_ID, mHidBuffer.limit(), null, 0, 10000);
+        if (len != 0) {
+            mLogger.logError("Device rejected ACCESSORY_REGISTER_HID request.");
+            return;
+        }
+
+        while (mHidBuffer.hasRemaining()) {
+            int position = mHidBuffer.position();
+            int count = Math.min(mHidBuffer.remaining(), maxPacketSize);
+            len = mAccessoryConnection.controlTransfer(
+                    UsbConstants.USB_DIR_OUT | UsbConstants.USB_TYPE_VENDOR,
+                    UsbAccessoryConstants.ACCESSORY_SET_HID_REPORT_DESC,
+                    MULTITOUCH_DEVICE_ID, 0,
+                    mHidBuffer.array(), position, count, 10000);
+            if (len != count) {
+                mLogger.logError("Device rejected ACCESSORY_SET_HID_REPORT_DESC request.");
+                return;
+            }
+            mHidBuffer.position(position + count);
+        }
+
+        mLogger.log("HID device registered.");
+
+        mMultitouchEnabled = true;
+        if (mMultitouchContacts == null) {
+            mMultitouchContacts = new UsbHid.Multitouch.Contact[MULTITOUCH_MAX_CONTACTS];
+            for (int i = 0; i < MULTITOUCH_MAX_CONTACTS; i++) {
+                mMultitouchContacts[i] = new UsbHid.Multitouch.Contact();
+            }
+        }
+!!!34686519.java!!!	unregisterHid() : void
+        mMultitouch = null;
+        mMultitouchContacts = null;
+        mMultitouchEnabled = false;
+!!!34686647.java!!!	sendHidTouch(inout event : MotionEvent) : void
+        if (mMultitouchEnabled) {
+            mLogger.log("Sending touch event: " + event);
+
+            switch (event.getActionMasked()) {
+                case MotionEvent.ACTION_DOWN:
+                case MotionEvent.ACTION_MOVE: {
+                    final int pointerCount =
+                            Math.min(MULTITOUCH_MAX_CONTACTS, event.getPointerCount());
+                    final int historySize = event.getHistorySize();
+                    for (int p = 0; p < pointerCount; p++) {
+                        mMultitouchContacts[p].id = event.getPointerId(p);
+                    }
+                    for (int h = 0; h < historySize; h++) {
+                        for (int p = 0; p < pointerCount; p++) {
+                            mMultitouchContacts[p].x = (int)event.getHistoricalX(p, h);
+                            mMultitouchContacts[p].y = (int)event.getHistoricalY(p, h);
+                        }
+                        sendHidTouchReport(pointerCount);
+                    }
+                    for (int p = 0; p < pointerCount; p++) {
+                        mMultitouchContacts[p].x = (int)event.getX(p);
+                        mMultitouchContacts[p].y = (int)event.getY(p);
+                    }
+                    sendHidTouchReport(pointerCount);
+                    break;
+                }
+
+                case MotionEvent.ACTION_CANCEL:
+                case MotionEvent.ACTION_UP:
+                    sendHidTouchReport(0);
+                    break;
+            }
+        }
+!!!34686775.java!!!	sendHidTouchReport(in contactCount : int) : void
+        mHidBuffer.clear();
+        mMultitouch.generateReport(mHidBuffer, mMultitouchContacts, contactCount);
+        mHidBuffer.flip();
+
+        int count = mHidBuffer.limit();
+        int len = mAccessoryConnection.controlTransfer(
+                UsbConstants.USB_DIR_OUT | UsbConstants.USB_TYPE_VENDOR,
+                UsbAccessoryConstants.ACCESSORY_SEND_HID_EVENT,
+                MULTITOUCH_DEVICE_ID, 0,
+                mHidBuffer.array(), 0, count, 10000);
+        if (len != count) {
+            mLogger.logError("Device rejected ACCESSORY_SEND_HID_EVENT request.");
+            return;
+        }
+!!!34686903.java!!!	startServices() : void
+        mDisplaySinkService = new DisplaySinkService(this, mTransport,
+                getResources().getConfiguration().densityDpi);
+        mDisplaySinkService.start();
+
+        if (mAttached) {
+            mDisplaySinkService.setSurfaceView(mSurfaceView);
+        }
+!!!34687031.java!!!	stopServices() : void
+        if (mDisplaySinkService != null) {
+            mDisplaySinkService.stop();
+            mDisplaySinkService = null;
+        }
+!!!34687159.java!!!	onAttachedToWindow() : void
+        super.onAttachedToWindow();
+
+        mAttached = true;
+        if (mDisplaySinkService != null) {
+            mDisplaySinkService.setSurfaceView(mSurfaceView);
+        }
+!!!34687287.java!!!	onDetachedFromWindow() : void
+        super.onDetachedFromWindow();
+
+        mAttached = false;
+        if (mDisplaySinkService != null) {
+            mDisplaySinkService.setSurfaceView(null);
+        }
+!!!34687415.java!!!	getProtocol(inout conn : UsbDeviceConnection) : int
+        byte buffer[] = new byte[2];
+        int len = conn.controlTransfer(
+                UsbConstants.USB_DIR_IN | UsbConstants.USB_TYPE_VENDOR,
+                UsbAccessoryConstants.ACCESSORY_GET_PROTOCOL, 0, 0, buffer, 2, 10000);
+        if (len != 2) {
+            return -1;
+        }
+        return (buffer[1] << 8) | buffer[0];
+!!!34687543.java!!!	sendString(inout conn : UsbDeviceConnection, in index : int, inout string : String) : void
+        byte[] buffer = (string + "\0").getBytes();
+        int len = conn.controlTransfer(UsbConstants.USB_DIR_OUT | UsbConstants.USB_TYPE_VENDOR,
+                UsbAccessoryConstants.ACCESSORY_SEND_STRING, 0, index,
+                buffer, buffer.length, 10000);
+        if (len != buffer.length) {
+            mLogger.logError("Failed to send string " + index + ": \"" + string + "\"");
+        } else {
+            mLogger.log("Sent string " + index + ": \"" + string + "\"");
+        }
+!!!34687671.java!!!	isAccessory(inout device : UsbDevice) : boolean
+        final int vid = device.getVendorId();
+        final int pid = device.getProductId();
+        return vid == UsbAccessoryConstants.USB_ACCESSORY_VENDOR_ID
+                && (pid == UsbAccessoryConstants.USB_ACCESSORY_PRODUCT_ID
+                        || pid == UsbAccessoryConstants.USB_ACCESSORY_ADB_PRODUCT_ID);

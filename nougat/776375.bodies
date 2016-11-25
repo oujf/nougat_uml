@@ -1,0 +1,127 @@
+class KernelWakelockReader
+!!!6119991.java!!!	readKernelWakelockStats(inout staleStats : KernelWakelockStats) : KernelWakelockStats
+        byte[] buffer = new byte[32*1024];
+        int len;
+        boolean wakeup_sources;
+
+        try {
+            FileInputStream is;
+            try {
+                is = new FileInputStream(sWakelockFile);
+                wakeup_sources = false;
+            } catch (java.io.FileNotFoundException e) {
+                try {
+                    is = new FileInputStream(sWakeupSourceFile);
+                    wakeup_sources = true;
+                } catch (java.io.FileNotFoundException e2) {
+                    Slog.wtf(TAG, "neither " + sWakelockFile + " nor " +
+                            sWakeupSourceFile + " exists");
+                    return null;
+                }
+            }
+
+            len = is.read(buffer);
+            is.close();
+        } catch (java.io.IOException e) {
+            Slog.wtf(TAG, "failed to read kernel wakelocks", e);
+            return null;
+        }
+
+        if (len > 0) {
+            if (len >= buffer.length) {
+                Slog.wtf(TAG, "Kernel wake locks exceeded buffer size " + buffer.length);
+            }
+            int i;
+            for (i=0; i<len; i++) {
+                if (buffer[i] == '\0') {
+                    len = i;
+                    break;
+                }
+            }
+        }
+        return parseProcWakelocks(buffer, len, wakeup_sources, staleStats);
+!!!6120119.java!!!	parseProcWakelocks(inout wlBuffer : byte, in len : int, inout wakeup_sources : boolean, in staleStats : KernelWakelockStats) : KernelWakelockStats
+        String name;
+        int count;
+        long totalTime;
+        int startIndex;
+        int endIndex;
+
+        // Advance past the first line.
+        int i;
+        for (i = 0; i < len && wlBuffer[i] != '\n' && wlBuffer[i] != '\0'; i++);
+        startIndex = endIndex = i + 1;
+
+        synchronized(this) {
+            sKernelWakelockUpdateVersion++;
+            while (endIndex < len) {
+                for (endIndex=startIndex;
+                        endIndex < len && wlBuffer[endIndex] != '\n' && wlBuffer[endIndex] != '\0';
+                        endIndex++);
+                // Don't go over the end of the buffer, Process.parseProcLine might
+                // write to wlBuffer[endIndex]
+                if (endIndex > (len - 1) ) {
+                    break;
+                }
+
+                String[] nameStringArray = mProcWakelocksName;
+                long[] wlData = mProcWakelocksData;
+                // Stomp out any bad characters since this is from a circular buffer
+                // A corruption is seen sometimes that results in the vm crashing
+                // This should prevent crashes and the line will probably fail to parse
+                for (int j = startIndex; j < endIndex; j++) {
+                    if ((wlBuffer[j] & 0x80) != 0) wlBuffer[j] = (byte) '?';
+                }
+                boolean parsed = Process.parseProcLine(wlBuffer, startIndex, endIndex,
+                        wakeup_sources ? WAKEUP_SOURCES_FORMAT :
+                                         PROC_WAKELOCKS_FORMAT,
+                        nameStringArray, wlData, null);
+
+                name = nameStringArray[0];
+                count = (int) wlData[1];
+
+                if (wakeup_sources) {
+                        // convert milliseconds to microseconds
+                        totalTime = wlData[2] * 1000;
+                } else {
+                        // convert nanoseconds to microseconds with rounding.
+                        totalTime = (wlData[2] + 500) / 1000;
+                }
+
+                if (parsed && name.length() > 0) {
+                    if (!staleStats.containsKey(name)) {
+                        staleStats.put(name, new KernelWakelockStats.Entry(count, totalTime,
+                                sKernelWakelockUpdateVersion));
+                    } else {
+                        KernelWakelockStats.Entry kwlStats = staleStats.get(name);
+                        if (kwlStats.mVersion == sKernelWakelockUpdateVersion) {
+                            kwlStats.mCount += count;
+                            kwlStats.mTotalTime += totalTime;
+                        } else {
+                            kwlStats.mCount = count;
+                            kwlStats.mTotalTime = totalTime;
+                            kwlStats.mVersion = sKernelWakelockUpdateVersion;
+                        }
+                    }
+                } else if (!parsed) {
+                    try {
+                        Slog.wtf(TAG, "Failed to parse proc line: " +
+                                new String(wlBuffer, startIndex, endIndex - startIndex));
+                    } catch (Exception e) {
+                        Slog.wtf(TAG, "Failed to parse proc line!");
+                    }
+                }
+                startIndex = endIndex + 1;
+            }
+
+            // Don't report old data.
+            Iterator<KernelWakelockStats.Entry> itr = staleStats.values().iterator();
+            while (itr.hasNext()) {
+                if (itr.next().mVersion != sKernelWakelockUpdateVersion) {
+                    itr.remove();
+                }
+            }
+
+            staleStats.kernelWakelockVersion = sKernelWakelockUpdateVersion;
+            return staleStats;
+        }

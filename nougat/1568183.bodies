@@ -1,0 +1,124 @@
+class RemoteDisplayProviderWatcher
+!!!33031223.java!!!	RemoteDisplayProviderWatcher(inout context : Context, inout callback : RemoteDisplayProviderWatcher::Callback, inout handler : Handler, in userId : int)
+        mContext = context;
+        mCallback = callback;
+        mHandler = handler;
+        mUserId = userId;
+        mPackageManager = context.getPackageManager();
+!!!33031351.java!!!	dump(inout pw : PrintWriter, inout prefix : String) : void
+        pw.println(prefix + "Watcher");
+        pw.println(prefix + "  mUserId=" + mUserId);
+        pw.println(prefix + "  mRunning=" + mRunning);
+        pw.println(prefix + "  mProviders.size()=" + mProviders.size());
+!!!33031479.java!!!	start() : void
+        if (!mRunning) {
+            mRunning = true;
+
+            IntentFilter filter = new IntentFilter();
+            filter.addAction(Intent.ACTION_PACKAGE_ADDED);
+            filter.addAction(Intent.ACTION_PACKAGE_REMOVED);
+            filter.addAction(Intent.ACTION_PACKAGE_CHANGED);
+            filter.addAction(Intent.ACTION_PACKAGE_REPLACED);
+            filter.addAction(Intent.ACTION_PACKAGE_RESTARTED);
+            filter.addDataScheme("package");
+            mContext.registerReceiverAsUser(mScanPackagesReceiver,
+                    new UserHandle(mUserId), filter, null, mHandler);
+
+            // Scan packages.
+            // Also has the side-effect of restarting providers if needed.
+            mHandler.post(mScanPackagesRunnable);
+        }
+!!!33031607.java!!!	stop() : void
+        if (mRunning) {
+            mRunning = false;
+
+            mContext.unregisterReceiver(mScanPackagesReceiver);
+            mHandler.removeCallbacks(mScanPackagesRunnable);
+
+            // Stop all providers.
+            for (int i = mProviders.size() - 1; i >= 0; i--) {
+                mProviders.get(i).stop();
+            }
+        }
+!!!33031735.java!!!	scanPackages() : void
+        if (!mRunning) {
+            return;
+        }
+
+        // Add providers for all new services.
+        // Reorder the list so that providers left at the end will be the ones to remove.
+        int targetIndex = 0;
+        Intent intent = new Intent(RemoteDisplayState.SERVICE_INTERFACE);
+        for (ResolveInfo resolveInfo : mPackageManager.queryIntentServicesAsUser(
+                intent, 0, mUserId)) {
+            ServiceInfo serviceInfo = resolveInfo.serviceInfo;
+            if (serviceInfo != null && verifyServiceTrusted(serviceInfo)) {
+                int sourceIndex = findProvider(serviceInfo.packageName, serviceInfo.name);
+                if (sourceIndex < 0) {
+                    RemoteDisplayProviderProxy provider =
+                            new RemoteDisplayProviderProxy(mContext,
+                            new ComponentName(serviceInfo.packageName, serviceInfo.name),
+                            mUserId);
+                    provider.start();
+                    mProviders.add(targetIndex++, provider);
+                    mCallback.addProvider(provider);
+                } else if (sourceIndex >= targetIndex) {
+                    RemoteDisplayProviderProxy provider = mProviders.get(sourceIndex);
+                    provider.start(); // restart the provider if needed
+                    provider.rebindIfDisconnected();
+                    Collections.swap(mProviders, sourceIndex, targetIndex++);
+                }
+            }
+        }
+
+        // Remove providers for missing services.
+        if (targetIndex < mProviders.size()) {
+            for (int i = mProviders.size() - 1; i >= targetIndex; i--) {
+                RemoteDisplayProviderProxy provider = mProviders.get(i);
+                mCallback.removeProvider(provider);
+                mProviders.remove(provider);
+                provider.stop();
+            }
+        }
+!!!33031863.java!!!	verifyServiceTrusted(inout serviceInfo : ServiceInfo) : boolean
+        if (serviceInfo.permission == null || !serviceInfo.permission.equals(
+                Manifest.permission.BIND_REMOTE_DISPLAY)) {
+            // If the service does not require this permission then any app could
+            // potentially bind to it and cause the remote display service to
+            // misbehave.  So we only want to trust providers that require the
+            // correct permissions.
+            Slog.w(TAG, "Ignoring remote display provider service because it did not "
+                    + "require the BIND_REMOTE_DISPLAY permission in its manifest: "
+                    + serviceInfo.packageName + "/" + serviceInfo.name);
+            return false;
+        }
+        if (!hasCaptureVideoPermission(serviceInfo.packageName)) {
+            // If the service does not have permission to capture video then it
+            // isn't going to be terribly useful as a remote display, is it?
+            // Kind of makes you wonder what it's doing there in the first place.
+            Slog.w(TAG, "Ignoring remote display provider service because it does not "
+                    + "have the CAPTURE_VIDEO_OUTPUT or CAPTURE_SECURE_VIDEO_OUTPUT "
+                    + "permission: " + serviceInfo.packageName + "/" + serviceInfo.name);
+            return false;
+        }
+        // Looks good.
+        return true;
+!!!33031991.java!!!	hasCaptureVideoPermission(inout packageName : String) : boolean
+        if (mPackageManager.checkPermission(Manifest.permission.CAPTURE_VIDEO_OUTPUT,
+                packageName) == PackageManager.PERMISSION_GRANTED) {
+            return true;
+        }
+        if (mPackageManager.checkPermission(Manifest.permission.CAPTURE_SECURE_VIDEO_OUTPUT,
+                packageName) == PackageManager.PERMISSION_GRANTED) {
+            return true;
+        }
+        return false;
+!!!33032119.java!!!	findProvider(inout packageName : String, inout className : String) : int
+        int count = mProviders.size();
+        for (int i = 0; i < count; i++) {
+            RemoteDisplayProviderProxy provider = mProviders.get(i);
+            if (provider.hasComponentName(packageName, className)) {
+                return i;
+            }
+        }
+        return -1;

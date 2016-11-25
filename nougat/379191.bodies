@@ -1,0 +1,490 @@
+class MediaRouter
+!!!2166583.java!!!	typesToString(in types : int) : String
+        final StringBuilder result = new StringBuilder();
+        if ((types & ROUTE_TYPE_LIVE_AUDIO) != 0) {
+            result.append("ROUTE_TYPE_LIVE_AUDIO ");
+        }
+        if ((types & ROUTE_TYPE_LIVE_VIDEO) != 0) {
+            result.append("ROUTE_TYPE_LIVE_VIDEO ");
+        }
+        if ((types & ROUTE_TYPE_REMOTE_DISPLAY) != 0) {
+            result.append("ROUTE_TYPE_REMOTE_DISPLAY ");
+        }
+        if ((types & ROUTE_TYPE_USER) != 0) {
+            result.append("ROUTE_TYPE_USER ");
+        }
+        return result.toString();
+!!!2166711.java!!!	MediaRouter(inout context : Context)
+        synchronized (Static.class) {
+            if (sStatic == null) {
+                final Context appContext = context.getApplicationContext();
+                sStatic = new Static(appContext);
+                sStatic.startMonitoringRoutes(appContext);
+            }
+        }
+!!!2166839.java!!!	getDefaultRoute() : MediaRouter::RouteInfo
+        return sStatic.mDefaultAudioVideo;
+!!!2166967.java!!!	getSystemCategory() : MediaRouter::RouteCategory
+        return sStatic.mSystemCategory;
+!!!2167095.java!!!	getSelectedRoute() : MediaRouter::RouteInfo
+        return getSelectedRoute(ROUTE_TYPE_ANY);
+!!!2167223.java!!!	getSelectedRoute(in type : int) : MediaRouter::RouteInfo
+        if (sStatic.mSelectedRoute != null &&
+                (sStatic.mSelectedRoute.mSupportedTypes & type) != 0) {
+            // If the selected route supports any of the types supplied, it's still considered
+            // 'selected' for that type.
+            return sStatic.mSelectedRoute;
+        } else if (type == ROUTE_TYPE_USER) {
+            // The caller specifically asked for a user route and the currently selected route
+            // doesn't qualify.
+            return null;
+        }
+        // If the above didn't match and we're not specifically asking for a user route,
+        // consider the default selected.
+        return sStatic.mDefaultAudioVideo;
+!!!2167351.java!!!	isRouteAvailable(in types : int, in flags : int) : boolean
+        final int count = sStatic.mRoutes.size();
+        for (int i = 0; i < count; i++) {
+            RouteInfo route = sStatic.mRoutes.get(i);
+            if (route.matchesTypes(types)) {
+                if ((flags & AVAILABILITY_FLAG_IGNORE_DEFAULT_ROUTE) == 0
+                        || route != sStatic.mDefaultAudioVideo) {
+                    return true;
+                }
+            }
+        }
+
+        // It doesn't look like we can find a matching route right now.
+        return false;
+!!!2167479.java!!!	addCallback(in types : int, inout cb : MediaRouter::Callback) : void
+        addCallback(types, cb, 0);
+!!!2167607.java!!!	addCallback(in types : int, inout cb : MediaRouter::Callback, in flags : int) : void
+        CallbackInfo info;
+        int index = findCallbackInfo(cb);
+        if (index >= 0) {
+            info = sStatic.mCallbacks.get(index);
+            info.type |= types;
+            info.flags |= flags;
+        } else {
+            info = new CallbackInfo(cb, types, flags, this);
+            sStatic.mCallbacks.add(info);
+        }
+        sStatic.updateDiscoveryRequest();
+!!!2167735.java!!!	removeCallback(inout cb : MediaRouter::Callback) : void
+        int index = findCallbackInfo(cb);
+        if (index >= 0) {
+            sStatic.mCallbacks.remove(index);
+            sStatic.updateDiscoveryRequest();
+        } else {
+            Log.w(TAG, "removeCallback(" + cb + "): callback not registered");
+        }
+!!!2167863.java!!!	findCallbackInfo(inout cb : MediaRouter::Callback) : int
+        final int count = sStatic.mCallbacks.size();
+        for (int i = 0; i < count; i++) {
+            final CallbackInfo info = sStatic.mCallbacks.get(i);
+            if (info.cb == cb) {
+                return i;
+            }
+        }
+        return -1;
+!!!2167991.java!!!	selectRoute(in types : int, inout route : MediaRouter::RouteInfo) : void
+        if (route == null) {
+            throw new IllegalArgumentException("Route cannot be null.");
+        }
+        selectRouteStatic(types, route, true);
+!!!2168119.java!!!	selectRouteInt(in types : int, inout route : MediaRouter::RouteInfo, inout explicit : boolean) : void
+        selectRouteStatic(types, route, explicit);
+!!!2168247.java!!!	selectRouteStatic(in types : int, inout route : MediaRouter::RouteInfo, inout explicit : boolean) : void
+        Log.v(TAG, "Selecting route: " + route);
+        assert(route != null);
+        final RouteInfo oldRoute = sStatic.mSelectedRoute;
+        if (oldRoute == route) return;
+        if (!route.matchesTypes(types)) {
+            Log.w(TAG, "selectRoute ignored; cannot select route with supported types " +
+                    typesToString(route.getSupportedTypes()) + " into route types " +
+                    typesToString(types));
+            return;
+        }
+
+        final RouteInfo btRoute = sStatic.mBluetoothA2dpRoute;
+        if (btRoute != null && (types & ROUTE_TYPE_LIVE_AUDIO) != 0 &&
+                (route == btRoute || route == sStatic.mDefaultAudioVideo)) {
+            try {
+                sStatic.mAudioService.setBluetoothA2dpOn(route == btRoute);
+            } catch (RemoteException e) {
+                Log.e(TAG, "Error changing Bluetooth A2DP state", e);
+            }
+        }
+
+        final WifiDisplay activeDisplay =
+                sStatic.mDisplayService.getWifiDisplayStatus().getActiveDisplay();
+        final boolean oldRouteHasAddress = oldRoute != null && oldRoute.mDeviceAddress != null;
+        final boolean newRouteHasAddress = route.mDeviceAddress != null;
+        if (activeDisplay != null || oldRouteHasAddress || newRouteHasAddress) {
+            if (newRouteHasAddress && !matchesDeviceAddress(activeDisplay, route)) {
+                if (sStatic.mCanConfigureWifiDisplays) {
+                    sStatic.mDisplayService.connectWifiDisplay(route.mDeviceAddress);
+                } else {
+                    Log.e(TAG, "Cannot connect to wifi displays because this process "
+                            + "is not allowed to do so.");
+                }
+            } else if (activeDisplay != null && !newRouteHasAddress) {
+                sStatic.mDisplayService.disconnectWifiDisplay();
+            }
+        }
+
+        sStatic.setSelectedRoute(route, explicit);
+
+        if (oldRoute != null) {
+            dispatchRouteUnselected(types & oldRoute.getSupportedTypes(), oldRoute);
+            if (oldRoute.resolveStatusCode()) {
+                dispatchRouteChanged(oldRoute);
+            }
+        }
+        if (route != null) {
+            if (route.resolveStatusCode()) {
+                dispatchRouteChanged(route);
+            }
+            dispatchRouteSelected(types & route.getSupportedTypes(), route);
+        }
+
+        // The behavior of active scans may depend on the currently selected route.
+        sStatic.updateDiscoveryRequest();
+!!!2168375.java!!!	selectDefaultRouteStatic() : void
+        // TODO: Be smarter about the route types here; this selects for all valid.
+        if (sStatic.mSelectedRoute != sStatic.mBluetoothA2dpRoute
+                && sStatic.mBluetoothA2dpRoute != null && sStatic.isBluetoothA2dpOn()) {
+            selectRouteStatic(ROUTE_TYPE_ANY, sStatic.mBluetoothA2dpRoute, false);
+        } else {
+            selectRouteStatic(ROUTE_TYPE_ANY, sStatic.mDefaultAudioVideo, false);
+        }
+!!!2168503.java!!!	matchesDeviceAddress(inout display : WifiDisplay, inout info : MediaRouter::RouteInfo) : boolean
+        final boolean routeHasAddress = info != null && info.mDeviceAddress != null;
+        if (display == null && !routeHasAddress) {
+            return true;
+        }
+
+        if (display != null && routeHasAddress) {
+            return display.getDeviceAddress().equals(info.mDeviceAddress);
+        }
+        return false;
+!!!2168631.java!!!	addUserRoute(inout info : MediaRouter::UserRouteInfo) : void
+        addRouteStatic(info);
+!!!2168759.java!!!	addRouteInt(inout info : MediaRouter::RouteInfo) : void
+        addRouteStatic(info);
+!!!2168887.java!!!	addRouteStatic(inout info : MediaRouter::RouteInfo) : void
+        Log.v(TAG, "Adding route: " + info);
+        final RouteCategory cat = info.getCategory();
+        if (!sStatic.mCategories.contains(cat)) {
+            sStatic.mCategories.add(cat);
+        }
+        if (cat.isGroupable() && !(info instanceof RouteGroup)) {
+            // Enforce that any added route in a groupable category must be in a group.
+            final RouteGroup group = new RouteGroup(info.getCategory());
+            group.mSupportedTypes = info.mSupportedTypes;
+            sStatic.mRoutes.add(group);
+            dispatchRouteAdded(group);
+            group.addRoute(info);
+
+            info = group;
+        } else {
+            sStatic.mRoutes.add(info);
+            dispatchRouteAdded(info);
+        }
+!!!2169015.java!!!	removeUserRoute(inout info : MediaRouter::UserRouteInfo) : void
+        removeRouteStatic(info);
+!!!2169143.java!!!	clearUserRoutes() : void
+        for (int i = 0; i < sStatic.mRoutes.size(); i++) {
+            final RouteInfo info = sStatic.mRoutes.get(i);
+            // TODO Right now, RouteGroups only ever contain user routes.
+            // The code below will need to change if this assumption does.
+            if (info instanceof UserRouteInfo || info instanceof RouteGroup) {
+                removeRouteStatic(info);
+                i--;
+            }
+        }
+!!!2169271.java!!!	removeRouteInt(inout info : MediaRouter::RouteInfo) : void
+        removeRouteStatic(info);
+!!!2169399.java!!!	removeRouteStatic(inout info : MediaRouter::RouteInfo) : void
+        Log.v(TAG, "Removing route: " + info);
+        if (sStatic.mRoutes.remove(info)) {
+            final RouteCategory removingCat = info.getCategory();
+            final int count = sStatic.mRoutes.size();
+            boolean found = false;
+            for (int i = 0; i < count; i++) {
+                final RouteCategory cat = sStatic.mRoutes.get(i).getCategory();
+                if (removingCat == cat) {
+                    found = true;
+                    break;
+                }
+            }
+            if (info.isSelected()) {
+                // Removing the currently selected route? Select the default before we remove it.
+                selectDefaultRouteStatic();
+            }
+            if (!found) {
+                sStatic.mCategories.remove(removingCat);
+            }
+            dispatchRouteRemoved(info);
+        }
+!!!2169527.java!!!	getCategoryCount() : int
+        return sStatic.mCategories.size();
+!!!2169655.java!!!	getCategoryAt(in index : int) : MediaRouter::RouteCategory
+        return sStatic.mCategories.get(index);
+!!!2169783.java!!!	getRouteCount() : int
+        return sStatic.mRoutes.size();
+!!!2169911.java!!!	getRouteAt(in index : int) : MediaRouter::RouteInfo
+        return sStatic.mRoutes.get(index);
+!!!2170039.java!!!	getRouteCountStatic() : int
+        return sStatic.mRoutes.size();
+!!!2170167.java!!!	getRouteAtStatic(in index : int) : MediaRouter::RouteInfo
+        return sStatic.mRoutes.get(index);
+!!!2170295.java!!!	createUserRoute(inout category : MediaRouter::RouteCategory) : MediaRouter::UserRouteInfo
+        return new UserRouteInfo(category);
+!!!2170423.java!!!	createRouteCategory(inout name : CharSequence, inout isGroupable : boolean) : MediaRouter::RouteCategory
+        return new RouteCategory(name, ROUTE_TYPE_USER, isGroupable);
+!!!2170551.java!!!	createRouteCategory(in nameResId : int, inout isGroupable : boolean) : MediaRouter::RouteCategory
+        return new RouteCategory(nameResId, ROUTE_TYPE_USER, isGroupable);
+!!!2170679.java!!!	rebindAsUser(in userId : int) : void
+        sStatic.rebindAsUser(userId);
+!!!2170807.java!!!	updateRoute(in info : MediaRouter::RouteInfo) : void
+        dispatchRouteChanged(info);
+!!!2170935.java!!!	dispatchRouteSelected(in type : int, inout info : MediaRouter::RouteInfo) : void
+        for (CallbackInfo cbi : sStatic.mCallbacks) {
+            if (cbi.filterRouteEvent(info)) {
+                cbi.cb.onRouteSelected(cbi.router, type, info);
+            }
+        }
+!!!2171063.java!!!	dispatchRouteUnselected(in type : int, inout info : MediaRouter::RouteInfo) : void
+        for (CallbackInfo cbi : sStatic.mCallbacks) {
+            if (cbi.filterRouteEvent(info)) {
+                cbi.cb.onRouteUnselected(cbi.router, type, info);
+            }
+        }
+!!!2171191.java!!!	dispatchRouteChanged(inout info : MediaRouter::RouteInfo) : void
+        dispatchRouteChanged(info, info.mSupportedTypes);
+!!!2171319.java!!!	dispatchRouteChanged(inout info : MediaRouter::RouteInfo, in oldSupportedTypes : int) : void
+        Log.v(TAG, "Dispatching route change: " + info);
+        final int newSupportedTypes = info.mSupportedTypes;
+        for (CallbackInfo cbi : sStatic.mCallbacks) {
+            // Reconstruct some of the history for callbacks that may not have observed
+            // all of the events needed to correctly interpret the current state.
+            // FIXME: This is a strong signal that we should deprecate route type filtering
+            // completely in the future because it can lead to inconsistencies in
+            // applications.
+            final boolean oldVisibility = cbi.filterRouteEvent(oldSupportedTypes);
+            final boolean newVisibility = cbi.filterRouteEvent(newSupportedTypes);
+            if (!oldVisibility && newVisibility) {
+                cbi.cb.onRouteAdded(cbi.router, info);
+                if (info.isSelected()) {
+                    cbi.cb.onRouteSelected(cbi.router, newSupportedTypes, info);
+                }
+            }
+            if (oldVisibility || newVisibility) {
+                cbi.cb.onRouteChanged(cbi.router, info);
+            }
+            if (oldVisibility && !newVisibility) {
+                if (info.isSelected()) {
+                    cbi.cb.onRouteUnselected(cbi.router, oldSupportedTypes, info);
+                }
+                cbi.cb.onRouteRemoved(cbi.router, info);
+            }
+        }
+!!!2171447.java!!!	dispatchRouteAdded(inout info : MediaRouter::RouteInfo) : void
+        for (CallbackInfo cbi : sStatic.mCallbacks) {
+            if (cbi.filterRouteEvent(info)) {
+                cbi.cb.onRouteAdded(cbi.router, info);
+            }
+        }
+!!!2171575.java!!!	dispatchRouteRemoved(inout info : MediaRouter::RouteInfo) : void
+        for (CallbackInfo cbi : sStatic.mCallbacks) {
+            if (cbi.filterRouteEvent(info)) {
+                cbi.cb.onRouteRemoved(cbi.router, info);
+            }
+        }
+!!!2171703.java!!!	dispatchRouteGrouped(inout info : MediaRouter::RouteInfo, inout group : MediaRouter::RouteGroup, in index : int) : void
+        for (CallbackInfo cbi : sStatic.mCallbacks) {
+            if (cbi.filterRouteEvent(group)) {
+                cbi.cb.onRouteGrouped(cbi.router, info, group, index);
+            }
+        }
+!!!2171831.java!!!	dispatchRouteUngrouped(inout info : MediaRouter::RouteInfo, inout group : MediaRouter::RouteGroup) : void
+        for (CallbackInfo cbi : sStatic.mCallbacks) {
+            if (cbi.filterRouteEvent(group)) {
+                cbi.cb.onRouteUngrouped(cbi.router, info, group);
+            }
+        }
+!!!2171959.java!!!	dispatchRouteVolumeChanged(inout info : MediaRouter::RouteInfo) : void
+        for (CallbackInfo cbi : sStatic.mCallbacks) {
+            if (cbi.filterRouteEvent(info)) {
+                cbi.cb.onRouteVolumeChanged(cbi.router, info);
+            }
+        }
+!!!2172087.java!!!	dispatchRoutePresentationDisplayChanged(inout info : MediaRouter::RouteInfo) : void
+        for (CallbackInfo cbi : sStatic.mCallbacks) {
+            if (cbi.filterRouteEvent(info)) {
+                cbi.cb.onRoutePresentationDisplayChanged(cbi.router, info);
+            }
+        }
+!!!2172215.java!!!	systemVolumeChanged(in newValue : int) : void
+        final RouteInfo selectedRoute = sStatic.mSelectedRoute;
+        if (selectedRoute == null) return;
+
+        if (selectedRoute == sStatic.mBluetoothA2dpRoute ||
+                selectedRoute == sStatic.mDefaultAudioVideo) {
+            dispatchRouteVolumeChanged(selectedRoute);
+        } else if (sStatic.mBluetoothA2dpRoute != null) {
+            try {
+                dispatchRouteVolumeChanged(sStatic.mAudioService.isBluetoothA2dpOn() ?
+                        sStatic.mBluetoothA2dpRoute : sStatic.mDefaultAudioVideo);
+            } catch (RemoteException e) {
+                Log.e(TAG, "Error checking Bluetooth A2DP state to report volume change", e);
+            }
+        } else {
+            dispatchRouteVolumeChanged(sStatic.mDefaultAudioVideo);
+        }
+!!!2172343.java!!!	updateWifiDisplayStatus(inout status : WifiDisplayStatus) : void
+        WifiDisplay[] displays;
+        WifiDisplay activeDisplay;
+        if (status.getFeatureState() == WifiDisplayStatus.FEATURE_STATE_ON) {
+            displays = status.getDisplays();
+            activeDisplay = status.getActiveDisplay();
+
+            // Only the system is able to connect to wifi display routes.
+            // The display manager will enforce this with a permission check but it
+            // still publishes information about all available displays.
+            // Filter the list down to just the active display.
+            if (!sStatic.mCanConfigureWifiDisplays) {
+                if (activeDisplay != null) {
+                    displays = new WifiDisplay[] { activeDisplay };
+                } else {
+                    displays = WifiDisplay.EMPTY_ARRAY;
+                }
+            }
+        } else {
+            displays = WifiDisplay.EMPTY_ARRAY;
+            activeDisplay = null;
+        }
+        String activeDisplayAddress = activeDisplay != null ?
+                activeDisplay.getDeviceAddress() : null;
+
+        // Add or update routes.
+        for (int i = 0; i < displays.length; i++) {
+            final WifiDisplay d = displays[i];
+            if (shouldShowWifiDisplay(d, activeDisplay)) {
+                RouteInfo route = findWifiDisplayRoute(d);
+                if (route == null) {
+                    route = makeWifiDisplayRoute(d, status);
+                    addRouteStatic(route);
+                } else {
+                    String address = d.getDeviceAddress();
+                    boolean disconnected = !address.equals(activeDisplayAddress)
+                            && address.equals(sStatic.mPreviousActiveWifiDisplayAddress);
+                    updateWifiDisplayRoute(route, d, status, disconnected);
+                }
+                if (d.equals(activeDisplay)) {
+                    selectRouteStatic(route.getSupportedTypes(), route, false);
+                }
+            }
+        }
+
+        // Remove stale routes.
+        for (int i = sStatic.mRoutes.size(); i-- > 0; ) {
+            RouteInfo route = sStatic.mRoutes.get(i);
+            if (route.mDeviceAddress != null) {
+                WifiDisplay d = findWifiDisplay(displays, route.mDeviceAddress);
+                if (d == null || !shouldShowWifiDisplay(d, activeDisplay)) {
+                    removeRouteStatic(route);
+                }
+            }
+        }
+
+        // Remember the current active wifi display address so that we can infer disconnections.
+        // TODO: This hack will go away once all of this is moved into the media router service.
+        sStatic.mPreviousActiveWifiDisplayAddress = activeDisplayAddress;
+!!!2172471.java!!!	shouldShowWifiDisplay(inout d : WifiDisplay, inout activeDisplay : WifiDisplay) : boolean
+        return d.isRemembered() || d.equals(activeDisplay);
+!!!2172599.java!!!	getWifiDisplayStatusCode(inout d : WifiDisplay, inout wfdStatus : WifiDisplayStatus) : int
+        int newStatus;
+        if (wfdStatus.getScanState() == WifiDisplayStatus.SCAN_STATE_SCANNING) {
+            newStatus = RouteInfo.STATUS_SCANNING;
+        } else if (d.isAvailable()) {
+            newStatus = d.canConnect() ?
+                    RouteInfo.STATUS_AVAILABLE: RouteInfo.STATUS_IN_USE;
+        } else {
+            newStatus = RouteInfo.STATUS_NOT_AVAILABLE;
+        }
+
+        if (d.equals(wfdStatus.getActiveDisplay())) {
+            final int activeState = wfdStatus.getActiveDisplayState();
+            switch (activeState) {
+                case WifiDisplayStatus.DISPLAY_STATE_CONNECTED:
+                    newStatus = RouteInfo.STATUS_CONNECTED;
+                    break;
+                case WifiDisplayStatus.DISPLAY_STATE_CONNECTING:
+                    newStatus = RouteInfo.STATUS_CONNECTING;
+                    break;
+                case WifiDisplayStatus.DISPLAY_STATE_NOT_CONNECTED:
+                    Log.e(TAG, "Active display is not connected!");
+                    break;
+            }
+        }
+
+        return newStatus;
+!!!2172727.java!!!	isWifiDisplayEnabled(inout d : WifiDisplay, inout wfdStatus : WifiDisplayStatus) : boolean
+        return d.isAvailable() && (d.canConnect() || d.equals(wfdStatus.getActiveDisplay()));
+!!!2172855.java!!!	makeWifiDisplayRoute(inout display : WifiDisplay, inout wfdStatus : WifiDisplayStatus) : MediaRouter::RouteInfo
+        final RouteInfo newRoute = new RouteInfo(sStatic.mSystemCategory);
+        newRoute.mDeviceAddress = display.getDeviceAddress();
+        newRoute.mSupportedTypes = ROUTE_TYPE_LIVE_AUDIO | ROUTE_TYPE_LIVE_VIDEO
+                | ROUTE_TYPE_REMOTE_DISPLAY;
+        newRoute.mVolumeHandling = RouteInfo.PLAYBACK_VOLUME_FIXED;
+        newRoute.mPlaybackType = RouteInfo.PLAYBACK_TYPE_REMOTE;
+
+        newRoute.setRealStatusCode(getWifiDisplayStatusCode(display, wfdStatus));
+        newRoute.mEnabled = isWifiDisplayEnabled(display, wfdStatus);
+        newRoute.mName = display.getFriendlyDisplayName();
+        newRoute.mDescription = sStatic.mResources.getText(
+                com.android.internal.R.string.wireless_display_route_description);
+        newRoute.updatePresentationDisplay();
+        newRoute.mDeviceType = RouteInfo.DEVICE_TYPE_TV;
+        return newRoute;
+!!!2172983.java!!!	updateWifiDisplayRoute(inout route : MediaRouter::RouteInfo, inout display : WifiDisplay, inout wfdStatus : WifiDisplayStatus, inout disconnected : boolean) : void
+        boolean changed = false;
+        final String newName = display.getFriendlyDisplayName();
+        if (!route.getName().equals(newName)) {
+            route.mName = newName;
+            changed = true;
+        }
+
+        boolean enabled = isWifiDisplayEnabled(display, wfdStatus);
+        changed |= route.mEnabled != enabled;
+        route.mEnabled = enabled;
+
+        changed |= route.setRealStatusCode(getWifiDisplayStatusCode(display, wfdStatus));
+
+        if (changed) {
+            dispatchRouteChanged(route);
+        }
+
+        if ((!enabled || disconnected) && route.isSelected()) {
+            // Oops, no longer available. Reselect the default.
+            selectDefaultRouteStatic();
+        }
+!!!2173111.java!!!	findWifiDisplay(inout displays : WifiDisplay, inout deviceAddress : String) : WifiDisplay
+        for (int i = 0; i < displays.length; i++) {
+            final WifiDisplay d = displays[i];
+            if (d.getDeviceAddress().equals(deviceAddress)) {
+                return d;
+            }
+        }
+        return null;
+!!!2173239.java!!!	findWifiDisplayRoute(inout d : WifiDisplay) : MediaRouter::RouteInfo
+        final int count = sStatic.mRoutes.size();
+        for (int i = 0; i < count; i++) {
+            final RouteInfo info = sStatic.mRoutes.get(i);
+            if (d.getDeviceAddress().equals(info.mDeviceAddress)) {
+                return info;
+            }
+        }
+        return null;

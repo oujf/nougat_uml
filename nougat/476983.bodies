@@ -1,0 +1,159 @@
+class LegacyFaceDetectMapper
+!!!3148983.java!!!	LegacyFaceDetectMapper(inout camera : Camera, inout characteristics : CameraCharacteristics)
+        mCamera = checkNotNull(camera, "camera must not be null");
+        checkNotNull(characteristics, "characteristics must not be null");
+
+        mFaceDetectSupported = ArrayUtils.contains(
+                characteristics.get(
+                        CameraCharacteristics.STATISTICS_INFO_AVAILABLE_FACE_DETECT_MODES),
+                STATISTICS_FACE_DETECT_MODE_SIMPLE);
+
+        if (!mFaceDetectSupported) {
+            return;
+        }
+
+       mCamera.setFaceDetectionListener(new FaceDetectionListener() {
+
+        @Override
+        public void onFaceDetection(Camera.Face[] faces, Camera camera) {
+            int lengthFaces = faces == null ? 0 : faces.length;
+            synchronized (mLock) {
+                if (mFaceDetectEnabled) {
+                    mFaces = faces;
+                } else if (lengthFaces > 0) {
+                    // stopFaceDetectMode could race against the requests, print a debug log
+                    Log.d(TAG,
+                            "onFaceDetection - Ignored some incoming faces since" +
+                            "face detection was disabled");
+                }
+            }
+
+            if (DEBUG) {
+                Log.v(TAG, "onFaceDetection - read " + lengthFaces + " faces");
+            }
+        }
+       });
+!!!3149111.java!!!	processFaceDetectMode(inout captureRequest : CaptureRequest, inout parameters : Camera::Parameters) : void
+        checkNotNull(captureRequest, "captureRequest must not be null");
+
+        /*
+         * statistics.faceDetectMode
+         */
+        int fdMode = ParamsUtils.getOrDefault(captureRequest, STATISTICS_FACE_DETECT_MODE,
+                STATISTICS_FACE_DETECT_MODE_OFF);
+
+        if (fdMode != STATISTICS_FACE_DETECT_MODE_OFF && !mFaceDetectSupported) {
+            Log.w(TAG,
+                    "processFaceDetectMode - Ignoring statistics.faceDetectMode; " +
+                    "face detection is not available");
+            return;
+        }
+
+        /*
+         * control.sceneMode
+         */
+        int sceneMode = ParamsUtils.getOrDefault(captureRequest, CONTROL_SCENE_MODE,
+                CONTROL_SCENE_MODE_DISABLED);
+        if (sceneMode == CONTROL_SCENE_MODE_FACE_PRIORITY && !mFaceDetectSupported) {
+            Log.w(TAG, "processFaceDetectMode - ignoring control.sceneMode == FACE_PRIORITY; " +
+                    "face detection is not available");
+            return;
+        }
+
+        // Print some warnings out in case the values were wrong
+        switch (fdMode) {
+            case STATISTICS_FACE_DETECT_MODE_OFF:
+            case STATISTICS_FACE_DETECT_MODE_SIMPLE:
+                break;
+            case STATISTICS_FACE_DETECT_MODE_FULL:
+                Log.w(TAG,
+                        "processFaceDetectMode - statistics.faceDetectMode == FULL unsupported, " +
+                        "downgrading to SIMPLE");
+                break;
+            default:
+                Log.w(TAG, "processFaceDetectMode - ignoring unknown statistics.faceDetectMode = "
+                        + fdMode);
+                return;
+        }
+
+        boolean enableFaceDetect = (fdMode != STATISTICS_FACE_DETECT_MODE_OFF)
+                || (sceneMode == CONTROL_SCENE_MODE_FACE_PRIORITY);
+        synchronized (mLock) {
+            // Enable/disable face detection if it's changed since last time
+            if (enableFaceDetect != mFaceDetectEnabled) {
+                if (enableFaceDetect) {
+                    mCamera.startFaceDetection();
+
+                    if (DEBUG) {
+                        Log.v(TAG, "processFaceDetectMode - start face detection");
+                    }
+                } else {
+                    mCamera.stopFaceDetection();
+
+                    if (DEBUG) {
+                        Log.v(TAG, "processFaceDetectMode - stop face detection");
+                    }
+
+                    mFaces = null;
+                }
+
+                mFaceDetectEnabled = enableFaceDetect;
+                mFaceDetectScenePriority = sceneMode == CONTROL_SCENE_MODE_FACE_PRIORITY;
+                mFaceDetectReporting = fdMode != STATISTICS_FACE_DETECT_MODE_OFF;
+            }
+        }
+!!!3149239.java!!!	mapResultFaces(inout result : CameraMetadataNative, inout legacyRequest : LegacyRequest) : void
+        checkNotNull(result, "result must not be null");
+        checkNotNull(legacyRequest, "legacyRequest must not be null");
+
+        Camera.Face[] faces, previousFaces;
+        int fdMode;
+        boolean fdScenePriority;
+        synchronized (mLock) {
+            fdMode = mFaceDetectReporting ?
+                            STATISTICS_FACE_DETECT_MODE_SIMPLE : STATISTICS_FACE_DETECT_MODE_OFF;
+
+            if (mFaceDetectReporting) {
+                faces = mFaces;
+            } else {
+                faces = null;
+            }
+
+            fdScenePriority = mFaceDetectScenePriority;
+
+            previousFaces = mFacesPrev;
+            mFacesPrev = faces;
+        }
+
+        CameraCharacteristics characteristics = legacyRequest.characteristics;
+        CaptureRequest request = legacyRequest.captureRequest;
+        Size previewSize = legacyRequest.previewSize;
+        Camera.Parameters params = legacyRequest.parameters;
+
+        Rect activeArray = characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE);
+        ZoomData zoomData = ParameterUtils.convertScalerCropRegion(activeArray,
+                request.get(CaptureRequest.SCALER_CROP_REGION), previewSize, params);
+
+        List<Face> convertedFaces = new ArrayList<>();
+        if (faces != null) {
+            for (Camera.Face face : faces) {
+                if (face != null) {
+                    convertedFaces.add(
+                            ParameterUtils.convertFaceFromLegacy(face, activeArray, zoomData));
+                } else {
+                    Log.w(TAG, "mapResultFaces - read NULL face from camera1 device");
+                }
+            }
+        }
+
+        if (DEBUG && previousFaces != faces) { // Log only in verbose and IF the faces changed
+            Log.v(TAG, "mapResultFaces - changed to " + ListUtils.listToString(convertedFaces));
+        }
+
+        result.set(CaptureResult.STATISTICS_FACES, convertedFaces.toArray(new Face[0]));
+        result.set(CaptureResult.STATISTICS_FACE_DETECT_MODE, fdMode);
+
+        // Override scene mode with FACE_PRIORITY if the request was using FACE_PRIORITY
+        if (fdScenePriority) {
+            result.set(CaptureResult.CONTROL_SCENE_MODE, CONTROL_SCENE_MODE_FACE_PRIORITY);
+        }

@@ -1,0 +1,213 @@
+class BlockIterator
+!!!40218295.cpp!!!	BlockIterator(inout extractor : MatroskaExtractor, in trackNum : ulong, in index : ulong)
+    reset();
+!!!40218423.cpp!!!	eos() : bool
+    return mCluster == NULL || mCluster->EOS();
+!!!40218551.cpp!!!	advance() : void
+    Mutex::Autolock autoLock(mExtractor->mLock);
+    advance_l();
+!!!40218679.cpp!!!	reset() : void
+    Mutex::Autolock autoLock(mExtractor->mLock);
+
+    mCluster = mExtractor->mSegment->GetFirst();
+    mBlockEntry = NULL;
+    mBlockEntryIndex = 0;
+
+    do {
+        advance_l();
+    } while (!eos() && block()->GetTrackNumber() != mTrackNum);
+!!!40218807.cpp!!!	seek(in seekTimeUs : int64_t, in isAudio : bool, inout actualFrameTimeUs : int64_t) : void
+    Mutex::Autolock autoLock(mExtractor->mLock);
+
+    *actualFrameTimeUs = -1ll;
+
+    const int64_t seekTimeNs = seekTimeUs * 1000ll - mExtractor->mSeekPreRollNs;
+
+    mkvparser::Segment* const pSegment = mExtractor->mSegment;
+
+    // Special case the 0 seek to avoid loading Cues when the application
+    // extraneously seeks to 0 before playing.
+    if (seekTimeNs <= 0) {
+        ALOGV("Seek to beginning: %" PRId64, seekTimeUs);
+        mCluster = pSegment->GetFirst();
+        mBlockEntryIndex = 0;
+        do {
+            advance_l();
+        } while (!eos() && block()->GetTrackNumber() != mTrackNum);
+        return;
+    }
+
+    ALOGV("Seeking to: %" PRId64, seekTimeUs);
+
+    // If the Cues have not been located then find them.
+    const mkvparser::Cues* pCues = pSegment->GetCues();
+    const mkvparser::SeekHead* pSH = pSegment->GetSeekHead();
+    if (!pCues && pSH) {
+        const size_t count = pSH->GetCount();
+        const mkvparser::SeekHead::Entry* pEntry;
+        ALOGV("No Cues yet");
+
+        for (size_t index = 0; index < count; index++) {
+            pEntry = pSH->GetEntry(index);
+
+            if (pEntry->id == 0x0C53BB6B) { // Cues ID
+                long len; long long pos;
+                pSegment->ParseCues(pEntry->pos, pos, len);
+                pCues = pSegment->GetCues();
+                ALOGV("Cues found");
+                break;
+            }
+        }
+
+        if (!pCues) {
+            ALOGE("No Cues in file");
+            return;
+        }
+    }
+    else if (!pSH) {
+        ALOGE("No SeekHead");
+        return;
+    }
+
+    const mkvparser::CuePoint* pCP;
+    mkvparser::Tracks const *pTracks = pSegment->GetTracks();
+    while (!pCues->DoneParsing()) {
+        pCues->LoadCuePoint();
+        pCP = pCues->GetLast();
+        CHECK(pCP);
+
+        size_t trackCount = mExtractor->mTracks.size();
+        for (size_t index = 0; index < trackCount; ++index) {
+            MatroskaExtractor::TrackInfo& track = mExtractor->mTracks.editItemAt(index);
+            const mkvparser::Track *pTrack = pTracks->GetTrackByNumber(track.mTrackNum);
+            if (pTrack && pTrack->GetType() == 1 && pCP->Find(pTrack)) { // VIDEO_TRACK
+                track.mCuePoints.push_back(pCP);
+            }
+        }
+
+        if (pCP->GetTime(pSegment) >= seekTimeNs) {
+            ALOGV("Parsed past relevant Cue");
+            break;
+        }
+    }
+
+    const mkvparser::CuePoint::TrackPosition *pTP = NULL;
+    const mkvparser::Track *thisTrack = pTracks->GetTrackByNumber(mTrackNum);
+    if (thisTrack->GetType() == 1) { // video
+        MatroskaExtractor::TrackInfo& track = mExtractor->mTracks.editItemAt(mIndex);
+        pTP = track.find(seekTimeNs);
+    } else {
+        // The Cue index is built around video keyframes
+        unsigned long int trackCount = pTracks->GetTracksCount();
+        for (size_t index = 0; index < trackCount; ++index) {
+            const mkvparser::Track *pTrack = pTracks->GetTrackByIndex(index);
+            if (pTrack && pTrack->GetType() == 1 && pCues->Find(seekTimeNs, pTrack, pCP, pTP)) {
+                ALOGV("Video track located at %zu", index);
+                break;
+            }
+        }
+    }
+
+
+    // Always *search* based on the video track, but finalize based on mTrackNum
+    if (!pTP) {
+        ALOGE("Did not locate the video track for seeking");
+        return;
+    }
+
+    mCluster = pSegment->FindOrPreloadCluster(pTP->m_pos);
+
+    CHECK(mCluster);
+    CHECK(!mCluster->EOS());
+
+    // mBlockEntryIndex starts at 0 but m_block starts at 1
+    CHECK_GT(pTP->m_block, 0);
+    mBlockEntryIndex = pTP->m_block - 1;
+
+    for (;;) {
+        advance_l();
+
+        if (eos()) break;
+
+        if (isAudio || block()->IsKey()) {
+            // Accept the first key frame
+            int64_t frameTimeUs = (block()->GetTime(mCluster) + 500LL) / 1000LL;
+            if (thisTrack->GetType() == 1 || frameTimeUs >= seekTimeUs) {
+                *actualFrameTimeUs = frameTimeUs;
+                ALOGV("Requested seek point: %" PRId64 " actual: %" PRId64,
+                      seekTimeUs, *actualFrameTimeUs);
+                break;
+            }
+        }
+    }
+!!!40218935.cpp!!!	block() : mkvparser::Block
+    CHECK(!eos());
+
+    return mBlockEntry->GetBlock();
+!!!40219063.cpp!!!	blockTimeUs() : int64_t
+    if (mCluster == NULL || mBlockEntry == NULL) {
+        return -1;
+    }
+    return (mBlockEntry->GetBlock()->GetTime(mCluster) + 500ll) / 1000ll;
+!!!40219191.cpp!!!	advance_l() : void
+    for (;;) {
+        long res = mCluster->GetEntry(mBlockEntryIndex, mBlockEntry);
+        ALOGV("GetEntry returned %ld", res);
+
+        long long pos;
+        long len;
+        if (res < 0) {
+            // Need to parse this cluster some more
+
+            CHECK_EQ(res, mkvparser::E_BUFFER_NOT_FULL);
+
+            res = mCluster->Parse(pos, len);
+            ALOGV("Parse returned %ld", res);
+
+            if (res < 0) {
+                // I/O error
+
+                ALOGE("Cluster::Parse returned result %ld", res);
+
+                mCluster = NULL;
+                break;
+            }
+
+            continue;
+        } else if (res == 0) {
+            // We're done with this cluster
+
+            const mkvparser::Cluster *nextCluster;
+            res = mExtractor->mSegment->ParseNext(
+                    mCluster, nextCluster, pos, len);
+            ALOGV("ParseNext returned %ld", res);
+
+            if (res != 0) {
+                // EOF or error
+
+                mCluster = NULL;
+                break;
+            }
+
+            CHECK_EQ(res, 0);
+            CHECK(nextCluster != NULL);
+            CHECK(!nextCluster->EOS());
+
+            mCluster = nextCluster;
+
+            res = mCluster->Parse(pos, len);
+            ALOGV("Parse (2) returned %ld", res);
+            CHECK_GE(res, 0);
+
+            mBlockEntryIndex = 0;
+            continue;
+        }
+
+        CHECK(mBlockEntry != NULL);
+        CHECK(mBlockEntry->GetBlock() != NULL);
+        ++mBlockEntryIndex;
+
+        if (mBlockEntry->GetBlock()->GetTrackNumber() == mTrackNum) {
+            break;
+        }
+    }

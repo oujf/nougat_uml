@@ -1,0 +1,543 @@
+class SupplicantWifiScannerImpl
+!!!37094967.java!!!	SupplicantWifiScannerImpl(inout context : Context, inout wifiNative : WifiNative, inout channelHelper : ChannelHelper, inout looper : Looper, inout clock : Clock)
+        mContext = context;
+        mWifiNative = wifiNative;
+        mChannelHelper = channelHelper;
+        mAlarmManager = (AlarmManager) mContext.getSystemService(Context.ALARM_SERVICE);
+        mEventHandler = new Handler(looper, this);
+        mClock = clock;
+        mHwPnoDebouncer = new HwPnoDebouncer(mWifiNative, mAlarmManager, mEventHandler, mClock);
+
+        // Check if the device supports HW PNO scans.
+        mHwPnoScanSupported = mContext.getResources().getBoolean(
+                R.bool.config_wifi_background_scan_support);
+
+        WifiMonitor.getInstance().registerHandler(mWifiNative.getInterfaceName(),
+                WifiMonitor.SCAN_FAILED_EVENT, mEventHandler);
+        WifiMonitor.getInstance().registerHandler(mWifiNative.getInterfaceName(),
+                WifiMonitor.SCAN_RESULTS_EVENT, mEventHandler);
+!!!37095095.java!!!	SupplicantWifiScannerImpl(inout context : Context, inout wifiNative : WifiNative, inout looper : Looper, inout clock : Clock)
+        // TODO figure out how to get channel information from supplicant
+        this(context, wifiNative, new NoBandChannelHelper(), looper, clock);
+!!!37095223.java!!!	cleanup() : void
+        synchronized (mSettingsLock) {
+            mPendingSingleScanSettings = null;
+            mPendingSingleScanEventHandler = null;
+            stopHwPnoScan();
+            stopBatchedScan();
+            resetHotlist();
+            untrackSignificantWifiChange();
+            mLastScanSettings = null; // finally clear any active scan
+        }
+!!!37095351.java!!!	getScanCapabilities(inout capabilities : WifiNative::ScanCapabilities) : boolean
+        capabilities.max_scan_cache_size = Integer.MAX_VALUE;
+        capabilities.max_scan_buckets = MAX_SCAN_BUCKETS;
+        capabilities.max_ap_cache_per_scan = MAX_APS_PER_SCAN;
+        capabilities.max_rssi_sample_size = 8;
+        capabilities.max_scan_reporting_threshold = SCAN_BUFFER_CAPACITY;
+        capabilities.max_hotlist_bssids = 0;
+        capabilities.max_significant_wifi_change_aps = 0;
+        return true;
+!!!37095479.java!!!	getChannelHelper() : ChannelHelper
+        return mChannelHelper;
+!!!37095607.java!!!	startSingleScan(inout settings : WifiNative::ScanSettings, inout eventHandler : WifiNative::ScanEventHandler) : boolean
+        if (eventHandler == null || settings == null) {
+            Log.w(TAG, "Invalid arguments for startSingleScan: settings=" + settings
+                    + ",eventHandler=" + eventHandler);
+            return false;
+        }
+        if (mPendingSingleScanSettings != null
+                || (mLastScanSettings != null && mLastScanSettings.singleScanActive)) {
+            Log.w(TAG, "A single scan is already running");
+            return false;
+        }
+        synchronized (mSettingsLock) {
+            mPendingSingleScanSettings = settings;
+            mPendingSingleScanEventHandler = eventHandler;
+            processPendingScans();
+            return true;
+        }
+!!!37095735.java!!!	getLatestSingleScanResults() : WifiScanner::ScanData
+        return mLatestSingleScanResult;
+!!!37095863.java!!!	startBatchedScan(inout settings : WifiNative::ScanSettings, inout eventHandler : WifiNative::ScanEventHandler) : boolean
+        if (settings == null || eventHandler == null) {
+            Log.w(TAG, "Invalid arguments for startBatched: settings=" + settings
+                    + ",eventHandler=" + eventHandler);
+            return false;
+        }
+
+        if (settings.max_ap_per_scan < 0 || settings.max_ap_per_scan > MAX_APS_PER_SCAN) {
+            return false;
+        }
+        if (settings.num_buckets < 0 || settings.num_buckets > MAX_SCAN_BUCKETS) {
+            return false;
+        }
+        if (settings.report_threshold_num_scans < 0
+                || settings.report_threshold_num_scans > SCAN_BUFFER_CAPACITY) {
+            return false;
+        }
+        if (settings.report_threshold_percent < 0 || settings.report_threshold_percent > 100) {
+            return false;
+        }
+        if (settings.base_period_ms <= 0) {
+            return false;
+        }
+        for (int i = 0; i < settings.num_buckets; ++i) {
+            WifiNative.BucketSettings bucket = settings.buckets[i];
+            if (bucket.period_ms % settings.base_period_ms != 0) {
+                return false;
+            }
+        }
+
+        synchronized (mSettingsLock) {
+            stopBatchedScan();
+            if (DBG) {
+                Log.d(TAG, "Starting scan num_buckets=" + settings.num_buckets + ", base_period="
+                    + settings.base_period_ms + " ms");
+            }
+            mPendingBackgroundScanSettings = settings;
+            mPendingBackgroundScanEventHandler = eventHandler;
+            handleScanPeriod(); // Try to start scan immediately
+            return true;
+        }
+!!!37095991.java!!!	stopBatchedScan() : void
+        synchronized (mSettingsLock) {
+            if (DBG) Log.d(TAG, "Stopping scan");
+            mBackgroundScanSettings = null;
+            mBackgroundScanEventHandler = null;
+            mPendingBackgroundScanSettings = null;
+            mPendingBackgroundScanEventHandler = null;
+            mBackgroundScanPaused = false;
+            mBackgroundScanPeriodPending = false;
+            unscheduleScansLocked();
+        }
+        processPendingScans();
+!!!37096119.java!!!	pauseBatchedScan() : void
+        synchronized (mSettingsLock) {
+            if (DBG) Log.d(TAG, "Pausing scan");
+            // if there isn't a pending scan then make the current scan pending
+            if (mPendingBackgroundScanSettings == null) {
+                mPendingBackgroundScanSettings = mBackgroundScanSettings;
+                mPendingBackgroundScanEventHandler = mBackgroundScanEventHandler;
+            }
+            mBackgroundScanSettings = null;
+            mBackgroundScanEventHandler = null;
+            mBackgroundScanPeriodPending = false;
+            mBackgroundScanPaused = true;
+
+            unscheduleScansLocked();
+
+            WifiScanner.ScanData[] results = getLatestBatchedScanResults(/* flush = */ true);
+            if (mPendingBackgroundScanEventHandler != null) {
+                mPendingBackgroundScanEventHandler.onScanPaused(results);
+            }
+        }
+        processPendingScans();
+!!!37096247.java!!!	restartBatchedScan() : void
+        synchronized (mSettingsLock) {
+            if (DBG) Log.d(TAG, "Restarting scan");
+            if (mPendingBackgroundScanEventHandler != null) {
+                mPendingBackgroundScanEventHandler.onScanRestarted();
+            }
+            mBackgroundScanPaused = false;
+            handleScanPeriod();
+        }
+!!!37096375.java!!!	unscheduleScansLocked() : void
+        mAlarmManager.cancel(mScanPeriodListener);
+        if (mLastScanSettings != null) {
+            mLastScanSettings.backgroundScanActive = false;
+        }
+!!!37096503.java!!!	handleScanPeriod() : void
+        synchronized (mSettingsLock) {
+            mBackgroundScanPeriodPending = true;
+            processPendingScans();
+        }
+!!!37096631.java!!!	handleScanTimeout() : void
+        Log.e(TAG, "Timed out waiting for scan result from supplicant");
+        reportScanFailure();
+        processPendingScans();
+!!!37096759.java!!!	processPendingScans() : void
+        synchronized (mSettingsLock) {
+            // Wait for the active scan result to come back to reschedule other scans,
+            // unless if HW pno scan is running. Hw PNO scans are paused it if there
+            // are other pending scans,
+            if (mLastScanSettings != null && !mLastScanSettings.hwPnoScanActive) {
+                return;
+            }
+
+            ChannelCollection allFreqs = mChannelHelper.createChannelCollection();
+            Set<Integer> hiddenNetworkIdSet = new HashSet<Integer>();
+            final LastScanSettings newScanSettings =
+                    new LastScanSettings(mClock.elapsedRealtime());
+
+            // Update scan settings if there is a pending scan
+            if (!mBackgroundScanPaused) {
+                if (mPendingBackgroundScanSettings != null) {
+                    mBackgroundScanSettings = mPendingBackgroundScanSettings;
+                    mBackgroundScanEventHandler = mPendingBackgroundScanEventHandler;
+                    mNextBackgroundScanPeriod = 0;
+                    mPendingBackgroundScanSettings = null;
+                    mPendingBackgroundScanEventHandler = null;
+                    mBackgroundScanPeriodPending = true;
+                }
+                if (mBackgroundScanPeriodPending && mBackgroundScanSettings != null) {
+                    int reportEvents = WifiScanner.REPORT_EVENT_NO_BATCH; // default to no batch
+                    for (int bucket_id = 0; bucket_id < mBackgroundScanSettings.num_buckets;
+                            ++bucket_id) {
+                        WifiNative.BucketSettings bucket =
+                                mBackgroundScanSettings.buckets[bucket_id];
+                        if (mNextBackgroundScanPeriod % (bucket.period_ms
+                                        / mBackgroundScanSettings.base_period_ms) == 0) {
+                            if ((bucket.report_events
+                                            & WifiScanner.REPORT_EVENT_AFTER_EACH_SCAN) != 0) {
+                                reportEvents |= WifiScanner.REPORT_EVENT_AFTER_EACH_SCAN;
+                            }
+                            if ((bucket.report_events
+                                            & WifiScanner.REPORT_EVENT_FULL_SCAN_RESULT) != 0) {
+                                reportEvents |= WifiScanner.REPORT_EVENT_FULL_SCAN_RESULT;
+                            }
+                            // only no batch if all buckets specify it
+                            if ((bucket.report_events
+                                            & WifiScanner.REPORT_EVENT_NO_BATCH) == 0) {
+                                reportEvents &= ~WifiScanner.REPORT_EVENT_NO_BATCH;
+                            }
+
+                            allFreqs.addChannels(bucket);
+                        }
+                    }
+                    if (!allFreqs.isEmpty()) {
+                        newScanSettings.setBackgroundScan(mNextBackgroundScanId++,
+                                mBackgroundScanSettings.max_ap_per_scan, reportEvents,
+                                mBackgroundScanSettings.report_threshold_num_scans,
+                                mBackgroundScanSettings.report_threshold_percent);
+                    }
+
+                    int[] hiddenNetworkIds = mBackgroundScanSettings.hiddenNetworkIds;
+                    if (hiddenNetworkIds != null) {
+                        int numHiddenNetworkIds = Math.min(hiddenNetworkIds.length,
+                                MAX_HIDDEN_NETWORK_IDS_PER_SCAN);
+                        for (int i = 0; i < numHiddenNetworkIds; i++) {
+                            hiddenNetworkIdSet.add(hiddenNetworkIds[i]);
+                        }
+                    }
+
+                    mNextBackgroundScanPeriod++;
+                    mBackgroundScanPeriodPending = false;
+                    mAlarmManager.set(AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                            mClock.elapsedRealtime() + mBackgroundScanSettings.base_period_ms,
+                            BACKGROUND_PERIOD_ALARM_TAG, mScanPeriodListener, mEventHandler);
+                }
+            }
+
+            if (mPendingSingleScanSettings != null) {
+                boolean reportFullResults = false;
+                ChannelCollection singleScanFreqs = mChannelHelper.createChannelCollection();
+                for (int i = 0; i < mPendingSingleScanSettings.num_buckets; ++i) {
+                    WifiNative.BucketSettings bucketSettings =
+                            mPendingSingleScanSettings.buckets[i];
+                    if ((bucketSettings.report_events
+                                    & WifiScanner.REPORT_EVENT_FULL_SCAN_RESULT) != 0) {
+                        reportFullResults = true;
+                    }
+                    singleScanFreqs.addChannels(bucketSettings);
+                    allFreqs.addChannels(bucketSettings);
+                }
+                newScanSettings.setSingleScan(reportFullResults, singleScanFreqs,
+                        mPendingSingleScanEventHandler);
+                int[] hiddenNetworkIds = mPendingSingleScanSettings.hiddenNetworkIds;
+                if (hiddenNetworkIds != null) {
+                    int numHiddenNetworkIds = Math.min(hiddenNetworkIds.length,
+                            MAX_HIDDEN_NETWORK_IDS_PER_SCAN);
+                    for (int i = 0; i < numHiddenNetworkIds; i++) {
+                        hiddenNetworkIdSet.add(hiddenNetworkIds[i]);
+                    }
+                }
+                mPendingSingleScanSettings = null;
+                mPendingSingleScanEventHandler = null;
+            }
+
+            if ((newScanSettings.backgroundScanActive || newScanSettings.singleScanActive)
+                    && !allFreqs.isEmpty()) {
+                pauseHwPnoScan();
+                Set<Integer> freqs = allFreqs.getSupplicantScanFreqs();
+                boolean success = mWifiNative.scan(freqs, hiddenNetworkIdSet);
+                if (success) {
+                    // TODO handle scan timeout
+                    if (DBG) {
+                        Log.d(TAG, "Starting wifi scan for freqs=" + freqs
+                                + ", background=" + newScanSettings.backgroundScanActive
+                                + ", single=" + newScanSettings.singleScanActive);
+                    }
+                    mLastScanSettings = newScanSettings;
+                    mAlarmManager.set(AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                            mClock.elapsedRealtime() + SCAN_TIMEOUT_MS,
+                            TIMEOUT_ALARM_TAG, mScanTimeoutListener, mEventHandler);
+                } else {
+                    Log.e(TAG, "Failed to start scan, freqs=" + freqs);
+                    // indicate scan failure async
+                    mEventHandler.post(new Runnable() {
+                            public void run() {
+                                if (newScanSettings.singleScanEventHandler != null) {
+                                    newScanSettings.singleScanEventHandler
+                                            .onScanStatus(WifiNative.WIFI_SCAN_FAILED);
+                                }
+                            }
+                        });
+                    // TODO(b/27769665) background scans should be failed too if scans fail enough
+                }
+            } else if (isHwPnoScanRequired()) {
+                newScanSettings.setHwPnoScan(mPnoEventHandler);
+                if (startHwPnoScan()) {
+                    mLastScanSettings = newScanSettings;
+                } else {
+                    Log.e(TAG, "Failed to start PNO scan");
+                    // indicate scan failure async
+                    mEventHandler.post(new Runnable() {
+                        public void run() {
+                            if (mPnoEventHandler != null) {
+                                mPnoEventHandler.onPnoScanFailed();
+                            }
+                            // Clean up PNO state, we don't want to continue PNO scanning.
+                            mPnoSettings = null;
+                            mPnoEventHandler = null;
+                        }
+                    });
+                }
+            }
+        }
+!!!37096887.java!!!	handleMessage(inout msg : Message) : boolean
+        switch(msg.what) {
+            case WifiMonitor.SCAN_FAILED_EVENT:
+                Log.w(TAG, "Scan failed");
+                mAlarmManager.cancel(mScanTimeoutListener);
+                reportScanFailure();
+                processPendingScans();
+                break;
+            case WifiMonitor.SCAN_RESULTS_EVENT:
+                mAlarmManager.cancel(mScanTimeoutListener);
+                pollLatestScanData();
+                processPendingScans();
+                break;
+            default:
+                // ignore unknown event
+        }
+        return true;
+!!!37097015.java!!!	reportScanFailure() : void
+        synchronized (mSettingsLock) {
+            if (mLastScanSettings != null) {
+                if (mLastScanSettings.singleScanEventHandler != null) {
+                    mLastScanSettings.singleScanEventHandler
+                            .onScanStatus(WifiNative.WIFI_SCAN_FAILED);
+                }
+                // TODO(b/27769665) background scans should be failed too if scans fail enough
+                mLastScanSettings = null;
+            }
+        }
+!!!37097143.java!!!	reportPnoScanFailure() : void
+        synchronized (mSettingsLock) {
+            if (mLastScanSettings != null && mLastScanSettings.hwPnoScanActive) {
+                if (mLastScanSettings.pnoScanEventHandler != null) {
+                    mLastScanSettings.pnoScanEventHandler.onPnoScanFailed();
+                }
+                // Clean up PNO state, we don't want to continue PNO scanning.
+                mPnoSettings = null;
+                mPnoEventHandler = null;
+                mLastScanSettings = null;
+            }
+        }
+!!!37097271.java!!!	pollLatestScanData() : void
+        synchronized (mSettingsLock) {
+            if (mLastScanSettings == null) {
+                 // got a scan before we started scanning or after scan was canceled
+                return;
+            }
+
+            if (DBG) Log.d(TAG, "Polling scan data for scan: " + mLastScanSettings.scanId);
+            ArrayList<ScanDetail> nativeResults = mWifiNative.getScanResults();
+            List<ScanResult> singleScanResults = new ArrayList<>();
+            List<ScanResult> backgroundScanResults = new ArrayList<>();
+            List<ScanResult> hwPnoScanResults = new ArrayList<>();
+            for (int i = 0; i < nativeResults.size(); ++i) {
+                ScanResult result = nativeResults.get(i).getScanResult();
+                long timestamp_ms = result.timestamp / 1000; // convert us -> ms
+                if (timestamp_ms > mLastScanSettings.startTime) {
+                    if (mLastScanSettings.backgroundScanActive) {
+                        backgroundScanResults.add(result);
+                    }
+                    if (mLastScanSettings.singleScanActive
+                            && mLastScanSettings.singleScanFreqs.containsChannel(
+                                    result.frequency)) {
+                        singleScanResults.add(result);
+                    }
+                    if (mLastScanSettings.hwPnoScanActive) {
+                        hwPnoScanResults.add(result);
+                    }
+                } else {
+                    // was a cached result in wpa_supplicant
+                }
+            }
+
+            if (mLastScanSettings.backgroundScanActive) {
+                if (mBackgroundScanEventHandler != null) {
+                    if ((mLastScanSettings.reportEvents
+                                    & WifiScanner.REPORT_EVENT_FULL_SCAN_RESULT) != 0) {
+                        for (ScanResult scanResult : backgroundScanResults) {
+                            // TODO(b/27506257): Fill in correct bucketsScanned value
+                            mBackgroundScanEventHandler.onFullScanResult(scanResult, 0);
+                        }
+                    }
+                }
+
+                Collections.sort(backgroundScanResults, SCAN_RESULT_SORT_COMPARATOR);
+                ScanResult[] scanResultsArray = new ScanResult[Math.min(mLastScanSettings.maxAps,
+                            backgroundScanResults.size())];
+                for (int i = 0; i < scanResultsArray.length; ++i) {
+                    scanResultsArray[i] = backgroundScanResults.get(i);
+                }
+
+                if ((mLastScanSettings.reportEvents & WifiScanner.REPORT_EVENT_NO_BATCH) == 0) {
+                    // TODO(b/27506257): Fill in correct bucketsScanned value
+                    mBackgroundScanBuffer.add(new WifiScanner.ScanData(mLastScanSettings.scanId, 0,
+                                    scanResultsArray));
+                }
+
+                if (mBackgroundScanEventHandler != null) {
+                    if ((mLastScanSettings.reportEvents
+                                    & WifiScanner.REPORT_EVENT_FULL_SCAN_RESULT) != 0
+                            || (mLastScanSettings.reportEvents
+                                    & WifiScanner.REPORT_EVENT_AFTER_EACH_SCAN) != 0
+                            || (mLastScanSettings.reportEvents
+                                    == WifiScanner.REPORT_EVENT_AFTER_BUFFER_FULL
+                                    && (mBackgroundScanBuffer.size()
+                                            >= (mBackgroundScanBuffer.capacity()
+                                                    * mLastScanSettings.reportPercentThreshold
+                                                    / 100)
+                                            || mBackgroundScanBuffer.size()
+                                            >= mLastScanSettings.reportNumScansThreshold))) {
+                        mBackgroundScanEventHandler
+                                .onScanStatus(WifiNative.WIFI_SCAN_RESULTS_AVAILABLE);
+                    }
+                }
+
+                if (mHotlistHandler != null) {
+                    int event = mHotlistChangeBuffer.processScan(backgroundScanResults);
+                    if ((event & ChangeBuffer.EVENT_FOUND) != 0) {
+                        mHotlistHandler.onHotlistApFound(
+                                mHotlistChangeBuffer.getLastResults(ChangeBuffer.EVENT_FOUND));
+                    }
+                    if ((event & ChangeBuffer.EVENT_LOST) != 0) {
+                        mHotlistHandler.onHotlistApLost(
+                                mHotlistChangeBuffer.getLastResults(ChangeBuffer.EVENT_LOST));
+                    }
+                }
+            }
+
+            if (mLastScanSettings.singleScanActive
+                    && mLastScanSettings.singleScanEventHandler != null) {
+                if (mLastScanSettings.reportSingleScanFullResults) {
+                    for (ScanResult scanResult : singleScanResults) {
+                        // ignore buckets scanned since there is only one bucket for a single scan
+                        mLastScanSettings.singleScanEventHandler.onFullScanResult(scanResult,
+                                /* bucketsScanned */ 0);
+                    }
+                }
+                Collections.sort(singleScanResults, SCAN_RESULT_SORT_COMPARATOR);
+                mLatestSingleScanResult = new WifiScanner.ScanData(mLastScanSettings.scanId, 0,
+                        singleScanResults.toArray(new ScanResult[singleScanResults.size()]));
+                mLastScanSettings.singleScanEventHandler
+                        .onScanStatus(WifiNative.WIFI_SCAN_RESULTS_AVAILABLE);
+            }
+
+            if (mLastScanSettings.hwPnoScanActive
+                    && mLastScanSettings.pnoScanEventHandler != null) {
+                ScanResult[] pnoScanResultsArray = new ScanResult[hwPnoScanResults.size()];
+                for (int i = 0; i < pnoScanResultsArray.length; ++i) {
+                    pnoScanResultsArray[i] = hwPnoScanResults.get(i);
+                }
+                mLastScanSettings.pnoScanEventHandler.onPnoNetworkFound(pnoScanResultsArray);
+            }
+
+            mLastScanSettings = null;
+        }
+!!!37097399.java!!!	getLatestBatchedScanResults(inout flush : boolean) : WifiScanner::ScanData
+        synchronized (mSettingsLock) {
+            WifiScanner.ScanData[] results = mBackgroundScanBuffer.get();
+            if (flush) {
+                mBackgroundScanBuffer.clear();
+            }
+            return results;
+        }
+!!!37097527.java!!!	setNetworkPriorities(inout networkList : WifiNative::PnoNetwork) : boolean
+        if (networkList != null) {
+            if (DBG) Log.i(TAG, "Enable network and Set priorities for PNO.");
+            for (WifiNative.PnoNetwork network : networkList) {
+                if (!mWifiNative.setNetworkVariable(network.networkId,
+                        WifiConfiguration.priorityVarName,
+                        Integer.toString(network.priority))) {
+                    Log.e(TAG, "Set priority failed for: " + network.networkId);
+                    return false;
+                }
+                if (!mWifiNative.enableNetworkWithoutConnect(network.networkId)) {
+                    Log.e(TAG, "Enable network failed for: " + network.networkId);
+                    return false;
+                }
+            }
+        }
+        return true;
+!!!37097655.java!!!	startHwPnoScan() : boolean
+        return mHwPnoDebouncer.startPnoScan(mHwPnoDebouncerListener);
+!!!37097783.java!!!	stopHwPnoScan() : void
+        mHwPnoDebouncer.stopPnoScan();
+!!!37097911.java!!!	pauseHwPnoScan() : void
+        mHwPnoDebouncer.forceStopPnoScan();
+!!!37098039.java!!!	isHwPnoScanRequired(inout isConnectedPno : boolean) : boolean
+        return (!isConnectedPno & mHwPnoScanSupported);
+!!!37098167.java!!!	isHwPnoScanRequired() : boolean
+        if (mPnoSettings == null) return false;
+        return isHwPnoScanRequired(mPnoSettings.isConnected);
+!!!37098295.java!!!	setHwPnoList(inout settings : WifiNative::PnoSettings, inout eventHandler : WifiNative::PnoEventHandler) : boolean
+        synchronized (mSettingsLock) {
+            if (mPnoSettings != null) {
+                Log.w(TAG, "Already running a PNO scan");
+                return false;
+            }
+            mPnoEventHandler = eventHandler;
+            mPnoSettings = settings;
+            if (!setNetworkPriorities(settings.networkList)) return false;
+            // For supplicant based PNO, we start the scan immediately when we set pno list.
+            processPendingScans();
+            return true;
+        }
+!!!37098423.java!!!	resetHwPnoList() : boolean
+        synchronized (mSettingsLock) {
+            if (mPnoSettings == null) {
+                Log.w(TAG, "No PNO scan running");
+                return false;
+            }
+            mPnoEventHandler = null;
+            mPnoSettings = null;
+            // For supplicant based PNO, we stop the scan immediately when we reset pno list.
+            stopHwPnoScan();
+            return true;
+        }
+!!!37098551.java!!!	isHwPnoSupported(inout isConnectedPno : boolean) : boolean
+        // Hw Pno Scan is supported only for disconnected PNO when the device supports it.
+        return isHwPnoScanRequired(isConnectedPno);
+!!!37098679.java!!!	shouldScheduleBackgroundScanForHwPno() : boolean
+        return false;
+!!!37098807.java!!!	setHotlist(inout settings : WifiScanner::HotlistSettings, inout eventHandler : WifiNative::HotlistEventHandler) : boolean
+        if (settings == null || eventHandler == null) {
+            return false;
+        }
+        synchronized (mSettingsLock) {
+            mHotlistHandler = eventHandler;
+            mHotlistChangeBuffer.setSettings(settings.bssidInfos, settings.apLostThreshold, 1);
+            return true;
+        }
+!!!37098935.java!!!	resetHotlist() : void
+        synchronized (mSettingsLock) {
+            mHotlistChangeBuffer.clearSettings();
+            mHotlistHandler = null;
+        }
+!!!37099063.java!!!	trackSignificantWifiChange(inout settings : WifiScanner::WifiChangeSettings, inout handler : WifiNative::SignificantWifiChangeEventHandler) : boolean
+        return false;

@@ -1,0 +1,296 @@
+class EnabledState
+!!!32231863.java!!!	enter() : void
+                sendNsdStateChangeBroadcast(true);
+                if (mClients.size() > 0) {
+                    startMDnsDaemon();
+                }
+!!!32231991.java!!!	exit() : void
+                if (mClients.size() > 0) {
+                    stopMDnsDaemon();
+                }
+!!!32232119.java!!!	requestLimitReached(inout clientInfo : NsdService::ClientInfo) : boolean
+                if (clientInfo.mClientIds.size() >= ClientInfo.MAX_LIMIT) {
+                    if (DBG) Slog.d(TAG, "Exceeded max outstanding requests " + clientInfo);
+                    return true;
+                }
+                return false;
+!!!32232247.java!!!	storeRequestMap(in clientId : int, in globalId : int, inout clientInfo : NsdService::ClientInfo, in what : int) : void
+                clientInfo.mClientIds.put(clientId, globalId);
+                clientInfo.mClientRequests.put(clientId, what);
+                mIdToClientInfoMap.put(globalId, clientInfo);
+!!!32232375.java!!!	removeRequestMap(in clientId : int, in globalId : int, inout clientInfo : NsdService::ClientInfo) : void
+                clientInfo.mClientIds.remove(clientId);
+                clientInfo.mClientRequests.remove(clientId);
+                mIdToClientInfoMap.remove(globalId);
+!!!32232503.java!!!	processMessage(inout msg : Message) : boolean
+                ClientInfo clientInfo;
+                NsdServiceInfo servInfo;
+                boolean result = HANDLED;
+                int id;
+                switch (msg.what) {
+                  case AsyncChannel.CMD_CHANNEL_HALF_CONNECTED:
+                        //First client
+                        if (msg.arg1 == AsyncChannel.STATUS_SUCCESSFUL &&
+                                mClients.size() == 0) {
+                            startMDnsDaemon();
+                        }
+                        result = NOT_HANDLED;
+                        break;
+                    case AsyncChannel.CMD_CHANNEL_DISCONNECTED:
+                        result = NOT_HANDLED;
+                        break;
+                    case NsdManager.DISABLE:
+                        //TODO: cleanup clients
+                        transitionTo(mDisabledState);
+                        break;
+                    case NsdManager.DISCOVER_SERVICES:
+                        if (DBG) Slog.d(TAG, "Discover services");
+                        servInfo = (NsdServiceInfo) msg.obj;
+                        clientInfo = mClients.get(msg.replyTo);
+
+                        if (requestLimitReached(clientInfo)) {
+                            replyToMessage(msg, NsdManager.DISCOVER_SERVICES_FAILED,
+                                    NsdManager.FAILURE_MAX_LIMIT);
+                            break;
+                        }
+
+                        id = getUniqueId();
+                        if (discoverServices(id, servInfo.getServiceType())) {
+                            if (DBG) {
+                                Slog.d(TAG, "Discover " + msg.arg2 + " " + id +
+                                        servInfo.getServiceType());
+                            }
+                            storeRequestMap(msg.arg2, id, clientInfo, msg.what);
+                            replyToMessage(msg, NsdManager.DISCOVER_SERVICES_STARTED, servInfo);
+                        } else {
+                            stopServiceDiscovery(id);
+                            replyToMessage(msg, NsdManager.DISCOVER_SERVICES_FAILED,
+                                    NsdManager.FAILURE_INTERNAL_ERROR);
+                        }
+                        break;
+                    case NsdManager.STOP_DISCOVERY:
+                        if (DBG) Slog.d(TAG, "Stop service discovery");
+                        clientInfo = mClients.get(msg.replyTo);
+
+                        try {
+                            id = clientInfo.mClientIds.get(msg.arg2).intValue();
+                        } catch (NullPointerException e) {
+                            replyToMessage(msg, NsdManager.STOP_DISCOVERY_FAILED,
+                                    NsdManager.FAILURE_INTERNAL_ERROR);
+                            break;
+                        }
+                        removeRequestMap(msg.arg2, id, clientInfo);
+                        if (stopServiceDiscovery(id)) {
+                            replyToMessage(msg, NsdManager.STOP_DISCOVERY_SUCCEEDED);
+                        } else {
+                            replyToMessage(msg, NsdManager.STOP_DISCOVERY_FAILED,
+                                    NsdManager.FAILURE_INTERNAL_ERROR);
+                        }
+                        break;
+                    case NsdManager.REGISTER_SERVICE:
+                        if (DBG) Slog.d(TAG, "Register service");
+                        clientInfo = mClients.get(msg.replyTo);
+                        if (requestLimitReached(clientInfo)) {
+                            replyToMessage(msg, NsdManager.REGISTER_SERVICE_FAILED,
+                                    NsdManager.FAILURE_MAX_LIMIT);
+                            break;
+                        }
+
+                        id = getUniqueId();
+                        if (registerService(id, (NsdServiceInfo) msg.obj)) {
+                            if (DBG) Slog.d(TAG, "Register " + msg.arg2 + " " + id);
+                            storeRequestMap(msg.arg2, id, clientInfo, msg.what);
+                            // Return success after mDns reports success
+                        } else {
+                            unregisterService(id);
+                            replyToMessage(msg, NsdManager.REGISTER_SERVICE_FAILED,
+                                    NsdManager.FAILURE_INTERNAL_ERROR);
+                        }
+                        break;
+                    case NsdManager.UNREGISTER_SERVICE:
+                        if (DBG) Slog.d(TAG, "unregister service");
+                        clientInfo = mClients.get(msg.replyTo);
+                        try {
+                            id = clientInfo.mClientIds.get(msg.arg2).intValue();
+                        } catch (NullPointerException e) {
+                            replyToMessage(msg, NsdManager.UNREGISTER_SERVICE_FAILED,
+                                    NsdManager.FAILURE_INTERNAL_ERROR);
+                            break;
+                        }
+                        removeRequestMap(msg.arg2, id, clientInfo);
+                        if (unregisterService(id)) {
+                            replyToMessage(msg, NsdManager.UNREGISTER_SERVICE_SUCCEEDED);
+                        } else {
+                            replyToMessage(msg, NsdManager.UNREGISTER_SERVICE_FAILED,
+                                    NsdManager.FAILURE_INTERNAL_ERROR);
+                        }
+                        break;
+                    case NsdManager.RESOLVE_SERVICE:
+                        if (DBG) Slog.d(TAG, "Resolve service");
+                        servInfo = (NsdServiceInfo) msg.obj;
+                        clientInfo = mClients.get(msg.replyTo);
+
+
+                        if (clientInfo.mResolvedService != null) {
+                            replyToMessage(msg, NsdManager.RESOLVE_SERVICE_FAILED,
+                                    NsdManager.FAILURE_ALREADY_ACTIVE);
+                            break;
+                        }
+
+                        id = getUniqueId();
+                        if (resolveService(id, servInfo)) {
+                            clientInfo.mResolvedService = new NsdServiceInfo();
+                            storeRequestMap(msg.arg2, id, clientInfo, msg.what);
+                        } else {
+                            replyToMessage(msg, NsdManager.RESOLVE_SERVICE_FAILED,
+                                    NsdManager.FAILURE_INTERNAL_ERROR);
+                        }
+                        break;
+                    case NsdManager.NATIVE_DAEMON_EVENT:
+                        NativeEvent event = (NativeEvent) msg.obj;
+                        if (!handleNativeEvent(event.code, event.raw, event.cooked)) {
+                            result = NOT_HANDLED;
+                        }
+                        break;
+                    default:
+                        result = NOT_HANDLED;
+                        break;
+                }
+                return result;
+!!!32232631.java!!!	handleNativeEvent(in code : int, inout raw : String, inout cooked : String) : boolean
+                boolean handled = true;
+                NsdServiceInfo servInfo;
+                int id = Integer.parseInt(cooked[1]);
+                ClientInfo clientInfo = mIdToClientInfoMap.get(id);
+                if (clientInfo == null) {
+                    Slog.e(TAG, "Unique id with no client mapping: " + id);
+                    handled = false;
+                    return handled;
+                }
+
+                /* This goes in response as msg.arg2 */
+                int clientId = clientInfo.getClientId(id);
+                if (clientId < 0) {
+                    // This can happen because of race conditions. For example,
+                    // SERVICE_FOUND may race with STOP_SERVICE_DISCOVERY,
+                    // and we may get in this situation.
+                    Slog.d(TAG, "Notification for a listener that is no longer active: " + id);
+                    handled = false;
+                    return handled;
+                }
+
+                switch (code) {
+                    case NativeResponseCode.SERVICE_FOUND:
+                        /* NNN uniqueId serviceName regType domain */
+                        if (DBG) Slog.d(TAG, "SERVICE_FOUND Raw: " + raw);
+                        servInfo = new NsdServiceInfo(cooked[2], cooked[3]);
+                        clientInfo.mChannel.sendMessage(NsdManager.SERVICE_FOUND, 0,
+                                clientId, servInfo);
+                        break;
+                    case NativeResponseCode.SERVICE_LOST:
+                        /* NNN uniqueId serviceName regType domain */
+                        if (DBG) Slog.d(TAG, "SERVICE_LOST Raw: " + raw);
+                        servInfo = new NsdServiceInfo(cooked[2], cooked[3]);
+                        clientInfo.mChannel.sendMessage(NsdManager.SERVICE_LOST, 0,
+                                clientId, servInfo);
+                        break;
+                    case NativeResponseCode.SERVICE_DISCOVERY_FAILED:
+                        /* NNN uniqueId errorCode */
+                        if (DBG) Slog.d(TAG, "SERVICE_DISC_FAILED Raw: " + raw);
+                        clientInfo.mChannel.sendMessage(NsdManager.DISCOVER_SERVICES_FAILED,
+                                NsdManager.FAILURE_INTERNAL_ERROR, clientId);
+                        break;
+                    case NativeResponseCode.SERVICE_REGISTERED:
+                        /* NNN regId serviceName regType */
+                        if (DBG) Slog.d(TAG, "SERVICE_REGISTERED Raw: " + raw);
+                        servInfo = new NsdServiceInfo(cooked[2], null);
+                        clientInfo.mChannel.sendMessage(NsdManager.REGISTER_SERVICE_SUCCEEDED,
+                                id, clientId, servInfo);
+                        break;
+                    case NativeResponseCode.SERVICE_REGISTRATION_FAILED:
+                        /* NNN regId errorCode */
+                        if (DBG) Slog.d(TAG, "SERVICE_REGISTER_FAILED Raw: " + raw);
+                        clientInfo.mChannel.sendMessage(NsdManager.REGISTER_SERVICE_FAILED,
+                               NsdManager.FAILURE_INTERNAL_ERROR, clientId);
+                        break;
+                    case NativeResponseCode.SERVICE_UPDATED:
+                        /* NNN regId */
+                        break;
+                    case NativeResponseCode.SERVICE_UPDATE_FAILED:
+                        /* NNN regId errorCode */
+                        break;
+                    case NativeResponseCode.SERVICE_RESOLVED:
+                        /* NNN resolveId fullName hostName port txtlen txtdata */
+                        if (DBG) Slog.d(TAG, "SERVICE_RESOLVED Raw: " + raw);
+                        int index = 0;
+                        while (index < cooked[2].length() && cooked[2].charAt(index) != '.') {
+                            if (cooked[2].charAt(index) == '\\') {
+                                ++index;
+                            }
+                            ++index;
+                        }
+                        if (index >= cooked[2].length()) {
+                            Slog.e(TAG, "Invalid service found " + raw);
+                            break;
+                        }
+                        String name = cooked[2].substring(0, index);
+                        String rest = cooked[2].substring(index);
+                        String type = rest.replace(".local.", "");
+
+                        name = unescape(name);
+
+                        clientInfo.mResolvedService.setServiceName(name);
+                        clientInfo.mResolvedService.setServiceType(type);
+                        clientInfo.mResolvedService.setPort(Integer.parseInt(cooked[4]));
+                        clientInfo.mResolvedService.setTxtRecords(cooked[6]);
+
+                        stopResolveService(id);
+                        removeRequestMap(clientId, id, clientInfo);
+
+                        int id2 = getUniqueId();
+                        if (getAddrInfo(id2, cooked[3])) {
+                            storeRequestMap(clientId, id2, clientInfo, NsdManager.RESOLVE_SERVICE);
+                        } else {
+                            clientInfo.mChannel.sendMessage(NsdManager.RESOLVE_SERVICE_FAILED,
+                                    NsdManager.FAILURE_INTERNAL_ERROR, clientId);
+                            clientInfo.mResolvedService = null;
+                        }
+                        break;
+                    case NativeResponseCode.SERVICE_RESOLUTION_FAILED:
+                        /* NNN resolveId errorCode */
+                        if (DBG) Slog.d(TAG, "SERVICE_RESOLVE_FAILED Raw: " + raw);
+                        stopResolveService(id);
+                        removeRequestMap(clientId, id, clientInfo);
+                        clientInfo.mResolvedService = null;
+                        clientInfo.mChannel.sendMessage(NsdManager.RESOLVE_SERVICE_FAILED,
+                                NsdManager.FAILURE_INTERNAL_ERROR, clientId);
+                        break;
+                    case NativeResponseCode.SERVICE_GET_ADDR_FAILED:
+                        /* NNN resolveId errorCode */
+                        stopGetAddrInfo(id);
+                        removeRequestMap(clientId, id, clientInfo);
+                        clientInfo.mResolvedService = null;
+                        if (DBG) Slog.d(TAG, "SERVICE_RESOLVE_FAILED Raw: " + raw);
+                        clientInfo.mChannel.sendMessage(NsdManager.RESOLVE_SERVICE_FAILED,
+                                NsdManager.FAILURE_INTERNAL_ERROR, clientId);
+                        break;
+                    case NativeResponseCode.SERVICE_GET_ADDR_SUCCESS:
+                        /* NNN resolveId hostname ttl addr */
+                        if (DBG) Slog.d(TAG, "SERVICE_GET_ADDR_SUCCESS Raw: " + raw);
+                        try {
+                            clientInfo.mResolvedService.setHost(InetAddress.getByName(cooked[4]));
+                            clientInfo.mChannel.sendMessage(NsdManager.RESOLVE_SERVICE_SUCCEEDED,
+                                   0, clientId, clientInfo.mResolvedService);
+                        } catch (java.net.UnknownHostException e) {
+                            clientInfo.mChannel.sendMessage(NsdManager.RESOLVE_SERVICE_FAILED,
+                                    NsdManager.FAILURE_INTERNAL_ERROR, clientId);
+                        }
+                        stopGetAddrInfo(id);
+                        removeRequestMap(clientId, id, clientInfo);
+                        clientInfo.mResolvedService = null;
+                        break;
+                    default:
+                        handled = false;
+                        break;
+                }
+                return handled;

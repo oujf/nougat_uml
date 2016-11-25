@@ -1,0 +1,197 @@
+class HTTPDownloader
+!!!39884215.cpp!!!	reconnect() : void
+    AutoMutex _l(mLock);
+    mDisconnecting = false;
+!!!39884343.cpp!!!	disconnect() : void
+    {
+        AutoMutex _l(mLock);
+        mDisconnecting = true;
+    }
+    mHTTPDataSource->disconnect();
+!!!39884471.cpp!!!	isDisconnecting() : bool
+    AutoMutex _l(mLock);
+    return mDisconnecting;
+!!!39884599.cpp!!!	fetchBlock(in url : char, inout out : sp<ABuffer>, in range_offset : int64_t, in range_length : int64_t, in block_size : uint32_t, inout actualUrl : String8, in reconnect : bool) : ssize_t
+    if (isDisconnecting()) {
+        return ERROR_NOT_CONNECTED;
+    }
+
+    off64_t size;
+
+    if (reconnect) {
+        if (!strncasecmp(url, "file://", 7)) {
+            mDataSource = new FileSource(url + 7);
+        } else if (strncasecmp(url, "http://", 7)
+                && strncasecmp(url, "https://", 8)) {
+            return ERROR_UNSUPPORTED;
+        } else {
+            KeyedVector<String8, String8> headers = mExtraHeaders;
+            if (range_offset > 0 || range_length >= 0) {
+                headers.add(
+                        String8("Range"),
+                        String8(
+                            AStringPrintf(
+                                "bytes=%lld-%s",
+                                range_offset,
+                                range_length < 0
+                                    ? "" : AStringPrintf("%lld",
+                                            range_offset + range_length - 1).c_str()).c_str()));
+            }
+
+            status_t err = mHTTPDataSource->connect(url, &headers);
+
+            if (isDisconnecting()) {
+                return ERROR_NOT_CONNECTED;
+            }
+
+            if (err != OK) {
+                return err;
+            }
+
+            mDataSource = mHTTPDataSource;
+        }
+    }
+
+    status_t getSizeErr = mDataSource->getSize(&size);
+
+    if (isDisconnecting()) {
+        return ERROR_NOT_CONNECTED;
+    }
+
+    if (getSizeErr != OK) {
+        size = 65536;
+    }
+
+    sp<ABuffer> buffer = *out != NULL ? *out : new ABuffer(size);
+    if (*out == NULL) {
+        buffer->setRange(0, 0);
+    }
+
+    ssize_t bytesRead = 0;
+    // adjust range_length if only reading partial block
+    if (block_size > 0 && (range_length == -1 || (int64_t)(buffer->size() + block_size) < range_length)) {
+        range_length = buffer->size() + block_size;
+    }
+    for (;;) {
+        // Only resize when we don't know the size.
+        size_t bufferRemaining = buffer->capacity() - buffer->size();
+        if (bufferRemaining == 0 && getSizeErr != OK) {
+            size_t bufferIncrement = buffer->size() / 2;
+            if (bufferIncrement < 32768) {
+                bufferIncrement = 32768;
+            }
+            bufferRemaining = bufferIncrement;
+
+            ALOGV("increasing download buffer to %zu bytes",
+                 buffer->size() + bufferRemaining);
+
+            sp<ABuffer> copy = new ABuffer(buffer->size() + bufferRemaining);
+            memcpy(copy->data(), buffer->data(), buffer->size());
+            copy->setRange(0, buffer->size());
+
+            buffer = copy;
+        }
+
+        size_t maxBytesToRead = bufferRemaining;
+        if (range_length >= 0) {
+            int64_t bytesLeftInRange = range_length - buffer->size();
+            if (bytesLeftInRange < 0) {
+                ALOGE("range_length %" PRId64 " wrapped around", range_length);
+                return ERROR_OUT_OF_RANGE;
+            } else if (bytesLeftInRange < (int64_t)maxBytesToRead) {
+                maxBytesToRead = bytesLeftInRange;
+
+                if (bytesLeftInRange == 0) {
+                    break;
+                }
+            }
+        }
+
+        // The DataSource is responsible for informing us of error (n < 0) or eof (n == 0)
+        // to help us break out of the loop.
+        ssize_t n = mDataSource->readAt(
+                buffer->size(), buffer->data() + buffer->size(),
+                maxBytesToRead);
+
+        if (isDisconnecting()) {
+            return ERROR_NOT_CONNECTED;
+        }
+
+        if (n < 0) {
+            return n;
+        }
+
+        if (n == 0) {
+            break;
+        }
+
+        buffer->setRange(0, buffer->size() + (size_t)n);
+        bytesRead += n;
+    }
+
+    *out = buffer;
+    if (actualUrl != NULL) {
+        *actualUrl = mDataSource->getUri();
+        if (actualUrl->isEmpty()) {
+            *actualUrl = url;
+        }
+    }
+
+    return bytesRead;
+!!!39884727.cpp!!!	fetchFile(in url : char, inout out : sp<ABuffer>, inout actualUrl : String8 = NULL) : ssize_t
+    ssize_t err = fetchBlock(url, out, 0, -1, 0, actualUrl, true /* reconnect */);
+
+    // close off the connection after use
+    mHTTPDataSource->disconnect();
+
+    return err;
+!!!39884855.cpp!!!	fetchPlaylist(in url : char, inout curPlaylistHash : uint8_t, inout unchanged : bool) : sp<M3UParser>
+    ALOGV("fetchPlaylist '%s'", url);
+
+    *unchanged = false;
+
+    sp<ABuffer> buffer;
+    String8 actualUrl;
+    ssize_t err = fetchFile(url, &buffer, &actualUrl);
+
+    // close off the connection after use
+    mHTTPDataSource->disconnect();
+
+    if (err <= 0) {
+        return NULL;
+    }
+
+    // MD5 functionality is not available on the simulator, treat all
+    // playlists as changed.
+
+#if defined(__ANDROID__)
+    uint8_t hash[16];
+
+    MD5_CTX m;
+    MD5_Init(&m);
+    MD5_Update(&m, buffer->data(), buffer->size());
+
+    MD5_Final(hash, &m);
+
+    if (curPlaylistHash != NULL && !memcmp(hash, curPlaylistHash, 16)) {
+        // playlist unchanged
+        *unchanged = true;
+
+        return NULL;
+    }
+
+    if (curPlaylistHash != NULL) {
+        memcpy(curPlaylistHash, hash, sizeof(hash));
+    }
+#endif
+
+    sp<M3UParser> playlist =
+        new M3UParser(actualUrl.string(), buffer->data(), buffer->size());
+
+    if (playlist->initCheck() != OK) {
+        ALOGE("failed to parse .m3u8 playlist");
+
+        return NULL;
+    }
+
+    return playlist;

@@ -1,0 +1,115 @@
+class MountServiceHandler
+!!!32180919.java!!!	MountServiceHandler(inout looper : Looper)
+            super(looper);
+!!!32181047.java!!!	handleMessage(inout msg : Message) : void
+            switch (msg.what) {
+                case H_SYSTEM_READY: {
+                    handleSystemReady();
+                    break;
+                }
+                case H_DAEMON_CONNECTED: {
+                    handleDaemonConnected();
+                    break;
+                }
+                case H_FSTRIM: {
+                    if (!isReady()) {
+                        Slog.i(TAG, "fstrim requested, but no daemon connection yet; trying again");
+                        sendMessageDelayed(obtainMessage(H_FSTRIM, msg.obj),
+                                DateUtils.SECOND_IN_MILLIS);
+                        break;
+                    }
+
+                    Slog.i(TAG, "Running fstrim idle maintenance");
+
+                    // Remember when we kicked it off
+                    try {
+                        mLastMaintenance = System.currentTimeMillis();
+                        mLastMaintenanceFile.setLastModified(mLastMaintenance);
+                    } catch (Exception e) {
+                        Slog.e(TAG, "Unable to record last fstrim!");
+                    }
+
+                    final boolean shouldBenchmark = shouldBenchmark();
+                    try {
+                        // This method must be run on the main (handler) thread,
+                        // so it is safe to directly call into vold.
+                        mConnector.execute("fstrim", shouldBenchmark ? "dotrimbench" : "dotrim");
+                    } catch (NativeDaemonConnectorException ndce) {
+                        Slog.e(TAG, "Failed to run fstrim!");
+                    }
+
+                    // invoke the completion callback, if any
+                    // TODO: fstrim is non-blocking, so remove this useless callback
+                    Runnable callback = (Runnable) msg.obj;
+                    if (callback != null) {
+                        callback.run();
+                    }
+                    break;
+                }
+                case H_SHUTDOWN: {
+                    final IMountShutdownObserver obs = (IMountShutdownObserver) msg.obj;
+                    boolean success = false;
+                    try {
+                        success = mConnector.execute("volume", "shutdown").isClassOk();
+                    } catch (NativeDaemonConnectorException ignored) {
+                    }
+                    if (obs != null) {
+                        try {
+                            obs.onShutDownComplete(success ? 0 : -1);
+                        } catch (RemoteException ignored) {
+                        }
+                    }
+                    break;
+                }
+                case H_VOLUME_MOUNT: {
+                    final VolumeInfo vol = (VolumeInfo) msg.obj;
+                    if (isMountDisallowed(vol)) {
+                        Slog.i(TAG, "Ignoring mount " + vol.getId() + " due to policy");
+                        break;
+                    }
+                    try {
+                        mConnector.execute("volume", "mount", vol.id, vol.mountFlags,
+                                vol.mountUserId);
+                    } catch (NativeDaemonConnectorException ignored) {
+                    }
+                    break;
+                }
+                case H_VOLUME_UNMOUNT: {
+                    final VolumeInfo vol = (VolumeInfo) msg.obj;
+                    unmount(vol.getId());
+                    break;
+                }
+                case H_VOLUME_BROADCAST: {
+                    final StorageVolume userVol = (StorageVolume) msg.obj;
+                    final String envState = userVol.getState();
+                    Slog.d(TAG, "Volume " + userVol.getId() + " broadcasting " + envState + " to "
+                            + userVol.getOwner());
+
+                    final String action = VolumeInfo.getBroadcastForEnvironment(envState);
+                    if (action != null) {
+                        final Intent intent = new Intent(action,
+                                Uri.fromFile(userVol.getPathFile()));
+                        intent.putExtra(StorageVolume.EXTRA_STORAGE_VOLUME, userVol);
+                        intent.addFlags(Intent.FLAG_RECEIVER_REGISTERED_ONLY_BEFORE_BOOT);
+                        mContext.sendBroadcastAsUser(intent, userVol.getOwner());
+                    }
+                    break;
+                }
+                case H_INTERNAL_BROADCAST: {
+                    // Internal broadcasts aimed at system components, not for
+                    // third-party apps.
+                    final Intent intent = (Intent) msg.obj;
+                    mContext.sendBroadcastAsUser(intent, UserHandle.ALL,
+                            android.Manifest.permission.WRITE_MEDIA_STORAGE);
+                    break;
+                }
+                case H_PARTITION_FORGET: {
+                    final String partGuid = (String) msg.obj;
+                    forgetPartition(partGuid);
+                    break;
+                }
+                case H_RESET: {
+                    resetIfReadyAndConnected();
+                    break;
+                }
+            }

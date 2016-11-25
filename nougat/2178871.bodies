@@ -1,0 +1,139 @@
+class DcActivatingState
+!!!37895351.java!!!	processMessage(inout msg : Message) : boolean
+            boolean retVal;
+            AsyncResult ar;
+            ConnectionParams cp;
+
+            if (DBG) log("DcActivatingState: msg=" + msgToString(msg));
+            switch (msg.what) {
+                case EVENT_DATA_CONNECTION_DRS_OR_RAT_CHANGED:
+                case EVENT_CONNECT:
+                    // Activating can't process until we're done.
+                    deferMessage(msg);
+                    retVal = HANDLED;
+                    break;
+
+                case EVENT_SETUP_DATA_CONNECTION_DONE:
+                    ar = (AsyncResult) msg.obj;
+                    cp = (ConnectionParams) ar.userObj;
+
+                    DataCallResponse.SetupResult result = onSetupConnectionCompleted(ar);
+                    if (result != DataCallResponse.SetupResult.ERR_Stale) {
+                        if (mConnectionParams != cp) {
+                            loge("DcActivatingState: WEIRD mConnectionsParams:"+ mConnectionParams
+                                    + " != cp:" + cp);
+                        }
+                    }
+                    if (DBG) {
+                        log("DcActivatingState onSetupConnectionCompleted result=" + result
+                                + " dc=" + DataConnection.this);
+                    }
+                    if (cp.mApnContext != null) {
+                        cp.mApnContext.requestLog("onSetupConnectionCompleted result=" + result);
+                    }
+                    switch (result) {
+                        case SUCCESS:
+                            // All is well
+                            mDcFailCause = DcFailCause.NONE;
+                            transitionTo(mActiveState);
+                            break;
+                        case ERR_BadCommand:
+                            // Vendor ril rejected the command and didn't connect.
+                            // Transition to inactive but send notifications after
+                            // we've entered the mInactive state.
+                            mInactiveState.setEnterNotificationParams(cp, result.mFailCause);
+                            transitionTo(mInactiveState);
+                            break;
+                        case ERR_UnacceptableParameter:
+                            // The addresses given from the RIL are bad
+                            tearDownData(cp);
+                            transitionTo(mDisconnectingErrorCreatingConnection);
+                            break;
+                        case ERR_GetLastErrorFromRil:
+                            // Request failed and this is an old RIL
+                            mPhone.mCi.getLastDataCallFailCause(
+                                    obtainMessage(EVENT_GET_LAST_FAIL_DONE, cp));
+                            break;
+                        case ERR_RilError:
+
+                            // Retrieve the suggested retry delay from the modem and save it.
+                            // If the modem want us to retry the current APN again, it will
+                            // suggest a positive delay value (in milliseconds). Otherwise we'll get
+                            // NO_SUGGESTED_RETRY_DELAY here.
+                            long delay = getSuggestedRetryDelay(ar);
+                            cp.mApnContext.setModemSuggestedDelay(delay);
+
+                            String str = "DcActivatingState: ERR_RilError "
+                                    + " delay=" + delay
+                                    + " result=" + result
+                                    + " result.isRestartRadioFail=" +
+                                    result.mFailCause.isRestartRadioFail()
+                                    + " result.isPermanentFail=" +
+                                    mDct.isPermanentFail(result.mFailCause);
+                            if (DBG) log(str);
+                            if (cp.mApnContext != null) cp.mApnContext.requestLog(str);
+
+                            // Save the cause. DcTracker.onDataSetupComplete will check this
+                            // failure cause and determine if we need to retry this APN later
+                            // or not.
+                            mInactiveState.setEnterNotificationParams(cp, result.mFailCause);
+                            transitionTo(mInactiveState);
+                            break;
+                        case ERR_Stale:
+                            loge("DcActivatingState: stale EVENT_SETUP_DATA_CONNECTION_DONE"
+                                    + " tag:" + cp.mTag + " != mTag:" + mTag);
+                            break;
+                        default:
+                            throw new RuntimeException("Unknown SetupResult, should not happen");
+                    }
+                    retVal = HANDLED;
+                    break;
+
+                case EVENT_GET_LAST_FAIL_DONE:
+                    ar = (AsyncResult) msg.obj;
+                    cp = (ConnectionParams) ar.userObj;
+                    if (cp.mTag == mTag) {
+                        if (mConnectionParams != cp) {
+                            loge("DcActivatingState: WEIRD mConnectionsParams:" + mConnectionParams
+                                    + " != cp:" + cp);
+                        }
+
+                        DcFailCause cause = DcFailCause.UNKNOWN;
+
+                        if (ar.exception == null) {
+                            int rilFailCause = ((int[]) (ar.result))[0];
+                            cause = DcFailCause.fromInt(rilFailCause);
+                            if (cause == DcFailCause.NONE) {
+                                if (DBG) {
+                                    log("DcActivatingState msg.what=EVENT_GET_LAST_FAIL_DONE"
+                                            + " BAD: error was NONE, change to UNKNOWN");
+                                }
+                                cause = DcFailCause.UNKNOWN;
+                            }
+                        }
+                        mDcFailCause = cause;
+
+                        if (DBG) {
+                            log("DcActivatingState msg.what=EVENT_GET_LAST_FAIL_DONE"
+                                    + " cause=" + cause + " dc=" + DataConnection.this);
+                        }
+
+                        mInactiveState.setEnterNotificationParams(cp, cause);
+                        transitionTo(mInactiveState);
+                    } else {
+                        loge("DcActivatingState: stale EVENT_GET_LAST_FAIL_DONE"
+                                + " tag:" + cp.mTag + " != mTag:" + mTag);
+                    }
+
+                    retVal = HANDLED;
+                    break;
+
+                default:
+                    if (VDBG) {
+                        log("DcActivatingState not handled msg.what=" +
+                                getWhatToString(msg.what) + " RefCount=" + mApnContexts.size());
+                    }
+                    retVal = NOT_HANDLED;
+                    break;
+            }
+            return retVal;

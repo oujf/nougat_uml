@@ -1,0 +1,476 @@
+class ATSParser::Stream
+!!!40223159.cpp!!!	parse(in continuity_counter : uint, in payload_unit_start_indicator : uint, inout br : ABitReader, inout event : SyncEvent) : status_t
+    if (mQueue == NULL) {
+        return OK;
+    }
+
+    if (mExpectedContinuityCounter >= 0
+            && (unsigned)mExpectedContinuityCounter != continuity_counter) {
+        ALOGI("discontinuity on stream pid 0x%04x", mElementaryPID);
+
+        mPayloadStarted = false;
+        mPesStartOffsets.clear();
+        mBuffer->setRange(0, 0);
+        mExpectedContinuityCounter = -1;
+
+#if 0
+        // Uncomment this if you'd rather see no corruption whatsoever on
+        // screen and suspend updates until we come across another IDR frame.
+
+        if (mStreamType == STREAMTYPE_H264) {
+            ALOGI("clearing video queue");
+            mQueue->clear(true /* clearFormat */);
+        }
+#endif
+
+        if (!payload_unit_start_indicator) {
+            return OK;
+        }
+    }
+
+    mExpectedContinuityCounter = (continuity_counter + 1) & 0x0f;
+
+    if (payload_unit_start_indicator) {
+        off64_t offset = (event != NULL) ? event->getOffset() : 0;
+        if (mPayloadStarted) {
+            // Otherwise we run the danger of receiving the trailing bytes
+            // of a PES packet that we never saw the start of and assuming
+            // we have a a complete PES packet.
+
+            status_t err = flush(event);
+
+            if (err != OK) {
+                ALOGW("Error (%08x) happened while flushing; we simply discard "
+                      "the PES packet and continue.", err);
+            }
+        }
+
+        mPayloadStarted = true;
+        mPesStartOffsets.push_back(offset);
+    }
+
+    if (!mPayloadStarted) {
+        return OK;
+    }
+
+    size_t payloadSizeBits = br->numBitsLeft();
+    if (payloadSizeBits % 8 != 0u) {
+        ALOGE("Wrong value");
+        return BAD_VALUE;
+    }
+
+    size_t neededSize = mBuffer->size() + payloadSizeBits / 8;
+    if (mBuffer->capacity() < neededSize) {
+        // Increment in multiples of 64K.
+        neededSize = (neededSize + 65535) & ~65535;
+
+        ALOGI("resizing buffer to %zu bytes", neededSize);
+
+        sp<ABuffer> newBuffer = new ABuffer(neededSize);
+        memcpy(newBuffer->data(), mBuffer->data(), mBuffer->size());
+        newBuffer->setRange(0, mBuffer->size());
+        mBuffer = newBuffer;
+    }
+
+    memcpy(mBuffer->data() + mBuffer->size(), br->data(), payloadSizeBits / 8);
+    mBuffer->setRange(0, mBuffer->size() + payloadSizeBits / 8);
+
+    return OK;
+!!!40223287.cpp!!!	signalDiscontinuity(in type : DiscontinuityType, in extra : sp<AMessage>) : void
+    mExpectedContinuityCounter = -1;
+
+    if (mQueue == NULL) {
+        return;
+    }
+
+    mPayloadStarted = false;
+    mPesStartOffsets.clear();
+    mEOSReached = false;
+    mBuffer->setRange(0, 0);
+
+    bool clearFormat = false;
+    if (isAudio()) {
+        if (type & DISCONTINUITY_AUDIO_FORMAT) {
+            clearFormat = true;
+        }
+    } else {
+        if (type & DISCONTINUITY_VIDEO_FORMAT) {
+            clearFormat = true;
+        }
+    }
+
+    mQueue->clear(clearFormat);
+
+    if (type & DISCONTINUITY_TIME) {
+        uint64_t resumeAtPTS;
+        if (extra != NULL
+                && extra->findInt64(
+                    IStreamListener::kKeyResumeAtPTS,
+                    (int64_t *)&resumeAtPTS)) {
+            int64_t resumeAtMediaTimeUs =
+                mProgram->convertPTSToTimestamp(resumeAtPTS);
+
+            extra->setInt64("resume-at-mediaTimeUs", resumeAtMediaTimeUs);
+        }
+    }
+
+    if (mSource != NULL) {
+        mSource->queueDiscontinuity(type, extra, true);
+    }
+!!!40223415.cpp!!!	signalEOS(in finalResult : status_t) : void
+    if (mSource != NULL) {
+        mSource->signalEOS(finalResult);
+    }
+    mEOSReached = true;
+    flush(NULL);
+!!!40223543.cpp!!!	getSource(in type : SourceType) : sp<MediaSource>
+    switch (type) {
+        case VIDEO:
+        {
+            if (isVideo()) {
+                return mSource;
+            }
+            break;
+        }
+
+        case AUDIO:
+        {
+            if (isAudio()) {
+                return mSource;
+            }
+            break;
+        }
+
+        case META:
+        {
+            if (isMeta()) {
+                return mSource;
+            }
+            break;
+        }
+
+        default:
+            break;
+    }
+
+    return NULL;
+!!!40223671.cpp!!!	isAudio() : bool
+    switch (mStreamType) {
+        case STREAMTYPE_MPEG1_AUDIO:
+        case STREAMTYPE_MPEG2_AUDIO:
+        case STREAMTYPE_MPEG2_AUDIO_ADTS:
+        case STREAMTYPE_LPCM_AC3:
+        case STREAMTYPE_AC3:
+            return true;
+
+        default:
+            return false;
+    }
+!!!40223799.cpp!!!	isVideo() : bool
+    switch (mStreamType) {
+        case STREAMTYPE_H264:
+        case STREAMTYPE_MPEG1_VIDEO:
+        case STREAMTYPE_MPEG2_VIDEO:
+        case STREAMTYPE_MPEG4_VIDEO:
+            return true;
+
+        default:
+            return false;
+    }
+!!!40223927.cpp!!!	isMeta() : bool
+    if (mStreamType == STREAMTYPE_METADATA) {
+        return true;
+    }
+    return false;
+!!!40224055.cpp!!!	flush(inout event : SyncEvent) : status_t
+    if (mBuffer == NULL || mBuffer->size() == 0) {
+        return OK;
+    }
+
+    ALOGV("flushing stream 0x%04x size = %zu", mElementaryPID, mBuffer->size());
+
+    ABitReader br(mBuffer->data(), mBuffer->size());
+
+    status_t err = parsePES(&br, event);
+
+    mBuffer->setRange(0, 0);
+
+    return err;
+!!!40224183.cpp!!!	parsePES(inout br : ABitReader, inout event : SyncEvent) : status_t
+    unsigned packet_startcode_prefix = br->getBits(24);
+
+    ALOGV("packet_startcode_prefix = 0x%08x", packet_startcode_prefix);
+
+    if (packet_startcode_prefix != 1) {
+        ALOGV("Supposedly payload_unit_start=1 unit does not start "
+             "with startcode.");
+
+        return ERROR_MALFORMED;
+    }
+
+    unsigned stream_id = br->getBits(8);
+    ALOGV("stream_id = 0x%02x", stream_id);
+
+    unsigned PES_packet_length = br->getBits(16);
+    ALOGV("PES_packet_length = %u", PES_packet_length);
+
+    if (stream_id != 0xbc  // program_stream_map
+            && stream_id != 0xbe  // padding_stream
+            && stream_id != 0xbf  // private_stream_2
+            && stream_id != 0xf0  // ECM
+            && stream_id != 0xf1  // EMM
+            && stream_id != 0xff  // program_stream_directory
+            && stream_id != 0xf2  // DSMCC
+            && stream_id != 0xf8) {  // H.222.1 type E
+        if (br->getBits(2) != 2u) {
+            return ERROR_MALFORMED;
+        }
+
+        MY_LOGV("PES_scrambling_control = %u", br->getBits(2));
+        MY_LOGV("PES_priority = %u", br->getBits(1));
+        MY_LOGV("data_alignment_indicator = %u", br->getBits(1));
+        MY_LOGV("copyright = %u", br->getBits(1));
+        MY_LOGV("original_or_copy = %u", br->getBits(1));
+
+        unsigned PTS_DTS_flags = br->getBits(2);
+        ALOGV("PTS_DTS_flags = %u", PTS_DTS_flags);
+
+        unsigned ESCR_flag = br->getBits(1);
+        ALOGV("ESCR_flag = %u", ESCR_flag);
+
+        unsigned ES_rate_flag = br->getBits(1);
+        ALOGV("ES_rate_flag = %u", ES_rate_flag);
+
+        unsigned DSM_trick_mode_flag = br->getBits(1);
+        ALOGV("DSM_trick_mode_flag = %u", DSM_trick_mode_flag);
+
+        unsigned additional_copy_info_flag = br->getBits(1);
+        ALOGV("additional_copy_info_flag = %u", additional_copy_info_flag);
+
+        MY_LOGV("PES_CRC_flag = %u", br->getBits(1));
+        MY_LOGV("PES_extension_flag = %u", br->getBits(1));
+
+        unsigned PES_header_data_length = br->getBits(8);
+        ALOGV("PES_header_data_length = %u", PES_header_data_length);
+
+        unsigned optional_bytes_remaining = PES_header_data_length;
+
+        uint64_t PTS = 0, DTS = 0;
+
+        if (PTS_DTS_flags == 2 || PTS_DTS_flags == 3) {
+            if (optional_bytes_remaining < 5u) {
+                return ERROR_MALFORMED;
+            }
+
+            if (br->getBits(4) != PTS_DTS_flags) {
+                return ERROR_MALFORMED;
+            }
+            PTS = ((uint64_t)br->getBits(3)) << 30;
+            if (br->getBits(1) != 1u) {
+                return ERROR_MALFORMED;
+            }
+            PTS |= ((uint64_t)br->getBits(15)) << 15;
+            if (br->getBits(1) != 1u) {
+                return ERROR_MALFORMED;
+            }
+            PTS |= br->getBits(15);
+            if (br->getBits(1) != 1u) {
+                return ERROR_MALFORMED;
+            }
+
+            ALOGV("PTS = 0x%016" PRIx64 " (%.2f)", PTS, PTS / 90000.0);
+
+            optional_bytes_remaining -= 5;
+
+            if (PTS_DTS_flags == 3) {
+                if (optional_bytes_remaining < 5u) {
+                    return ERROR_MALFORMED;
+                }
+
+                if (br->getBits(4) != 1u) {
+                    return ERROR_MALFORMED;
+                }
+
+                DTS = ((uint64_t)br->getBits(3)) << 30;
+                if (br->getBits(1) != 1u) {
+                    return ERROR_MALFORMED;
+                }
+                DTS |= ((uint64_t)br->getBits(15)) << 15;
+                if (br->getBits(1) != 1u) {
+                    return ERROR_MALFORMED;
+                }
+                DTS |= br->getBits(15);
+                if (br->getBits(1) != 1u) {
+                    return ERROR_MALFORMED;
+                }
+
+                ALOGV("DTS = %" PRIu64, DTS);
+
+                optional_bytes_remaining -= 5;
+            }
+        }
+
+        if (ESCR_flag) {
+            if (optional_bytes_remaining < 6u) {
+                return ERROR_MALFORMED;
+            }
+
+            br->getBits(2);
+
+            uint64_t ESCR = ((uint64_t)br->getBits(3)) << 30;
+            if (br->getBits(1) != 1u) {
+                return ERROR_MALFORMED;
+            }
+            ESCR |= ((uint64_t)br->getBits(15)) << 15;
+            if (br->getBits(1) != 1u) {
+                return ERROR_MALFORMED;
+            }
+            ESCR |= br->getBits(15);
+            if (br->getBits(1) != 1u) {
+                return ERROR_MALFORMED;
+            }
+
+            ALOGV("ESCR = %" PRIu64, ESCR);
+            MY_LOGV("ESCR_extension = %u", br->getBits(9));
+
+            if (br->getBits(1) != 1u) {
+                return ERROR_MALFORMED;
+            }
+
+            optional_bytes_remaining -= 6;
+        }
+
+        if (ES_rate_flag) {
+            if (optional_bytes_remaining < 3u) {
+                return ERROR_MALFORMED;
+            }
+
+            if (br->getBits(1) != 1u) {
+                return ERROR_MALFORMED;
+            }
+            MY_LOGV("ES_rate = %u", br->getBits(22));
+            if (br->getBits(1) != 1u) {
+                return ERROR_MALFORMED;
+            }
+
+            optional_bytes_remaining -= 3;
+        }
+
+        br->skipBits(optional_bytes_remaining * 8);
+
+        // ES data follows.
+
+        if (PES_packet_length != 0) {
+            if (PES_packet_length < PES_header_data_length + 3) {
+                return ERROR_MALFORMED;
+            }
+
+            unsigned dataLength =
+                PES_packet_length - 3 - PES_header_data_length;
+
+            if (br->numBitsLeft() < dataLength * 8) {
+                ALOGE("PES packet does not carry enough data to contain "
+                     "payload. (numBitsLeft = %zu, required = %u)",
+                     br->numBitsLeft(), dataLength * 8);
+
+                return ERROR_MALFORMED;
+            }
+
+            onPayloadData(
+                    PTS_DTS_flags, PTS, DTS, br->data(), dataLength, event);
+
+            br->skipBits(dataLength * 8);
+        } else {
+            onPayloadData(
+                    PTS_DTS_flags, PTS, DTS,
+                    br->data(), br->numBitsLeft() / 8, event);
+
+            size_t payloadSizeBits = br->numBitsLeft();
+            if (payloadSizeBits % 8 != 0u) {
+                return ERROR_MALFORMED;
+            }
+
+            ALOGV("There's %zu bytes of payload.", payloadSizeBits / 8);
+        }
+    } else if (stream_id == 0xbe) {  // padding_stream
+        if (PES_packet_length == 0u) {
+            return ERROR_MALFORMED;
+        }
+        br->skipBits(PES_packet_length * 8);
+    } else {
+        if (PES_packet_length == 0u) {
+            return ERROR_MALFORMED;
+        }
+        br->skipBits(PES_packet_length * 8);
+    }
+
+    return OK;
+!!!40224311.cpp!!!	onPayloadData(in PTS_DTS_flags : uint, in PTS : uint64_t, in DTS : uint64_t, in data : uint8_t, in size : size_t, inout event : SyncEvent) : void
+#if 0
+    ALOGI("payload streamType 0x%02x, PTS = 0x%016llx, dPTS = %lld",
+          mStreamType,
+          PTS,
+          (int64_t)PTS - mPrevPTS);
+    mPrevPTS = PTS;
+#endif
+
+    ALOGV("onPayloadData mStreamType=0x%02x", mStreamType);
+
+    int64_t timeUs = 0ll;  // no presentation timestamp available.
+    if (PTS_DTS_flags == 2 || PTS_DTS_flags == 3) {
+        timeUs = mProgram->convertPTSToTimestamp(PTS);
+    }
+
+    status_t err = mQueue->appendData(data, size, timeUs);
+
+    if (mEOSReached) {
+        mQueue->signalEOS();
+    }
+
+    if (err != OK) {
+        return;
+    }
+
+    sp<ABuffer> accessUnit;
+    bool found = false;
+    while ((accessUnit = mQueue->dequeueAccessUnit()) != NULL) {
+        if (mSource == NULL) {
+            sp<MetaData> meta = mQueue->getFormat();
+
+            if (meta != NULL) {
+                ALOGV("Stream PID 0x%08x of type 0x%02x now has data.",
+                     mElementaryPID, mStreamType);
+
+                const char *mime;
+                if (meta->findCString(kKeyMIMEType, &mime)
+                        && !strcasecmp(mime, MEDIA_MIMETYPE_VIDEO_AVC)
+                        && !IsIDR(accessUnit)) {
+                    continue;
+                }
+                mSource = new AnotherPacketSource(meta);
+                mSource->queueAccessUnit(accessUnit);
+            }
+        } else if (mQueue->getFormat() != NULL) {
+            // After a discontinuity we invalidate the queue's format
+            // and won't enqueue any access units to the source until
+            // the queue has reestablished the new format.
+
+            if (mSource->getFormat() == NULL) {
+                mSource->setFormat(mQueue->getFormat());
+            }
+            mSource->queueAccessUnit(accessUnit);
+        }
+
+        if ((event != NULL) && !found && mQueue->getFormat() != NULL) {
+            int32_t sync = 0;
+            if (accessUnit->meta()->findInt32("isSync", &sync) && sync) {
+                int64_t timeUs;
+                if (accessUnit->meta()->findInt64("timeUs", &timeUs)) {
+                    found = true;
+                    off64_t pesStartOffset = *mPesStartOffsets.begin();
+                    event->init(pesStartOffset, mSource, timeUs);
+                    mPesStartOffsets.erase(mPesStartOffsets.begin());
+                }
+            }
+        }
+    }

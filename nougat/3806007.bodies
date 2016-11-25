@@ -1,0 +1,199 @@
+class Camera3IOStreamBase
+!!!41168311.cpp!!!	Camera3IOStreamBase(in id : int, in type : camera3_stream_type_t, in width : uint32_t, in height : uint32_t, in maxSize : size_t, in format : int, in dataSpace : android_dataspace, in rotation : camera3_stream_rotation_t, in setId : int = CAMERA3_STREAM_SET_ID_INVALID)
+
+    mCombinedFence = new Fence();
+
+    if (maxSize > 0 &&
+            (format != HAL_PIXEL_FORMAT_BLOB && format != HAL_PIXEL_FORMAT_RAW_OPAQUE)) {
+        ALOGE("%s: Bad format for size-only stream: %d", __FUNCTION__,
+                format);
+        mState = STATE_ERROR;
+    }
+!!!41168439.cpp!!!	~Camera3IOStreamBase()
+    disconnectLocked();
+!!!41168567.cpp!!!	dump(in fd : int, in args : Vector<String16>) : void
+    (void) args;
+    String8 lines;
+
+    uint32_t consumerUsage = 0;
+    status_t res = getEndpointUsage(&consumerUsage);
+    if (res != OK) consumerUsage = 0;
+
+    lines.appendFormat("      State: %d\n", mState);
+    lines.appendFormat("      Dims: %d x %d, format 0x%x, dataspace 0x%x\n",
+            camera3_stream::width, camera3_stream::height,
+            camera3_stream::format, camera3_stream::data_space);
+    lines.appendFormat("      Max size: %zu\n", mMaxSize);
+    lines.appendFormat("      Combined usage: %d, max HAL buffers: %d\n",
+            camera3_stream::usage | consumerUsage, camera3_stream::max_buffers);
+    lines.appendFormat("      Frames produced: %d, last timestamp: %" PRId64 " ns\n",
+            mFrameCount, mLastTimestamp);
+    lines.appendFormat("      Total buffers: %zu, currently dequeued: %zu\n",
+            mTotalBufferCount, mHandoutTotalBufferCount);
+    write(fd, lines.string(), lines.size());
+!!!41168695.cpp!!!	returnAnyBufferLocked(in buffer : camera3_stream_buffer, in timestamp : nsecs_t, in output : bool) : status_t
+    status_t res;
+
+    // returnBuffer may be called from a raw pointer, not a sp<>, and we'll be
+    // decrementing the internal refcount next. In case this is the last ref, we
+    // might get destructed on the decStrong(), so keep an sp around until the
+    // end of the call - otherwise have to sprinkle the decStrong on all exit
+    // points.
+    sp<Camera3IOStreamBase> keepAlive(this);
+    decStrong(this);
+
+    if ((res = returnBufferPreconditionCheckLocked()) != OK) {
+        return res;
+    }
+
+    sp<Fence> releaseFence;
+    res = returnBufferCheckedLocked(buffer, timestamp, output,
+                                    &releaseFence);
+    // Res may be an error, but we still want to decrement our owned count
+    // to enable clean shutdown. So we'll just return the error but otherwise
+    // carry on
+
+    if (releaseFence != 0) {
+        mCombinedFence = Fence::merge(mName, mCombinedFence, releaseFence);
+    }
+
+    if (output) {
+        mHandoutOutputBufferCount--;
+    }
+
+    mHandoutTotalBufferCount--;
+    if (mHandoutTotalBufferCount == 0 && mState != STATE_IN_CONFIG &&
+            mState != STATE_IN_RECONFIG && mState != STATE_PREPARING) {
+        /**
+         * Avoid a spurious IDLE->ACTIVE->IDLE transition when using buffers
+         * before/after register_stream_buffers during initial configuration
+         * or re-configuration, or during prepare pre-allocation
+         */
+        ALOGV("%s: Stream %d: All buffers returned; now idle", __FUNCTION__,
+                mId);
+        sp<StatusTracker> statusTracker = mStatusTracker.promote();
+        if (statusTracker != 0) {
+            statusTracker->markComponentIdle(mStatusId, mCombinedFence);
+        }
+    }
+
+    mBufferReturnedSignal.signal();
+
+    if (output) {
+        mLastTimestamp = timestamp;
+    }
+
+    return res;
+!!!41168951.cpp!!!	hasOutstandingBuffersLocked() : bool
+    nsecs_t signalTime = mCombinedFence->getSignalTime();
+    ALOGV("%s: Stream %d: Has %zu outstanding buffers,"
+            " buffer signal time is %" PRId64,
+            __FUNCTION__, mId, mHandoutTotalBufferCount, signalTime);
+    if (mHandoutTotalBufferCount > 0 || signalTime == INT64_MAX) {
+        return true;
+    }
+    return false;
+!!!41169079.cpp!!!	getBufferCountLocked() : size_t
+    return mTotalBufferCount;
+!!!41169207.cpp!!!	getHandoutOutputBufferCountLocked() : size_t
+    return mHandoutOutputBufferCount;
+!!!41169335.cpp!!!	getHandoutInputBufferCountLocked() : size_t
+    return (mHandoutTotalBufferCount - mHandoutOutputBufferCount);
+!!!41169591.cpp!!!	getBufferPreconditionCheckLocked() : status_t
+    // Allow dequeue during IN_[RE]CONFIG for registration, in
+    // PREPARING for pre-allocation
+    if (mState != STATE_CONFIGURED &&
+            mState != STATE_IN_CONFIG && mState != STATE_IN_RECONFIG &&
+            mState != STATE_PREPARING) {
+        ALOGE("%s: Stream %d: Can't get buffers in unconfigured state %d",
+                __FUNCTION__, mId, mState);
+        return INVALID_OPERATION;
+    }
+
+    return OK;
+!!!41169719.cpp!!!	returnBufferPreconditionCheckLocked() : status_t
+    // Allow buffers to be returned in the error state, to allow for disconnect
+    // and in the in-config states for registration
+    if (mState == STATE_CONSTRUCTED) {
+        ALOGE("%s: Stream %d: Can't return buffers in unconfigured state %d",
+                __FUNCTION__, mId, mState);
+        return INVALID_OPERATION;
+    }
+    if (mHandoutTotalBufferCount == 0) {
+        ALOGE("%s: Stream %d: No buffers outstanding to return", __FUNCTION__,
+                mId);
+        return INVALID_OPERATION;
+    }
+
+    return OK;
+!!!41169847.cpp!!!	configureQueueLocked() : status_t
+    status_t res;
+
+    switch (mState) {
+        case STATE_IN_RECONFIG:
+            res = disconnectLocked();
+            if (res != OK) {
+                return res;
+            }
+            break;
+        case STATE_IN_CONFIG:
+            // OK
+            break;
+        default:
+            ALOGE("%s: Bad state: %d", __FUNCTION__, mState);
+            return INVALID_OPERATION;
+    }
+
+    return OK;
+!!!41169975.cpp!!!	disconnectLocked() : status_t
+    switch (mState) {
+        case STATE_IN_RECONFIG:
+        case STATE_CONFIGURED:
+        case STATE_ABANDONED:
+            // OK
+            break;
+        default:
+            // No connection, nothing to do
+            ALOGV("%s: Stream %d: Already disconnected",
+                  __FUNCTION__, mId);
+            return -ENOTCONN;
+    }
+
+    if (mHandoutTotalBufferCount > 0) {
+        ALOGE("%s: Can't disconnect with %zu buffers still dequeued!",
+                __FUNCTION__, mHandoutTotalBufferCount);
+        return INVALID_OPERATION;
+    }
+
+   return OK;
+!!!41170103.cpp!!!	handoutBufferLocked(inout buffer : camera3_stream_buffer, inout handle : buffer_handle_t, in acquireFence : int, in releaseFence : int, in status : camera3_buffer_status_t, in output : bool) : void
+    /**
+     * Note that all fences are now owned by HAL.
+     */
+
+    // Handing out a raw pointer to this object. Increment internal refcount.
+    incStrong(this);
+    buffer.stream = this;
+    buffer.buffer = handle;
+    buffer.acquire_fence = acquireFence;
+    buffer.release_fence = releaseFence;
+    buffer.status = status;
+
+    // Inform tracker about becoming busy
+    if (mHandoutTotalBufferCount == 0 && mState != STATE_IN_CONFIG &&
+            mState != STATE_IN_RECONFIG && mState != STATE_PREPARING) {
+        /**
+         * Avoid a spurious IDLE->ACTIVE->IDLE transition when using buffers
+         * before/after register_stream_buffers during initial configuration
+         * or re-configuration, or during prepare pre-allocation
+         */
+        sp<StatusTracker> statusTracker = mStatusTracker.promote();
+        if (statusTracker != 0) {
+            statusTracker->markComponentActive(mStatusId);
+        }
+    }
+    mHandoutTotalBufferCount++;
+
+    if (output) {
+        mHandoutOutputBufferCount++;
+    }

@@ -1,0 +1,133 @@
+class AnyMotionDetector
+!!!32023607.java!!!	AnyMotionDetector(inout pm : PowerManager, inout handler : Handler, inout sm : SensorManager, inout callback : AnyMotionDetector::DeviceIdleCallback, in thresholdAngle : float)
+        if (DEBUG) Slog.d(TAG, "AnyMotionDetector instantiated.");
+        synchronized (mLock) {
+            mWakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, TAG);
+            mWakeLock.setReferenceCounted(false);
+            mHandler = handler;
+            mSensorManager = sm;
+            mAccelSensor = mSensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER);
+            mMeasurementInProgress = false;
+            mState = STATE_INACTIVE;
+            mCallback = callback;
+            mThresholdAngle = thresholdAngle;
+            mRunningStats = new RunningSignalStats();
+            mNumSufficientSamples = (int) Math.ceil(
+                    ((double)ORIENTATION_MEASUREMENT_DURATION_MILLIS / SAMPLING_INTERVAL_MILLIS));
+            if (DEBUG) Slog.d(TAG, "mNumSufficientSamples = " + mNumSufficientSamples);
+        }
+!!!32023735.java!!!	checkForAnyMotion() : void
+        if (DEBUG) {
+            Slog.d(TAG, "checkForAnyMotion(). mState = " + mState);
+        }
+        if (mState != STATE_ACTIVE) {
+            synchronized (mLock) {
+                mState = STATE_ACTIVE;
+                if (DEBUG) {
+                    Slog.d(TAG, "Moved from STATE_INACTIVE to STATE_ACTIVE.");
+                }
+                mCurrentGravityVector = null;
+                mPreviousGravityVector = null;
+                mWakeLock.acquire();
+                startOrientationMeasurementLocked();
+            }
+        }
+!!!32023863.java!!!	stop() : void
+        if (mState == STATE_ACTIVE) {
+            synchronized (mLock) {
+                mState = STATE_INACTIVE;
+                if (DEBUG) Slog.d(TAG, "Moved from STATE_ACTIVE to STATE_INACTIVE.");
+                if (mMeasurementInProgress) {
+                    mMeasurementInProgress = false;
+                    mSensorManager.unregisterListener(mListener);
+                }
+                mHandler.removeCallbacks(mMeasurementTimeout);
+                mHandler.removeCallbacks(mSensorRestart);
+                mCurrentGravityVector = null;
+                mPreviousGravityVector = null;
+                mWakeLock.release();
+            }
+        }
+!!!32023991.java!!!	startOrientationMeasurementLocked() : void
+        if (DEBUG) Slog.d(TAG, "startOrientationMeasurementLocked: mMeasurementInProgress=" +
+            mMeasurementInProgress + ", (mAccelSensor != null)=" + (mAccelSensor != null));
+        if (!mMeasurementInProgress && mAccelSensor != null) {
+            if (mSensorManager.registerListener(mListener, mAccelSensor,
+                    SAMPLING_INTERVAL_MILLIS * 1000)) {
+                mMeasurementInProgress = true;
+                mRunningStats.reset();
+            }
+            Message msg = Message.obtain(mHandler, mMeasurementTimeout);
+            msg.setAsynchronous(true);
+            mHandler.sendMessageDelayed(msg, ACCELEROMETER_DATA_TIMEOUT_MILLIS);
+        }
+!!!32024119.java!!!	stopOrientationMeasurementLocked() : int
+        if (DEBUG) Slog.d(TAG, "stopOrientationMeasurement. mMeasurementInProgress=" +
+                mMeasurementInProgress);
+        int status = RESULT_UNKNOWN;
+        if (mMeasurementInProgress) {
+            mSensorManager.unregisterListener(mListener);
+            mHandler.removeCallbacks(mMeasurementTimeout);
+            long detectionEndTime = SystemClock.elapsedRealtime();
+            mMeasurementInProgress = false;
+            mPreviousGravityVector = mCurrentGravityVector;
+            mCurrentGravityVector = mRunningStats.getRunningAverage();
+            if (DEBUG) {
+                Slog.d(TAG, "mRunningStats = " + mRunningStats.toString());
+                String currentGravityVectorString = (mCurrentGravityVector == null) ?
+                        "null" : mCurrentGravityVector.toString();
+                String previousGravityVectorString = (mPreviousGravityVector == null) ?
+                        "null" : mPreviousGravityVector.toString();
+                Slog.d(TAG, "mCurrentGravityVector = " + currentGravityVectorString);
+                Slog.d(TAG, "mPreviousGravityVector = " + previousGravityVectorString);
+            }
+            mRunningStats.reset();
+            status = getStationaryStatus();
+            if (DEBUG) Slog.d(TAG, "getStationaryStatus() returned " + status);
+            if (status != RESULT_UNKNOWN) {
+                mWakeLock.release();
+                if (DEBUG) {
+                    Slog.d(TAG, "Moved from STATE_ACTIVE to STATE_INACTIVE. status = " + status);
+                }
+                mState = STATE_INACTIVE;
+            } else {
+                /*
+                 * Unknown due to insufficient measurements. Schedule another orientation
+                 * measurement.
+                 */
+                if (DEBUG) Slog.d(TAG, "stopOrientationMeasurementLocked(): another measurement" +
+                        " scheduled in " + ORIENTATION_MEASUREMENT_INTERVAL_MILLIS +
+                        " milliseconds.");
+                Message msg = Message.obtain(mHandler, mSensorRestart);
+                msg.setAsynchronous(true);
+                mHandler.sendMessageDelayed(msg, ORIENTATION_MEASUREMENT_INTERVAL_MILLIS);
+            }
+        }
+        return status;
+!!!32024247.java!!!	getStationaryStatus() : int
+        if ((mPreviousGravityVector == null) || (mCurrentGravityVector == null)) {
+            return RESULT_UNKNOWN;
+        }
+        Vector3 previousGravityVectorNormalized = mPreviousGravityVector.normalized();
+        Vector3 currentGravityVectorNormalized = mCurrentGravityVector.normalized();
+        float angle = previousGravityVectorNormalized.angleBetween(currentGravityVectorNormalized);
+        if (DEBUG) Slog.d(TAG, "getStationaryStatus: angle = " + angle
+                + " energy = " + mRunningStats.getEnergy());
+        if ((angle < mThresholdAngle) && (mRunningStats.getEnergy() < THRESHOLD_ENERGY)) {
+            return RESULT_STATIONARY;
+        } else if (Float.isNaN(angle)) {
+          /**
+           * Floating point rounding errors have caused the angle calcuation's dot product to 
+           * exceed 1.0. In such case, we report RESULT_MOVED to prevent devices from rapidly
+           * retrying this measurement.
+           */
+            return RESULT_MOVED;
+        }
+        long diffTime = mCurrentGravityVector.timeMillisSinceBoot -
+                mPreviousGravityVector.timeMillisSinceBoot;
+        if (diffTime > STALE_MEASUREMENT_TIMEOUT_MILLIS) {
+            if (DEBUG) Slog.d(TAG, "getStationaryStatus: mPreviousGravityVector is too stale at " +
+                    diffTime + " ms ago. Returning RESULT_UNKNOWN.");
+            return RESULT_UNKNOWN;
+        }
+        return RESULT_MOVED;

@@ -1,0 +1,206 @@
+class BlobBackupHelper
+!!!2427575.java!!!	BlobBackupHelper(in currentBlobVersion : int, inout  : String...keys)
+        mCurrentBlobVersion = currentBlobVersion;
+        mKeys = keys;
+!!!2427959.java!!!	readOldState(inout oldStateFd : ParcelFileDescriptor) : ArrayMap
+        final ArrayMap<String, Long> state = new ArrayMap<String, Long>();
+
+        FileInputStream fis = new FileInputStream(oldStateFd.getFileDescriptor());
+        DataInputStream in = new DataInputStream(fis);
+
+        try {
+            int version = in.readInt();
+            if (version <= mCurrentBlobVersion) {
+                final int numKeys = in.readInt();
+                if (DEBUG) {
+                    Log.i(TAG, "  " + numKeys + " keys in state record");
+                }
+                for (int i = 0; i < numKeys; i++) {
+                    String key = in.readUTF();
+                    long checksum = in.readLong();
+                    if (DEBUG) {
+                        Log.i(TAG, "  key '" + key + "' checksum is " + checksum);
+                    }
+                    state.put(key, checksum);
+                }
+            } else {
+                Log.w(TAG, "Prior state from unrecognized version " + version);
+            }
+        } catch (EOFException e) {
+            // Empty file is expected on first backup,  so carry on. If the state
+            // is truncated we just treat it the same way.
+            if (DEBUG) {
+                Log.i(TAG, "Hit EOF reading prior state");
+            }
+            state.clear();
+        } catch (Exception e) {
+            Log.e(TAG, "Error examining prior backup state " + e.getMessage());
+            state.clear();
+        }
+
+        return state;
+!!!2428087.java!!!	writeBackupState(inout state : ArrayMap, inout stateFile : ParcelFileDescriptor) : void
+        try {
+            FileOutputStream fos = new FileOutputStream(stateFile.getFileDescriptor());
+
+            // We explicitly don't close 'out' because we must not close the backing fd.
+            // The FileOutputStream will not close it implicitly.
+            @SuppressWarnings("resource")
+            DataOutputStream out = new DataOutputStream(fos);
+
+            out.writeInt(mCurrentBlobVersion);
+
+            final int N = (state != null) ? state.size() : 0;
+            out.writeInt(N);
+            for (int i = 0; i < N; i++) {
+                final String key = state.keyAt(i);
+                final long checksum = state.valueAt(i).longValue();
+                if (DEBUG) {
+                    Log.i(TAG, "  writing key " + key + " checksum = " + checksum);
+                }
+                out.writeUTF(key);
+                out.writeLong(checksum);
+            }
+        } catch (IOException e) {
+            Log.e(TAG, "Unable to write updated state", e);
+        }
+!!!2428215.java!!!	deflate(inout data : byte) : byte
+        byte[] result = null;
+        if (data != null) {
+            try {
+                ByteArrayOutputStream sink = new ByteArrayOutputStream();
+                DataOutputStream headerOut = new DataOutputStream(sink);
+
+                // write the header directly to the sink ahead of the deflated payload
+                headerOut.writeInt(mCurrentBlobVersion);
+
+                DeflaterOutputStream out = new DeflaterOutputStream(sink);
+                out.write(data);
+                out.close();  // finishes and commits the compression run
+                result = sink.toByteArray();
+                if (DEBUG) {
+                    Log.v(TAG, "Deflated " + data.length + " bytes to " + result.length);
+                }
+            } catch (IOException e) {
+                Log.w(TAG, "Unable to process payload: " + e.getMessage());
+            }
+        }
+        return result;
+!!!2428343.java!!!	inflate(inout compressedData : byte) : byte
+        byte[] result = null;
+        if (compressedData != null) {
+            try {
+                ByteArrayInputStream source = new ByteArrayInputStream(compressedData);
+                DataInputStream headerIn = new DataInputStream(source);
+                int version = headerIn.readInt();
+                if (version > mCurrentBlobVersion) {
+                    Log.w(TAG, "Saved payload from unrecognized version " + version);
+                    return null;
+                }
+
+                InflaterInputStream in = new InflaterInputStream(source);
+                ByteArrayOutputStream inflated = new ByteArrayOutputStream();
+                byte[] buffer = new byte[4096];
+                int nRead;
+                while ((nRead = in.read(buffer)) > 0) {
+                    inflated.write(buffer, 0, nRead);
+                }
+                in.close();
+                inflated.flush();
+                result = inflated.toByteArray();
+                if (DEBUG) {
+                    Log.v(TAG, "Inflated " + compressedData.length + " bytes to " + result.length);
+                }
+            } catch (IOException e) {
+                // result is still null here
+                Log.w(TAG, "Unable to process restored payload: " + e.getMessage());
+            }
+        }
+        return result;
+!!!2428471.java!!!	checksum(inout buffer : byte) : long
+        if (buffer != null) {
+            try {
+                CRC32 crc = new CRC32();
+                ByteArrayInputStream bis = new ByteArrayInputStream(buffer);
+                byte[] buf = new byte[4096];
+                int nRead = 0;
+                while ((nRead = bis.read(buf)) >= 0) {
+                    crc.update(buf, 0, nRead);
+                }
+                return crc.getValue();
+            } catch (Exception e) {
+                // whoops; fall through with an explicitly bogus checksum
+            }
+        }
+        return -1;
+!!!2428599.java!!!	performBackup(inout oldStateFd : ParcelFileDescriptor, inout data : BackupDataOutput, inout newStateFd : ParcelFileDescriptor) : void
+        if (DEBUG) {
+            Log.i(TAG, "Performing backup for " + this.getClass().getName());
+        }
+
+        final ArrayMap<String, Long> oldState = readOldState(oldStateFd);
+        final ArrayMap<String, Long> newState = new ArrayMap<String, Long>();
+
+        try {
+            for (String key : mKeys) {
+                final byte[] payload = deflate(getBackupPayload(key));
+                final long checksum = checksum(payload);
+                if (DEBUG) {
+                    Log.i(TAG, "Key " + key + " backup checksum is " + checksum);
+                }
+                newState.put(key, checksum);
+
+                Long oldChecksum = oldState.get(key);
+                if (oldChecksum == null || checksum != oldChecksum.longValue()) {
+                    if (DEBUG) {
+                        Log.i(TAG, "Checksum has changed from " + oldChecksum + " to " + checksum
+                                + " for key " + key + ", writing");
+                    }
+                    if (payload != null) {
+                        data.writeEntityHeader(key, payload.length);
+                        data.writeEntityData(payload, payload.length);
+                    } else {
+                        // state's changed but there's no current payload => delete
+                        data.writeEntityHeader(key, -1);
+                    }
+                } else {
+                    if (DEBUG) {
+                        Log.i(TAG, "No change under key " + key + " => not writing");
+                    }
+                }
+            }
+        } catch (Exception e) {
+            Log.w(TAG,  "Unable to record notification state: " + e.getMessage());
+            newState.clear();
+        } finally {
+            // Always rewrite the state even if nothing changed
+            writeBackupState(newState, newStateFd);
+        }
+!!!2428727.java!!!	restoreEntity(inout data : BackupDataInputStream) : void
+        final String key = data.getKey();
+        try {
+            // known key?
+            int which;
+            for (which = 0; which < mKeys.length; which++) {
+                if (key.equals(mKeys[which])) {
+                    break;
+                }
+            }
+            if (which >= mKeys.length) {
+                Log.e(TAG, "Unrecognized key " + key + ", ignoring");
+                return;
+            }
+
+            byte[] compressed = new byte[data.size()];
+            data.read(compressed);
+            byte[] payload = inflate(compressed);
+            applyRestoredPayload(key, payload);
+        } catch (Exception e) {
+            Log.e(TAG, "Exception restoring entity " + key + " : " + e.getMessage());
+        }
+!!!2428855.java!!!	writeNewStateDescription(inout newState : ParcelFileDescriptor) : void
+        // Just ensure that we do a full backup the first time after a restore
+        if (DEBUG) {
+            Log.i(TAG, "Writing state description after restore");
+        }
+        writeBackupState(null, newState);

@@ -1,0 +1,760 @@
+class SmsMessage
+!!!37953335.java!!!	createFromPdu(inout pdu : byte) : SmsMessage
+        try {
+            SmsMessage msg = new SmsMessage();
+            msg.parsePdu(pdu);
+            return msg;
+        } catch (RuntimeException ex) {
+            Rlog.e(LOG_TAG, "SMS PDU parsing failed: ", ex);
+            return null;
+        } catch (OutOfMemoryError e) {
+            Rlog.e(LOG_TAG, "SMS PDU parsing failed with out of memory: ", e);
+            return null;
+        }
+!!!37953463.java!!!	isTypeZero() : boolean
+        return (mProtocolIdentifier == 0x40);
+!!!37953591.java!!!	newFromCMT(inout lines : String) : SmsMessage
+        try {
+            SmsMessage msg = new SmsMessage();
+            msg.parsePdu(IccUtils.hexStringToBytes(lines[1]));
+            return msg;
+        } catch (RuntimeException ex) {
+            Rlog.e(LOG_TAG, "SMS PDU parsing failed: ", ex);
+            return null;
+        }
+!!!37953719.java!!!	newFromCDS(inout line : String) : SmsMessage
+        try {
+            SmsMessage msg = new SmsMessage();
+            msg.parsePdu(IccUtils.hexStringToBytes(line));
+            return msg;
+        } catch (RuntimeException ex) {
+            Rlog.e(LOG_TAG, "CDS SMS PDU parsing failed: ", ex);
+            return null;
+        }
+!!!37953847.java!!!	createFromEfRecord(in index : int, inout data : byte) : SmsMessage
+        try {
+            SmsMessage msg = new SmsMessage();
+
+            msg.mIndexOnIcc = index;
+
+            // First byte is status: RECEIVED_READ, RECEIVED_UNREAD, STORED_SENT,
+            // or STORED_UNSENT
+            // See TS 51.011 10.5.3
+            if ((data[0] & 1) == 0) {
+                Rlog.w(LOG_TAG,
+                        "SMS parsing failed: Trying to parse a free record");
+                return null;
+            } else {
+                msg.mStatusOnIcc = data[0] & 0x07;
+            }
+
+            int size = data.length - 1;
+
+            // Note: Data may include trailing FF's.  That's OK; message
+            // should still parse correctly.
+            byte[] pdu = new byte[size];
+            System.arraycopy(data, 1, pdu, 0, size);
+            msg.parsePdu(pdu);
+            return msg;
+        } catch (RuntimeException ex) {
+            Rlog.e(LOG_TAG, "SMS PDU parsing failed: ", ex);
+            return null;
+        }
+!!!37953975.java!!!	getTPLayerLengthForPDU(inout pdu : String) : int
+        int len = pdu.length() / 2;
+        int smscLen = Integer.parseInt(pdu.substring(0, 2), 16);
+
+        return len - smscLen - 1;
+!!!37954103.java!!!	getSubmitPdu(inout scAddress : String, inout destinationAddress : String, inout message : String, inout statusReportRequested : boolean, inout header : byte) : SmsMessage::SubmitPdu
+        return getSubmitPdu(scAddress, destinationAddress, message, statusReportRequested, header,
+                ENCODING_UNKNOWN, 0, 0);
+!!!37954231.java!!!	getSubmitPdu(inout scAddress : String, inout destinationAddress : String, inout message : String, inout statusReportRequested : boolean, inout header : byte, in encoding : int, in languageTable : int, in languageShiftTable : int) : SmsMessage::SubmitPdu
+
+        // Perform null parameter checks.
+        if (message == null || destinationAddress == null) {
+            return null;
+        }
+
+        if (encoding == ENCODING_UNKNOWN) {
+            // Find the best encoding to use
+            TextEncodingDetails ted = calculateLength(message, false);
+            encoding = ted.codeUnitSize;
+            languageTable = ted.languageTable;
+            languageShiftTable = ted.languageShiftTable;
+
+            if (encoding == ENCODING_7BIT &&
+                    (languageTable != 0 || languageShiftTable != 0)) {
+                if (header != null) {
+                    SmsHeader smsHeader = SmsHeader.fromByteArray(header);
+                    if (smsHeader.languageTable != languageTable
+                            || smsHeader.languageShiftTable != languageShiftTable) {
+                        Rlog.w(LOG_TAG, "Updating language table in SMS header: "
+                                + smsHeader.languageTable + " -> " + languageTable + ", "
+                                + smsHeader.languageShiftTable + " -> " + languageShiftTable);
+                        smsHeader.languageTable = languageTable;
+                        smsHeader.languageShiftTable = languageShiftTable;
+                        header = SmsHeader.toByteArray(smsHeader);
+                    }
+                } else {
+                    SmsHeader smsHeader = new SmsHeader();
+                    smsHeader.languageTable = languageTable;
+                    smsHeader.languageShiftTable = languageShiftTable;
+                    header = SmsHeader.toByteArray(smsHeader);
+                }
+            }
+        }
+
+        SubmitPdu ret = new SubmitPdu();
+        // MTI = SMS-SUBMIT, UDHI = header != null
+        byte mtiByte = (byte)(0x01 | (header != null ? 0x40 : 0x00));
+        ByteArrayOutputStream bo = getSubmitPduHead(
+                scAddress, destinationAddress, mtiByte,
+                statusReportRequested, ret);
+
+        // User Data (and length)
+        byte[] userData;
+        try {
+            if (encoding == ENCODING_7BIT) {
+                userData = GsmAlphabet.stringToGsm7BitPackedWithHeader(message, header,
+                        languageTable, languageShiftTable);
+            } else { //assume UCS-2
+                try {
+                    userData = encodeUCS2(message, header);
+                } catch(UnsupportedEncodingException uex) {
+                    Rlog.e(LOG_TAG,
+                            "Implausible UnsupportedEncodingException ",
+                            uex);
+                    return null;
+                }
+            }
+        } catch (EncodeException ex) {
+            // Encoding to the 7-bit alphabet failed. Let's see if we can
+            // send it as a UCS-2 encoded message
+            try {
+                userData = encodeUCS2(message, header);
+                encoding = ENCODING_16BIT;
+            } catch(UnsupportedEncodingException uex) {
+                Rlog.e(LOG_TAG,
+                        "Implausible UnsupportedEncodingException ",
+                        uex);
+                return null;
+            }
+        }
+
+        if (encoding == ENCODING_7BIT) {
+            if ((0xff & userData[0]) > MAX_USER_DATA_SEPTETS) {
+                // Message too long
+                Rlog.e(LOG_TAG, "Message too long (" + (0xff & userData[0]) + " septets)");
+                return null;
+            }
+            // TP-Data-Coding-Scheme
+            // Default encoding, uncompressed
+            // To test writing messages to the SIM card, change this value 0x00
+            // to 0x12, which means "bits 1 and 0 contain message class, and the
+            // class is 2". Note that this takes effect for the sender. In other
+            // words, messages sent by the phone with this change will end up on
+            // the receiver's SIM card. You can then send messages to yourself
+            // (on a phone with this change) and they'll end up on the SIM card.
+            bo.write(0x00);
+        } else { // assume UCS-2
+            if ((0xff & userData[0]) > MAX_USER_DATA_BYTES) {
+                // Message too long
+                Rlog.e(LOG_TAG, "Message too long (" + (0xff & userData[0]) + " bytes)");
+                return null;
+            }
+            // TP-Data-Coding-Scheme
+            // UCS-2 encoding, uncompressed
+            bo.write(0x08);
+        }
+
+        // (no TP-Validity-Period)
+        bo.write(userData, 0, userData.length);
+        ret.encodedMessage = bo.toByteArray();
+        return ret;
+!!!37954359.java!!!	encodeUCS2(inout message : String, inout header : byte) : byte
+        byte[] userData, textPart;
+        textPart = message.getBytes("utf-16be");
+
+        if (header != null) {
+            // Need 1 byte for UDHL
+            userData = new byte[header.length + textPart.length + 1];
+
+            userData[0] = (byte)header.length;
+            System.arraycopy(header, 0, userData, 1, header.length);
+            System.arraycopy(textPart, 0, userData, header.length + 1, textPart.length);
+        }
+        else {
+            userData = textPart;
+        }
+        byte[] ret = new byte[userData.length+1];
+        ret[0] = (byte) (userData.length & 0xff );
+        System.arraycopy(userData, 0, ret, 1, userData.length);
+        return ret;
+!!!37954487.java!!!	getSubmitPdu(inout scAddress : String, inout destinationAddress : String, inout message : String, inout statusReportRequested : boolean) : SmsMessage::SubmitPdu
+
+        return getSubmitPdu(scAddress, destinationAddress, message, statusReportRequested, null);
+!!!37954615.java!!!	getSubmitPdu(inout scAddress : String, inout destinationAddress : String, in destinationPort : int, inout data : byte, inout statusReportRequested : boolean) : SmsMessage::SubmitPdu
+
+        SmsHeader.PortAddrs portAddrs = new SmsHeader.PortAddrs();
+        portAddrs.destPort = destinationPort;
+        portAddrs.origPort = 0;
+        portAddrs.areEightBits = false;
+
+        SmsHeader smsHeader = new SmsHeader();
+        smsHeader.portAddrs = portAddrs;
+
+        byte[] smsHeaderData = SmsHeader.toByteArray(smsHeader);
+
+        if ((data.length + smsHeaderData.length + 1) > MAX_USER_DATA_BYTES) {
+            Rlog.e(LOG_TAG, "SMS data message may only contain "
+                    + (MAX_USER_DATA_BYTES - smsHeaderData.length - 1) + " bytes");
+            return null;
+        }
+
+        SubmitPdu ret = new SubmitPdu();
+        ByteArrayOutputStream bo = getSubmitPduHead(
+                scAddress, destinationAddress, (byte) 0x41, // MTI = SMS-SUBMIT,
+                                                            // TP-UDHI = true
+                statusReportRequested, ret);
+
+        // TP-Data-Coding-Scheme
+        // No class, 8 bit data
+        bo.write(0x04);
+
+        // (no TP-Validity-Period)
+
+        // Total size
+        bo.write(data.length + smsHeaderData.length + 1);
+
+        // User data header
+        bo.write(smsHeaderData.length);
+        bo.write(smsHeaderData, 0, smsHeaderData.length);
+
+        // User data
+        bo.write(data, 0, data.length);
+
+        ret.encodedMessage = bo.toByteArray();
+        return ret;
+!!!37954743.java!!!	getSubmitPduHead(inout scAddress : String, inout destinationAddress : String, in mtiByte : byte, inout statusReportRequested : boolean, inout ret : SmsMessage::SubmitPdu) : ByteArrayOutputStream
+        ByteArrayOutputStream bo = new ByteArrayOutputStream(
+                MAX_USER_DATA_BYTES + 40);
+
+        // SMSC address with length octet, or 0
+        if (scAddress == null) {
+            ret.encodedScAddress = null;
+        } else {
+            ret.encodedScAddress = PhoneNumberUtils.networkPortionToCalledPartyBCDWithLength(
+                    scAddress);
+        }
+
+        // TP-Message-Type-Indicator (and friends)
+        if (statusReportRequested) {
+            // Set TP-Status-Report-Request bit.
+            mtiByte |= 0x20;
+            if (VDBG) Rlog.d(LOG_TAG, "SMS status report requested");
+        }
+        bo.write(mtiByte);
+
+        // space for TP-Message-Reference
+        bo.write(0);
+
+        byte[] daBytes;
+
+        daBytes = PhoneNumberUtils.networkPortionToCalledPartyBCD(destinationAddress);
+
+        // destination address length in BCD digits, ignoring TON byte and pad
+        // TODO Should be better.
+        bo.write((daBytes.length - 1) * 2
+                - ((daBytes[daBytes.length - 1] & 0xf0) == 0xf0 ? 1 : 0));
+
+        // destination address
+        bo.write(daBytes, 0, daBytes.length);
+
+        // TP-Protocol-Identifier
+        bo.write(0);
+        return bo;
+!!!37956535.java!!!	calculateLength(inout msgBody : CharSequence, inout use7bitOnly : boolean) : GsmAlphabet::TextEncodingDetails
+        CharSequence newMsgBody = null;
+        Resources r = Resources.getSystem();
+        if (r.getBoolean(com.android.internal.R.bool.config_sms_force_7bit_encoding)) {
+            newMsgBody  = Sms7BitEncodingTranslator.translate(msgBody);
+        }
+        if (TextUtils.isEmpty(newMsgBody)) {
+            newMsgBody = msgBody;
+        }
+        TextEncodingDetails ted = GsmAlphabet.countGsmSeptets(newMsgBody, use7bitOnly);
+        if (ted == null) {
+            return SmsMessageBase.calcUnicodeEncodingDetails(newMsgBody);
+        }
+        return ted;
+!!!37956663.java!!!	getProtocolIdentifier() : int
+        return mProtocolIdentifier;
+!!!37956791.java!!!	getDataCodingScheme() : int
+        return mDataCodingScheme;
+!!!37956919.java!!!	isReplace() : boolean
+        return (mProtocolIdentifier & 0xc0) == 0x40
+                && (mProtocolIdentifier & 0x3f) > 0
+                && (mProtocolIdentifier & 0x3f) < 8;
+!!!37957047.java!!!	isCphsMwiMessage() : boolean
+        return ((GsmSmsAddress) mOriginatingAddress).isCphsVoiceMessageClear()
+                || ((GsmSmsAddress) mOriginatingAddress).isCphsVoiceMessageSet();
+!!!37957175.java!!!	isMWIClearMessage() : boolean
+        if (mIsMwi && !mMwiSense) {
+            return true;
+        }
+
+        return mOriginatingAddress != null
+                && ((GsmSmsAddress) mOriginatingAddress).isCphsVoiceMessageClear();
+!!!37957303.java!!!	isMWISetMessage() : boolean
+        if (mIsMwi && mMwiSense) {
+            return true;
+        }
+
+        return mOriginatingAddress != null
+                && ((GsmSmsAddress) mOriginatingAddress).isCphsVoiceMessageSet();
+!!!37957431.java!!!	isMwiDontStore() : boolean
+        if (mIsMwi && mMwiDontStore) {
+            return true;
+        }
+
+        if (isCphsMwiMessage()) {
+            // See CPHS 4.2 Section B.4.2.1
+            // If the user data is a single space char, do not store
+            // the message. Otherwise, store and display as usual
+            if (" ".equals(getMessageBody())) {
+                return true;
+            }
+        }
+
+        return false;
+!!!37957559.java!!!	getStatus() : int
+        return mStatus;
+!!!37957687.java!!!	isStatusReportMessage() : boolean
+        return mIsStatusReportMessage;
+!!!37957815.java!!!	isReplyPathPresent() : boolean
+        return mReplyPathPresent;
+!!!37957943.java!!!	parsePdu(inout pdu : byte) : void
+        mPdu = pdu;
+        // Rlog.d(LOG_TAG, "raw sms message:");
+        // Rlog.d(LOG_TAG, s);
+
+        PduParser p = new PduParser(pdu);
+
+        mScAddress = p.getSCAddress();
+
+        if (mScAddress != null) {
+            if (VDBG) Rlog.d(LOG_TAG, "SMS SC address: " + mScAddress);
+        }
+
+        // TODO(mkf) support reply path, user data header indicator
+
+        // TP-Message-Type-Indicator
+        // 9.2.3
+        int firstByte = p.getByte();
+
+        mMti = firstByte & 0x3;
+        switch (mMti) {
+        // TP-Message-Type-Indicator
+        // 9.2.3
+        case 0:
+        case 3: //GSM 03.40 9.2.3.1: MTI == 3 is Reserved.
+                //This should be processed in the same way as MTI == 0 (Deliver)
+            parseSmsDeliver(p, firstByte);
+            break;
+        case 1:
+            parseSmsSubmit(p, firstByte);
+            break;
+        case 2:
+            parseSmsStatusReport(p, firstByte);
+            break;
+        default:
+            // TODO(mkf) the rest of these
+            throw new RuntimeException("Unsupported message type");
+        }
+!!!37958071.java!!!	parseSmsStatusReport(inout p : SmsMessage::PduParser, in firstByte : int) : void
+        mIsStatusReportMessage = true;
+
+        // TP-Message-Reference
+        mMessageRef = p.getByte();
+        // TP-Recipient-Address
+        mRecipientAddress = p.getAddress();
+        // TP-Service-Centre-Time-Stamp
+        mScTimeMillis = p.getSCTimestampMillis();
+        p.getSCTimestampMillis();
+        // TP-Status
+        mStatus = p.getByte();
+
+        // The following are optional fields that may or may not be present.
+        if (p.moreDataPresent()) {
+            // TP-Parameter-Indicator
+            int extraParams = p.getByte();
+            int moreExtraParams = extraParams;
+            while ((moreExtraParams & 0x80) != 0) {
+                // We only know how to parse a few extra parameters, all
+                // indicated in the first TP-PI octet, so skip over any
+                // additional TP-PI octets.
+                moreExtraParams = p.getByte();
+            }
+            // As per 3GPP 23.040 section 9.2.3.27 TP-Parameter-Indicator,
+            // only process the byte if the reserved bits (bits3 to 6) are zero.
+            if ((extraParams & 0x78) == 0) {
+                // TP-Protocol-Identifier
+                if ((extraParams & 0x01) != 0) {
+                    mProtocolIdentifier = p.getByte();
+                }
+                // TP-Data-Coding-Scheme
+                if ((extraParams & 0x02) != 0) {
+                    mDataCodingScheme = p.getByte();
+                }
+                // TP-User-Data-Length (implies existence of TP-User-Data)
+                if ((extraParams & 0x04) != 0) {
+                    boolean hasUserDataHeader = (firstByte & 0x40) == 0x40;
+                    parseUserData(p, hasUserDataHeader);
+                }
+            }
+        }
+!!!37958199.java!!!	parseSmsDeliver(inout p : SmsMessage::PduParser, in firstByte : int) : void
+        mReplyPathPresent = (firstByte & 0x80) == 0x80;
+
+        mOriginatingAddress = p.getAddress();
+
+        if (mOriginatingAddress != null) {
+            if (VDBG) Rlog.v(LOG_TAG, "SMS originating address: "
+                    + mOriginatingAddress.address);
+        }
+
+        // TP-Protocol-Identifier (TP-PID)
+        // TS 23.040 9.2.3.9
+        mProtocolIdentifier = p.getByte();
+
+        // TP-Data-Coding-Scheme
+        // see TS 23.038
+        mDataCodingScheme = p.getByte();
+
+        if (VDBG) {
+            Rlog.v(LOG_TAG, "SMS TP-PID:" + mProtocolIdentifier
+                    + " data coding scheme: " + mDataCodingScheme);
+        }
+
+        mScTimeMillis = p.getSCTimestampMillis();
+
+        if (VDBG) Rlog.d(LOG_TAG, "SMS SC timestamp: " + mScTimeMillis);
+
+        boolean hasUserDataHeader = (firstByte & 0x40) == 0x40;
+
+        parseUserData(p, hasUserDataHeader);
+!!!37958327.java!!!	parseSmsSubmit(inout p : SmsMessage::PduParser, in firstByte : int) : void
+        mReplyPathPresent = (firstByte & 0x80) == 0x80;
+
+        // TP-MR (TP-Message Reference)
+        mMessageRef = p.getByte();
+
+        mRecipientAddress = p.getAddress();
+
+        if (mRecipientAddress != null) {
+            if (VDBG) Rlog.v(LOG_TAG, "SMS recipient address: " + mRecipientAddress.address);
+        }
+
+        // TP-Protocol-Identifier (TP-PID)
+        // TS 23.040 9.2.3.9
+        mProtocolIdentifier = p.getByte();
+
+        // TP-Data-Coding-Scheme
+        // see TS 23.038
+        mDataCodingScheme = p.getByte();
+
+        if (VDBG) {
+            Rlog.v(LOG_TAG, "SMS TP-PID:" + mProtocolIdentifier
+                    + " data coding scheme: " + mDataCodingScheme);
+        }
+
+        // TP-Validity-Period-Format
+        int validityPeriodLength = 0;
+        int validityPeriodFormat = ((firstByte>>3) & 0x3);
+        if (0x0 == validityPeriodFormat) /* 00, TP-VP field not present*/
+        {
+            validityPeriodLength = 0;
+        }
+        else if (0x2 == validityPeriodFormat) /* 10, TP-VP: relative format*/
+        {
+            validityPeriodLength = 1;
+        }
+        else /* other case, 11 or 01, TP-VP: absolute or enhanced format*/
+        {
+            validityPeriodLength = 7;
+        }
+
+        // TP-Validity-Period is not used on phone, so just ignore it for now.
+        while (validityPeriodLength-- > 0)
+        {
+            p.getByte();
+        }
+
+        boolean hasUserDataHeader = (firstByte & 0x40) == 0x40;
+
+        parseUserData(p, hasUserDataHeader);
+!!!37958455.java!!!	parseUserData(inout p : SmsMessage::PduParser, inout hasUserDataHeader : boolean) : void
+        boolean hasMessageClass = false;
+        boolean userDataCompressed = false;
+
+        int encodingType = ENCODING_UNKNOWN;
+
+        // Look up the data encoding scheme
+        if ((mDataCodingScheme & 0x80) == 0) {
+            userDataCompressed = (0 != (mDataCodingScheme & 0x20));
+            hasMessageClass = (0 != (mDataCodingScheme & 0x10));
+
+            if (userDataCompressed) {
+                Rlog.w(LOG_TAG, "4 - Unsupported SMS data coding scheme "
+                        + "(compression) " + (mDataCodingScheme & 0xff));
+            } else {
+                switch ((mDataCodingScheme >> 2) & 0x3) {
+                case 0: // GSM 7 bit default alphabet
+                    encodingType = ENCODING_7BIT;
+                    break;
+
+                case 2: // UCS 2 (16bit)
+                    encodingType = ENCODING_16BIT;
+                    break;
+
+                case 1: // 8 bit data
+                    //Support decoding the user data payload as pack GSM 8-bit (a GSM alphabet string
+                    //that's stored in 8-bit unpacked format) characters.
+                    Resources r = Resources.getSystem();
+                    if (r.getBoolean(com.android.internal.
+                            R.bool.config_sms_decode_gsm_8bit_data)) {
+                        encodingType = ENCODING_8BIT;
+                        break;
+                    }
+
+                case 3: // reserved
+                    Rlog.w(LOG_TAG, "1 - Unsupported SMS data coding scheme "
+                            + (mDataCodingScheme & 0xff));
+                    encodingType = ENCODING_8BIT;
+                    break;
+                }
+            }
+        } else if ((mDataCodingScheme & 0xf0) == 0xf0) {
+            hasMessageClass = true;
+            userDataCompressed = false;
+
+            if (0 == (mDataCodingScheme & 0x04)) {
+                // GSM 7 bit default alphabet
+                encodingType = ENCODING_7BIT;
+            } else {
+                // 8 bit data
+                encodingType = ENCODING_8BIT;
+            }
+        } else if ((mDataCodingScheme & 0xF0) == 0xC0
+                || (mDataCodingScheme & 0xF0) == 0xD0
+                || (mDataCodingScheme & 0xF0) == 0xE0) {
+            // 3GPP TS 23.038 V7.0.0 (2006-03) section 4
+
+            // 0xC0 == 7 bit, don't store
+            // 0xD0 == 7 bit, store
+            // 0xE0 == UCS-2, store
+
+            if ((mDataCodingScheme & 0xF0) == 0xE0) {
+                encodingType = ENCODING_16BIT;
+            } else {
+                encodingType = ENCODING_7BIT;
+            }
+
+            userDataCompressed = false;
+            boolean active = ((mDataCodingScheme & 0x08) == 0x08);
+            // bit 0x04 reserved
+
+            // VM - If TP-UDH is present, these values will be overwritten
+            if ((mDataCodingScheme & 0x03) == 0x00) {
+                mIsMwi = true; /* Indicates vmail */
+                mMwiSense = active;/* Indicates vmail notification set/clear */
+                mMwiDontStore = ((mDataCodingScheme & 0xF0) == 0xC0);
+
+                /* Set voice mail count based on notification bit */
+                if (active == true) {
+                    mVoiceMailCount = -1; // unknown number of messages waiting
+                } else {
+                    mVoiceMailCount = 0; // no unread messages
+                }
+
+                Rlog.w(LOG_TAG, "MWI in DCS for Vmail. DCS = "
+                        + (mDataCodingScheme & 0xff) + " Dont store = "
+                        + mMwiDontStore + " vmail count = " + mVoiceMailCount);
+
+            } else {
+                mIsMwi = false;
+                Rlog.w(LOG_TAG, "MWI in DCS for fax/email/other: "
+                        + (mDataCodingScheme & 0xff));
+            }
+        } else if ((mDataCodingScheme & 0xC0) == 0x80) {
+            // 3GPP TS 23.038 V7.0.0 (2006-03) section 4
+            // 0x80..0xBF == Reserved coding groups
+            if (mDataCodingScheme == 0x84) {
+                // This value used for KSC5601 by carriers in Korea.
+                encodingType = ENCODING_KSC5601;
+            } else {
+                Rlog.w(LOG_TAG, "5 - Unsupported SMS data coding scheme "
+                        + (mDataCodingScheme & 0xff));
+            }
+        } else {
+            Rlog.w(LOG_TAG, "3 - Unsupported SMS data coding scheme "
+                    + (mDataCodingScheme & 0xff));
+        }
+
+        // set both the user data and the user data header.
+        int count = p.constructUserData(hasUserDataHeader,
+                encodingType == ENCODING_7BIT);
+        this.mUserData = p.getUserData();
+        this.mUserDataHeader = p.getUserDataHeader();
+
+        /*
+         * Look for voice mail indication in TP_UDH TS23.040 9.2.3.24
+         * ieid = 1 (0x1) (SPECIAL_SMS_MSG_IND)
+         * ieidl =2 octets
+         * ieda msg_ind_type = 0x00 (voice mail; discard sms )or
+         *                   = 0x80 (voice mail; store sms)
+         * msg_count = 0x00 ..0xFF
+         */
+        if (hasUserDataHeader && (mUserDataHeader.specialSmsMsgList.size() != 0)) {
+            for (SmsHeader.SpecialSmsMsg msg : mUserDataHeader.specialSmsMsgList) {
+                int msgInd = msg.msgIndType & 0xff;
+                /*
+                 * TS 23.040 V6.8.1 Sec 9.2.3.24.2
+                 * bits 1 0 : basic message indication type
+                 * bits 4 3 2 : extended message indication type
+                 * bits 6 5 : Profile id bit 7 storage type
+                 */
+                if ((msgInd == 0) || (msgInd == 0x80)) {
+                    mIsMwi = true;
+                    if (msgInd == 0x80) {
+                        /* Store message because TP_UDH indicates so*/
+                        mMwiDontStore = false;
+                    } else if (mMwiDontStore == false) {
+                        /* Storage bit is not set by TP_UDH
+                         * Check for conflict
+                         * between message storage bit in TP_UDH
+                         * & DCS. The message shall be stored if either of
+                         * the one indicates so.
+                         * TS 23.040 V6.8.1 Sec 9.2.3.24.2
+                         */
+                        if (!((((mDataCodingScheme & 0xF0) == 0xD0)
+                               || ((mDataCodingScheme & 0xF0) == 0xE0))
+                               && ((mDataCodingScheme & 0x03) == 0x00))) {
+                            /* Even DCS did not have voice mail with Storage bit
+                             * 3GPP TS 23.038 V7.0.0 section 4
+                             * So clear this flag*/
+                            mMwiDontStore = true;
+                        }
+                    }
+
+                    mVoiceMailCount = msg.msgCount & 0xff;
+
+                    /*
+                     * In the event of a conflict between message count setting
+                     * and DCS then the Message Count in the TP-UDH shall
+                     * override the indication in the TP-DCS. Set voice mail
+                     * notification based on count in TP-UDH
+                     */
+                    if (mVoiceMailCount > 0)
+                        mMwiSense = true;
+                    else
+                        mMwiSense = false;
+
+                    Rlog.w(LOG_TAG, "MWI in TP-UDH for Vmail. Msg Ind = " + msgInd
+                            + " Dont store = " + mMwiDontStore + " Vmail count = "
+                            + mVoiceMailCount);
+
+                    /*
+                     * There can be only one IE for each type of message
+                     * indication in TP_UDH. In the event they are duplicated
+                     * last occurence will be used. Hence the for loop
+                     */
+                } else {
+                    Rlog.w(LOG_TAG, "TP_UDH fax/email/"
+                            + "extended msg/multisubscriber profile. Msg Ind = " + msgInd);
+                }
+            } // end of for
+        } // end of if UDH
+
+        switch (encodingType) {
+        case ENCODING_UNKNOWN:
+            mMessageBody = null;
+            break;
+
+        case ENCODING_8BIT:
+            //Support decoding the user data payload as pack GSM 8-bit (a GSM alphabet string
+            //that's stored in 8-bit unpacked format) characters.
+            Resources r = Resources.getSystem();
+            if (r.getBoolean(com.android.internal.
+                    R.bool.config_sms_decode_gsm_8bit_data)) {
+                mMessageBody = p.getUserDataGSM8bit(count);
+            } else {
+                mMessageBody = null;
+            }
+            break;
+
+        case ENCODING_7BIT:
+            mMessageBody = p.getUserDataGSM7Bit(count,
+                    hasUserDataHeader ? mUserDataHeader.languageTable : 0,
+                    hasUserDataHeader ? mUserDataHeader.languageShiftTable : 0);
+            break;
+
+        case ENCODING_16BIT:
+            mMessageBody = p.getUserDataUCS2(count);
+            break;
+
+        case ENCODING_KSC5601:
+            mMessageBody = p.getUserDataKSC5601(count);
+            break;
+        }
+
+        if (VDBG) Rlog.v(LOG_TAG, "SMS message body (raw): '" + mMessageBody + "'");
+
+        if (mMessageBody != null) {
+            parseMessageBody();
+        }
+
+        if (!hasMessageClass) {
+            messageClass = MessageClass.UNKNOWN;
+        } else {
+            switch (mDataCodingScheme & 0x3) {
+            case 0:
+                messageClass = MessageClass.CLASS_0;
+                break;
+            case 1:
+                messageClass = MessageClass.CLASS_1;
+                break;
+            case 2:
+                messageClass = MessageClass.CLASS_2;
+                break;
+            case 3:
+                messageClass = MessageClass.CLASS_3;
+                break;
+            }
+        }
+!!!37958583.java!!!	getMessageClass() : MessageClass
+        return messageClass;
+!!!37958711.java!!!	isUsimDataDownload() : boolean
+        return messageClass == MessageClass.CLASS_2 &&
+                (mProtocolIdentifier == 0x7f || mProtocolIdentifier == 0x7c);
+!!!37958839.java!!!	getNumOfVoicemails() : int
+        /*
+         * Order of priority if multiple indications are present is 1.UDH,
+         *      2.DCS, 3.CPHS.
+         * Voice mail count if voice mail present indication is
+         * received
+         *  1. UDH (or both UDH & DCS): mVoiceMailCount = 0 to 0xff. Ref[TS 23. 040]
+         *  2. DCS only: count is unknown mVoiceMailCount= -1
+         *  3. CPHS only: count is unknown mVoiceMailCount = 0xff. Ref[GSM-BTR-1-4700]
+         * Voice mail clear, mVoiceMailCount = 0.
+         */
+        if ((!mIsMwi) && isCphsMwiMessage()) {
+            if (mOriginatingAddress != null
+                    && ((GsmSmsAddress) mOriginatingAddress).isCphsVoiceMessageSet()) {
+                mVoiceMailCount = 0xff;
+            } else {
+                mVoiceMailCount = 0;
+            }
+            Rlog.v(LOG_TAG, "CPHS voice mail message");
+        }
+        return mVoiceMailCount;

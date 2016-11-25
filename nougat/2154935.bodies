@@ -1,0 +1,161 @@
+class SmsTracker
+!!!37685559.java!!!	SmsTracker(inout data : HashMap<String, Object>, inout sentIntent : PendingIntent, inout deliveryIntent : PendingIntent, inout appInfo : PackageInfo, inout destAddr : String, inout format : String, inout unsentPartCount : AtomicInteger, inout anyPartFailed : AtomicBoolean, inout messageUri : Uri, inout smsHeader : SmsHeader, inout isExpectMore : boolean, inout fullMessageText : String, in subId : int, inout isText : boolean, inout persistMessage : boolean)
+            mData = data;
+            mSentIntent = sentIntent;
+            mDeliveryIntent = deliveryIntent;
+            mRetryCount = 0;
+            mAppInfo = appInfo;
+            mDestAddress = destAddr;
+            mFormat = format;
+            mExpectMore = isExpectMore;
+            mImsRetry = 0;
+            mMessageRef = 0;
+            mUnsentPartCount = unsentPartCount;
+            mAnyPartFailed = anyPartFailed;
+            mMessageUri = messageUri;
+            mSmsHeader = smsHeader;
+            mFullMessageText = fullMessageText;
+            mSubId = subId;
+            mIsText = isText;
+            mPersistMessage = persistMessage;
+!!!37685687.java!!!	isMultipart() : boolean
+            return mData.containsKey("parts");
+!!!37685815.java!!!	getData() : String
+            return mData;
+!!!37685943.java!!!	updateSentMessageStatus(inout context : Context, in status : int) : void
+            if (mMessageUri != null) {
+                // If we wrote this message in writeSentMessage, update it now
+                ContentValues values = new ContentValues(1);
+                values.put(Sms.STATUS, status);
+                SqliteWrapper.update(context, context.getContentResolver(),
+                        mMessageUri, values, null, null);
+            }
+!!!37686071.java!!!	updateMessageState(inout context : Context, in messageType : int, in errorCode : int) : void
+            if (mMessageUri == null) {
+                return;
+            }
+            final ContentValues values = new ContentValues(2);
+            values.put(Sms.TYPE, messageType);
+            values.put(Sms.ERROR_CODE, errorCode);
+            final long identity = Binder.clearCallingIdentity();
+            try {
+                if (SqliteWrapper.update(context, context.getContentResolver(), mMessageUri, values,
+                        null/*where*/, null/*selectionArgs*/) != 1) {
+                    Rlog.e(TAG, "Failed to move message to " + messageType);
+                }
+            } finally {
+                Binder.restoreCallingIdentity(identity);
+            }
+!!!37686199.java!!!	persistSentMessageIfRequired(inout context : Context, in messageType : int, in errorCode : int) : Uri
+            if (!mIsText || !mPersistMessage ||
+                    !SmsApplication.shouldWriteMessageForPackage(mAppInfo.packageName, context)) {
+                return null;
+            }
+            Rlog.d(TAG, "Persist SMS into "
+                    + (messageType == Sms.MESSAGE_TYPE_FAILED ? "FAILED" : "SENT"));
+            final ContentValues values = new ContentValues();
+            values.put(Sms.SUBSCRIPTION_ID, mSubId);
+            values.put(Sms.ADDRESS, mDestAddress);
+            values.put(Sms.BODY, mFullMessageText);
+            values.put(Sms.DATE, System.currentTimeMillis()); // milliseconds
+            values.put(Sms.SEEN, 1);
+            values.put(Sms.READ, 1);
+            final String creator = mAppInfo != null ? mAppInfo.packageName : null;
+            if (!TextUtils.isEmpty(creator)) {
+                values.put(Sms.CREATOR, creator);
+            }
+            if (mDeliveryIntent != null) {
+                values.put(Sms.STATUS, Telephony.Sms.STATUS_PENDING);
+            }
+            if (errorCode != 0) {
+                values.put(Sms.ERROR_CODE, errorCode);
+            }
+            final long identity = Binder.clearCallingIdentity();
+            final ContentResolver resolver = context.getContentResolver();
+            try {
+                final Uri uri =  resolver.insert(Telephony.Sms.Sent.CONTENT_URI, values);
+                if (uri != null && messageType == Sms.MESSAGE_TYPE_FAILED) {
+                    // Since we can't persist a message directly into FAILED box,
+                    // we have to update the column after we persist it into SENT box.
+                    // The gap between the state change is tiny so I would not expect
+                    // it to cause any serious problem
+                    // TODO: we should add a "failed" URI for this in SmsProvider?
+                    final ContentValues updateValues = new ContentValues(1);
+                    updateValues.put(Sms.TYPE, Sms.MESSAGE_TYPE_FAILED);
+                    resolver.update(uri, updateValues, null/*where*/, null/*selectionArgs*/);
+                }
+                return uri;
+            } catch (Exception e) {
+                Rlog.e(TAG, "writeOutboxMessage: Failed to persist outbox message", e);
+                return null;
+            } finally {
+                Binder.restoreCallingIdentity(identity);
+            }
+!!!37686327.java!!!	persistOrUpdateMessage(inout context : Context, in messageType : int, in errorCode : int) : void
+            if (mMessageUri != null) {
+                updateMessageState(context, messageType, errorCode);
+            } else {
+                mMessageUri = persistSentMessageIfRequired(context, messageType, errorCode);
+            }
+!!!37686455.java!!!	onFailed(inout context : Context, in error : int, in errorCode : int) : void
+            if (mAnyPartFailed != null) {
+                mAnyPartFailed.set(true);
+            }
+            // is single part or last part of multipart message
+            boolean isSinglePartOrLastPart = true;
+            if (mUnsentPartCount != null) {
+                isSinglePartOrLastPart = mUnsentPartCount.decrementAndGet() == 0;
+            }
+            if (isSinglePartOrLastPart) {
+                persistOrUpdateMessage(context, Sms.MESSAGE_TYPE_FAILED, errorCode);
+            }
+            if (mSentIntent != null) {
+                try {
+                    // Extra information to send with the sent intent
+                    Intent fillIn = new Intent();
+                    if (mMessageUri != null) {
+                        // Pass this to SMS apps so that they know where it is stored
+                        fillIn.putExtra("uri", mMessageUri.toString());
+                    }
+                    if (errorCode != 0) {
+                        fillIn.putExtra("errorCode", errorCode);
+                    }
+                    if (mUnsentPartCount != null && isSinglePartOrLastPart) {
+                        // Is multipart and last part
+                        fillIn.putExtra(SEND_NEXT_MSG_EXTRA, true);
+                    }
+                    mSentIntent.send(context, error, fillIn);
+                } catch (CanceledException ex) {
+                    Rlog.e(TAG, "Failed to send result");
+                }
+            }
+!!!37686583.java!!!	onSent(inout context : Context) : void
+            // is single part or last part of multipart message
+            boolean isSinglePartOrLastPart = true;
+            if (mUnsentPartCount != null) {
+                isSinglePartOrLastPart = mUnsentPartCount.decrementAndGet() == 0;
+            }
+            if (isSinglePartOrLastPart) {
+                int messageType = Sms.MESSAGE_TYPE_SENT;
+                if (mAnyPartFailed != null && mAnyPartFailed.get()) {
+                    messageType = Sms.MESSAGE_TYPE_FAILED;
+                }
+                persistOrUpdateMessage(context, messageType, 0/*errorCode*/);
+            }
+            if (mSentIntent != null) {
+                try {
+                    // Extra information to send with the sent intent
+                    Intent fillIn = new Intent();
+                    if (mMessageUri != null) {
+                        // Pass this to SMS apps so that they know where it is stored
+                        fillIn.putExtra("uri", mMessageUri.toString());
+                    }
+                    if (mUnsentPartCount != null && isSinglePartOrLastPart) {
+                        // Is multipart and last part
+                        fillIn.putExtra(SEND_NEXT_MSG_EXTRA, true);
+                    }
+                    mSentIntent.send(context, Activity.RESULT_OK, fillIn);
+                } catch (CanceledException ex) {
+                    Rlog.e(TAG, "Failed to send result");
+                }
+            }

@@ -1,0 +1,170 @@
+class CameraService
+!!!41988279.java!!!	CameraService(inout context : Context)
+        super(context);
+        mContext = context;
+        mHandlerThread = new ServiceThread(TAG, Process.THREAD_PRIORITY_DISPLAY, /*allowTo*/false);
+        mHandlerThread.start();
+        mHandler = new Handler(mHandlerThread.getLooper(), this);
+
+        mNotifyNfc = SystemProperties.getInt(NFC_NOTIFICATION_PROP, 0) > 0;
+        if (DEBUG) Slog.v(TAG, "Notify NFC behavior is " + (mNotifyNfc ? "active" : "disabled"));
+!!!41988407.java!!!	handleMessage(inout msg : Message) : boolean
+        switch(msg.what) {
+            case MSG_SWITCH_USER: {
+                notifySwitchWithRetries(msg.arg1);
+            } break;
+            default: {
+                Slog.e(TAG, "CameraService error, invalid message: " + msg.what);
+            } break;
+        }
+        return true;
+!!!41988535.java!!!	onStart() : void
+        mUserManager = UserManager.get(mContext);
+        if (mUserManager == null) {
+            // Should never see this unless someone messes up the SystemServer service boot order.
+            throw new IllegalStateException("UserManagerService must start before CameraService!");
+        }
+
+        IntentFilter filter = new IntentFilter();
+        filter.addAction(Intent.ACTION_USER_ADDED);
+        filter.addAction(Intent.ACTION_USER_REMOVED);
+        filter.addAction(Intent.ACTION_USER_INFO_CHANGED);
+        filter.addAction(Intent.ACTION_MANAGED_PROFILE_ADDED);
+        filter.addAction(Intent.ACTION_MANAGED_PROFILE_REMOVED);
+        mContext.registerReceiver(mIntentReceiver, filter);
+
+        publishBinderService(CAMERA_SERVICE_PROXY_BINDER_NAME, mCameraServiceProxy);
+!!!41988663.java!!!	onStartUser(in userHandle : int) : void
+        synchronized(mLock) {
+            if (mEnabledCameraUsers == null) {
+                // Initialize mediaserver, or update mediaserver if we are recovering from a crash.
+                switchUserLocked(userHandle);
+            }
+        }
+!!!41988791.java!!!	onSwitchUser(in userHandle : int) : void
+        synchronized(mLock) {
+            switchUserLocked(userHandle);
+        }
+!!!41988919.java!!!	binderDied() : void
+        if (DEBUG) Slog.w(TAG, "Native camera service has died");
+        synchronized(mLock) {
+            mCameraServiceRaw = null;
+
+            // All cameras reset to idle on camera service death
+            boolean wasEmpty = mActiveCameraIds.isEmpty();
+            mActiveCameraIds.clear();
+
+            if ( mNotifyNfc && !wasEmpty ) {
+                notifyNfcService(/*enablePolling*/ true);
+            }
+        }
+!!!41989047.java!!!	switchUserLocked(in userHandle : int) : void
+        Set<Integer> currentUserHandles = getEnabledUserHandles(userHandle);
+        mLastUser = userHandle;
+        if (mEnabledCameraUsers == null || !mEnabledCameraUsers.equals(currentUserHandles)) {
+            // Some user handles have been added or removed, update mediaserver.
+            mEnabledCameraUsers = currentUserHandles;
+            notifyMediaserverLocked(ICameraService.EVENT_USER_SWITCHED, currentUserHandles);
+        }
+!!!41989175.java!!!	getEnabledUserHandles(in currentUserHandle : int) : Set<Integer>
+        int[] userProfiles = mUserManager.getEnabledProfileIds(currentUserHandle);
+        Set<Integer> handles = new ArraySet<>(userProfiles.length);
+
+        for (int id : userProfiles) {
+            handles.add(id);
+        }
+
+        return handles;
+!!!41989303.java!!!	notifySwitchWithRetries(in retries : int) : void
+        synchronized(mLock) {
+            if (mEnabledCameraUsers == null) {
+                return;
+            }
+            if (notifyMediaserverLocked(ICameraService.EVENT_USER_SWITCHED, mEnabledCameraUsers)) {
+                retries = 0;
+            }
+        }
+        if (retries <= 0) {
+            return;
+        }
+        Slog.i(TAG, "Could not notify camera service of user switch, retrying...");
+        mHandler.sendMessageDelayed(mHandler.obtainMessage(MSG_SWITCH_USER, retries - 1, 0, null),
+                RETRY_DELAY_TIME);
+!!!41989431.java!!!	notifyMediaserverLocked(in eventType : int, inout updatedUserHandles : Set<Integer>) : boolean
+        // Forward the user switch event to the native camera service running in the mediaserver
+        // process.
+        if (mCameraServiceRaw == null) {
+            IBinder cameraServiceBinder = getBinderService(CAMERA_SERVICE_BINDER_NAME);
+            if (cameraServiceBinder == null) {
+                Slog.w(TAG, "Could not notify mediaserver, camera service not available.");
+                return false; // Camera service not active, cannot evict user clients.
+            }
+            try {
+                cameraServiceBinder.linkToDeath(this, /*flags*/ 0);
+            } catch (RemoteException e) {
+                Slog.w(TAG, "Could not link to death of native camera service");
+                return false;
+            }
+
+            mCameraServiceRaw = ICameraService.Stub.asInterface(cameraServiceBinder);
+        }
+
+        try {
+            mCameraServiceRaw.notifySystemEvent(eventType, toArray(updatedUserHandles));
+        } catch (RemoteException e) {
+            Slog.w(TAG, "Could not notify mediaserver, remote exception: " + e);
+            // Not much we can do if camera service is dead.
+            return false;
+        }
+        return true;
+!!!41989559.java!!!	updateActivityCount(inout cameraId : String, in newCameraState : int) : void
+        synchronized(mLock) {
+            boolean wasEmpty = mActiveCameraIds.isEmpty();
+            switch (newCameraState) {
+                case CAMERA_STATE_OPEN:
+                    break;
+                case CAMERA_STATE_ACTIVE:
+                    mActiveCameraIds.add(cameraId);
+                    break;
+                case CAMERA_STATE_IDLE:
+                case CAMERA_STATE_CLOSED:
+                    mActiveCameraIds.remove(cameraId);
+                    break;
+            }
+            boolean isEmpty = mActiveCameraIds.isEmpty();
+            if ( mNotifyNfc && (wasEmpty != isEmpty) ) {
+                notifyNfcService(isEmpty);
+            }
+        }
+!!!41989687.java!!!	notifyNfcService(inout enablePolling : boolean) : void
+
+        IBinder nfcServiceBinder = getBinderService(NFC_SERVICE_BINDER_NAME);
+        if (nfcServiceBinder == null) {
+            Slog.w(TAG, "Could not connect to NFC service to notify it of camera state");
+            return;
+        }
+        INfcAdapter nfcAdapterRaw = INfcAdapter.Stub.asInterface(nfcServiceBinder);
+        int flags = enablePolling ? ENABLE_POLLING_FLAGS : DISABLE_POLLING_FLAGS;
+        if (DEBUG) Slog.v(TAG, "Setting NFC reader mode to flags " + flags);
+        try {
+            nfcAdapterRaw.setReaderMode(nfcInterfaceToken, null, flags, null);
+        } catch (RemoteException e) {
+            Slog.w(TAG, "Could not notify NFC service, remote exception: " + e);
+        }
+!!!41989815.java!!!	toArray(inout c : Collection<Integer>) : int
+        int len = c.size();
+        int[] ret = new int[len];
+        int idx = 0;
+        for (Integer i : c) {
+            ret[idx++] = i;
+        }
+        return ret;
+!!!41989943.java!!!	cameraStateToString(in newCameraState : int) : String
+        switch (newCameraState) {
+            case CAMERA_STATE_OPEN: return "CAMERA_STATE_OPEN";
+            case CAMERA_STATE_ACTIVE: return "CAMERA_STATE_ACTIVE";
+            case CAMERA_STATE_IDLE: return "CAMERA_STATE_IDLE";
+            case CAMERA_STATE_CLOSED: return "CAMERA_STATE_CLOSED";
+            default: break;
+        }
+        return "CAMERA_STATE_UNKNOWN";

@@ -1,0 +1,514 @@
+class BaseActivity
+!!!43590839.java!!!	BaseActivity(in layoutId : int, inout tag : String)
+        mLayoutId = layoutId;
+        mTag = tag;
+!!!43590967.java!!!	onCreate(inout icicle : Bundle) : void
+        // Record the time when onCreate is invoked for metric.
+        mStartTime = new Date().getTime();
+
+        super.onCreate(icicle);
+
+        final Intent intent = getIntent();
+
+        addListenerForLaunchCompletion();
+
+        setContentView(mLayoutId);
+
+        mDrawer = DrawerController.create(this);
+        mState = getState(icicle);
+        Metrics.logActivityLaunch(this, mState, intent);
+
+        mRoots = DocumentsApplication.getRootsCache(this);
+
+        getContentResolver().registerContentObserver(
+                RootsCache.sNotificationUri, false, mRootsCacheObserver);
+
+        mSearchManager = new SearchViewManager(this, icicle);
+
+        DocumentsToolbar toolbar = (DocumentsToolbar) findViewById(R.id.toolbar);
+        setActionBar(toolbar);
+        mNavigator = new NavigationView(
+                mDrawer,
+                toolbar,
+                (Spinner) findViewById(R.id.stack),
+                mState,
+                this);
+
+        // Base classes must update result in their onCreate.
+        setResult(Activity.RESULT_CANCELED);
+!!!43591095.java!!!	onCreateOptionsMenu(inout menu : Menu) : boolean
+        boolean showMenu = super.onCreateOptionsMenu(menu);
+
+        getMenuInflater().inflate(R.menu.activity, menu);
+        mNavigator.update();
+        boolean fullBarSearch = getResources().getBoolean(R.bool.full_bar_search_view);
+        mSearchManager.install((DocumentsToolbar) findViewById(R.id.toolbar), fullBarSearch);
+
+        return showMenu;
+!!!43591223.java!!!	onPrepareOptionsMenu(inout menu : Menu) : boolean
+        super.onPrepareOptionsMenu(menu);
+
+        mSearchManager.showMenu(canSearchRoot());
+
+        final boolean inRecents = getCurrentDirectory() == null;
+
+        final MenuItem sort = menu.findItem(R.id.menu_sort);
+        final MenuItem sortSize = menu.findItem(R.id.menu_sort_size);
+        final MenuItem grid = menu.findItem(R.id.menu_grid);
+        final MenuItem list = menu.findItem(R.id.menu_list);
+        final MenuItem advanced = menu.findItem(R.id.menu_advanced);
+        final MenuItem fileSize = menu.findItem(R.id.menu_file_size);
+
+        // Search uses backend ranking; no sorting, recents doesn't support sort.
+        sort.setEnabled(!inRecents && !mSearchManager.isSearching());
+        sortSize.setVisible(mState.showSize); // Only sort by size when file sizes are visible
+        fileSize.setVisible(!mState.forceSize);
+
+        // grid/list is effectively a toggle.
+        grid.setVisible(mState.derivedMode != State.MODE_GRID);
+        list.setVisible(mState.derivedMode != State.MODE_LIST);
+
+        advanced.setVisible(mState.showAdvancedOption);
+        advanced.setTitle(mState.showAdvancedOption && mState.showAdvanced
+                ? R.string.menu_advanced_hide : R.string.menu_advanced_show);
+        fileSize.setTitle(LocalPreferences.getDisplayFileSize(this)
+                ? R.string.menu_file_size_hide : R.string.menu_file_size_show);
+
+        return true;
+!!!43591351.java!!!	onDestroy() : void
+        getContentResolver().unregisterContentObserver(mRootsCacheObserver);
+        super.onDestroy();
+!!!43591479.java!!!	getState(inout icicle : Bundle) : State
+        if (icicle != null) {
+            State state = icicle.<State>getParcelable(Shared.EXTRA_STATE);
+            if (DEBUG) Log.d(mTag, "Recovered existing state object: " + state);
+            return state;
+        }
+
+        State state = new State();
+
+        final Intent intent = getIntent();
+
+        state.localOnly = intent.getBooleanExtra(Intent.EXTRA_LOCAL_ONLY, false);
+        state.forceSize = intent.getBooleanExtra(DocumentsContract.EXTRA_SHOW_FILESIZE, false);
+        state.showSize = state.forceSize || LocalPreferences.getDisplayFileSize(this);
+        state.initAcceptMimes(intent);
+        state.excludedAuthorities = getExcludedAuthorities();
+
+        includeState(state);
+
+        // Advanced roots are shown by default without menu option if forced by config or intent.
+        boolean forceAdvanced = Shared.shouldShowDeviceRoot(this, intent);
+        boolean chosenAdvanced = LocalPreferences.getShowDeviceRoot(this, state.action);
+        state.showAdvanced = forceAdvanced || chosenAdvanced;
+
+        // Menu option is shown for whitelisted intents if advanced roots are not shown by default.
+        state.showAdvancedOption = !forceAdvanced && (
+                Shared.shouldShowFancyFeatures(this)
+                || state.action == ACTION_OPEN
+                || state.action == ACTION_CREATE
+                || state.action == ACTION_OPEN_TREE
+                || state.action == ACTION_PICK_COPY_DESTINATION
+                || state.action == ACTION_GET_CONTENT);
+
+        if (DEBUG) Log.d(mTag, "Created new state object: " + state);
+
+        return state;
+!!!43591607.java!!!	setRootsDrawerOpen(inout open : boolean) : void
+        mNavigator.revealRootsDrawer(open);
+!!!43591735.java!!!	onRootPicked(inout root : RootInfo) : void
+        // Clicking on the current root removes search
+        mSearchManager.cancelSearch();
+
+        // Skip refreshing if root nor directory didn't change
+        if (root.equals(getCurrentRoot()) && mState.stack.size() == 1) {
+            return;
+        }
+
+        mState.derivedMode = LocalPreferences.getViewMode(this, root, MODE_GRID);
+
+        // Clear entire backstack and start in new root
+        mState.onRootChanged(root);
+
+        // Recents is always in memory, so we just load it directly.
+        // Otherwise we delegate loading data from disk to a task
+        // to ensure a responsive ui.
+        if (mRoots.isRecentsRoot(root)) {
+            refreshCurrentRootAndDirectory(AnimationView.ANIM_NONE);
+        } else {
+            new PickRootTask(this, root).executeOnExecutor(getExecutorForCurrentDirectory());
+        }
+!!!43591863.java!!!	onOptionsItemSelected(inout item : MenuItem) : boolean
+
+        switch (item.getItemId()) {
+            case android.R.id.home:
+                onBackPressed();
+                return true;
+
+            case R.id.menu_create_dir:
+                showCreateDirectoryDialog();
+                return true;
+
+            case R.id.menu_search:
+                // SearchViewManager listens for this directly.
+                return false;
+
+            case R.id.menu_sort_name:
+                setUserSortOrder(State.SORT_ORDER_DISPLAY_NAME);
+                return true;
+
+            case R.id.menu_sort_date:
+                setUserSortOrder(State.SORT_ORDER_LAST_MODIFIED);
+                return true;
+
+            case R.id.menu_sort_size:
+                setUserSortOrder(State.SORT_ORDER_SIZE);
+                return true;
+
+            case R.id.menu_grid:
+                setViewMode(State.MODE_GRID);
+                return true;
+
+            case R.id.menu_list:
+                setViewMode(State.MODE_LIST);
+                return true;
+
+            case R.id.menu_paste_from_clipboard:
+                DirectoryFragment dir = getDirectoryFragment();
+                if (dir != null) {
+                    dir.pasteFromClipboard();
+                }
+                return true;
+
+            case R.id.menu_advanced:
+                setDisplayAdvancedDevices(!mState.showAdvanced);
+                return true;
+
+            case R.id.menu_file_size:
+                setDisplayFileSize(!LocalPreferences.getDisplayFileSize(this));
+                return true;
+
+            case R.id.menu_settings:
+                Metrics.logUserAction(this, Metrics.USER_ACTION_SETTINGS);
+
+                final RootInfo root = getCurrentRoot();
+                final Intent intent = new Intent(DocumentsContract.ACTION_DOCUMENT_ROOT_SETTINGS);
+                intent.setDataAndType(root.getUri(), DocumentsContract.Root.MIME_TYPE_ITEM);
+                startActivity(intent);
+                return true;
+
+            default:
+                return super.onOptionsItemSelected(item);
+        }
+!!!43591991.java!!!	getDirectoryFragment() : DirectoryFragment
+        return DirectoryFragment.get(getFragmentManager());
+!!!43592119.java!!!	showCreateDirectoryDialog() : void
+        Metrics.logUserAction(this, Metrics.USER_ACTION_CREATE_DIR);
+
+        CreateDirectoryFragment.show(getFragmentManager());
+!!!43592247.java!!!	onDirectoryCreated(inout doc : DocumentInfo) : void
+        // By default we do nothing, just let the new directory appear.
+        // DocumentsActivity auto-opens directories after creating them
+        // As that is more attuned to the "picker" use cases it supports.
+!!!43592375.java!!!	canCreateDirectory() : boolean
+        final RootInfo root = getCurrentRoot();
+        final DocumentInfo cwd = getCurrentDirectory();
+        return cwd != null
+                && cwd.isCreateSupported()
+                && !mSearchManager.isSearching()
+                && !root.isRecents()
+                && !root.isDownloads();
+!!!43592503.java!!!	openContainerDocument(inout doc : DocumentInfo) : void
+        assert(doc.isContainer());
+
+        notifyDirectoryNavigated(doc.derivedUri);
+
+        mState.pushDocument(doc);
+        // Show an opening animation only if pressing "back" would get us back to the
+        // previous directory. Especially after opening a root document, pressing
+        // back, wouldn't go to the previous root, but close the activity.
+        final int anim = (mState.hasLocationChanged() && mState.stack.size() > 1)
+                ? AnimationView.ANIM_ENTER : AnimationView.ANIM_NONE;
+        refreshCurrentRootAndDirectory(anim);
+!!!43592631.java!!!	refreshCurrentRootAndDirectory(in anim : int) : void
+        mSearchManager.cancelSearch();
+
+        refreshDirectory(anim);
+
+        final RootsFragment roots = RootsFragment.get(getFragmentManager());
+        if (roots != null) {
+            roots.onCurrentRootChanged();
+        }
+
+        mNavigator.update();
+        invalidateOptionsMenu();
+!!!43592759.java!!!	loadRoot(in uri : Uri) : void
+        new LoadRootTask(this, uri).executeOnExecutor(
+                ProviderExecutor.forAuthority(uri.getAuthority()));
+!!!43592887.java!!!	onSearchChanged(inout query : String) : void
+        // We should not get here if root is not searchable
+        assert(canSearchRoot());
+        reloadSearch(query);
+!!!43593015.java!!!	onSearchFinished() : void
+        // Restores menu icons state
+        invalidateOptionsMenu();
+!!!43593143.java!!!	reloadSearch(inout query : String) : void
+        FragmentManager fm = getFragmentManager();
+        RootInfo root = getCurrentRoot();
+        DocumentInfo cwd = getCurrentDirectory();
+
+        DirectoryFragment.reloadSearch(fm, root, cwd, query);
+!!!43593271.java!!!	getExcludedAuthorities() : String
+        List<String> authorities = new ArrayList<>();
+        if (getIntent().getBooleanExtra(DocumentsContract.EXTRA_EXCLUDE_SELF, false)) {
+            // Exclude roots provided by the calling package.
+            String packageName = getCallingPackageMaybeExtra();
+            try {
+                PackageInfo pkgInfo = getPackageManager().getPackageInfo(packageName,
+                        PackageManager.GET_PROVIDERS);
+                for (ProviderInfo provider: pkgInfo.providers) {
+                    authorities.add(provider.authority);
+                }
+            } catch (PackageManager.NameNotFoundException e) {
+                Log.e(mTag, "Calling package name does not resolve: " + packageName);
+            }
+        }
+        return authorities;
+!!!43593399.java!!!	canSearchRoot() : boolean
+        final RootInfo root = getCurrentRoot();
+        return (root.flags & Root.FLAG_SUPPORTS_SEARCH) != 0;
+!!!43593527.java!!!	getCallingPackageMaybeExtra() : String
+        String callingPackage = getCallingPackage();
+        // System apps can set the calling package name using an extra.
+        try {
+            ApplicationInfo info = getPackageManager().getApplicationInfo(callingPackage, 0);
+            if (info.isSystemApp() || info.isUpdatedSystemApp()) {
+                final String extra = getIntent().getStringExtra(DocumentsContract.EXTRA_PACKAGE_NAME);
+                if (extra != null) {
+                    callingPackage = extra;
+                }
+            }
+        } finally {
+            return callingPackage;
+        }
+!!!43593655.java!!!	get(inout fragment : Fragment) : BaseActivity
+        return (BaseActivity) fragment.getActivity();
+!!!43593783.java!!!	getDisplayState() : State
+        return mState;
+!!!43593911.java!!!	getDefaultRoot() : Uri
+        return Shared.shouldShowDocumentsRoot(this, getIntent())
+                ? DocumentsContract.buildHomeUri()
+                : DocumentsContract.buildRootUri(
+                        "com.android.providers.downloads.documents", "downloads");
+!!!43594039.java!!!	setDisplayAdvancedDevices(inout display : boolean) : void
+        Metrics.logUserAction(this,
+                display ? Metrics.USER_ACTION_SHOW_ADVANCED : Metrics.USER_ACTION_HIDE_ADVANCED);
+
+        LocalPreferences.setShowDeviceRoot(this, mState.action, display);
+        mState.showAdvanced = display;
+        RootsFragment.get(getFragmentManager()).onDisplayStateChanged();
+        invalidateOptionsMenu();
+!!!43594167.java!!!	setDisplayFileSize(inout display : boolean) : void
+        Metrics.logUserAction(this,
+                display ? Metrics.USER_ACTION_SHOW_SIZE : Metrics.USER_ACTION_HIDE_SIZE);
+
+        LocalPreferences.setDisplayFileSize(this, display);
+        mState.showSize = display;
+        DirectoryFragment dir = getDirectoryFragment();
+        if (dir != null) {
+            dir.onDisplayStateChanged();
+        }
+        invalidateOptionsMenu();
+!!!43594295.java!!!	setUserSortOrder(in sortOrder : int) : void
+        switch(sortOrder) {
+            case State.SORT_ORDER_DISPLAY_NAME:
+                Metrics.logUserAction(this, Metrics.USER_ACTION_SORT_NAME);
+                break;
+            case State.SORT_ORDER_LAST_MODIFIED:
+                Metrics.logUserAction(this, Metrics.USER_ACTION_SORT_DATE);
+                break;
+            case State.SORT_ORDER_SIZE:
+                Metrics.logUserAction(this, Metrics.USER_ACTION_SORT_SIZE);
+                break;
+        }
+
+        mState.userSortOrder = sortOrder;
+        DirectoryFragment dir = getDirectoryFragment();
+        if (dir != null) {
+            dir.onSortOrderChanged();
+        }
+!!!43594423.java!!!	setViewMode(in mode : int) : void
+        if (mode == State.MODE_GRID) {
+            Metrics.logUserAction(this, Metrics.USER_ACTION_GRID);
+        } else if (mode == State.MODE_LIST) {
+            Metrics.logUserAction(this, Metrics.USER_ACTION_LIST);
+        }
+
+        LocalPreferences.setViewMode(this, getCurrentRoot(), mode);
+        mState.derivedMode = mode;
+
+        // view icon needs to be updated, but we *could* do it
+        // in onOptionsItemSelected, and not do the full invalidation
+        // But! That's a larger refactoring we'll save for another day.
+        invalidateOptionsMenu();
+        DirectoryFragment dir = getDirectoryFragment();
+        if (dir != null) {
+            dir.onViewModeChanged();
+        }
+!!!43594551.java!!!	setPending(inout pending : boolean) : void
+        final SaveFragment save = SaveFragment.get(getFragmentManager());
+        if (save != null) {
+            save.setPending(pending);
+        }
+!!!43594679.java!!!	onSaveInstanceState(inout state : Bundle) : void
+        super.onSaveInstanceState(state);
+        state.putParcelable(Shared.EXTRA_STATE, mState);
+        mSearchManager.onSaveInstanceState(state);
+!!!43594807.java!!!	onRestoreInstanceState(inout state : Bundle) : void
+        super.onRestoreInstanceState(state);
+!!!43594935.java!!!	isSearchExpanded() : boolean
+        return mSearchManager.isExpanded();
+!!!43595063.java!!!	getCurrentRoot() : RootInfo
+        if (mState.stack.root != null) {
+            return mState.stack.root;
+        } else {
+            return mRoots.getRecentsRoot();
+        }
+!!!43595191.java!!!	getCurrentDirectory() : DocumentInfo
+        return mState.stack.peek();
+!!!43595319.java!!!	getExecutorForCurrentDirectory() : Executor
+        final DocumentInfo cwd = getCurrentDirectory();
+        if (cwd != null && cwd.authority != null) {
+            return ProviderExecutor.forAuthority(cwd.authority);
+        } else {
+            return AsyncTask.THREAD_POOL_EXECUTOR;
+        }
+!!!43595447.java!!!	onBackPressed() : void
+        // While action bar is expanded, the state stack UI is hidden.
+        if (mSearchManager.cancelSearch()) {
+            return;
+        }
+
+        DirectoryFragment dir = getDirectoryFragment();
+        if (dir != null && dir.onBackPressed()) {
+            return;
+        }
+
+        if (!mState.hasLocationChanged()) {
+            super.onBackPressed();
+            return;
+        }
+
+        if (onBeforePopDir() || popDir()) {
+            return;
+        }
+
+        super.onBackPressed();
+!!!43595575.java!!!	onBeforePopDir() : boolean
+        // Files app overrides this with some fancy logic.
+        return false;
+!!!43595703.java!!!	onStackPicked(inout stack : DocumentStack) : void
+        try {
+            // Update the restored stack to ensure we have freshest data
+            stack.updateDocuments(getContentResolver());
+            mState.setStack(stack);
+            refreshCurrentRootAndDirectory(AnimationView.ANIM_SIDE);
+
+        } catch (FileNotFoundException e) {
+            Log.w(mTag, "Failed to restore stack: " + e);
+        }
+!!!43595831.java!!!	onKeyDown(in keyCode : int, inout event : KeyEvent) : boolean
+        if (Events.isNavigationKeyCode(keyCode)) {
+            // Forward all unclaimed navigation keystrokes to the DirectoryFragment. This causes any
+            // stray navigation keystrokes focus the content pane, which is probably what the user
+            // is trying to do.
+            DirectoryFragment df = DirectoryFragment.get(getFragmentManager());
+            if (df != null) {
+                df.requestFocus();
+                return true;
+            }
+        } else if (keyCode == KeyEvent.KEYCODE_TAB) {
+            // Tab toggles focus on the navigation drawer.
+            toggleNavDrawerFocus();
+            return true;
+        } else if (keyCode == KeyEvent.KEYCODE_DEL) {
+            popDir();
+            return true;
+        }
+        return super.onKeyDown(keyCode, event);
+!!!43595959.java!!!	addEventListener(inout listener : EventListener) : void
+        mEventListeners.add(listener);
+!!!43596087.java!!!	removeEventListener(inout listener : EventListener) : void
+        mEventListeners.remove(listener);
+!!!43596215.java!!!	notifyDirectoryLoaded(inout uri : Uri) : void
+        for (EventListener listener : mEventListeners) {
+            listener.onDirectoryLoaded(uri);
+        }
+!!!43596343.java!!!	notifyDirectoryNavigated(inout uri : Uri) : void
+        for (EventListener listener : mEventListeners) {
+            listener.onDirectoryNavigated(uri);
+        }
+!!!43596471.java!!!	toggleNavDrawerFocus() : void
+        if (mNavDrawerHasFocus) {
+            mDrawer.setOpen(false);
+            DirectoryFragment df = DirectoryFragment.get(getFragmentManager());
+            if (df != null) {
+                df.requestFocus();
+            }
+        } else {
+            mDrawer.setOpen(true);
+            RootsFragment rf = RootsFragment.get(getFragmentManager());
+            if (rf != null) {
+                rf.requestFocus();
+            }
+        }
+        mNavDrawerHasFocus = !mNavDrawerHasFocus;
+!!!43596599.java!!!	getRootDocumentBlocking(inout root : RootInfo) : DocumentInfo
+        try {
+            final Uri uri = DocumentsContract.buildDocumentUri(
+                    root.authority, root.documentId);
+            return DocumentInfo.fromUri(getContentResolver(), uri);
+        } catch (FileNotFoundException e) {
+            Log.w(mTag, "Failed to find root", e);
+            return null;
+        }
+!!!43596727.java!!!	popDir() : boolean
+        if (mState.stack.size() > 1) {
+            mState.stack.pop();
+            refreshCurrentRootAndDirectory(AnimationView.ANIM_LEAVE);
+            return true;
+        }
+        return false;
+!!!43596855.java!!!	addListenerForLaunchCompletion() : void
+        addEventListener(new EventListener() {
+            @Override
+            public void onDirectoryNavigated(Uri uri) {
+            }
+
+            @Override
+            public void onDirectoryLoaded(Uri uri) {
+                removeEventListener(this);
+                getMainLooper().getQueue().addIdleHandler(new IdleHandler() {
+                    @Override
+                    public boolean queueIdle() {
+                        // If startup benchmark is requested by a whitelisted testing package, then
+                        // close the activity once idle, and notify the testing activity.
+                        if (getIntent().getBooleanExtra(EXTRA_BENCHMARK, false) &&
+                                BENCHMARK_TESTING_PACKAGE.equals(getCallingPackage())) {
+                            setResult(RESULT_OK);
+                            finish();
+                        }
+
+                        Metrics.logStartupMs(
+                                BaseActivity.this, (int) (new Date().getTime() - mStartTime));
+
+                        // Remove the idle handler.
+                        return false;
+                    }
+                });
+                new Handler().post(new Runnable() {
+                    @Override public void run() {
+                    }
+                });
+            }
+        });

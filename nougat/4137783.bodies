@@ -1,0 +1,141 @@
+class RenderPageTask
+!!!44083767.java!!!	RenderPageTask(in pageIndex : int, inout renderSpec : PageContentRepository::RenderSpec, inout callback : PageContentRepository::OnPageContentAvailableCallback)
+                mPageIndex = pageIndex;
+                mRenderSpec = renderSpec;
+                mCallback = callback;
+!!!44083895.java!!!	onPreExecute() : void
+                mRenderedPage = mPageContentCache.getRenderedPage(mPageIndex);
+                if (mRenderedPage != null && mRenderedPage.state == RenderedPage.STATE_RENDERED) {
+                    throw new IllegalStateException("Trying to render a rendered page");
+                }
+
+                // Reuse bitmap for the page only if the right size.
+                if (mRenderedPage != null && !mRenderSpec.hasSameSize(mRenderedPage)) {
+                    if (DEBUG) {
+                        Log.i(LOG_TAG, "Recycling bitmap for page: " + mPageIndex
+                                + " with different size.");
+                    }
+                    mPageContentCache.removeRenderedPage(mPageIndex);
+                    mRenderedPage = null;
+                }
+
+                final int bitmapSizeInBytes = mRenderSpec.bitmapWidth
+                        * mRenderSpec.bitmapHeight * BYTES_PER_PIXEL;
+
+                // Try to find a bitmap to reuse.
+                while (mRenderedPage == null) {
+
+                    // Fill the cache greedily.
+                    if (mPageContentCache.getSizeInBytes() <= 0
+                            || mPageContentCache.getSizeInBytes() + bitmapSizeInBytes
+                            <= mPageContentCache.getMaxSizeInBytes()) {
+                        break;
+                    }
+
+                    RenderedPage renderedPage = mPageContentCache.removeLeastNeeded();
+
+                    if (!mRenderSpec.hasSameSize(renderedPage)) {
+                        if (DEBUG) {
+                            Log.i(LOG_TAG, "Recycling bitmap for page: " + mPageIndex
+                                   + " with different size.");
+                        }
+                        continue;
+                    }
+
+                    mRenderedPage = renderedPage;
+                    renderedPage.erase();
+
+                    if (DEBUG) {
+                        Log.i(LOG_TAG, "Reused bitmap for page: " + mPageIndex + " cache size: "
+                                + mPageContentCache.getSizeInBytes() + " bytes");
+                    }
+
+                    break;
+                }
+
+                if (mRenderedPage == null) {
+                    if (DEBUG) {
+                        Log.i(LOG_TAG, "Created bitmap for page: " + mPageIndex + " cache size: "
+                                + mPageContentCache.getSizeInBytes() + " bytes");
+                    }
+                    Bitmap bitmap = Bitmap.createBitmap(mRenderSpec.bitmapWidth,
+                            mRenderSpec.bitmapHeight, Bitmap.Config.ARGB_8888);
+                    bitmap.eraseColor(Color.WHITE);
+                    BitmapDrawable content = new BitmapDrawable(mContext.getResources(), bitmap);
+                    mRenderedPage = new RenderedPage(content);
+                }
+
+                mRenderedPage.renderSpec = mRenderSpec;
+                mRenderedPage.state = RenderedPage.STATE_RENDERING;
+
+                mPageContentCache.putRenderedPage(mPageIndex, mRenderedPage);
+!!!44084023.java!!!	doInBackground(inout  : Void...params) : PageContentRepository::RenderedPage
+                if (isCancelled()) {
+                    return mRenderedPage;
+                }
+
+                Bitmap bitmap = mRenderedPage.content.getBitmap();
+
+                ParcelFileDescriptor[] pipe;
+                try {
+                    pipe = ParcelFileDescriptor.createPipe();
+
+                    try (ParcelFileDescriptor source = pipe[0]) {
+                        try (ParcelFileDescriptor destination = pipe[1]) {
+
+                            mRenderer.renderPage(mPageIndex, bitmap.getWidth(), bitmap.getHeight(),
+                                    mRenderSpec.printAttributes, destination);
+                        }
+
+                        BitmapSerializeUtils.readBitmapPixels(bitmap, source);
+                    }
+
+                    mIsFailed = false;
+                } catch (IOException|RemoteException|IllegalStateException e) {
+                    Log.e(LOG_TAG, "Error rendering page " + mPageIndex, e);
+                    mIsFailed = true;
+                }
+
+                return mRenderedPage;
+!!!44084151.java!!!	onPostExecute(inout renderedPage : PageContentRepository::RenderedPage) : void
+                if (DEBUG) {
+                    Log.i(LOG_TAG, "Completed rendering page: " + mPageIndex);
+                }
+
+                // This task is done.
+                mPageToRenderTaskMap.remove(mPageIndex);
+
+                if (mIsFailed) {
+                    renderedPage.state = RenderedPage.STATE_SCRAP;
+                } else {
+                    renderedPage.state = RenderedPage.STATE_RENDERED;
+                }
+
+                // Invalidate all caches of the old state of the bitmap
+                mRenderedPage.content.invalidateSelf();
+
+                // Announce success if needed.
+                if (mCallback != null) {
+                    if (mIsFailed) {
+                        mCallback.onPageContentAvailable(null);
+                    } else {
+                        mCallback.onPageContentAvailable(renderedPage.content);
+                    }
+                }
+!!!44084279.java!!!	onCancelled(inout renderedPage : PageContentRepository::RenderedPage) : void
+                if (DEBUG) {
+                    Log.i(LOG_TAG, "Cancelled rendering page: " + mPageIndex);
+                }
+
+                // This task is done.
+                mPageToRenderTaskMap.remove(mPageIndex);
+
+                // If canceled before on pre-execute.
+                if (renderedPage == null) {
+                    return;
+                }
+
+                // Take a note that the content is not rendered.
+                renderedPage.state = RenderedPage.STATE_SCRAP;
+!!!44084407.java!!!	isPreload() : boolean
+                return mCallback == null;

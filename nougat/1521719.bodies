@@ -1,0 +1,419 @@
+class AudioHandler
+!!!32606263.java!!!	setDeviceVolume(inout streamState : AudioService::VolumeStreamState, in device : int) : void
+
+            synchronized (VolumeStreamState.class) {
+                // Apply volume
+                streamState.applyDeviceVolume_syncVSS(device);
+
+                // Apply change to all streams using this one as alias
+                int numStreamTypes = AudioSystem.getNumStreamTypes();
+                for (int streamType = numStreamTypes - 1; streamType >= 0; streamType--) {
+                    if (streamType != streamState.mStreamType &&
+                            mStreamVolumeAlias[streamType] == streamState.mStreamType) {
+                        // Make sure volume is also maxed out on A2DP device for aliased stream
+                        // that may have a different device selected
+                        int streamDevice = getDeviceForStream(streamType);
+                        if ((device != streamDevice) && mAvrcpAbsVolSupported &&
+                                ((device & AudioSystem.DEVICE_OUT_ALL_A2DP) != 0)) {
+                            mStreamStates[streamType].applyDeviceVolume_syncVSS(device);
+                        }
+                        mStreamStates[streamType].applyDeviceVolume_syncVSS(streamDevice);
+                    }
+                }
+            }
+            // Post a persist volume msg
+            sendMsg(mAudioHandler,
+                    MSG_PERSIST_VOLUME,
+                    SENDMSG_QUEUE,
+                    device,
+                    0,
+                    streamState,
+                    PERSIST_DELAY);
+
+!!!32606391.java!!!	setAllVolumes(inout streamState : AudioService::VolumeStreamState) : void
+
+            // Apply volume
+            streamState.applyAllVolumes();
+
+            // Apply change to all streams using this one as alias
+            int numStreamTypes = AudioSystem.getNumStreamTypes();
+            for (int streamType = numStreamTypes - 1; streamType >= 0; streamType--) {
+                if (streamType != streamState.mStreamType &&
+                        mStreamVolumeAlias[streamType] == streamState.mStreamType) {
+                    mStreamStates[streamType].applyAllVolumes();
+                }
+            }
+!!!32606519.java!!!	persistVolume(inout streamState : AudioService::VolumeStreamState, in device : int) : void
+            if (mUseFixedVolume) {
+                return;
+            }
+            if (isPlatformTelevision() && (streamState.mStreamType != AudioSystem.STREAM_MUSIC)) {
+                return;
+            }
+            System.putIntForUser(mContentResolver,
+                      streamState.getSettingNameForDevice(device),
+                      (streamState.getIndex(device) + 5)/ 10,
+                      UserHandle.USER_CURRENT);
+!!!32606647.java!!!	persistRingerMode(in ringerMode : int) : void
+            if (mUseFixedVolume) {
+                return;
+            }
+            Settings.Global.putInt(mContentResolver, Settings.Global.MODE_RINGER, ringerMode);
+!!!32606775.java!!!	onLoadSoundEffects() : boolean
+            int status;
+
+            synchronized (mSoundEffectsLock) {
+                if (!mSystemReady) {
+                    Log.w(TAG, "onLoadSoundEffects() called before boot complete");
+                    return false;
+                }
+
+                if (mSoundPool != null) {
+                    return true;
+                }
+
+                loadTouchSoundAssets();
+
+                mSoundPool = new SoundPool.Builder()
+                        .setMaxStreams(NUM_SOUNDPOOL_CHANNELS)
+                        .setAudioAttributes(new AudioAttributes.Builder()
+                            .setUsage(AudioAttributes.USAGE_ASSISTANCE_SONIFICATION)
+                            .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                            .build())
+                        .build();
+                mSoundPoolCallBack = null;
+                mSoundPoolListenerThread = new SoundPoolListenerThread();
+                mSoundPoolListenerThread.start();
+                int attempts = 3;
+                while ((mSoundPoolCallBack == null) && (attempts-- > 0)) {
+                    try {
+                        // Wait for mSoundPoolCallBack to be set by the other thread
+                        mSoundEffectsLock.wait(SOUND_EFFECTS_LOAD_TIMEOUT_MS);
+                    } catch (InterruptedException e) {
+                        Log.w(TAG, "Interrupted while waiting sound pool listener thread.");
+                    }
+                }
+
+                if (mSoundPoolCallBack == null) {
+                    Log.w(TAG, "onLoadSoundEffects() SoundPool listener or thread creation error");
+                    if (mSoundPoolLooper != null) {
+                        mSoundPoolLooper.quit();
+                        mSoundPoolLooper = null;
+                    }
+                    mSoundPoolListenerThread = null;
+                    mSoundPool.release();
+                    mSoundPool = null;
+                    return false;
+                }
+                /*
+                 * poolId table: The value -1 in this table indicates that corresponding
+                 * file (same index in SOUND_EFFECT_FILES[] has not been loaded.
+                 * Once loaded, the value in poolId is the sample ID and the same
+                 * sample can be reused for another effect using the same file.
+                 */
+                int[] poolId = new int[SOUND_EFFECT_FILES.size()];
+                for (int fileIdx = 0; fileIdx < SOUND_EFFECT_FILES.size(); fileIdx++) {
+                    poolId[fileIdx] = -1;
+                }
+                /*
+                 * Effects whose value in SOUND_EFFECT_FILES_MAP[effect][1] is -1 must be loaded.
+                 * If load succeeds, value in SOUND_EFFECT_FILES_MAP[effect][1] is > 0:
+                 * this indicates we have a valid sample loaded for this effect.
+                 */
+
+                int numSamples = 0;
+                for (int effect = 0; effect < AudioManager.NUM_SOUND_EFFECTS; effect++) {
+                    // Do not load sample if this effect uses the MediaPlayer
+                    if (SOUND_EFFECT_FILES_MAP[effect][1] == 0) {
+                        continue;
+                    }
+                    if (poolId[SOUND_EFFECT_FILES_MAP[effect][0]] == -1) {
+                        String filePath = Environment.getRootDirectory()
+                                + SOUND_EFFECTS_PATH
+                                + SOUND_EFFECT_FILES.get(SOUND_EFFECT_FILES_MAP[effect][0]);
+                        int sampleId = mSoundPool.load(filePath, 0);
+                        if (sampleId <= 0) {
+                            Log.w(TAG, "Soundpool could not load file: "+filePath);
+                        } else {
+                            SOUND_EFFECT_FILES_MAP[effect][1] = sampleId;
+                            poolId[SOUND_EFFECT_FILES_MAP[effect][0]] = sampleId;
+                            numSamples++;
+                        }
+                    } else {
+                        SOUND_EFFECT_FILES_MAP[effect][1] =
+                                poolId[SOUND_EFFECT_FILES_MAP[effect][0]];
+                    }
+                }
+                // wait for all samples to be loaded
+                if (numSamples > 0) {
+                    mSoundPoolCallBack.setSamples(poolId);
+
+                    attempts = 3;
+                    status = 1;
+                    while ((status == 1) && (attempts-- > 0)) {
+                        try {
+                            mSoundEffectsLock.wait(SOUND_EFFECTS_LOAD_TIMEOUT_MS);
+                            status = mSoundPoolCallBack.status();
+                        } catch (InterruptedException e) {
+                            Log.w(TAG, "Interrupted while waiting sound pool callback.");
+                        }
+                    }
+                } else {
+                    status = -1;
+                }
+
+                if (mSoundPoolLooper != null) {
+                    mSoundPoolLooper.quit();
+                    mSoundPoolLooper = null;
+                }
+                mSoundPoolListenerThread = null;
+                if (status != 0) {
+                    Log.w(TAG,
+                            "onLoadSoundEffects(), Error "+status+ " while loading samples");
+                    for (int effect = 0; effect < AudioManager.NUM_SOUND_EFFECTS; effect++) {
+                        if (SOUND_EFFECT_FILES_MAP[effect][1] > 0) {
+                            SOUND_EFFECT_FILES_MAP[effect][1] = -1;
+                        }
+                    }
+
+                    mSoundPool.release();
+                    mSoundPool = null;
+                }
+            }
+            return (status == 0);
+!!!32606903.java!!!	onUnloadSoundEffects() : void
+            synchronized (mSoundEffectsLock) {
+                if (mSoundPool == null) {
+                    return;
+                }
+
+                int[] poolId = new int[SOUND_EFFECT_FILES.size()];
+                for (int fileIdx = 0; fileIdx < SOUND_EFFECT_FILES.size(); fileIdx++) {
+                    poolId[fileIdx] = 0;
+                }
+
+                for (int effect = 0; effect < AudioManager.NUM_SOUND_EFFECTS; effect++) {
+                    if (SOUND_EFFECT_FILES_MAP[effect][1] <= 0) {
+                        continue;
+                    }
+                    if (poolId[SOUND_EFFECT_FILES_MAP[effect][0]] == 0) {
+                        mSoundPool.unload(SOUND_EFFECT_FILES_MAP[effect][1]);
+                        SOUND_EFFECT_FILES_MAP[effect][1] = -1;
+                        poolId[SOUND_EFFECT_FILES_MAP[effect][0]] = -1;
+                    }
+                }
+                mSoundPool.release();
+                mSoundPool = null;
+            }
+!!!32607031.java!!!	onPlaySoundEffect(in effectType : int, in volume : int) : void
+            synchronized (mSoundEffectsLock) {
+
+                onLoadSoundEffects();
+
+                if (mSoundPool == null) {
+                    return;
+                }
+                float volFloat;
+                // use default if volume is not specified by caller
+                if (volume < 0) {
+                    volFloat = (float)Math.pow(10, (float)sSoundEffectVolumeDb/20);
+                } else {
+                    volFloat = volume / 1000.0f;
+                }
+
+                if (SOUND_EFFECT_FILES_MAP[effectType][1] > 0) {
+                    mSoundPool.play(SOUND_EFFECT_FILES_MAP[effectType][1],
+                                        volFloat, volFloat, 0, 0, 1.0f);
+                } else {
+                    MediaPlayer mediaPlayer = new MediaPlayer();
+                    try {
+                        String filePath = Environment.getRootDirectory() + SOUND_EFFECTS_PATH +
+                                    SOUND_EFFECT_FILES.get(SOUND_EFFECT_FILES_MAP[effectType][0]);
+                        mediaPlayer.setDataSource(filePath);
+                        mediaPlayer.setAudioStreamType(AudioSystem.STREAM_SYSTEM);
+                        mediaPlayer.prepare();
+                        mediaPlayer.setVolume(volFloat);
+                        mediaPlayer.setOnCompletionListener(new OnCompletionListener() {
+                            public void onCompletion(MediaPlayer mp) {
+                                cleanupPlayer(mp);
+                            }
+                        });
+                        mediaPlayer.setOnErrorListener(new OnErrorListener() {
+                            public boolean onError(MediaPlayer mp, int what, int extra) {
+                                cleanupPlayer(mp);
+                                return true;
+                            }
+                        });
+                        mediaPlayer.start();
+                    } catch (IOException ex) {
+                        Log.w(TAG, "MediaPlayer IOException: "+ex);
+                    } catch (IllegalArgumentException ex) {
+                        Log.w(TAG, "MediaPlayer IllegalArgumentException: "+ex);
+                    } catch (IllegalStateException ex) {
+                        Log.w(TAG, "MediaPlayer IllegalStateException: "+ex);
+                    }
+                }
+            }
+!!!32607159.java!!!	cleanupPlayer(inout mp : MediaPlayer) : void
+            if (mp != null) {
+                try {
+                    mp.stop();
+                    mp.release();
+                } catch (IllegalStateException ex) {
+                    Log.w(TAG, "MediaPlayer IllegalStateException: "+ex);
+                }
+            }
+!!!32607287.java!!!	setForceUse(in usage : int, in config : int) : void
+            synchronized (mConnectedDevices) {
+                setForceUseInt_SyncDevices(usage, config);
+            }
+!!!32607415.java!!!	onPersistSafeVolumeState(in state : int) : void
+            Settings.Global.putInt(mContentResolver,
+                    Settings.Global.AUDIO_SAFE_VOLUME_STATE,
+                    state);
+!!!32607543.java!!!	handleMessage(inout msg : Message) : void
+            switch (msg.what) {
+
+                case MSG_SET_DEVICE_VOLUME:
+                    setDeviceVolume((VolumeStreamState) msg.obj, msg.arg1);
+                    break;
+
+                case MSG_SET_ALL_VOLUMES:
+                    setAllVolumes((VolumeStreamState) msg.obj);
+                    break;
+
+                case MSG_PERSIST_VOLUME:
+                    persistVolume((VolumeStreamState) msg.obj, msg.arg1);
+                    break;
+
+                case MSG_PERSIST_RINGER_MODE:
+                    // note that the value persisted is the current ringer mode, not the
+                    // value of ringer mode as of the time the request was made to persist
+                    persistRingerMode(getRingerModeInternal());
+                    break;
+
+                case MSG_AUDIO_SERVER_DIED:
+                    onAudioServerDied();
+                    break;
+
+                case MSG_UNLOAD_SOUND_EFFECTS:
+                    onUnloadSoundEffects();
+                    break;
+
+                case MSG_LOAD_SOUND_EFFECTS:
+                    //FIXME: onLoadSoundEffects() should be executed in a separate thread as it
+                    // can take several dozens of milliseconds to complete
+                    boolean loaded = onLoadSoundEffects();
+                    if (msg.obj != null) {
+                        LoadSoundEffectReply reply = (LoadSoundEffectReply)msg.obj;
+                        synchronized (reply) {
+                            reply.mStatus = loaded ? 0 : -1;
+                            reply.notify();
+                        }
+                    }
+                    break;
+
+                case MSG_PLAY_SOUND_EFFECT:
+                    onPlaySoundEffect(msg.arg1, msg.arg2);
+                    break;
+
+                case MSG_BTA2DP_DOCK_TIMEOUT:
+                    // msg.obj  == address of BTA2DP device
+                    synchronized (mConnectedDevices) {
+                        makeA2dpDeviceUnavailableNow( (String) msg.obj );
+                    }
+                    break;
+
+                case MSG_SET_FORCE_USE:
+                case MSG_SET_FORCE_BT_A2DP_USE:
+                    setForceUse(msg.arg1, msg.arg2);
+                    break;
+
+                case MSG_BT_HEADSET_CNCT_FAILED:
+                    resetBluetoothSco();
+                    break;
+
+                case MSG_SET_WIRED_DEVICE_CONNECTION_STATE:
+                    {   WiredDeviceConnectionState connectState =
+                            (WiredDeviceConnectionState)msg.obj;
+                        onSetWiredDeviceConnectionState(connectState.mType, connectState.mState,
+                                connectState.mAddress, connectState.mName, connectState.mCaller);
+                        mAudioEventWakeLock.release();
+                    }
+                    break;
+
+                case MSG_SET_A2DP_SRC_CONNECTION_STATE:
+                    onSetA2dpSourceConnectionState((BluetoothDevice)msg.obj, msg.arg1);
+                    mAudioEventWakeLock.release();
+                    break;
+
+                case MSG_SET_A2DP_SINK_CONNECTION_STATE:
+                    onSetA2dpSinkConnectionState((BluetoothDevice)msg.obj, msg.arg1);
+                    mAudioEventWakeLock.release();
+                    break;
+
+                case MSG_REPORT_NEW_ROUTES: {
+                    int N = mRoutesObservers.beginBroadcast();
+                    if (N > 0) {
+                        AudioRoutesInfo routes;
+                        synchronized (mCurAudioRoutes) {
+                            routes = new AudioRoutesInfo(mCurAudioRoutes);
+                        }
+                        while (N > 0) {
+                            N--;
+                            IAudioRoutesObserver obs = mRoutesObservers.getBroadcastItem(N);
+                            try {
+                                obs.dispatchAudioRoutesChanged(routes);
+                            } catch (RemoteException e) {
+                            }
+                        }
+                    }
+                    mRoutesObservers.finishBroadcast();
+                    observeDevicesForStreams(-1);
+                    break;
+                }
+
+                case MSG_CHECK_MUSIC_ACTIVE:
+                    onCheckMusicActive((String) msg.obj);
+                    break;
+
+                case MSG_BROADCAST_AUDIO_BECOMING_NOISY:
+                    onSendBecomingNoisyIntent();
+                    break;
+
+                case MSG_CONFIGURE_SAFE_MEDIA_VOLUME_FORCED:
+                case MSG_CONFIGURE_SAFE_MEDIA_VOLUME:
+                    onConfigureSafeVolume((msg.what == MSG_CONFIGURE_SAFE_MEDIA_VOLUME_FORCED),
+                            (String) msg.obj);
+                    break;
+                case MSG_PERSIST_SAFE_VOLUME_STATE:
+                    onPersistSafeVolumeState(msg.arg1);
+                    break;
+
+                case MSG_BROADCAST_BT_CONNECTION_STATE:
+                    onBroadcastScoConnectionState(msg.arg1);
+                    break;
+
+                case MSG_SYSTEM_READY:
+                    onSystemReady();
+                    break;
+
+                case MSG_INDICATE_SYSTEM_READY:
+                    onIndicateSystemReady();
+                    break;
+
+                case MSG_PERSIST_MUSIC_ACTIVE_MS:
+                    final int musicActiveMs = msg.arg1;
+                    Settings.Secure.putIntForUser(mContentResolver,
+                            Settings.Secure.UNSAFE_VOLUME_MUSIC_ACTIVE_MS, musicActiveMs,
+                            UserHandle.USER_CURRENT);
+                    break;
+
+                case MSG_UNMUTE_STREAM:
+                    onUnmuteStream(msg.arg1, msg.arg2);
+                    break;
+
+                case MSG_DYN_POLICY_MIX_STATE_UPDATE:
+                    onDynPolicyMixStateUpdate((String) msg.obj, msg.arg1);
+                    break;
+            }

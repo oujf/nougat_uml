@@ -1,0 +1,279 @@
+class SipPhone
+!!!38070327.java!!!	SipPhone(inout context : Context, inout notifier : PhoneNotifier, inout profile : SipProfile)
+        super("SIP:" + profile.getUriString(), context, notifier);
+
+        if (DBG) log("new SipPhone: " + hidePii(profile.getUriString()));
+        mRingingCall = new SipCall();
+        mForegroundCall = new SipCall();
+        mBackgroundCall = new SipCall();
+        mProfile = profile;
+        mSipManager = SipManager.newInstance(context);
+!!!38070455.java!!!	equals(inout o : Object) : boolean
+        if (o == this) return true;
+        if (!(o instanceof SipPhone)) return false;
+        SipPhone that = (SipPhone) o;
+        return mProfile.getUriString().equals(that.mProfile.getUriString());
+!!!38070583.java!!!	getSipUri() : String
+        return mProfile.getUriString();
+!!!38070711.java!!!	equals(inout phone : SipPhone) : boolean
+        return getSipUri().equals(phone.getSipUri());
+!!!38070839.java!!!	takeIncomingCall(inout incomingCall : Object) : Connection
+        // FIXME: Is synchronizing on the class necessary, should we use a mLockObj?
+        // Also there are many things not synchronized, of course
+        // this may be true of GsmCdmaPhone too!!!
+        synchronized (SipPhone.class) {
+            if (!(incomingCall instanceof SipAudioCall)) {
+                if (DBG) log("takeIncomingCall: ret=null, not a SipAudioCall");
+                return null;
+            }
+            if (mRingingCall.getState().isAlive()) {
+                if (DBG) log("takeIncomingCall: ret=null, ringingCall not alive");
+                return null;
+            }
+
+            // FIXME: is it true that we cannot take any incoming call if
+            // both foreground and background are active
+            if (mForegroundCall.getState().isAlive()
+                    && mBackgroundCall.getState().isAlive()) {
+                if (DBG) {
+                    log("takeIncomingCall: ret=null," + " foreground and background both alive");
+                }
+                return null;
+            }
+
+            try {
+                SipAudioCall sipAudioCall = (SipAudioCall) incomingCall;
+                if (DBG) log("takeIncomingCall: taking call from: "
+                        + sipAudioCall.getPeerProfile().getUriString());
+                String localUri = sipAudioCall.getLocalProfile().getUriString();
+                if (localUri.equals(mProfile.getUriString())) {
+                    boolean makeCallWait = mForegroundCall.getState().isAlive();
+                    SipConnection connection = mRingingCall.initIncomingCall(sipAudioCall,
+                            makeCallWait);
+                    if (sipAudioCall.getState() != SipSession.State.INCOMING_CALL) {
+                        // Peer cancelled the call!
+                        if (DBG) log("    takeIncomingCall: call cancelled !!");
+                        mRingingCall.reset();
+                        connection = null;
+                    }
+                    return connection;
+                }
+            } catch (Exception e) {
+                // Peer may cancel the call at any time during the time we hook
+                // up ringingCall with sipAudioCall. Clean up ringingCall when
+                // that happens.
+                if (DBG) log("    takeIncomingCall: exception e=" + e);
+                mRingingCall.reset();
+            }
+            if (DBG) log("takeIncomingCall: NOT taking !!");
+            return null;
+        }
+!!!38070967.java!!!	acceptCall(in videoState : int) : void
+        synchronized (SipPhone.class) {
+            if ((mRingingCall.getState() == Call.State.INCOMING) ||
+                    (mRingingCall.getState() == Call.State.WAITING)) {
+                if (DBG) log("acceptCall: accepting");
+                // Always unmute when answering a new call
+                mRingingCall.setMute(false);
+                mRingingCall.acceptCall();
+            } else {
+                if (DBG) {
+                    log("acceptCall:" +
+                        " throw CallStateException(\"phone not ringing\")");
+                }
+                throw new CallStateException("phone not ringing");
+            }
+        }
+!!!38071095.java!!!	rejectCall() : void
+        synchronized (SipPhone.class) {
+            if (mRingingCall.getState().isRinging()) {
+                if (DBG) log("rejectCall: rejecting");
+                mRingingCall.rejectCall();
+            } else {
+                if (DBG) {
+                    log("rejectCall:" +
+                        " throw CallStateException(\"phone not ringing\")");
+                }
+                throw new CallStateException("phone not ringing");
+            }
+        }
+!!!38071223.java!!!	dial(inout dialString : String, in videoState : int) : Connection
+        synchronized (SipPhone.class) {
+            return dialInternal(dialString, videoState);
+        }
+!!!38071351.java!!!	dialInternal(inout dialString : String, in videoState : int) : Connection
+        if (DBG) log("dialInternal: dialString=" + hidePii(dialString));
+        clearDisconnected();
+
+        if (!canDial()) {
+            throw new CallStateException("dialInternal: cannot dial in current state");
+        }
+        if (mForegroundCall.getState() == SipCall.State.ACTIVE) {
+            switchHoldingAndActive();
+        }
+        if (mForegroundCall.getState() != SipCall.State.IDLE) {
+            //we should have failed in !canDial() above before we get here
+            throw new CallStateException("cannot dial in current state");
+        }
+
+        mForegroundCall.setMute(false);
+        try {
+            Connection c = mForegroundCall.dial(dialString);
+            return c;
+        } catch (SipException e) {
+            loge("dialInternal: ", e);
+            throw new CallStateException("dial error: " + e);
+        }
+!!!38071479.java!!!	switchHoldingAndActive() : void
+        // Wait for at least TIMEOUT_HOLD_PROCESSING ms to occur before sending hold/unhold requests
+        // to prevent spamming the SipAudioCall state machine and putting it into an invalid state.
+        if (!isHoldTimeoutExpired()) {
+            if (DBG) log("switchHoldingAndActive: Disregarded! Under " + TIMEOUT_HOLD_PROCESSING +
+                    " ms...");
+            return;
+        }
+        if (DBG) log("switchHoldingAndActive: switch fg and bg");
+        synchronized (SipPhone.class) {
+            mForegroundCall.switchWith(mBackgroundCall);
+            if (mBackgroundCall.getState().isAlive()) mBackgroundCall.hold();
+            if (mForegroundCall.getState().isAlive()) mForegroundCall.unhold();
+        }
+!!!38071607.java!!!	canConference() : boolean
+        if (DBG) log("canConference: ret=true");
+        return true;
+!!!38071735.java!!!	conference() : void
+        synchronized (SipPhone.class) {
+            if ((mForegroundCall.getState() != SipCall.State.ACTIVE)
+                    || (mForegroundCall.getState() != SipCall.State.ACTIVE)) {
+                throw new CallStateException("wrong state to merge calls: fg="
+                        + mForegroundCall.getState() + ", bg="
+                        + mBackgroundCall.getState());
+            }
+            if (DBG) log("conference: merge fg & bg");
+            mForegroundCall.merge(mBackgroundCall);
+        }
+!!!38071863.java!!!	conference(inout that : Call) : void
+        synchronized (SipPhone.class) {
+            if (!(that instanceof SipCall)) {
+                throw new CallStateException("expect " + SipCall.class
+                        + ", cannot merge with " + that.getClass());
+            }
+            mForegroundCall.merge((SipCall) that);
+        }
+!!!38071991.java!!!	canTransfer() : boolean
+        return false;
+!!!38072119.java!!!	explicitCallTransfer() : void
+        //mCT.explicitCallTransfer();
+!!!38072247.java!!!	clearDisconnected() : void
+        synchronized (SipPhone.class) {
+            mRingingCall.clearDisconnected();
+            mForegroundCall.clearDisconnected();
+            mBackgroundCall.clearDisconnected();
+
+            updatePhoneState();
+            notifyPreciseCallStateChanged();
+        }
+!!!38072375.java!!!	sendDtmf(in c : char) : void
+        if (!PhoneNumberUtils.is12Key(c)) {
+            loge("sendDtmf called with invalid character '" + c + "'");
+        } else if (mForegroundCall.getState().isAlive()) {
+            synchronized (SipPhone.class) {
+                mForegroundCall.sendDtmf(c);
+            }
+        }
+!!!38072503.java!!!	startDtmf(in c : char) : void
+        if (!PhoneNumberUtils.is12Key(c)) {
+            loge("startDtmf called with invalid character '" + c + "'");
+        } else {
+            sendDtmf(c);
+        }
+!!!38072631.java!!!	stopDtmf() : void
+        // no op
+!!!38072759.java!!!	sendBurstDtmf(inout dtmfString : String) : void
+        loge("sendBurstDtmf() is a CDMA method");
+!!!38072887.java!!!	getOutgoingCallerIdDisplay(inout onComplete : Message) : void
+        // FIXME: what to reply?
+        AsyncResult.forMessage(onComplete, null, null);
+        onComplete.sendToTarget();
+!!!38073015.java!!!	setOutgoingCallerIdDisplay(in commandInterfaceCLIRMode : int, inout onComplete : Message) : void
+        // FIXME: what's this for SIP?
+        AsyncResult.forMessage(onComplete, null, null);
+        onComplete.sendToTarget();
+!!!38073143.java!!!	getCallWaiting(inout onComplete : Message) : void
+        // FIXME: what to reply?
+        AsyncResult.forMessage(onComplete, null, null);
+        onComplete.sendToTarget();
+!!!38073271.java!!!	setCallWaiting(inout enable : boolean, inout onComplete : Message) : void
+        // FIXME: what to reply?
+        loge("call waiting not supported");
+!!!38073399.java!!!	setEchoSuppressionEnabled() : void
+        // Echo suppression may not be available on every device. So, check
+        // whether it is supported
+        synchronized (SipPhone.class) {
+            AudioManager audioManager = (AudioManager) mContext.getSystemService(Context.AUDIO_SERVICE);
+            String echoSuppression = audioManager.getParameters("ec_supported");
+            if (echoSuppression.contains("off")) {
+                mForegroundCall.setAudioGroupMode();
+            }
+        }
+!!!38073527.java!!!	setMute(inout muted : boolean) : void
+        synchronized (SipPhone.class) {
+            mForegroundCall.setMute(muted);
+        }
+!!!38073655.java!!!	getMute() : boolean
+        return (mForegroundCall.getState().isAlive()
+                ? mForegroundCall.getMute()
+                : mBackgroundCall.getMute());
+!!!38073783.java!!!	getForegroundCall() : Call
+        return mForegroundCall;
+!!!38073911.java!!!	getBackgroundCall() : Call
+        return mBackgroundCall;
+!!!38074039.java!!!	getRingingCall() : Call
+        return mRingingCall;
+!!!38074167.java!!!	getServiceState() : ServiceState
+        // FIXME: we may need to provide this when data connectivity is lost
+        // or when server is down
+        return super.getServiceState();
+!!!38074295.java!!!	getUriString(inout p : SipProfile) : String
+        // SipProfile.getUriString() may contain "SIP:" and port
+        return p.getUserName() + "@" + getSipDomain(p);
+!!!38074423.java!!!	getSipDomain(inout p : SipProfile) : String
+        String domain = p.getSipDomain();
+        // TODO: move this to SipProfile
+        if (domain.endsWith(":5060")) {
+            return domain.substring(0, domain.length() - 5);
+        } else {
+            return domain;
+        }
+!!!38074551.java!!!	getCallStateFrom(inout sipAudioCall : SipAudioCall) : Call::State
+        if (sipAudioCall.isOnHold()) return Call.State.HOLDING;
+        int sessionState = sipAudioCall.getState();
+        switch (sessionState) {
+            case SipSession.State.READY_TO_CALL:            return Call.State.IDLE;
+            case SipSession.State.INCOMING_CALL:
+            case SipSession.State.INCOMING_CALL_ANSWERING:  return Call.State.INCOMING;
+            case SipSession.State.OUTGOING_CALL:            return Call.State.DIALING;
+            case SipSession.State.OUTGOING_CALL_RING_BACK:  return Call.State.ALERTING;
+            case SipSession.State.OUTGOING_CALL_CANCELING:  return Call.State.DISCONNECTING;
+            case SipSession.State.IN_CALL:                  return Call.State.ACTIVE;
+            default:
+                slog("illegal connection state: " + sessionState);
+                return Call.State.DISCONNECTED;
+        }
+!!!38074679.java!!!	isHoldTimeoutExpired() : boolean
+        long currTime = System.currentTimeMillis();
+        if ((currTime - mTimeOfLastValidHoldRequest) > TIMEOUT_HOLD_PROCESSING) {
+            mTimeOfLastValidHoldRequest = currTime;
+            return true;
+        }
+        return false;
+!!!38074807.java!!!	log(inout s : String) : void
+        Rlog.d(LOG_TAG, s);
+!!!38074935.java!!!	slog(inout s : String) : void
+        Rlog.d(LOG_TAG, s);
+!!!38075063.java!!!	loge(inout s : String) : void
+        Rlog.e(LOG_TAG, s);
+!!!38075191.java!!!	loge(inout s : String, inout e : Exception) : void
+        Rlog.e(LOG_TAG, s, e);
+!!!38082103.java!!!	hidePii(inout s : String) : String
+        return VDBG ? s : "xxxxx";

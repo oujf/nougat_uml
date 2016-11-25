@@ -1,0 +1,246 @@
+class NetworkScoreService
+!!!41578807.java!!!	NetworkScoreService(inout context : Context)
+        mContext = context;
+        mScoreCaches = new HashMap<>();
+        IntentFilter filter = new IntentFilter(Intent.ACTION_USER_UNLOCKED);
+        // TODO: Need to update when we support per-user scorers. http://b/23422763
+        mContext.registerReceiverAsUser(
+                mUserIntentReceiver, UserHandle.SYSTEM, filter, null /* broadcastPermission*/,
+                null /* scheduler */);
+!!!41578935.java!!!	systemReady() : void
+        if (DBG) Log.d(TAG, "systemReady");
+        ContentResolver cr = mContext.getContentResolver();
+        if (Settings.Global.getInt(cr, Settings.Global.NETWORK_SCORING_PROVISIONED, 0) == 0) {
+            // On first run, we try to initialize the scorer to the one configured at build time.
+            // This will be a no-op if the scorer isn't actually valid.
+            String defaultPackage = mContext.getResources().getString(
+                    R.string.config_defaultNetworkScorerPackageName);
+            if (!TextUtils.isEmpty(defaultPackage)) {
+                NetworkScorerAppManager.setActiveScorer(mContext, defaultPackage);
+            }
+            Settings.Global.putInt(cr, Settings.Global.NETWORK_SCORING_PROVISIONED, 1);
+        }
+
+        registerPackageMonitorIfNeeded();
+!!!41579063.java!!!	systemRunning() : void
+        if (DBG) Log.d(TAG, "systemRunning");
+        bindToScoringServiceIfNeeded();
+!!!41579191.java!!!	onUserUnlocked(in userId : int) : void
+        registerPackageMonitorIfNeeded();
+        bindToScoringServiceIfNeeded();
+!!!41579319.java!!!	registerPackageMonitorIfNeeded() : void
+        if (DBG) Log.d(TAG, "registerPackageMonitorIfNeeded");
+        NetworkScorerAppData scorer = NetworkScorerAppManager.getActiveScorer(mContext);
+        synchronized (mPackageMonitorLock) {
+            // Unregister the current monitor if needed.
+            if (mPackageMonitor != null) {
+                if (DBG) {
+                    Log.d(TAG, "Unregistering package monitor for "
+                            + mPackageMonitor.mRegisteredPackage);
+                }
+                mPackageMonitor.unregister();
+                mPackageMonitor = null;
+            }
+
+            // Create and register the monitor if a scorer is active.
+            if (scorer != null) {
+                mPackageMonitor = new NetworkScorerPackageMonitor(scorer.mPackageName);
+                // TODO: Need to update when we support per-user scorers. http://b/23422763
+                mPackageMonitor.register(mContext, null /* thread */, UserHandle.SYSTEM,
+                        false /* externalStorage */);
+                if (DBG) {
+                    Log.d(TAG, "Registered package monitor for "
+                            + mPackageMonitor.mRegisteredPackage);
+                }
+            }
+        }
+!!!41579447.java!!!	bindToScoringServiceIfNeeded() : void
+        if (DBG) Log.d(TAG, "bindToScoringServiceIfNeeded");
+        NetworkScorerAppData scorerData = NetworkScorerAppManager.getActiveScorer(mContext);
+        bindToScoringServiceIfNeeded(scorerData);
+!!!41579575.java!!!	bindToScoringServiceIfNeeded(inout scorerData : NetworkScorerAppManager::NetworkScorerAppData) : void
+        if (DBG) Log.d(TAG, "bindToScoringServiceIfNeeded(" + scorerData + ")");
+        if (scorerData != null && scorerData.mScoringServiceClassName != null) {
+            ComponentName componentName =
+                    new ComponentName(scorerData.mPackageName, scorerData.mScoringServiceClassName);
+            // If we're connected to a different component then drop it.
+            if (mServiceConnection != null
+                    && !mServiceConnection.mComponentName.equals(componentName)) {
+                unbindFromScoringServiceIfNeeded();
+            }
+
+            // If we're not connected at all then create a new connection.
+            if (mServiceConnection == null) {
+                mServiceConnection = new ScoringServiceConnection(componentName);
+            }
+
+            // Make sure the connection is connected (idempotent)
+            mServiceConnection.connect(mContext);
+        } else { // otherwise make sure it isn't bound.
+            unbindFromScoringServiceIfNeeded();
+        }
+!!!41579703.java!!!	unbindFromScoringServiceIfNeeded() : void
+        if (DBG) Log.d(TAG, "unbindFromScoringServiceIfNeeded");
+        if (mServiceConnection != null) {
+            mServiceConnection.disconnect(mContext);
+        }
+        mServiceConnection = null;
+!!!41579831.java!!!	updateScores(inout networks : ScoredNetwork) : boolean
+        if (!NetworkScorerAppManager.isCallerActiveScorer(mContext, getCallingUid())) {
+            throw new SecurityException("Caller with UID " + getCallingUid() +
+                    " is not the active scorer.");
+        }
+
+        // Separate networks by type.
+        Map<Integer, List<ScoredNetwork>> networksByType = new HashMap<>();
+        for (ScoredNetwork network : networks) {
+            List<ScoredNetwork> networkList = networksByType.get(network.networkKey.type);
+            if (networkList == null) {
+                networkList = new ArrayList<>();
+                networksByType.put(network.networkKey.type, networkList);
+            }
+            networkList.add(network);
+        }
+
+        // Pass the scores of each type down to the appropriate network scorer.
+        for (Map.Entry<Integer, List<ScoredNetwork>> entry : networksByType.entrySet()) {
+            INetworkScoreCache scoreCache = mScoreCaches.get(entry.getKey());
+            if (scoreCache != null) {
+                try {
+                    scoreCache.updateScores(entry.getValue());
+                } catch (RemoteException e) {
+                    if (Log.isLoggable(TAG, Log.VERBOSE)) {
+                        Log.v(TAG, "Unable to update scores of type " + entry.getKey(), e);
+                    }
+                }
+            } else if (Log.isLoggable(TAG, Log.VERBOSE)) {
+                Log.v(TAG, "No scorer registered for type " + entry.getKey() + ", discarding");
+            }
+        }
+
+        return true;
+!!!41579959.java!!!	clearScores() : boolean
+        // Only the active scorer or the system (who can broadcast BROADCAST_NETWORK_PRIVILEGED)
+        // should be allowed to flush all scores.
+        if (NetworkScorerAppManager.isCallerActiveScorer(mContext, getCallingUid()) ||
+                mContext.checkCallingOrSelfPermission(permission.BROADCAST_NETWORK_PRIVILEGED) ==
+                        PackageManager.PERMISSION_GRANTED) {
+            clearInternal();
+            return true;
+        } else {
+            throw new SecurityException(
+                    "Caller is neither the active scorer nor the scorer manager.");
+        }
+!!!41580087.java!!!	setActiveScorer(inout packageName : String) : boolean
+        // TODO: For now, since SCORE_NETWORKS requires an app to be privileged, we allow such apps
+        // to directly set the scorer app rather than having to use the consent dialog. The
+        // assumption is that anyone bundling a scorer app with the system is trusted by the OEM to
+        // do the right thing and not enable this feature without explaining it to the user.
+        // In the future, should this API be opened to 3p apps, we will need to lock this down and
+        // figure out another way to streamline the UX.
+
+        // mContext.enforceCallingOrSelfPermission(permission.BROADCAST_NETWORK_PRIVILEGED, TAG);
+        mContext.enforceCallingOrSelfPermission(permission.SCORE_NETWORKS, TAG);
+
+        return setScorerInternal(packageName);
+!!!41580215.java!!!	disableScoring() : void
+        // Only the active scorer or the system (who can broadcast BROADCAST_NETWORK_PRIVILEGED)
+        // should be allowed to disable scoring.
+        if (NetworkScorerAppManager.isCallerActiveScorer(mContext, getCallingUid()) ||
+                mContext.checkCallingOrSelfPermission(permission.BROADCAST_NETWORK_PRIVILEGED) ==
+                        PackageManager.PERMISSION_GRANTED) {
+            // The return value is discarded here because at this point, the call should always
+            // succeed. The only reason for failure is if the new package is not a valid scorer, but
+            // we're disabling scoring altogether here.
+            setScorerInternal(null /* packageName */);
+        } else {
+            throw new SecurityException(
+                    "Caller is neither the active scorer nor the scorer manager.");
+        }
+!!!41580343.java!!!	setScorerInternal(inout packageName : String) : boolean
+        if (DBG) Log.d(TAG, "setScorerInternal(" + packageName + ")");
+        long token = Binder.clearCallingIdentity();
+        try {
+            unbindFromScoringServiceIfNeeded();
+            // Preemptively clear scores even though the set operation could fail. We do this for
+            // safety as scores should never be compared across apps; in practice, Settings should
+            // only be allowing valid apps to be set as scorers, so failure here should be rare.
+            clearInternal();
+            // Get the scorer that is about to be replaced, if any, so we can notify it directly.
+            NetworkScorerAppData prevScorer = NetworkScorerAppManager.getActiveScorer(mContext);
+            boolean result = NetworkScorerAppManager.setActiveScorer(mContext, packageName);
+            // Unconditionally attempt to bind to the current scorer. If setActiveScorer() failed
+            // then we'll attempt to restore the previous binding (if any), otherwise an attempt
+            // will be made to bind to the new scorer.
+            bindToScoringServiceIfNeeded();
+            if (result) { // new scorer successfully set
+                registerPackageMonitorIfNeeded();
+
+                Intent intent = new Intent(NetworkScoreManager.ACTION_SCORER_CHANGED);
+                if (prevScorer != null) { // Directly notify the old scorer.
+                    intent.setPackage(prevScorer.mPackageName);
+                    // TODO: Need to update when we support per-user scorers. http://b/23422763
+                    mContext.sendBroadcastAsUser(intent, UserHandle.SYSTEM);
+                }
+
+                if (packageName != null) { // Then notify the new scorer
+                    intent.putExtra(NetworkScoreManager.EXTRA_NEW_SCORER, packageName);
+                    intent.setPackage(packageName);
+                    // TODO: Need to update when we support per-user scorers. http://b/23422763
+                    mContext.sendBroadcastAsUser(intent, UserHandle.SYSTEM);
+                }
+            }
+            return result;
+        } finally {
+            Binder.restoreCallingIdentity(token);
+        }
+!!!41580471.java!!!	clearInternal() : void
+        Set<INetworkScoreCache> cachesToClear = getScoreCaches();
+
+        for (INetworkScoreCache scoreCache : cachesToClear) {
+            try {
+                scoreCache.clearScores();
+            } catch (RemoteException e) {
+                if (Log.isLoggable(TAG, Log.VERBOSE)) {
+                    Log.v(TAG, "Unable to clear scores", e);
+                }
+            }
+        }
+!!!41580599.java!!!	registerNetworkScoreCache(in networkType : int, inout scoreCache : INetworkScoreCache) : void
+        mContext.enforceCallingOrSelfPermission(permission.BROADCAST_NETWORK_PRIVILEGED, TAG);
+        synchronized (mScoreCaches) {
+            if (mScoreCaches.containsKey(networkType)) {
+                throw new IllegalArgumentException(
+                        "Score cache already registered for type " + networkType);
+            }
+            mScoreCaches.put(networkType, scoreCache);
+        }
+!!!41580727.java!!!	dump(inout fd : FileDescriptor, inout writer : PrintWriter, inout args : String) : void
+        mContext.enforceCallingOrSelfPermission(permission.DUMP, TAG);
+        NetworkScorerAppData currentScorer = NetworkScorerAppManager.getActiveScorer(mContext);
+        if (currentScorer == null) {
+            writer.println("Scoring is disabled.");
+            return;
+        }
+        writer.println("Current scorer: " + currentScorer.mPackageName);
+
+        for (INetworkScoreCache scoreCache : getScoreCaches()) {
+            try {
+                scoreCache.asBinder().dump(fd, args);
+            } catch (RemoteException e) {
+                writer.println("Unable to dump score cache");
+                if (Log.isLoggable(TAG, Log.VERBOSE)) {
+                    Log.v(TAG, "Unable to dump score cache", e);
+                }
+            }
+        }
+        if (mServiceConnection != null) {
+            mServiceConnection.dump(fd, writer, args);
+        } else {
+            writer.println("ScoringServiceConnection: null");
+        }
+        writer.flush();
+!!!41580855.java!!!	getScoreCaches() : Set<INetworkScoreCache>
+        synchronized (mScoreCaches) {
+            return new HashSet<>(mScoreCaches.values());
+        }

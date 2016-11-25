@@ -1,0 +1,631 @@
+class WifiDisplaySource::PlaybackSession
+!!!40051127.cpp!!!	destroyAsync() : void
+    ALOGI("destroyAsync");
+
+    for (size_t i = 0; i < mTracks.size(); ++i) {
+        mTracks.valueAt(i)->stopAsync();
+    }
+!!!40051255.cpp!!!	getRTPPort() : int32_t
+    return mLocalRTPPort;
+!!!40051383.cpp!!!	getLastLifesignUs() : int64_t
+    return mLastLifesignUs;
+!!!40051511.cpp!!!	updateLiveness() : void
+    mLastLifesignUs = ALooper::GetNowUs();
+!!!40051639.cpp!!!	play() : status_t
+    updateLiveness();
+
+    (new AMessage(kWhatResume, this))->post();
+
+    return OK;
+!!!40051895.cpp!!!	pause() : status_t
+    updateLiveness();
+
+    (new AMessage(kWhatPause, this))->post();
+
+    return OK;
+!!!40052023.cpp!!!	getSurfaceTexture() : sp<IGraphicBufferProducer>
+    return mProducer;
+!!!40052151.cpp!!!	requestIDRFrame() : void
+    for (size_t i = 0; i < mTracks.size(); ++i) {
+        const sp<Track> &track = mTracks.valueAt(i);
+
+        track->requestIDRFrame();
+    }
+!!!40052279.cpp!!!	onMessageReceived(in msg : sp<AMessage>) : void
+    switch (msg->what()) {
+        case kWhatConverterNotify:
+        {
+            if (mWeAreDead) {
+                ALOGV("dropping msg '%s' because we're dead",
+                      msg->debugString().c_str());
+
+                break;
+            }
+
+            int32_t what;
+            CHECK(msg->findInt32("what", &what));
+
+            size_t trackIndex;
+            CHECK(msg->findSize("trackIndex", &trackIndex));
+
+            if (what == Converter::kWhatAccessUnit) {
+                sp<ABuffer> accessUnit;
+                CHECK(msg->findBuffer("accessUnit", &accessUnit));
+
+                const sp<Track> &track = mTracks.valueFor(trackIndex);
+
+                status_t err = mMediaSender->queueAccessUnit(
+                        track->mediaSenderTrackIndex(),
+                        accessUnit);
+
+                if (err != OK) {
+                    notifySessionDead();
+                }
+                break;
+            } else if (what == Converter::kWhatEOS) {
+                CHECK_EQ(what, Converter::kWhatEOS);
+
+                ALOGI("output EOS on track %zu", trackIndex);
+
+                ssize_t index = mTracks.indexOfKey(trackIndex);
+                CHECK_GE(index, 0);
+
+                const sp<Converter> &converter =
+                    mTracks.valueAt(index)->converter();
+                looper()->unregisterHandler(converter->id());
+
+                mTracks.removeItemsAt(index);
+
+                if (mTracks.isEmpty()) {
+                    ALOGI("Reached EOS");
+                }
+            } else if (what != Converter::kWhatShutdownCompleted) {
+                CHECK_EQ(what, Converter::kWhatError);
+
+                status_t err;
+                CHECK(msg->findInt32("err", &err));
+
+                ALOGE("converter signaled error %d", err);
+
+                notifySessionDead();
+            }
+            break;
+        }
+
+        case kWhatMediaSenderNotify:
+        {
+            int32_t what;
+            CHECK(msg->findInt32("what", &what));
+
+            if (what == MediaSender::kWhatInitDone) {
+                status_t err;
+                CHECK(msg->findInt32("err", &err));
+
+                if (err == OK) {
+                    onMediaSenderInitialized();
+                } else {
+                    notifySessionDead();
+                }
+            } else if (what == MediaSender::kWhatError) {
+                notifySessionDead();
+            } else if (what == MediaSender::kWhatNetworkStall) {
+                size_t numBytesQueued;
+                CHECK(msg->findSize("numBytesQueued", &numBytesQueued));
+
+                if (mVideoTrackIndex >= 0) {
+                    const sp<Track> &videoTrack =
+                        mTracks.valueFor(mVideoTrackIndex);
+
+                    sp<Converter> converter = videoTrack->converter();
+                    if (converter != NULL) {
+                        converter->dropAFrame();
+                    }
+                }
+            } else if (what == MediaSender::kWhatInformSender) {
+                onSinkFeedback(msg);
+            } else {
+                TRESPASS();
+            }
+            break;
+        }
+
+        case kWhatTrackNotify:
+        {
+            int32_t what;
+            CHECK(msg->findInt32("what", &what));
+
+            size_t trackIndex;
+            CHECK(msg->findSize("trackIndex", &trackIndex));
+
+            if (what == Track::kWhatStopped) {
+                ALOGI("Track %zu stopped", trackIndex);
+
+                sp<Track> track = mTracks.valueFor(trackIndex);
+                looper()->unregisterHandler(track->id());
+                mTracks.removeItem(trackIndex);
+                track.clear();
+
+                if (!mTracks.isEmpty()) {
+                    ALOGI("not all tracks are stopped yet");
+                    break;
+                }
+
+                looper()->unregisterHandler(mMediaSender->id());
+                mMediaSender.clear();
+
+                sp<AMessage> notify = mNotify->dup();
+                notify->setInt32("what", kWhatSessionDestroyed);
+                notify->post();
+            }
+            break;
+        }
+
+        case kWhatPause:
+        {
+            if (mExtractor != NULL) {
+                ++mPullExtractorGeneration;
+                mFirstSampleTimeRealUs = -1ll;
+                mFirstSampleTimeUs = -1ll;
+            }
+
+            if (mPaused) {
+                break;
+            }
+
+            for (size_t i = 0; i < mTracks.size(); ++i) {
+                mTracks.editValueAt(i)->pause();
+            }
+
+            mPaused = true;
+            break;
+        }
+
+        case kWhatResume:
+        {
+            if (mExtractor != NULL) {
+                schedulePullExtractor();
+            }
+
+            if (!mPaused) {
+                break;
+            }
+
+            for (size_t i = 0; i < mTracks.size(); ++i) {
+                mTracks.editValueAt(i)->resume();
+            }
+
+            mPaused = false;
+            break;
+        }
+
+        case kWhatPullExtractorSample:
+        {
+            int32_t generation;
+            CHECK(msg->findInt32("generation", &generation));
+
+            if (generation != mPullExtractorGeneration) {
+                break;
+            }
+
+            mPullExtractorPending = false;
+
+            onPullExtractor();
+            break;
+        }
+
+        default:
+            TRESPASS();
+    }
+!!!40052407.cpp!!!	setupMediaPacketizer(in enableAudio : bool, in enableVideo : bool) : status_t
+    DataSource::RegisterDefaultSniffers();
+
+    mExtractor = new NuMediaExtractor;
+
+    status_t err = mExtractor->setDataSource(
+            NULL /* httpService */, mMediaPath.c_str());
+
+    if (err != OK) {
+        return err;
+    }
+
+    size_t n = mExtractor->countTracks();
+    bool haveAudio = false;
+    bool haveVideo = false;
+    for (size_t i = 0; i < n; ++i) {
+        sp<AMessage> format;
+        err = mExtractor->getTrackFormat(i, &format);
+
+        if (err != OK) {
+            continue;
+        }
+
+        AString mime;
+        CHECK(format->findString("mime", &mime));
+
+        bool isAudio = !strncasecmp(mime.c_str(), "audio/", 6);
+        bool isVideo = !strncasecmp(mime.c_str(), "video/", 6);
+
+        if (isAudio && enableAudio && !haveAudio) {
+            haveAudio = true;
+        } else if (isVideo && enableVideo && !haveVideo) {
+            haveVideo = true;
+        } else {
+            continue;
+        }
+
+        err = mExtractor->selectTrack(i);
+
+        size_t trackIndex = mTracks.size();
+
+        sp<AMessage> notify = new AMessage(kWhatTrackNotify, this);
+        notify->setSize("trackIndex", trackIndex);
+
+        sp<Track> track = new Track(notify, format);
+        looper()->registerHandler(track);
+
+        mTracks.add(trackIndex, track);
+
+        mExtractorTrackToInternalTrack.add(i, trackIndex);
+
+        if (isVideo) {
+            mVideoTrackIndex = trackIndex;
+        }
+
+        uint32_t flags = MediaSender::FLAG_MANUALLY_PREPEND_SPS_PPS;
+
+        ssize_t mediaSenderTrackIndex =
+            mMediaSender->addTrack(format, flags);
+        CHECK_GE(mediaSenderTrackIndex, 0);
+
+        track->setMediaSenderTrackIndex(mediaSenderTrackIndex);
+
+        if ((haveAudio || !enableAudio) && (haveVideo || !enableVideo)) {
+            break;
+        }
+    }
+
+    return OK;
+!!!40052535.cpp!!!	setupPacketizer(in enableAudio : bool, in usePCMAudio : bool, in enableVideo : bool, in videoResolutionType : VideoFormats::ResolutionType, in videoResolutionIndex : size_t, in videoProfileType : VideoFormats::ProfileType, in videoLevelType : VideoFormats::LevelType) : status_t
+    CHECK(enableAudio || enableVideo);
+
+    if (!mMediaPath.empty()) {
+        return setupMediaPacketizer(enableAudio, enableVideo);
+    }
+
+    if (enableVideo) {
+        status_t err = addVideoSource(
+                videoResolutionType, videoResolutionIndex, videoProfileType,
+                videoLevelType);
+
+        if (err != OK) {
+            return err;
+        }
+    }
+
+    if (!enableAudio) {
+        return OK;
+    }
+
+    return addAudioSource(usePCMAudio);
+!!!40052663.cpp!!!	addSource(in isVideo : bool, in source : sp<MediaSource>, in isRepeaterSource : bool, in usePCMAudio : bool, in profileIdc : uint, in levelIdc : uint, in constraintSet : uint, inout numInputBuffers : size_t) : status_t
+    CHECK(!usePCMAudio || !isVideo);
+    CHECK(!isRepeaterSource || isVideo);
+    CHECK(!profileIdc || isVideo);
+    CHECK(!levelIdc || isVideo);
+    CHECK(!constraintSet || isVideo);
+
+    sp<ALooper> pullLooper = new ALooper;
+    pullLooper->setName("pull_looper");
+
+    pullLooper->start(
+            false /* runOnCallingThread */,
+            false /* canCallJava */,
+            PRIORITY_AUDIO);
+
+    sp<ALooper> codecLooper = new ALooper;
+    codecLooper->setName("codec_looper");
+
+    codecLooper->start(
+            false /* runOnCallingThread */,
+            false /* canCallJava */,
+            PRIORITY_AUDIO);
+
+    size_t trackIndex;
+
+    sp<AMessage> notify;
+
+    trackIndex = mTracks.size();
+
+    sp<AMessage> format;
+    status_t err = convertMetaDataToMessage(source->getFormat(), &format);
+    CHECK_EQ(err, (status_t)OK);
+
+    if (isVideo) {
+        format->setString("mime", MEDIA_MIMETYPE_VIDEO_AVC);
+        format->setInt32(
+                "android._input-metadata-buffer-type", kMetadataBufferTypeANWBuffer);
+        format->setInt32("android._store-metadata-in-buffers-output", (mHDCP != NULL)
+                && (mHDCP->getCaps() & HDCPModule::HDCP_CAPS_ENCRYPT_NATIVE));
+        format->setInt32(
+                "color-format", OMX_COLOR_FormatAndroidOpaque);
+        format->setInt32("profile-idc", profileIdc);
+        format->setInt32("level-idc", levelIdc);
+        format->setInt32("constraint-set", constraintSet);
+    } else {
+        if (usePCMAudio) {
+            format->setInt32("pcm-encoding", kAudioEncodingPcm16bit);
+            format->setString("mime", MEDIA_MIMETYPE_AUDIO_RAW);
+        } else {
+            format->setString("mime", MEDIA_MIMETYPE_AUDIO_AAC);
+        }
+    }
+
+    notify = new AMessage(kWhatConverterNotify, this);
+    notify->setSize("trackIndex", trackIndex);
+
+    sp<Converter> converter = new Converter(notify, codecLooper, format);
+
+    looper()->registerHandler(converter);
+
+    err = converter->init();
+    if (err != OK) {
+        ALOGE("%s converter returned err %d", isVideo ? "video" : "audio", err);
+
+        looper()->unregisterHandler(converter->id());
+        return err;
+    }
+
+    notify = new AMessage(Converter::kWhatMediaPullerNotify, converter);
+    notify->setSize("trackIndex", trackIndex);
+
+    sp<MediaPuller> puller = new MediaPuller(source, notify);
+    pullLooper->registerHandler(puller);
+
+    if (numInputBuffers != NULL) {
+        *numInputBuffers = converter->getInputBufferCount();
+    }
+
+    notify = new AMessage(kWhatTrackNotify, this);
+    notify->setSize("trackIndex", trackIndex);
+
+    sp<Track> track = new Track(
+            notify, pullLooper, codecLooper, puller, converter);
+
+    if (isRepeaterSource) {
+        track->setRepeaterSource(static_cast<RepeaterSource *>(source.get()));
+    }
+
+    looper()->registerHandler(track);
+
+    mTracks.add(trackIndex, track);
+
+    if (isVideo) {
+        mVideoTrackIndex = trackIndex;
+    }
+
+    uint32_t flags = 0;
+    if (converter->needToManuallyPrependSPSPPS()) {
+        flags |= MediaSender::FLAG_MANUALLY_PREPEND_SPS_PPS;
+    }
+
+    ssize_t mediaSenderTrackIndex =
+        mMediaSender->addTrack(converter->getOutputFormat(), flags);
+    CHECK_GE(mediaSenderTrackIndex, 0);
+
+    track->setMediaSenderTrackIndex(mediaSenderTrackIndex);
+
+    return OK;
+!!!40052791.cpp!!!	addVideoSource(in videoResolutionType : VideoFormats::ResolutionType, in videoResolutionIndex : size_t, in videoProfileType : VideoFormats::ProfileType, in videoLevelType : VideoFormats::LevelType) : status_t
+    size_t width, height, framesPerSecond;
+    bool interlaced;
+    CHECK(VideoFormats::GetConfiguration(
+                videoResolutionType,
+                videoResolutionIndex,
+                &width,
+                &height,
+                &framesPerSecond,
+                &interlaced));
+
+    unsigned profileIdc, levelIdc, constraintSet;
+    CHECK(VideoFormats::GetProfileLevel(
+                videoProfileType,
+                videoLevelType,
+                &profileIdc,
+                &levelIdc,
+                &constraintSet));
+
+    sp<SurfaceMediaSource> source = new SurfaceMediaSource(width, height);
+
+    source->setUseAbsoluteTimestamps();
+
+    sp<RepeaterSource> videoSource =
+        new RepeaterSource(source, framesPerSecond);
+
+    size_t numInputBuffers;
+    status_t err = addSource(
+            true /* isVideo */, videoSource, true /* isRepeaterSource */,
+            false /* usePCMAudio */, profileIdc, levelIdc, constraintSet,
+            &numInputBuffers);
+
+    if (err != OK) {
+        return err;
+    }
+
+    err = source->setMaxAcquiredBufferCount(numInputBuffers);
+    CHECK_EQ(err, (status_t)OK);
+
+    mProducer = source->getProducer();
+
+    return OK;
+!!!40052919.cpp!!!	addAudioSource(in usePCMAudio : bool) : status_t
+    sp<AudioSource> audioSource = new AudioSource(
+            AUDIO_SOURCE_REMOTE_SUBMIX,
+            mOpPackageName,
+            48000 /* sampleRate */,
+            2 /* channelCount */);
+
+    if (audioSource->initCheck() == OK) {
+        return addSource(
+                false /* isVideo */, audioSource, false /* isRepeaterSource */,
+                usePCMAudio, 0 /* profileIdc */, 0 /* levelIdc */,
+                0 /* constraintSet */, NULL /* numInputBuffers */);
+    }
+
+    ALOGW("Unable to instantiate audio source");
+
+    return OK;
+!!!40053047.cpp!!!	onMediaSenderInitialized() : status_t
+    for (size_t i = 0; i < mTracks.size(); ++i) {
+        CHECK_EQ((status_t)OK, mTracks.editValueAt(i)->start());
+    }
+
+    sp<AMessage> notify = mNotify->dup();
+    notify->setInt32("what", kWhatSessionEstablished);
+    notify->post();
+
+    return OK;
+!!!40053175.cpp!!!	notifySessionDead() : void
+    // Inform WifiDisplaySource of our premature death (wish).
+    sp<AMessage> notify = mNotify->dup();
+    notify->setInt32("what", kWhatSessionDead);
+    notify->post();
+
+    mWeAreDead = true;
+!!!40053303.cpp!!!	schedulePullExtractor() : void
+    if (mPullExtractorPending) {
+        return;
+    }
+
+    int64_t delayUs = 1000000; // default delay is 1 sec
+    int64_t sampleTimeUs;
+    status_t err = mExtractor->getSampleTime(&sampleTimeUs);
+
+    if (err == OK) {
+        int64_t nowUs = ALooper::GetNowUs();
+
+        if (mFirstSampleTimeRealUs < 0ll) {
+            mFirstSampleTimeRealUs = nowUs;
+            mFirstSampleTimeUs = sampleTimeUs;
+        }
+
+        int64_t whenUs = sampleTimeUs - mFirstSampleTimeUs + mFirstSampleTimeRealUs;
+        delayUs = whenUs - nowUs;
+    } else {
+        ALOGW("could not get sample time (%d)", err);
+    }
+
+    sp<AMessage> msg = new AMessage(kWhatPullExtractorSample, this);
+    msg->setInt32("generation", mPullExtractorGeneration);
+    msg->post(delayUs);
+
+    mPullExtractorPending = true;
+!!!40053431.cpp!!!	onPullExtractor() : void
+    sp<ABuffer> accessUnit = new ABuffer(1024 * 1024);
+    status_t err = mExtractor->readSampleData(accessUnit);
+    if (err != OK) {
+        // EOS.
+        return;
+    }
+
+    int64_t timeUs;
+    CHECK_EQ((status_t)OK, mExtractor->getSampleTime(&timeUs));
+
+    accessUnit->meta()->setInt64(
+            "timeUs", mFirstSampleTimeRealUs + timeUs - mFirstSampleTimeUs);
+
+    size_t trackIndex;
+    CHECK_EQ((status_t)OK, mExtractor->getSampleTrackIndex(&trackIndex));
+
+    sp<AMessage> msg = new AMessage(kWhatConverterNotify, this);
+
+    msg->setSize(
+            "trackIndex", mExtractorTrackToInternalTrack.valueFor(trackIndex));
+
+    msg->setInt32("what", Converter::kWhatAccessUnit);
+    msg->setBuffer("accessUnit", accessUnit);
+    msg->post();
+
+    mExtractor->advance();
+
+    schedulePullExtractor();
+!!!40053559.cpp!!!	onSinkFeedback(in msg : sp<AMessage>) : void
+    int64_t avgLatencyUs;
+    CHECK(msg->findInt64("avgLatencyUs", &avgLatencyUs));
+
+    int64_t maxLatencyUs;
+    CHECK(msg->findInt64("maxLatencyUs", &maxLatencyUs));
+
+    ALOGI("sink reports avg. latency of %lld ms (max %lld ms)",
+          avgLatencyUs / 1000ll,
+          maxLatencyUs / 1000ll);
+
+    if (mVideoTrackIndex >= 0) {
+        const sp<Track> &videoTrack = mTracks.valueFor(mVideoTrackIndex);
+        sp<Converter> converter = videoTrack->converter();
+
+        if (converter != NULL) {
+            int32_t videoBitrate =
+                Converter::GetInt32Property("media.wfd.video-bitrate", -1);
+
+            char val[PROPERTY_VALUE_MAX];
+            if (videoBitrate < 0
+                    && property_get("media.wfd.video-bitrate", val, NULL)
+                    && !strcasecmp("adaptive", val)) {
+                videoBitrate = converter->getVideoBitrate();
+
+                if (avgLatencyUs > 300000ll) {
+                    videoBitrate *= 0.6;
+                } else if (avgLatencyUs < 100000ll) {
+                    videoBitrate *= 1.1;
+                }
+            }
+
+            if (videoBitrate > 0) {
+                if (videoBitrate < 500000) {
+                    videoBitrate = 500000;
+                } else if (videoBitrate > 10000000) {
+                    videoBitrate = 10000000;
+                }
+
+                if (videoBitrate != converter->getVideoBitrate()) {
+                    ALOGI("setting video bitrate to %d bps", videoBitrate);
+
+                    converter->setVideoBitrate(videoBitrate);
+                }
+            }
+        }
+
+        sp<RepeaterSource> repeaterSource = videoTrack->repeaterSource();
+        if (repeaterSource != NULL) {
+            double rateHz =
+                Converter::GetInt32Property(
+                        "media.wfd.video-framerate", -1);
+
+            char val[PROPERTY_VALUE_MAX];
+            if (rateHz < 0.0
+                    && property_get("media.wfd.video-framerate", val, NULL)
+                    && !strcasecmp("adaptive", val)) {
+                 rateHz = repeaterSource->getFrameRate();
+
+                if (avgLatencyUs > 300000ll) {
+                    rateHz *= 0.9;
+                } else if (avgLatencyUs < 200000ll) {
+                    rateHz *= 1.1;
+                }
+            }
+
+            if (rateHz > 0) {
+                if (rateHz < 5.0) {
+                    rateHz = 5.0;
+                } else if (rateHz > 30.0) {
+                    rateHz = 30.0;
+                }
+
+                if (rateHz != repeaterSource->getFrameRate()) {
+                    ALOGI("setting frame rate to %.2f Hz", rateHz);
+
+                    repeaterSource->setFrameRate(rateHz);
+                }
+            }
+        }
+    }

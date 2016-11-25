@@ -1,0 +1,326 @@
+class SmsMessage
+!!!37469111.java!!!	setSubId(in subId : int) : void
+        mSubId = subId;
+!!!37469239.java!!!	getSubId() : int
+        return mSubId;
+!!!37469623.java!!!	SmsMessage(inout smb : SmsMessageBase)
+        mWrappedSmsMessage = smb;
+!!!37469751.java!!!	createFromPdu(inout pdu : byte) : SmsMessage
+         SmsMessage message = null;
+
+        // cdma(3gpp2) vs gsm(3gpp) format info was not given,
+        // guess from active voice phone type
+        int activePhone = TelephonyManager.getDefault().getCurrentPhoneType();
+        String format = (PHONE_TYPE_CDMA == activePhone) ?
+                SmsConstants.FORMAT_3GPP2 : SmsConstants.FORMAT_3GPP;
+        message = createFromPdu(pdu, format);
+
+        if (null == message || null == message.mWrappedSmsMessage) {
+            // decoding pdu failed based on activePhone type, must be other format
+            format = (PHONE_TYPE_CDMA == activePhone) ?
+                    SmsConstants.FORMAT_3GPP : SmsConstants.FORMAT_3GPP2;
+            message = createFromPdu(pdu, format);
+        }
+        return message;
+!!!37469879.java!!!	createFromPdu(inout pdu : byte, inout format : String) : SmsMessage
+        SmsMessageBase wrappedMessage;
+
+        if (SmsConstants.FORMAT_3GPP2.equals(format)) {
+            wrappedMessage = com.android.internal.telephony.cdma.SmsMessage.createFromPdu(pdu);
+        } else if (SmsConstants.FORMAT_3GPP.equals(format)) {
+            wrappedMessage = com.android.internal.telephony.gsm.SmsMessage.createFromPdu(pdu);
+        } else {
+            Rlog.e(LOG_TAG, "createFromPdu(): unsupported message format " + format);
+            return null;
+        }
+
+        return new SmsMessage(wrappedMessage);
+!!!37470007.java!!!	newFromCMT(inout lines : String) : SmsMessage
+        // received SMS in 3GPP format
+        SmsMessageBase wrappedMessage =
+                com.android.internal.telephony.gsm.SmsMessage.newFromCMT(lines);
+
+        return new SmsMessage(wrappedMessage);
+!!!37470135.java!!!	newFromParcel(inout p : Parcel) : SmsMessage
+        // received SMS in 3GPP2 format
+        SmsMessageBase wrappedMessage =
+                com.android.internal.telephony.cdma.SmsMessage.newFromParcel(p);
+
+        return new SmsMessage(wrappedMessage);
+!!!37470263.java!!!	createFromEfRecord(in index : int, inout data : byte) : SmsMessage
+        SmsMessageBase wrappedMessage;
+
+        if (isCdmaVoice()) {
+            wrappedMessage = com.android.internal.telephony.cdma.SmsMessage.createFromEfRecord(
+                    index, data);
+        } else {
+            wrappedMessage = com.android.internal.telephony.gsm.SmsMessage.createFromEfRecord(
+                    index, data);
+        }
+
+        return wrappedMessage != null ? new SmsMessage(wrappedMessage) : null;
+!!!37470391.java!!!	getTPLayerLengthForPDU(inout pdu : String) : int
+        if (isCdmaVoice()) {
+            return com.android.internal.telephony.cdma.SmsMessage.getTPLayerLengthForPDU(pdu);
+        } else {
+            return com.android.internal.telephony.gsm.SmsMessage.getTPLayerLengthForPDU(pdu);
+        }
+!!!37470519.java!!!	calculateLength(inout msgBody : CharSequence, inout use7bitOnly : boolean) : int
+        // this function is for MO SMS
+        TextEncodingDetails ted = (useCdmaFormatForMoSms()) ?
+            com.android.internal.telephony.cdma.SmsMessage.calculateLength(msgBody, use7bitOnly,
+                    true) :
+            com.android.internal.telephony.gsm.SmsMessage.calculateLength(msgBody, use7bitOnly);
+        int ret[] = new int[4];
+        ret[0] = ted.msgCount;
+        ret[1] = ted.codeUnitCount;
+        ret[2] = ted.codeUnitsRemaining;
+        ret[3] = ted.codeUnitSize;
+        return ret;
+!!!37470647.java!!!	fragmentText(inout text : String) : String
+        // This function is for MO SMS
+        TextEncodingDetails ted = (useCdmaFormatForMoSms()) ?
+            com.android.internal.telephony.cdma.SmsMessage.calculateLength(text, false, true) :
+            com.android.internal.telephony.gsm.SmsMessage.calculateLength(text, false);
+
+        // TODO(cleanup): The code here could be rolled into the logic
+        // below cleanly if these MAX_* constants were defined more
+        // flexibly...
+
+        int limit;
+        if (ted.codeUnitSize == SmsConstants.ENCODING_7BIT) {
+            int udhLength;
+            if (ted.languageTable != 0 && ted.languageShiftTable != 0) {
+                udhLength = GsmAlphabet.UDH_SEPTET_COST_TWO_SHIFT_TABLES;
+            } else if (ted.languageTable != 0 || ted.languageShiftTable != 0) {
+                udhLength = GsmAlphabet.UDH_SEPTET_COST_ONE_SHIFT_TABLE;
+            } else {
+                udhLength = 0;
+            }
+
+            if (ted.msgCount > 1) {
+                udhLength += GsmAlphabet.UDH_SEPTET_COST_CONCATENATED_MESSAGE;
+            }
+
+            if (udhLength != 0) {
+                udhLength += GsmAlphabet.UDH_SEPTET_COST_LENGTH;
+            }
+
+            limit = SmsConstants.MAX_USER_DATA_SEPTETS - udhLength;
+        } else {
+            if (ted.msgCount > 1) {
+                limit = SmsConstants.MAX_USER_DATA_BYTES_WITH_HEADER;
+                // If EMS is not supported, break down EMS into single segment SMS
+                // and add page info " x/y".
+                // In the case of UCS2 encoding, we need 8 bytes for this,
+                // but we only have 6 bytes from UDH, so truncate the limit for
+                // each segment by 2 bytes (1 char).
+                // Make sure total number of segments is less than 10.
+                if (!hasEmsSupport() && ted.msgCount < 10) {
+                    limit -= 2;
+                }
+            } else {
+                limit = SmsConstants.MAX_USER_DATA_BYTES;
+            }
+        }
+
+        String newMsgBody = null;
+        Resources r = Resources.getSystem();
+        if (r.getBoolean(com.android.internal.R.bool.config_sms_force_7bit_encoding)) {
+            newMsgBody  = Sms7BitEncodingTranslator.translate(text);
+        }
+        if (TextUtils.isEmpty(newMsgBody)) {
+            newMsgBody = text;
+        }
+        int pos = 0;  // Index in code units.
+        int textLen = newMsgBody.length();
+        ArrayList<String> result = new ArrayList<String>(ted.msgCount);
+        while (pos < textLen) {
+            int nextPos = 0;  // Counts code units.
+            if (ted.codeUnitSize == SmsConstants.ENCODING_7BIT) {
+                if (useCdmaFormatForMoSms() && ted.msgCount == 1) {
+                    // For a singleton CDMA message, the encoding must be ASCII...
+                    nextPos = pos + Math.min(limit, textLen - pos);
+                } else {
+                    // For multi-segment messages, CDMA 7bit equals GSM 7bit encoding (EMS mode).
+                    nextPos = GsmAlphabet.findGsmSeptetLimitIndex(newMsgBody, pos, limit,
+                            ted.languageTable, ted.languageShiftTable);
+                }
+            } else {  // Assume unicode.
+                nextPos = SmsMessageBase.findNextUnicodePosition(pos, limit, newMsgBody);
+            }
+            if ((nextPos <= pos) || (nextPos > textLen)) {
+                Rlog.e(LOG_TAG, "fragmentText failed (" + pos + " >= " + nextPos + " or " +
+                          nextPos + " >= " + textLen + ")");
+                break;
+            }
+            result.add(newMsgBody.substring(pos, nextPos));
+            pos = nextPos;
+        }
+        return result;
+!!!37470775.java!!!	calculateLength(inout messageBody : String, inout use7bitOnly : boolean) : int
+        return calculateLength((CharSequence)messageBody, use7bitOnly);
+!!!37470903.java!!!	getSubmitPdu(inout scAddress : String, inout destinationAddress : String, inout message : String, inout statusReportRequested : boolean) : SmsMessage::SubmitPdu
+        SubmitPduBase spb;
+
+        if (useCdmaFormatForMoSms()) {
+            spb = com.android.internal.telephony.cdma.SmsMessage.getSubmitPdu(scAddress,
+                    destinationAddress, message, statusReportRequested, null);
+        } else {
+            spb = com.android.internal.telephony.gsm.SmsMessage.getSubmitPdu(scAddress,
+                    destinationAddress, message, statusReportRequested);
+        }
+
+        return new SubmitPdu(spb);
+!!!37471031.java!!!	getSubmitPdu(inout scAddress : String, inout destinationAddress : String, in destinationPort : short, inout data : byte, inout statusReportRequested : boolean) : SmsMessage::SubmitPdu
+        SubmitPduBase spb;
+
+        if (useCdmaFormatForMoSms()) {
+            spb = com.android.internal.telephony.cdma.SmsMessage.getSubmitPdu(scAddress,
+                    destinationAddress, destinationPort, data, statusReportRequested);
+        } else {
+            spb = com.android.internal.telephony.gsm.SmsMessage.getSubmitPdu(scAddress,
+                    destinationAddress, destinationPort, data, statusReportRequested);
+        }
+
+        return new SubmitPdu(spb);
+!!!37471159.java!!!	getServiceCenterAddress() : String
+        return mWrappedSmsMessage.getServiceCenterAddress();
+!!!37471287.java!!!	getOriginatingAddress() : String
+        return mWrappedSmsMessage.getOriginatingAddress();
+!!!37471415.java!!!	getDisplayOriginatingAddress() : String
+        return mWrappedSmsMessage.getDisplayOriginatingAddress();
+!!!37471543.java!!!	getMessageBody() : String
+        return mWrappedSmsMessage.getMessageBody();
+!!!37471671.java!!!	getMessageClass() : SmsMessage::MessageClass
+        switch(mWrappedSmsMessage.getMessageClass()) {
+            case CLASS_0: return MessageClass.CLASS_0;
+            case CLASS_1: return MessageClass.CLASS_1;
+            case CLASS_2: return MessageClass.CLASS_2;
+            case CLASS_3: return MessageClass.CLASS_3;
+            default: return MessageClass.UNKNOWN;
+
+        }
+!!!37471799.java!!!	getDisplayMessageBody() : String
+        return mWrappedSmsMessage.getDisplayMessageBody();
+!!!37471927.java!!!	getPseudoSubject() : String
+        return mWrappedSmsMessage.getPseudoSubject();
+!!!37472055.java!!!	getTimestampMillis() : long
+        return mWrappedSmsMessage.getTimestampMillis();
+!!!37472183.java!!!	isEmail() : boolean
+        return mWrappedSmsMessage.isEmail();
+!!!37472311.java!!!	getEmailBody() : String
+        return mWrappedSmsMessage.getEmailBody();
+!!!37472439.java!!!	getEmailFrom() : String
+        return mWrappedSmsMessage.getEmailFrom();
+!!!37472567.java!!!	getProtocolIdentifier() : int
+        return mWrappedSmsMessage.getProtocolIdentifier();
+!!!37472695.java!!!	isReplace() : boolean
+        return mWrappedSmsMessage.isReplace();
+!!!37472823.java!!!	isCphsMwiMessage() : boolean
+        return mWrappedSmsMessage.isCphsMwiMessage();
+!!!37472951.java!!!	isMWIClearMessage() : boolean
+        return mWrappedSmsMessage.isMWIClearMessage();
+!!!37473079.java!!!	isMWISetMessage() : boolean
+        return mWrappedSmsMessage.isMWISetMessage();
+!!!37473207.java!!!	isMwiDontStore() : boolean
+        return mWrappedSmsMessage.isMwiDontStore();
+!!!37473335.java!!!	getUserData() : byte
+        return mWrappedSmsMessage.getUserData();
+!!!37473463.java!!!	getPdu() : byte
+        return mWrappedSmsMessage.getPdu();
+!!!37473591.java!!!	getStatusOnSim() : int
+        return mWrappedSmsMessage.getStatusOnIcc();
+!!!37473719.java!!!	getStatusOnIcc() : int
+        return mWrappedSmsMessage.getStatusOnIcc();
+!!!37473847.java!!!	getIndexOnSim() : int
+        return mWrappedSmsMessage.getIndexOnIcc();
+!!!37473975.java!!!	getIndexOnIcc() : int
+        return mWrappedSmsMessage.getIndexOnIcc();
+!!!37474103.java!!!	getStatus() : int
+        return mWrappedSmsMessage.getStatus();
+!!!37474231.java!!!	isStatusReportMessage() : boolean
+        return mWrappedSmsMessage.isStatusReportMessage();
+!!!37474359.java!!!	isReplyPathPresent() : boolean
+        return mWrappedSmsMessage.isReplyPathPresent();
+!!!37474487.java!!!	useCdmaFormatForMoSms() : boolean
+        if (!SmsManager.getDefault().isImsSmsSupported()) {
+            // use Voice technology to determine SMS format.
+            return isCdmaVoice();
+        }
+        // IMS is registered with SMS support, check the SMS format supported
+        return (SmsConstants.FORMAT_3GPP2.equals(SmsManager.getDefault().getImsSmsFormat()));
+!!!37474615.java!!!	isCdmaVoice() : boolean
+        int activePhone = TelephonyManager.getDefault().getCurrentPhoneType();
+        return (PHONE_TYPE_CDMA == activePhone);
+!!!37474743.java!!!	hasEmsSupport() : boolean
+        if (!isNoEmsSupportConfigListExisted()) {
+            return true;
+        }
+
+        String simOperator;
+        String gid;
+        final long identity = Binder.clearCallingIdentity();
+        try {
+            simOperator = TelephonyManager.getDefault().getSimOperatorNumeric();
+            gid = TelephonyManager.getDefault().getGroupIdLevel1();
+        } finally {
+            Binder.restoreCallingIdentity(identity);
+        }
+
+        if (!TextUtils.isEmpty(simOperator)) {
+            for (NoEmsSupportConfig currentConfig : mNoEmsSupportConfigList) {
+                if (simOperator.startsWith(currentConfig.mOperatorNumber) &&
+                        (TextUtils.isEmpty(currentConfig.mGid1) ||
+                                (!TextUtils.isEmpty(currentConfig.mGid1) &&
+                                        currentConfig.mGid1.equalsIgnoreCase(gid)))) {
+                    return false;
+                }
+            }
+        }
+        return true;
+!!!37474871.java!!!	shouldAppendPageNumberAsPrefix() : boolean
+        if (!isNoEmsSupportConfigListExisted()) {
+            return false;
+        }
+
+        String simOperator;
+        String gid;
+        final long identity = Binder.clearCallingIdentity();
+        try {
+            simOperator = TelephonyManager.getDefault().getSimOperatorNumeric();
+            gid = TelephonyManager.getDefault().getGroupIdLevel1();
+        } finally {
+            Binder.restoreCallingIdentity(identity);
+        }
+
+        for (NoEmsSupportConfig currentConfig : mNoEmsSupportConfigList) {
+            if (simOperator.startsWith(currentConfig.mOperatorNumber) &&
+                (TextUtils.isEmpty(currentConfig.mGid1) ||
+                (!TextUtils.isEmpty(currentConfig.mGid1)
+                && currentConfig.mGid1.equalsIgnoreCase(gid)))) {
+                return currentConfig.mIsPrefix;
+            }
+        }
+        return false;
+!!!37475255.java!!!	isNoEmsSupportConfigListExisted() : boolean
+        if (!mIsNoEmsSupportConfigListLoaded) {
+            Resources r = Resources.getSystem();
+            if (r != null) {
+                String[] listArray = r.getStringArray(
+                        com.android.internal.R.array.no_ems_support_sim_operators);
+                if ((listArray != null) && (listArray.length > 0)) {
+                    mNoEmsSupportConfigList = new NoEmsSupportConfig[listArray.length];
+                    for (int i=0; i<listArray.length; i++) {
+                        mNoEmsSupportConfigList[i] = new NoEmsSupportConfig(listArray[i].split(";"));
+                    }
+                }
+                mIsNoEmsSupportConfigListLoaded = true;
+            }
+        }
+
+        if (mNoEmsSupportConfigList != null && mNoEmsSupportConfigList.length != 0) {
+            return true;
+        }
+
+        return false;

@@ -1,0 +1,207 @@
+class SeekBarVolumizer
+!!!4079543.java!!!	SeekBarVolumizer(inout context : Context, in streamType : int, inout defaultUri : Uri, inout callback : SeekBarVolumizer::Callback)
+        mContext = context;
+        mAudioManager = context.getSystemService(AudioManager.class);
+        mNotificationManager = context.getSystemService(NotificationManager.class);
+        mStreamType = streamType;
+        mAffectedByRingerMode = mAudioManager.isStreamAffectedByRingerMode(mStreamType);
+        mNotificationOrRing = isNotificationOrRing(mStreamType);
+        if (mNotificationOrRing) {
+            mRingerMode = mAudioManager.getRingerModeInternal();
+        }
+        mZenMode = mNotificationManager.getZenMode();
+        mMaxStreamVolume = mAudioManager.getStreamMaxVolume(mStreamType);
+        mCallback = callback;
+        mOriginalStreamVolume = mAudioManager.getStreamVolume(mStreamType);
+        mLastAudibleStreamVolume = mAudioManager.getLastAudibleStreamVolume(mStreamType);
+        mMuted = mAudioManager.isStreamMute(mStreamType);
+        if (mCallback != null) {
+            mCallback.onMuted(mMuted, isZenMuted());
+        }
+        if (defaultUri == null) {
+            if (mStreamType == AudioManager.STREAM_RING) {
+                defaultUri = Settings.System.DEFAULT_RINGTONE_URI;
+            } else if (mStreamType == AudioManager.STREAM_NOTIFICATION) {
+                defaultUri = Settings.System.DEFAULT_NOTIFICATION_URI;
+            } else {
+                defaultUri = Settings.System.DEFAULT_ALARM_ALERT_URI;
+            }
+        }
+        mDefaultUri = defaultUri;
+!!!4079671.java!!!	isNotificationOrRing(in stream : int) : boolean
+        return stream == AudioManager.STREAM_RING || stream == AudioManager.STREAM_NOTIFICATION;
+!!!4079799.java!!!	setSeekBar(inout seekBar : SeekBar) : void
+        if (mSeekBar != null) {
+            mSeekBar.setOnSeekBarChangeListener(null);
+        }
+        mSeekBar = seekBar;
+        mSeekBar.setOnSeekBarChangeListener(null);
+        mSeekBar.setMax(mMaxStreamVolume);
+        updateSeekBar();
+        mSeekBar.setOnSeekBarChangeListener(this);
+!!!4079927.java!!!	isZenMuted() : boolean
+        return mNotificationOrRing && mZenMode == Global.ZEN_MODE_ALARMS
+                || mZenMode == Global.ZEN_MODE_NO_INTERRUPTIONS;
+!!!4080055.java!!!	updateSeekBar() : void
+        final boolean zenMuted = isZenMuted();
+        mSeekBar.setEnabled(!zenMuted);
+        if (zenMuted) {
+            mSeekBar.setProgress(mLastAudibleStreamVolume);
+        } else if (mNotificationOrRing && mRingerMode == AudioManager.RINGER_MODE_VIBRATE) {
+            mSeekBar.setProgress(0);
+        } else if (mMuted) {
+            mSeekBar.setProgress(0);
+        } else {
+            mSeekBar.setProgress(mLastProgress > -1 ? mLastProgress : mOriginalStreamVolume);
+        }
+!!!4080183.java!!!	handleMessage(inout msg : Message) : boolean
+        switch (msg.what) {
+            case MSG_SET_STREAM_VOLUME:
+                if (mMuted && mLastProgress > 0) {
+                    mAudioManager.adjustStreamVolume(mStreamType, AudioManager.ADJUST_UNMUTE, 0);
+                } else if (!mMuted && mLastProgress == 0) {
+                    mAudioManager.adjustStreamVolume(mStreamType, AudioManager.ADJUST_MUTE, 0);
+                }
+                mAudioManager.setStreamVolume(mStreamType, mLastProgress,
+                        AudioManager.FLAG_SHOW_UI_WARNINGS);
+                break;
+            case MSG_START_SAMPLE:
+                onStartSample();
+                break;
+            case MSG_STOP_SAMPLE:
+                onStopSample();
+                break;
+            case MSG_INIT_SAMPLE:
+                onInitSample();
+                break;
+            default:
+                Log.e(TAG, "invalid SeekBarVolumizer message: "+msg.what);
+        }
+        return true;
+!!!4080311.java!!!	onInitSample() : void
+        synchronized (this) {
+            mRingtone = RingtoneManager.getRingtone(mContext, mDefaultUri);
+            if (mRingtone != null) {
+                mRingtone.setStreamType(mStreamType);
+            }
+        }
+!!!4080439.java!!!	postStartSample() : void
+        if (mHandler == null) return;
+        mHandler.removeMessages(MSG_START_SAMPLE);
+        mHandler.sendMessageDelayed(mHandler.obtainMessage(MSG_START_SAMPLE),
+                isSamplePlaying() ? CHECK_RINGTONE_PLAYBACK_DELAY_MS : 0);
+!!!4080567.java!!!	onStartSample() : void
+        if (!isSamplePlaying()) {
+            if (mCallback != null) {
+                mCallback.onSampleStarting(this);
+            }
+
+            synchronized (this) {
+                if (mRingtone != null) {
+                    try {
+                        mRingtone.setAudioAttributes(new AudioAttributes.Builder(mRingtone
+                                .getAudioAttributes())
+                                .setFlags(AudioAttributes.FLAG_BYPASS_INTERRUPTION_POLICY |
+                                        AudioAttributes.FLAG_BYPASS_MUTE)
+                                .build());
+                        mRingtone.play();
+                    } catch (Throwable e) {
+                        Log.w(TAG, "Error playing ringtone, stream " + mStreamType, e);
+                    }
+                }
+            }
+        }
+!!!4080695.java!!!	postStopSample() : void
+        if (mHandler == null) return;
+        // remove pending delayed start messages
+        mHandler.removeMessages(MSG_START_SAMPLE);
+        mHandler.removeMessages(MSG_STOP_SAMPLE);
+        mHandler.sendMessage(mHandler.obtainMessage(MSG_STOP_SAMPLE));
+!!!4080823.java!!!	onStopSample() : void
+        synchronized (this) {
+            if (mRingtone != null) {
+                mRingtone.stop();
+            }
+        }
+!!!4080951.java!!!	stop() : void
+        if (mHandler == null) return;  // already stopped
+        postStopSample();
+        mContext.getContentResolver().unregisterContentObserver(mVolumeObserver);
+        mReceiver.setListening(false);
+        mSeekBar.setOnSeekBarChangeListener(null);
+        mHandler.getLooper().quitSafely();
+        mHandler = null;
+        mVolumeObserver = null;
+!!!4081079.java!!!	start() : void
+        if (mHandler != null) return;  // already started
+        HandlerThread thread = new HandlerThread(TAG + ".CallbackHandler");
+        thread.start();
+        mHandler = new Handler(thread.getLooper(), this);
+        mHandler.sendEmptyMessage(MSG_INIT_SAMPLE);
+        mVolumeObserver = new Observer(mHandler);
+        mContext.getContentResolver().registerContentObserver(
+                System.getUriFor(System.VOLUME_SETTINGS[mStreamType]),
+                false, mVolumeObserver);
+        mReceiver.setListening(true);
+!!!4081207.java!!!	revertVolume() : void
+        mAudioManager.setStreamVolume(mStreamType, mOriginalStreamVolume, 0);
+!!!4081335.java!!!	onProgressChanged(inout seekBar : SeekBar, in progress : int, inout fromTouch : boolean) : void
+        if (fromTouch) {
+            postSetVolume(progress);
+        }
+        if (mCallback != null) {
+            mCallback.onProgressChanged(seekBar, progress, fromTouch);
+        }
+!!!4081463.java!!!	postSetVolume(in progress : int) : void
+        if (mHandler == null) return;
+        // Do the volume changing separately to give responsive UI
+        mLastProgress = progress;
+        mHandler.removeMessages(MSG_SET_STREAM_VOLUME);
+        mHandler.sendMessage(mHandler.obtainMessage(MSG_SET_STREAM_VOLUME));
+!!!4081719.java!!!	onStopTrackingTouch(inout seekBar : SeekBar) : void
+        postStartSample();
+!!!4081847.java!!!	isSamplePlaying() : boolean
+        synchronized (this) {
+            return mRingtone != null && mRingtone.isPlaying();
+        }
+!!!4081975.java!!!	startSample() : void
+        postStartSample();
+!!!4082103.java!!!	stopSample() : void
+        postStopSample();
+!!!4082231.java!!!	getSeekBar() : SeekBar
+        return mSeekBar;
+!!!4082359.java!!!	changeVolumeBy(in amount : int) : void
+        mSeekBar.incrementProgressBy(amount);
+        postSetVolume(mSeekBar.getProgress());
+        postStartSample();
+        mVolumeBeforeMute = -1;
+!!!4082487.java!!!	muteVolume() : void
+        if (mVolumeBeforeMute != -1) {
+            mSeekBar.setProgress(mVolumeBeforeMute);
+            postSetVolume(mVolumeBeforeMute);
+            postStartSample();
+            mVolumeBeforeMute = -1;
+        } else {
+            mVolumeBeforeMute = mSeekBar.getProgress();
+            mSeekBar.setProgress(0);
+            postStopSample();
+            postSetVolume(0);
+        }
+!!!4082615.java!!!	onSaveInstanceState(inout volumeStore : VolumePreference::VolumeStore) : void
+        if (mLastProgress >= 0) {
+            volumeStore.volume = mLastProgress;
+            volumeStore.originalVolume = mOriginalStreamVolume;
+        }
+!!!4082743.java!!!	onRestoreInstanceState(inout volumeStore : VolumePreference::VolumeStore) : void
+        if (volumeStore.volume != -1) {
+            mOriginalStreamVolume = volumeStore.originalVolume;
+            mLastProgress = volumeStore.volume;
+            postSetVolume(mLastProgress);
+        }
+!!!4083127.java!!!	updateSlider() : void
+        if (mSeekBar != null && mAudioManager != null) {
+            final int volume = mAudioManager.getStreamVolume(mStreamType);
+            final int lastAudibleVolume = mAudioManager.getLastAudibleStreamVolume(mStreamType);
+            final boolean mute = mAudioManager.isStreamMute(mStreamType);
+            mUiHandler.postUpdateSlider(volume, lastAudibleVolume, mute);
+        }

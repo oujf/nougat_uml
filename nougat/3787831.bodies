@@ -1,0 +1,230 @@
+class CameraFlashlight
+!!!41080247.cpp!!!	findFlashUnits() : status_t
+    Mutex::Autolock l(mLock);
+    status_t res;
+    int32_t numCameras = mCameraModule->getNumberOfCameras();
+
+    mHasFlashlightMap.clear();
+    mFlashlightMapInitialized = false;
+
+    for (int32_t i = 0; i < numCameras; i++) {
+        bool hasFlash = false;
+        String8 id = String8::format("%d", i);
+
+        res = createFlashlightControl(id);
+        if (res) {
+            ALOGE("%s: failed to create flash control for %s", __FUNCTION__,
+                    id.string());
+        } else {
+            res = mFlashControl->hasFlashUnit(id, &hasFlash);
+            if (res == -EUSERS || res == -EBUSY) {
+                ALOGE("%s: failed to check if camera %s has a flash unit. Some "
+                        "camera devices may be opened", __FUNCTION__,
+                        id.string());
+                return res;
+            } else if (res) {
+                ALOGE("%s: failed to check if camera %s has a flash unit. %s"
+                        " (%d)", __FUNCTION__, id.string(), strerror(-res),
+                        res);
+            }
+
+            mFlashControl.clear();
+        }
+        mHasFlashlightMap.add(id, hasFlash);
+    }
+
+    mFlashlightMapInitialized = true;
+    return OK;
+!!!41080375.cpp!!!	hasFlashUnit(in cameraId : String8) : bool
+    Mutex::Autolock l(mLock);
+    return hasFlashUnitLocked(cameraId);
+!!!41080503.cpp!!!	setTorchMode(in cameraId : String8, in enabled : bool) : status_t
+    if (!mFlashlightMapInitialized) {
+        ALOGE("%s: findFlashUnits() must be called before this method.",
+               __FUNCTION__);
+        return NO_INIT;
+    }
+
+    ALOGV("%s: set torch mode of camera %s to %d", __FUNCTION__,
+            cameraId.string(), enabled);
+
+    status_t res = OK;
+    Mutex::Autolock l(mLock);
+
+    if (mOpenedCameraIds.indexOf(cameraId) != NAME_NOT_FOUND) {
+        // This case is needed to avoid state corruption during the following call sequence:
+        // CameraService::setTorchMode for camera ID 0 begins, does torch status checks
+        // CameraService::connect for camera ID 0 begins, calls prepareDeviceOpen, ends
+        // CameraService::setTorchMode for camera ID 0 continues, calls
+        //        CameraFlashlight::setTorchMode
+
+        // TODO: Move torch status checks and state updates behind this CameraFlashlight lock
+        // to avoid other similar race conditions.
+        ALOGE("%s: Camera device %s is in use, cannot set torch mode.",
+                __FUNCTION__, cameraId.string());
+        return -EBUSY;
+    }
+
+    if (mFlashControl == NULL) {
+        if (enabled == false) {
+            return OK;
+        }
+
+        res = createFlashlightControl(cameraId);
+        if (res) {
+            return res;
+        }
+        res =  mFlashControl->setTorchMode(cameraId, enabled);
+        return res;
+    }
+
+    // if flash control already exists, turning on torch mode may fail if it's
+    // tied to another camera device for module v2.3 and below.
+    res = mFlashControl->setTorchMode(cameraId, enabled);
+    if (res == BAD_INDEX) {
+        // flash control is tied to another camera device, need to close it and
+        // try again.
+        mFlashControl.clear();
+        res = createFlashlightControl(cameraId);
+        if (res) {
+            return res;
+        }
+        res = mFlashControl->setTorchMode(cameraId, enabled);
+    }
+
+    return res;
+!!!41080631.cpp!!!	prepareDeviceOpen(in cameraId : String8) : status_t
+    ALOGV("%s: prepare for device open", __FUNCTION__);
+
+    Mutex::Autolock l(mLock);
+    if (!mFlashlightMapInitialized) {
+        ALOGE("%s: findFlashUnits() must be called before this method.",
+               __FUNCTION__);
+        return NO_INIT;
+    }
+
+    if (mCameraModule->getModuleApiVersion() < CAMERA_MODULE_API_VERSION_2_4) {
+        // framework is going to open a camera device, all flash light control
+        // should be closed for backward compatible support.
+        mFlashControl.clear();
+
+        if (mOpenedCameraIds.size() == 0) {
+            // notify torch unavailable for all cameras with a flash
+            int numCameras = mCameraModule->getNumberOfCameras();
+            for (int i = 0; i < numCameras; i++) {
+                if (hasFlashUnitLocked(String8::format("%d", i))) {
+                    mCallbacks->torch_mode_status_change(mCallbacks,
+                            String8::format("%d", i).string(),
+                            TORCH_MODE_STATUS_NOT_AVAILABLE);
+                }
+            }
+        }
+
+        // close flash control that may be opened by calling hasFlashUnitLocked.
+        mFlashControl.clear();
+    }
+
+    if (mOpenedCameraIds.indexOf(cameraId) == NAME_NOT_FOUND) {
+        mOpenedCameraIds.add(cameraId);
+    }
+
+    return OK;
+!!!41080759.cpp!!!	deviceClosed(in cameraId : String8) : status_t
+    ALOGV("%s: device %s is closed", __FUNCTION__, cameraId.string());
+
+    Mutex::Autolock l(mLock);
+    if (!mFlashlightMapInitialized) {
+        ALOGE("%s: findFlashUnits() must be called before this method.",
+               __FUNCTION__);
+        return NO_INIT;
+    }
+
+    ssize_t index = mOpenedCameraIds.indexOf(cameraId);
+    if (index == NAME_NOT_FOUND) {
+        ALOGE("%s: couldn't find camera %s in the opened list", __FUNCTION__,
+                cameraId.string());
+    } else {
+        mOpenedCameraIds.removeAt(index);
+    }
+
+    // Cannot do anything until all cameras are closed.
+    if (mOpenedCameraIds.size() != 0)
+        return OK;
+
+    if (mCameraModule->getModuleApiVersion() < CAMERA_MODULE_API_VERSION_2_4) {
+        // notify torch available for all cameras with a flash
+        int numCameras = mCameraModule->getNumberOfCameras();
+        for (int i = 0; i < numCameras; i++) {
+            if (hasFlashUnitLocked(String8::format("%d", i))) {
+                mCallbacks->torch_mode_status_change(mCallbacks,
+                        String8::format("%d", i).string(),
+                        TORCH_MODE_STATUS_AVAILABLE_OFF);
+            }
+        }
+    }
+
+    return OK;
+!!!41080887.cpp!!!	createFlashlightControl(in cameraId : String8) : status_t
+    ALOGV("%s: creating a flash light control for camera %s", __FUNCTION__,
+            cameraId.string());
+    if (mFlashControl != NULL) {
+        return INVALID_OPERATION;
+    }
+
+    status_t res = OK;
+
+    if (mCameraModule->getModuleApiVersion() >= CAMERA_MODULE_API_VERSION_2_4) {
+        mFlashControl = new ModuleFlashControl(*mCameraModule, *mCallbacks);
+        if (mFlashControl == NULL) {
+            ALOGV("%s: cannot create flash control for module api v2.4+",
+                     __FUNCTION__);
+            return NO_MEMORY;
+        }
+    } else {
+        uint32_t deviceVersion = CAMERA_DEVICE_API_VERSION_1_0;
+
+        if (mCameraModule->getModuleApiVersion() >=
+                    CAMERA_MODULE_API_VERSION_2_0) {
+            camera_info info;
+            res = mCameraModule->getCameraInfo(
+                    atoi(String8(cameraId).string()), &info);
+            if (res) {
+                ALOGE("%s: failed to get camera info for camera %s",
+                        __FUNCTION__, cameraId.string());
+                return res;
+            }
+            deviceVersion = info.device_version;
+        }
+
+        if (deviceVersion >= CAMERA_DEVICE_API_VERSION_3_0) {
+            CameraDeviceClientFlashControl *flashControl =
+                    new CameraDeviceClientFlashControl(*mCameraModule,
+                                                       *mCallbacks);
+            if (!flashControl) {
+                return NO_MEMORY;
+            }
+
+            mFlashControl = flashControl;
+        } else {
+            mFlashControl =
+                    new CameraHardwareInterfaceFlashControl(*mCameraModule,
+                                                            *mCallbacks);
+        }
+    }
+
+    return OK;
+!!!41081015.cpp!!!	hasFlashUnitLocked(in cameraId : String8) : bool
+    if (!mFlashlightMapInitialized) {
+        ALOGE("%s: findFlashUnits() must be called before this method.",
+               __FUNCTION__);
+        return false;
+    }
+
+    ssize_t index = mHasFlashlightMap.indexOfKey(cameraId);
+    if (index == NAME_NOT_FOUND) {
+        ALOGE("%s: camera %s not present when findFlashUnits() was called",
+                __FUNCTION__, cameraId.string());
+        return false;
+    }
+
+    return mHasFlashlightMap.valueAt(index);

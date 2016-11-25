@@ -1,0 +1,155 @@
+class RoamingState
+!!!36956087.java!!!	enter() : void
+            if (DBG) {
+                log("RoamingState Enter"
+                        + " mScreenOn=" + mScreenOn );
+            }
+
+            // Make sure we disconnect if roaming fails
+            roamWatchdogCount++;
+            logd("Start Roam Watchdog " + roamWatchdogCount);
+            sendMessageDelayed(obtainMessage(CMD_ROAM_WATCHDOG_TIMER,
+                    roamWatchdogCount, 0), ROAM_GUARD_TIMER_MSEC);
+            mAssociated = false;
+!!!36956215.java!!!	processMessage(inout message : Message) : boolean
+            logStateAndMessage(message, this);
+            WifiConfiguration config;
+            switch (message.what) {
+                case CMD_IP_CONFIGURATION_LOST:
+                    config = getCurrentWifiConfiguration();
+                    if (config != null) {
+                        mWifiLogger.captureBugReportData(WifiLogger.REPORT_REASON_AUTOROAM_FAILURE);
+                        mWifiConfigManager.noteRoamingFailure(config,
+                                WifiConfiguration.ROAMING_FAILURE_IP_CONFIG);
+                    }
+                    return NOT_HANDLED;
+                case CMD_UNWANTED_NETWORK:
+                    if (DBG) log("Roaming and CS doesnt want the network -> ignore");
+                    return HANDLED;
+                case CMD_SET_OPERATIONAL_MODE:
+                    if (message.arg1 != CONNECT_MODE) {
+                        deferMessage(message);
+                    }
+                    break;
+                case WifiMonitor.SUPPLICANT_STATE_CHANGE_EVENT:
+                    /**
+                     * If we get a SUPPLICANT_STATE_CHANGE_EVENT indicating a DISCONNECT
+                     * before NETWORK_DISCONNECTION_EVENT
+                     * And there is an associated BSSID corresponding to our target BSSID, then
+                     * we have missed the network disconnection, transition to mDisconnectedState
+                     * and handle the rest of the events there.
+                     */
+                    StateChangeResult stateChangeResult = (StateChangeResult) message.obj;
+                    if (stateChangeResult.state == SupplicantState.DISCONNECTED
+                            || stateChangeResult.state == SupplicantState.INACTIVE
+                            || stateChangeResult.state == SupplicantState.INTERFACE_DISABLED) {
+                        if (DBG) {
+                            log("STATE_CHANGE_EVENT in roaming state "
+                                    + stateChangeResult.toString() );
+                        }
+                        if (stateChangeResult.BSSID != null
+                                && stateChangeResult.BSSID.equals(mTargetRoamBSSID)) {
+                            handleNetworkDisconnect();
+                            transitionTo(mDisconnectedState);
+                        }
+                    }
+                    if (stateChangeResult.state == SupplicantState.ASSOCIATED) {
+                        // We completed the layer2 roaming part
+                        mAssociated = true;
+                        if (stateChangeResult.BSSID != null) {
+                            mTargetRoamBSSID = (String) stateChangeResult.BSSID;
+                        }
+                    }
+                    break;
+                case CMD_ROAM_WATCHDOG_TIMER:
+                    if (roamWatchdogCount == message.arg1) {
+                        if (DBG) log("roaming watchdog! -> disconnect");
+                        mWifiMetrics.endConnectionEvent(
+                                WifiMetrics.ConnectionEvent.FAILURE_ROAM_TIMEOUT,
+                                WifiMetricsProto.ConnectionEvent.HLF_NONE);
+                        mRoamFailCount++;
+                        handleNetworkDisconnect();
+                        mWifiNative.disconnect();
+                        transitionTo(mDisconnectedState);
+                    }
+                    break;
+                case WifiMonitor.NETWORK_CONNECTION_EVENT:
+                    if (mAssociated) {
+                        if (DBG) log("roaming and Network connection established");
+                        mLastNetworkId = message.arg1;
+                        mLastBssid = (String) message.obj;
+                        mWifiInfo.setBSSID(mLastBssid);
+                        mWifiInfo.setNetworkId(mLastNetworkId);
+                        if (mWifiConnectivityManager != null) {
+                            mWifiConnectivityManager.trackBssid(mLastBssid, true);
+                        }
+                        sendNetworkStateChangeBroadcast(mLastBssid);
+
+                        // Successful framework roam! (probably)
+                        reportConnectionAttemptEnd(
+                                WifiMetrics.ConnectionEvent.FAILURE_NONE,
+                                WifiMetricsProto.ConnectionEvent.HLF_NONE);
+
+                        // We must clear the config BSSID, as the wifi chipset may decide to roam
+                        // from this point on and having the BSSID specified by QNS would cause
+                        // the roam to fail and the device to disconnect.
+                        // When transition from RoamingState to DisconnectingState or
+                        // DisconnectedState, the config BSSID is cleared by
+                        // handleNetworkDisconnect().
+                        clearCurrentConfigBSSID("RoamingCompleted");
+
+                        // We used to transition to ObtainingIpState in an
+                        // attempt to do DHCPv4 RENEWs on framework roams.
+                        // DHCP can take too long to time out, and we now rely
+                        // upon IpManager's use of IpReachabilityMonitor to
+                        // confirm our current network configuration.
+                        //
+                        // mIpManager.confirmConfiguration() is called within
+                        // the handling of SupplicantState.COMPLETED.
+                        transitionTo(mConnectedState);
+                    } else {
+                        messageHandlingStatus = MESSAGE_HANDLING_STATUS_DISCARD;
+                    }
+                    break;
+                case WifiMonitor.NETWORK_DISCONNECTION_EVENT:
+                    // Throw away but only if it corresponds to the network we're roaming to
+                    String bssid = (String) message.obj;
+                    if (true) {
+                        String target = "";
+                        if (mTargetRoamBSSID != null) target = mTargetRoamBSSID;
+                        log("NETWORK_DISCONNECTION_EVENT in roaming state"
+                                + " BSSID=" + bssid
+                                + " target=" + target);
+                    }
+                    if (bssid != null && bssid.equals(mTargetRoamBSSID)) {
+                        handleNetworkDisconnect();
+                        transitionTo(mDisconnectedState);
+                    }
+                    break;
+                case WifiMonitor.SSID_TEMP_DISABLED:
+                    // Auth error while roaming
+                    logd("SSID_TEMP_DISABLED nid=" + Integer.toString(mLastNetworkId)
+                            + " id=" + Integer.toString(message.arg1)
+                            + " isRoaming=" + isRoaming()
+                            + " roam=" + mAutoRoaming);
+                    if (message.arg1 == mLastNetworkId) {
+                        config = getCurrentWifiConfiguration();
+                        if (config != null) {
+                            mWifiLogger.captureBugReportData(
+                                    WifiLogger.REPORT_REASON_AUTOROAM_FAILURE);
+                            mWifiConfigManager.noteRoamingFailure(config,
+                                    WifiConfiguration.ROAMING_FAILURE_AUTH_FAILURE);
+                        }
+                        handleNetworkDisconnect();
+                        transitionTo(mDisconnectingState);
+                    }
+                    return NOT_HANDLED;
+                case CMD_START_SCAN:
+                    deferMessage(message);
+                    break;
+                default:
+                    return NOT_HANDLED;
+            }
+            return HANDLED;
+!!!36956343.java!!!	exit() : void
+            logd("WifiStateMachine: Leaving Roaming state");

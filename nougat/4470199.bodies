@@ -1,0 +1,152 @@
+class SensorFusion
+!!!45904183.cpp!!!	process(in event : sensors_event_t) : void
+
+    if (event.type == mGyro.getType()) {
+        float dT;
+        if ( event.timestamp - mGyroTime> 0 &&
+             event.timestamp - mGyroTime< (int64_t)(5e7) ) { //0.05sec
+
+            dT = (event.timestamp - mGyroTime) / 1000000000.0f;
+            // here we estimate the gyro rate (useful for debugging)
+            const float freq = 1 / dT;
+            if (freq >= 100 && freq<1000) { // filter values obviously wrong
+                const float alpha = 1 / (1 + dT); // 1s time-constant
+                mEstimatedGyroRate = freq + (mEstimatedGyroRate - freq)*alpha;
+            }
+
+            const vec3_t gyro(event.data);
+            for (int i = 0; i<NUM_FUSION_MODE; ++i) {
+                if (mEnabled[i]) {
+                    // fusion in no gyro mode will ignore
+                    mFusions[i].handleGyro(gyro, dT);
+                }
+            }
+        }
+        mGyroTime = event.timestamp;
+    } else if (event.type == SENSOR_TYPE_MAGNETIC_FIELD) {
+        const vec3_t mag(event.data);
+        for (int i = 0; i<NUM_FUSION_MODE; ++i) {
+            if (mEnabled[i]) {
+                mFusions[i].handleMag(mag);// fusion in no mag mode will ignore
+            }
+        }
+    } else if (event.type == SENSOR_TYPE_ACCELEROMETER) {
+        float dT;
+        if ( event.timestamp - mAccTime> 0 &&
+             event.timestamp - mAccTime< (int64_t)(1e8) ) { //0.1sec
+            dT = (event.timestamp - mAccTime) / 1000000000.0f;
+
+            const vec3_t acc(event.data);
+            for (int i = 0; i<NUM_FUSION_MODE; ++i) {
+                if (mEnabled[i]) {
+                    mFusions[i].handleAcc(acc, dT);
+                    mAttitudes[i] = mFusions[i].getAttitude();
+                }
+            }
+        }
+        mAccTime = event.timestamp;
+    }
+!!!45905079.cpp!!!	activate(in mode : int, inout ident : void, in enabled : bool) : status_t
+
+    ALOGD_IF(DEBUG_CONNECTIONS,
+            "SensorFusion::activate(mode=%d, ident=%p, enabled=%d)",
+            mode, ident, enabled);
+
+    const ssize_t idx = mClients[mode].indexOf(ident);
+    if (enabled) {
+        if (idx < 0) {
+            mClients[mode].add(ident);
+        }
+    } else {
+        if (idx >= 0) {
+            mClients[mode].removeItemsAt(idx);
+        }
+    }
+
+    const bool newState = mClients[mode].size() != 0;
+    if (newState != mEnabled[mode]) {
+        mEnabled[mode] = newState;
+        if (newState) {
+            mFusions[mode].init(mode);
+        }
+    }
+
+    mSensorDevice.activate(ident, mAcc.getHandle(), enabled);
+    if (mode != FUSION_NOMAG) {
+        mSensorDevice.activate(ident, mMag.getHandle(), enabled);
+    }
+    if (mode != FUSION_NOGYRO) {
+        mSensorDevice.activate(ident, mGyro.getHandle(), enabled);
+    }
+
+    return NO_ERROR;
+!!!45905207.cpp!!!	setDelay(in mode : int, inout ident : void, in ns : int64_t) : status_t
+    // Call batch with timeout zero instead of setDelay().
+    if (ns > (int64_t)5e7) {
+        ns = (int64_t)(5e7);
+    }
+    mSensorDevice.batch(ident, mAcc.getHandle(), 0, ns, 0);
+    if (mode != FUSION_NOMAG) {
+        mSensorDevice.batch(ident, mMag.getHandle(), 0, ms2ns(20), 0);
+    }
+    if (mode != FUSION_NOGYRO) {
+        mSensorDevice.batch(ident, mGyro.getHandle(), 0, mTargetDelayNs, 0);
+    }
+    return NO_ERROR;
+!!!45905335.cpp!!!	getPowerUsage(in mode : int = FUSION_9AXIS) : float
+    float power =   mAcc.getPowerUsage() +
+                    ((mode != FUSION_NOMAG) ? mMag.getPowerUsage() : 0) +
+                    ((mode != FUSION_NOGYRO) ? mGyro.getPowerUsage() : 0);
+    return power;
+!!!45905463.cpp!!!	getMinDelay() : int32_t
+    return mAcc.getMinDelay();
+!!!45905591.cpp!!!	dump(inout result : String8) : void
+    const Fusion& fusion_9axis(mFusions[FUSION_9AXIS]);
+    result.appendFormat("9-axis fusion %s (%zd clients), gyro-rate=%7.2fHz, "
+            "q=< %g, %g, %g, %g > (%g), "
+            "b=< %g, %g, %g >\n",
+            mEnabled[FUSION_9AXIS] ? "enabled" : "disabled",
+            mClients[FUSION_9AXIS].size(),
+            mEstimatedGyroRate,
+            fusion_9axis.getAttitude().x,
+            fusion_9axis.getAttitude().y,
+            fusion_9axis.getAttitude().z,
+            fusion_9axis.getAttitude().w,
+            length(fusion_9axis.getAttitude()),
+            fusion_9axis.getBias().x,
+            fusion_9axis.getBias().y,
+            fusion_9axis.getBias().z);
+
+    const Fusion& fusion_nomag(mFusions[FUSION_NOMAG]);
+    result.appendFormat("game fusion(no mag) %s (%zd clients), "
+            "gyro-rate=%7.2fHz, "
+            "q=< %g, %g, %g, %g > (%g), "
+            "b=< %g, %g, %g >\n",
+            mEnabled[FUSION_NOMAG] ? "enabled" : "disabled",
+            mClients[FUSION_NOMAG].size(),
+            mEstimatedGyroRate,
+            fusion_nomag.getAttitude().x,
+            fusion_nomag.getAttitude().y,
+            fusion_nomag.getAttitude().z,
+            fusion_nomag.getAttitude().w,
+            length(fusion_nomag.getAttitude()),
+            fusion_nomag.getBias().x,
+            fusion_nomag.getBias().y,
+            fusion_nomag.getBias().z);
+
+    const Fusion& fusion_nogyro(mFusions[FUSION_NOGYRO]);
+    result.appendFormat("geomag fusion (no gyro) %s (%zd clients), "
+            "gyro-rate=%7.2fHz, "
+            "q=< %g, %g, %g, %g > (%g), "
+            "b=< %g, %g, %g >\n",
+            mEnabled[FUSION_NOGYRO] ? "enabled" : "disabled",
+            mClients[FUSION_NOGYRO].size(),
+            mEstimatedGyroRate,
+            fusion_nogyro.getAttitude().x,
+            fusion_nogyro.getAttitude().y,
+            fusion_nogyro.getAttitude().z,
+            fusion_nogyro.getAttitude().w,
+            length(fusion_nogyro.getAttitude()),
+            fusion_nogyro.getBias().x,
+            fusion_nogyro.getBias().y,
+            fusion_nogyro.getBias().z);

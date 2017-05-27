@@ -1,0 +1,339 @@
+class BufferQueueConsumer
+!!!45594679.cpp!!!	detachBuffer(in slot : int) : status_t
+    ATRACE_CALL();
+    ATRACE_BUFFER_INDEX(slot);
+    BQ_LOGV("detachBuffer: slot %d", slot);
+    Mutex::Autolock lock(mCore->mMutex);
+
+    if (mCore->mIsAbandoned) {
+        BQ_LOGE("detachBuffer: BufferQueue has been abandoned");
+        return NO_INIT;
+    }
+
+    if (mCore->mSharedBufferMode || slot == mCore->mSharedBufferSlot) {
+        BQ_LOGE("detachBuffer: detachBuffer not allowed in shared buffer mode");
+        return BAD_VALUE;
+    }
+
+    if (slot < 0 || slot >= BufferQueueDefs::NUM_BUFFER_SLOTS) {
+        BQ_LOGE("detachBuffer: slot index %d out of range [0, %d)",
+                slot, BufferQueueDefs::NUM_BUFFER_SLOTS);
+        return BAD_VALUE;
+    } else if (!mSlots[slot].mBufferState.isAcquired()) {
+        BQ_LOGE("detachBuffer: slot %d is not owned by the consumer "
+                "(state = %s)", slot, mSlots[slot].mBufferState.string());
+        return BAD_VALUE;
+    }
+
+    mSlots[slot].mBufferState.detachConsumer();
+    mCore->mActiveBuffers.erase(slot);
+    mCore->mFreeSlots.insert(slot);
+    mCore->clearBufferSlotLocked(slot);
+    mCore->mDequeueCondition.broadcast();
+    VALIDATE_CONSISTENCY();
+
+    return NO_ERROR;
+!!!45594935.cpp!!!	releaseBuffer(in slot : int, in frameNumber : uint64_t, in releaseFence : sp<Fence>, in eglDisplay : EGLDisplay, in eglFence : EGLSyncKHR) : status_t
+    ATRACE_CALL();
+    ATRACE_BUFFER_INDEX(slot);
+
+    if (slot < 0 || slot >= BufferQueueDefs::NUM_BUFFER_SLOTS ||
+            releaseFence == NULL) {
+        BQ_LOGE("releaseBuffer: slot %d out of range or fence %p NULL", slot,
+                releaseFence.get());
+        return BAD_VALUE;
+    }
+
+    sp<IProducerListener> listener;
+    { // Autolock scope
+        Mutex::Autolock lock(mCore->mMutex);
+
+        // If the frame number has changed because the buffer has been reallocated,
+        // we can ignore this releaseBuffer for the old buffer.
+        // Ignore this for the shared buffer where the frame number can easily
+        // get out of sync due to the buffer being queued and acquired at the
+        // same time.
+        if (frameNumber != mSlots[slot].mFrameNumber &&
+                !mSlots[slot].mBufferState.isShared()) {
+            return STALE_BUFFER_SLOT;
+        }
+
+        if (!mSlots[slot].mBufferState.isAcquired()) {
+            BQ_LOGE("releaseBuffer: attempted to release buffer slot %d "
+                    "but its state was %s", slot,
+                    mSlots[slot].mBufferState.string());
+            return BAD_VALUE;
+        }
+
+        mSlots[slot].mEglDisplay = eglDisplay;
+        mSlots[slot].mEglFence = eglFence;
+        mSlots[slot].mFence = releaseFence;
+        mSlots[slot].mBufferState.release();
+
+        // After leaving shared buffer mode, the shared buffer will
+        // still be around. Mark it as no longer shared if this
+        // operation causes it to be free.
+        if (!mCore->mSharedBufferMode && mSlots[slot].mBufferState.isFree()) {
+            mSlots[slot].mBufferState.mShared = false;
+        }
+        // Don't put the shared buffer on the free list.
+        if (!mSlots[slot].mBufferState.isShared()) {
+            mCore->mActiveBuffers.erase(slot);
+            mCore->mFreeBuffers.push_back(slot);
+        }
+
+        listener = mCore->mConnectedProducerListener;
+        BQ_LOGV("releaseBuffer: releasing slot %d", slot);
+
+        mCore->mDequeueCondition.broadcast();
+        VALIDATE_CONSISTENCY();
+    } // Autolock scope
+
+    // Call back without lock held
+    if (listener != NULL) {
+        listener->onBufferReleased();
+    }
+
+    return NO_ERROR;
+!!!45595063.cpp!!!	connect(in consumerListener : sp<IConsumerListener>, in controlledByApp : bool) : status_t
+    ATRACE_CALL();
+
+    if (consumerListener == NULL) {
+        BQ_LOGE("connect: consumerListener may not be NULL");
+        return BAD_VALUE;
+    }
+
+    BQ_LOGV("connect: controlledByApp=%s",
+            controlledByApp ? "true" : "false");
+
+    Mutex::Autolock lock(mCore->mMutex);
+
+    if (mCore->mIsAbandoned) {
+        BQ_LOGE("connect: BufferQueue has been abandoned");
+        return NO_INIT;
+    }
+
+    mCore->mConsumerListener = consumerListener;
+    mCore->mConsumerControlledByApp = controlledByApp;
+
+    return NO_ERROR;
+!!!45595191.cpp!!!	disconnect() : status_t
+    ATRACE_CALL();
+
+    BQ_LOGV("disconnect");
+
+    Mutex::Autolock lock(mCore->mMutex);
+
+    if (mCore->mConsumerListener == NULL) {
+        BQ_LOGE("disconnect: no consumer is connected");
+        return BAD_VALUE;
+    }
+
+    mCore->mIsAbandoned = true;
+    mCore->mConsumerListener = NULL;
+    mCore->mQueue.clear();
+    mCore->freeAllBuffersLocked();
+    mCore->mSharedBufferSlot = BufferQueueCore::INVALID_BUFFER_SLOT;
+    mCore->mDequeueCondition.broadcast();
+    return NO_ERROR;
+!!!45595319.cpp!!!	getReleasedBuffers(inout outSlotMask : uint64_t) : status_t
+    ATRACE_CALL();
+
+    if (outSlotMask == NULL) {
+        BQ_LOGE("getReleasedBuffers: outSlotMask may not be NULL");
+        return BAD_VALUE;
+    }
+
+    Mutex::Autolock lock(mCore->mMutex);
+
+    if (mCore->mIsAbandoned) {
+        BQ_LOGE("getReleasedBuffers: BufferQueue has been abandoned");
+        return NO_INIT;
+    }
+
+    uint64_t mask = 0;
+    for (int s = 0; s < BufferQueueDefs::NUM_BUFFER_SLOTS; ++s) {
+        if (!mSlots[s].mAcquireCalled) {
+            mask |= (1ULL << s);
+        }
+    }
+
+    // Remove from the mask queued buffers for which acquire has been called,
+    // since the consumer will not receive their buffer addresses and so must
+    // retain their cached information
+    BufferQueueCore::Fifo::iterator current(mCore->mQueue.begin());
+    while (current != mCore->mQueue.end()) {
+        if (current->mAcquireCalled) {
+            mask &= ~(1ULL << current->mSlot);
+        }
+        ++current;
+    }
+
+    BQ_LOGV("getReleasedBuffers: returning mask %#" PRIx64, mask);
+    *outSlotMask = mask;
+    return NO_ERROR;
+!!!45595447.cpp!!!	setDefaultBufferSize(in width : uint32_t, in height : uint32_t) : status_t
+    ATRACE_CALL();
+
+    if (width == 0 || height == 0) {
+        BQ_LOGV("setDefaultBufferSize: dimensions cannot be 0 (width=%u "
+                "height=%u)", width, height);
+        return BAD_VALUE;
+    }
+
+    BQ_LOGV("setDefaultBufferSize: width=%u height=%u", width, height);
+
+    Mutex::Autolock lock(mCore->mMutex);
+    mCore->mDefaultWidth = width;
+    mCore->mDefaultHeight = height;
+    return NO_ERROR;
+!!!45595575.cpp!!!	setMaxBufferCount(in bufferCount : int) : status_t
+    ATRACE_CALL();
+
+    if (bufferCount < 1 || bufferCount > BufferQueueDefs::NUM_BUFFER_SLOTS) {
+        BQ_LOGE("setMaxBufferCount: invalid count %d", bufferCount);
+        return BAD_VALUE;
+    }
+
+    Mutex::Autolock lock(mCore->mMutex);
+
+    if (mCore->mConnectedApi != BufferQueueCore::NO_CONNECTED_API) {
+        BQ_LOGE("setMaxBufferCount: producer is already connected");
+        return INVALID_OPERATION;
+    }
+
+    if (bufferCount < mCore->mMaxAcquiredBufferCount) {
+        BQ_LOGE("setMaxBufferCount: invalid buffer count (%d) less than"
+                "mMaxAcquiredBufferCount (%d)", bufferCount,
+                mCore->mMaxAcquiredBufferCount);
+        return BAD_VALUE;
+    }
+
+    int delta = mCore->getMaxBufferCountLocked(mCore->mAsyncMode,
+            mCore->mDequeueBufferCannotBlock, bufferCount) -
+            mCore->getMaxBufferCountLocked();
+    if (!mCore->adjustAvailableSlotsLocked(delta)) {
+        BQ_LOGE("setMaxBufferCount: BufferQueue failed to adjust the number of "
+                "available slots. Delta = %d", delta);
+        return BAD_VALUE;
+    }
+
+    mCore->mMaxBufferCount = bufferCount;
+    return NO_ERROR;
+!!!45595703.cpp!!!	setMaxAcquiredBufferCount(in maxAcquiredBuffers : int) : status_t
+    ATRACE_CALL();
+
+    if (maxAcquiredBuffers < 1 ||
+            maxAcquiredBuffers > BufferQueueCore::MAX_MAX_ACQUIRED_BUFFERS) {
+        BQ_LOGE("setMaxAcquiredBufferCount: invalid count %d",
+                maxAcquiredBuffers);
+        return BAD_VALUE;
+    }
+
+    sp<IConsumerListener> listener;
+    { // Autolock scope
+        Mutex::Autolock lock(mCore->mMutex);
+        mCore->waitWhileAllocatingLocked();
+
+        if (mCore->mIsAbandoned) {
+            BQ_LOGE("setMaxAcquiredBufferCount: consumer is abandoned");
+            return NO_INIT;
+        }
+
+        if (maxAcquiredBuffers == mCore->mMaxAcquiredBufferCount) {
+            return NO_ERROR;
+        }
+
+        // The new maxAcquiredBuffers count should not be violated by the number
+        // of currently acquired buffers
+        int acquiredCount = 0;
+        for (int slot : mCore->mActiveBuffers) {
+            if (mSlots[slot].mBufferState.isAcquired()) {
+                acquiredCount++;
+            }
+        }
+        if (acquiredCount > maxAcquiredBuffers) {
+            BQ_LOGE("setMaxAcquiredBufferCount: the requested maxAcquiredBuffer"
+                    "count (%d) exceeds the current acquired buffer count (%d)",
+                    maxAcquiredBuffers, acquiredCount);
+            return BAD_VALUE;
+        }
+
+        if ((maxAcquiredBuffers + mCore->mMaxDequeuedBufferCount +
+                (mCore->mAsyncMode || mCore->mDequeueBufferCannotBlock ? 1 : 0))
+                > mCore->mMaxBufferCount) {
+            BQ_LOGE("setMaxAcquiredBufferCount: %d acquired buffers would "
+                    "exceed the maxBufferCount (%d) (maxDequeued %d async %d)",
+                    maxAcquiredBuffers, mCore->mMaxBufferCount,
+                    mCore->mMaxDequeuedBufferCount, mCore->mAsyncMode ||
+                    mCore->mDequeueBufferCannotBlock);
+            return BAD_VALUE;
+        }
+
+        int delta = maxAcquiredBuffers - mCore->mMaxAcquiredBufferCount;
+        if (!mCore->adjustAvailableSlotsLocked(delta)) {
+            return BAD_VALUE;
+        }
+
+        BQ_LOGV("setMaxAcquiredBufferCount: %d", maxAcquiredBuffers);
+        mCore->mMaxAcquiredBufferCount = maxAcquiredBuffers;
+        VALIDATE_CONSISTENCY();
+        if (delta < 0) {
+            listener = mCore->mConsumerListener;
+        }
+    }
+    // Call back without lock held
+    if (listener != NULL) {
+        listener->onBuffersReleased();
+    }
+
+    return NO_ERROR;
+!!!45595831.cpp!!!	setConsumerName(in name : String8) : void
+    ATRACE_CALL();
+    BQ_LOGV("setConsumerName: '%s'", name.string());
+    Mutex::Autolock lock(mCore->mMutex);
+    mCore->mConsumerName = name;
+    mConsumerName = name;
+!!!45595959.cpp!!!	setDefaultBufferFormat(in defaultFormat : PixelFormat) : status_t
+    ATRACE_CALL();
+    BQ_LOGV("setDefaultBufferFormat: %u", defaultFormat);
+    Mutex::Autolock lock(mCore->mMutex);
+    mCore->mDefaultBufferFormat = defaultFormat;
+    return NO_ERROR;
+!!!45596087.cpp!!!	setDefaultBufferDataSpace(in defaultDataSpace : android_dataspace) : status_t
+    ATRACE_CALL();
+    BQ_LOGV("setDefaultBufferDataSpace: %u", defaultDataSpace);
+    Mutex::Autolock lock(mCore->mMutex);
+    mCore->mDefaultBufferDataSpace = defaultDataSpace;
+    return NO_ERROR;
+!!!45596215.cpp!!!	setConsumerUsageBits(in usage : uint32_t) : status_t
+    ATRACE_CALL();
+    BQ_LOGV("setConsumerUsageBits: %#x", usage);
+    Mutex::Autolock lock(mCore->mMutex);
+    mCore->mConsumerUsageBits = usage;
+    return NO_ERROR;
+!!!45596343.cpp!!!	setTransformHint(in hint : uint32_t) : status_t
+    ATRACE_CALL();
+    BQ_LOGV("setTransformHint: %#x", hint);
+    Mutex::Autolock lock(mCore->mMutex);
+    mCore->mTransformHint = hint;
+    return NO_ERROR;
+!!!45596471.cpp!!!	getSidebandStream() : sp<NativeHandle>
+    return mCore->mSidebandStream;
+!!!45596599.cpp!!!	discardFreeBuffers() : status_t
+    Mutex::Autolock lock(mCore->mMutex);
+    mCore->discardFreeBuffersLocked();
+    return NO_ERROR;
+!!!45596727.cpp!!!	dump(inout result : String8, in prefix : char) : void
+    const IPCThreadState* ipc = IPCThreadState::self();
+    const pid_t pid = ipc->getCallingPid();
+    const uid_t uid = ipc->getCallingUid();
+    if ((uid != AID_SHELL)
+            && !PermissionCache::checkPermission(String16(
+            "android.permission.DUMP"), pid, uid)) {
+        result.appendFormat("Permission Denial: can't dump BufferQueueConsumer "
+                "from pid=%d, uid=%d\n", pid, uid);
+        android_errorWriteWithInfoLog(0x534e4554, "27046057", uid, NULL, 0);
+    } else {
+        mCore->dump(result, prefix);
+    }

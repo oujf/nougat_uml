@@ -1,0 +1,193 @@
+class CreateInfoWrapper
+!!!46096823.cpp!!!	CreateInfoWrapper(in create_info : VkInstanceCreateInfo, in allocator : VkAllocationCallbacks)
+    hook_extensions_.set(ProcHook::EXTENSION_CORE);
+    hal_extensions_.set(ProcHook::EXTENSION_CORE);
+!!!46096951.cpp!!!	CreateInfoWrapper(in physical_dev : VkPhysicalDevice, in create_info : VkDeviceCreateInfo, in allocator : VkAllocationCallbacks)
+    hook_extensions_.set(ProcHook::EXTENSION_CORE);
+    hal_extensions_.set(ProcHook::EXTENSION_CORE);
+!!!46097079.cpp!!!	~CreateInfoWrapper()
+    allocator_.pfnFree(allocator_.pUserData, extension_filter_.exts);
+    allocator_.pfnFree(allocator_.pUserData, extension_filter_.names);
+!!!46097207.cpp!!!	Validate() : VkResult
+    VkResult result = SanitizePNext();
+    if (result == VK_SUCCESS)
+        result = SanitizeLayers();
+    if (result == VK_SUCCESS)
+        result = SanitizeExtensions();
+
+    return result;
+!!!46097335.cpp!!!	GetHookExtensions() : std::bitset<ProcHook::EXTENSION_COUNT>
+    return hook_extensions_;
+!!!46097463.cpp!!!	GetHalExtensions() : std::bitset<ProcHook::EXTENSION_COUNT>
+    return hal_extensions_;
+!!!46097591.cpp!!!	operator constVkInstanceCreateInfo*()
+    return &instance_info_;
+!!!46097719.cpp!!!	operator constVkDeviceCreateInfo*()
+    return &dev_info_;
+!!!46097847.cpp!!!	SanitizePNext() : VkResult
+    const struct StructHeader {
+        VkStructureType type;
+        const void* next;
+    } * header;
+
+    if (is_instance_) {
+        header = reinterpret_cast<const StructHeader*>(instance_info_.pNext);
+
+        // skip leading VK_STRUCTURE_TYPE_LOADER_INSTANCE_CREATE_INFOs
+        while (header &&
+               header->type == VK_STRUCTURE_TYPE_LOADER_INSTANCE_CREATE_INFO)
+            header = reinterpret_cast<const StructHeader*>(header->next);
+
+        instance_info_.pNext = header;
+    } else {
+        header = reinterpret_cast<const StructHeader*>(dev_info_.pNext);
+
+        // skip leading VK_STRUCTURE_TYPE_LOADER_DEVICE_CREATE_INFOs
+        while (header &&
+               header->type == VK_STRUCTURE_TYPE_LOADER_DEVICE_CREATE_INFO)
+            header = reinterpret_cast<const StructHeader*>(header->next);
+
+        dev_info_.pNext = header;
+    }
+
+    return VK_SUCCESS;
+!!!46097975.cpp!!!	SanitizeLayers() : VkResult
+    auto& layer_names = (is_instance_) ? instance_info_.ppEnabledLayerNames
+                                       : dev_info_.ppEnabledLayerNames;
+    auto& layer_count = (is_instance_) ? instance_info_.enabledLayerCount
+                                       : dev_info_.enabledLayerCount;
+
+    // remove all layers
+    layer_names = nullptr;
+    layer_count = 0;
+
+    return VK_SUCCESS;
+!!!46098103.cpp!!!	SanitizeExtensions() : VkResult
+    auto& ext_names = (is_instance_) ? instance_info_.ppEnabledExtensionNames
+                                     : dev_info_.ppEnabledExtensionNames;
+    auto& ext_count = (is_instance_) ? instance_info_.enabledExtensionCount
+                                     : dev_info_.enabledExtensionCount;
+    if (!ext_count)
+        return VK_SUCCESS;
+
+    VkResult result = InitExtensionFilter();
+    if (result != VK_SUCCESS)
+        return result;
+
+    for (uint32_t i = 0; i < ext_count; i++)
+        FilterExtension(ext_names[i]);
+
+    ext_names = extension_filter_.names;
+    ext_count = extension_filter_.name_count;
+
+    return VK_SUCCESS;
+!!!46098231.cpp!!!	QueryExtensionCount(inout count : uint32_t) : VkResult
+    if (is_instance_) {
+        return Hal::Device().EnumerateInstanceExtensionProperties(
+            nullptr, &count, nullptr);
+    } else {
+        const auto& driver = GetData(physical_dev_).driver;
+        return driver.EnumerateDeviceExtensionProperties(physical_dev_, nullptr,
+                                                         &count, nullptr);
+    }
+!!!46098359.cpp!!!	EnumerateExtensions(inout count : uint32_t, inout props : VkExtensionProperties) : VkResult
+    if (is_instance_) {
+        return Hal::Device().EnumerateInstanceExtensionProperties(
+            nullptr, &count, props);
+    } else {
+        const auto& driver = GetData(physical_dev_).driver;
+        return driver.EnumerateDeviceExtensionProperties(physical_dev_, nullptr,
+                                                         &count, props);
+    }
+!!!46098487.cpp!!!	InitExtensionFilter() : VkResult
+    // query extension count
+    uint32_t count;
+    VkResult result = QueryExtensionCount(count);
+    if (result != VK_SUCCESS || count == 0)
+        return result;
+
+    auto& filter = extension_filter_;
+    filter.exts =
+        reinterpret_cast<VkExtensionProperties*>(allocator_.pfnAllocation(
+            allocator_.pUserData, sizeof(VkExtensionProperties) * count,
+            alignof(VkExtensionProperties),
+            VK_SYSTEM_ALLOCATION_SCOPE_COMMAND));
+    if (!filter.exts)
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+
+    // enumerate extensions
+    result = EnumerateExtensions(count, filter.exts);
+    if (result != VK_SUCCESS && result != VK_INCOMPLETE)
+        return result;
+
+    if (!count)
+        return VK_SUCCESS;
+
+    filter.ext_count = count;
+
+    // allocate name array
+    uint32_t enabled_ext_count = (is_instance_)
+                                     ? instance_info_.enabledExtensionCount
+                                     : dev_info_.enabledExtensionCount;
+    count = std::min(filter.ext_count, enabled_ext_count);
+    filter.names = reinterpret_cast<const char**>(allocator_.pfnAllocation(
+        allocator_.pUserData, sizeof(const char*) * count, alignof(const char*),
+        VK_SYSTEM_ALLOCATION_SCOPE_COMMAND));
+    if (!filter.names)
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+
+    return VK_SUCCESS;
+!!!46098615.cpp!!!	FilterExtension(in name : char) : void
+    auto& filter = extension_filter_;
+
+    ProcHook::Extension ext_bit = GetProcHookExtension(name);
+    if (is_instance_) {
+        switch (ext_bit) {
+            case ProcHook::KHR_android_surface:
+            case ProcHook::KHR_surface:
+                hook_extensions_.set(ext_bit);
+                // return now as these extensions do not require HAL support
+                return;
+            case ProcHook::EXT_debug_report:
+                // both we and HAL can take part in
+                hook_extensions_.set(ext_bit);
+                break;
+            case ProcHook::EXTENSION_UNKNOWN:
+                // HAL's extensions
+                break;
+            default:
+                ALOGW("Ignored invalid instance extension %s", name);
+                return;
+        }
+    } else {
+        switch (ext_bit) {
+            case ProcHook::KHR_swapchain:
+                // map VK_KHR_swapchain to VK_ANDROID_native_buffer
+                name = VK_ANDROID_NATIVE_BUFFER_EXTENSION_NAME;
+                ext_bit = ProcHook::ANDROID_native_buffer;
+                break;
+            case ProcHook::EXTENSION_UNKNOWN:
+                // HAL's extensions
+                break;
+            default:
+                ALOGW("Ignored invalid device extension %s", name);
+                return;
+        }
+    }
+
+    for (uint32_t i = 0; i < filter.ext_count; i++) {
+        const VkExtensionProperties& props = filter.exts[i];
+        // ignore unknown extensions
+        if (strcmp(name, props.extensionName) != 0)
+            continue;
+
+        filter.names[filter.name_count++] = name;
+        if (ext_bit != ProcHook::EXTENSION_UNKNOWN) {
+            if (ext_bit == ProcHook::ANDROID_native_buffer)
+                hook_extensions_.set(ProcHook::KHR_swapchain);
+
+            hal_extensions_.set(ext_bit);
+        }
+
+        break;
+    }

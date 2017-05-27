@@ -1,0 +1,264 @@
+class Layer
+!!!45931575.cpp!!!	Layer(inout flinger : SurfaceFlinger, in client : sp<Client>, in name : String8, in w : uint32_t, in h : uint32_t, in flags : uint32_t)
+#ifdef USE_HWC2
+    ALOGV("Creating Layer %s", name.string());
+#endif
+
+    mCurrentCrop.makeInvalid();
+    mFlinger->getRenderEngine().genTextures(1, &mTextureName);
+    mTexture.init(Texture::TEXTURE_EXTERNAL, mTextureName);
+
+    uint32_t layerFlags = 0;
+    if (flags & ISurfaceComposerClient::eHidden)
+        layerFlags |= layer_state_t::eLayerHidden;
+    if (flags & ISurfaceComposerClient::eOpaque)
+        layerFlags |= layer_state_t::eLayerOpaque;
+    if (flags & ISurfaceComposerClient::eSecure)
+        layerFlags |= layer_state_t::eLayerSecure;
+
+    if (flags & ISurfaceComposerClient::eNonPremultiplied)
+        mPremultipliedAlpha = false;
+
+    mName = name;
+
+    mCurrentState.active.w = w;
+    mCurrentState.active.h = h;
+    mCurrentState.active.transform.set(0, 0);
+    mCurrentState.crop.makeInvalid();
+    mCurrentState.finalCrop.makeInvalid();
+    mCurrentState.z = 0;
+#ifdef USE_HWC2
+    mCurrentState.alpha = 1.0f;
+#else
+    mCurrentState.alpha = 0xFF;
+#endif
+    mCurrentState.layerStack = 0;
+    mCurrentState.flags = layerFlags;
+    mCurrentState.sequence = 0;
+    mCurrentState.requested = mCurrentState.active;
+
+    // drawing state & current state are identical
+    mDrawingState = mCurrentState;
+
+#ifdef USE_HWC2
+    const auto& hwc = flinger->getHwComposer();
+    const auto& activeConfig = hwc.getActiveConfig(HWC_DISPLAY_PRIMARY);
+    nsecs_t displayPeriod = activeConfig->getVsyncPeriod();
+#else
+    nsecs_t displayPeriod =
+            flinger->getHwComposer().getRefreshPeriod(HWC_DISPLAY_PRIMARY);
+#endif
+    mFrameTracker.setDisplayRefreshPeriod(displayPeriod);
+!!!45931703.cpp!!!	~Layer()
+  sp<Client> c(mClientRef.promote());
+    if (c != 0) {
+        c->detachLayer(this);
+    }
+
+    for (auto& point : mRemoteSyncPoints) {
+        point->setTransactionApplied();
+    }
+    for (auto& point : mLocalSyncPoints) {
+        point->setFrameAvailable();
+    }
+    mFlinger->deleteTextureAsync(mTextureName);
+    mFrameTracker.logAndResetStats(mName);
+!!!45931831.cpp!!!	setBuffers(in w : uint32_t, in h : uint32_t, in format : PixelFormat, in flags : uint32_t) : status_t
+    uint32_t const maxSurfaceDims = min(
+            mFlinger->getMaxTextureSize(), mFlinger->getMaxViewportDims());
+
+    // never allow a surface larger than what our underlying GL implementation
+    // can handle.
+    if ((uint32_t(w)>maxSurfaceDims) || (uint32_t(h)>maxSurfaceDims)) {
+        ALOGE("dimensions too large %u x %u", uint32_t(w), uint32_t(h));
+        return BAD_VALUE;
+    }
+
+    mFormat = format;
+
+    mPotentialCursor = (flags & ISurfaceComposerClient::eCursorWindow) ? true : false;
+    mProtectedByApp = (flags & ISurfaceComposerClient::eProtectedByApp) ? true : false;
+    mCurrentOpacity = getOpacityForFormat(format);
+
+    mSurfaceFlingerConsumer->setDefaultBufferSize(w, h);
+    mSurfaceFlingerConsumer->setDefaultBufferFormat(format);
+    mSurfaceFlingerConsumer->setConsumerUsageBits(getEffectiveUsage(0));
+
+    return NO_ERROR;
+!!!45934263.cpp!!!	computeBounds(in activeTransparentRegion : Region) : Rect
+    const Layer::State& s(getDrawingState());
+    Rect win(s.active.w, s.active.h);
+
+    if (!s.crop.isEmpty()) {
+        win.intersect(s.crop, &win);
+    }
+    // subtract the transparent region and snap to the bounds
+    return reduce(win, activeTransparentRegion);
+!!!45934391.cpp!!!	computeBounds() : Rect
+    const Layer::State& s(getDrawingState());
+    return computeBounds(s.activeTransparentRegion);
+!!!45934519.cpp!!!	getHandle() : sp<IBinder>
+    Mutex::Autolock _l(mLock);
+
+    LOG_ALWAYS_FATAL_IF(mHasSurface,
+            "Layer::getHandle() has already been called");
+
+    mHasSurface = true;
+
+    return new Handle(mFlinger, this);
+!!!45934647.cpp!!!	getProducer() : sp<IGraphicBufferProducer>
+    return mProducer;
+!!!45934775.cpp!!!	getName() : String8
+    return mName;
+!!!45937463.cpp!!!	onLayerDisplayed(in releaseFence : sp<Fence>) : void
+    if (mHwcLayers.empty()) {
+        return;
+    }
+    mSurfaceFlingerConsumer->setReleaseFence(releaseFence);
+!!!45937591.cpp!!!	onLayerDisplayed(in hw : sp<const DisplayDevice>, inout layer : HWComposer::HWCLayerInterface) : void
+    if (layer) {
+        layer->onDisplayed();
+        mSurfaceFlingerConsumer->setReleaseFence(layer->getAndResetReleaseFence());
+    }
+!!!45939383.cpp!!!	onRemoved() : void
+    mSurfaceFlingerConsumer->abandon();
+!!!45939639.cpp!!!	getContentCrop() : Rect
+    // this is the crop rectangle that applies to the buffer
+    // itself (as opposed to the window)
+    Rect crop;
+    if (!mCurrentCrop.isEmpty()) {
+        // if the buffer crop is defined, we use that
+        crop = mCurrentCrop;
+    } else if (mActiveBuffer != NULL) {
+        // otherwise we use the whole buffer
+        crop = mActiveBuffer->getBounds();
+    } else {
+        // if we don't have a buffer yet, we use an empty/invalid crop
+        crop.makeInvalid();
+    }
+    return crop;
+!!!45941943.cpp!!!	onFirstRef() : void
+    // Creates a custom BufferQueue for SurfaceFlingerConsumer to use
+    sp<IGraphicBufferProducer> producer;
+    sp<IGraphicBufferConsumer> consumer;
+    BufferQueue::createBufferQueue(&producer, &consumer);
+    mProducer = new MonitoredProducer(producer, mFlinger);
+    mSurfaceFlingerConsumer = new SurfaceFlingerConsumer(consumer, mTextureName);
+    mSurfaceFlingerConsumer->setConsumerUsageBits(getEffectiveUsage(0));
+    mSurfaceFlingerConsumer->setContentsChangedListener(this);
+    mSurfaceFlingerConsumer->setName(mName);
+
+#ifdef TARGET_DISABLE_TRIPLE_BUFFERING
+#warning "disabling triple buffering"
+#else
+    mProducer->setMaxDequeuedBufferCount(2);
+#endif
+
+    const sp<const DisplayDevice> hw(mFlinger->getDefaultDisplayDevice());
+    updateTransformHint(hw);
+!!!45942583.cpp!!!	onSidebandStreamChanged() : void
+    if (android_atomic_release_cas(false, true, &mSidebandStreamChanged) == 0) {
+        // mSidebandStreamChanged was false
+        mFlinger->signalLayerUpdate();
+    }
+!!!45943095.cpp!!!	computeCrop(in hw : sp<const DisplayDevice>) : FloatRect
+    // the content crop is the area of the content that gets scaled to the
+    // layer's size.
+    FloatRect crop(getContentCrop());
+
+    // the crop is the area of the window that gets cropped, but not
+    // scaled in any ways.
+    const State& s(getDrawingState());
+
+    // apply the projection's clipping to the window crop in
+    // layerstack space, and convert-back to layer space.
+    // if there are no window scaling involved, this operation will map to full
+    // pixels in the buffer.
+    // FIXME: the 3 lines below can produce slightly incorrect clipping when we have
+    // a viewport clipping and a window transform. we should use floating point to fix this.
+
+    Rect activeCrop(s.active.w, s.active.h);
+    if (!s.crop.isEmpty()) {
+        activeCrop = s.crop;
+    }
+
+    activeCrop = s.active.transform.transform(activeCrop);
+    if (!activeCrop.intersect(hw->getViewport(), &activeCrop)) {
+        activeCrop.clear();
+    }
+    if (!s.finalCrop.isEmpty()) {
+        if(!activeCrop.intersect(s.finalCrop, &activeCrop)) {
+            activeCrop.clear();
+        }
+    }
+    activeCrop = s.active.transform.inverse().transform(activeCrop);
+
+    // This needs to be here as transform.transform(Rect) computes the
+    // transformed rect and then takes the bounding box of the result before
+    // returning. This means
+    // transform.inverse().transform(transform.transform(Rect)) != Rect
+    // in which case we need to make sure the final rect is clipped to the
+    // display bounds.
+    if (!activeCrop.intersect(Rect(s.active.w, s.active.h), &activeCrop)) {
+        activeCrop.clear();
+    }
+
+    // subtract the transparent region and snap to the bounds
+    activeCrop = reduce(activeCrop, s.activeTransparentRegion);
+
+    // Transform the window crop to match the buffer coordinate system,
+    // which means using the inverse of the current transform set on the
+    // SurfaceFlingerConsumer.
+    uint32_t invTransform = mCurrentTransform;
+    if (mSurfaceFlingerConsumer->getTransformToDisplayInverse()) {
+        /*
+         * the code below applies the primary display's inverse transform to the
+         * buffer
+         */
+        uint32_t invTransformOrient =
+                DisplayDevice::getPrimaryDisplayOrientationTransform();
+        // calculate the inverse transform
+        if (invTransformOrient & NATIVE_WINDOW_TRANSFORM_ROT_90) {
+            invTransformOrient ^= NATIVE_WINDOW_TRANSFORM_FLIP_V |
+                    NATIVE_WINDOW_TRANSFORM_FLIP_H;
+        }
+        // and apply to the current transform
+        invTransform = (Transform(invTransformOrient) * Transform(invTransform))
+                .getOrientation();
+    }
+
+    int winWidth = s.active.w;
+    int winHeight = s.active.h;
+    if (invTransform & NATIVE_WINDOW_TRANSFORM_ROT_90) {
+        // If the activeCrop has been rotate the ends are rotated but not
+        // the space itself so when transforming ends back we can't rely on
+        // a modification of the axes of rotation. To account for this we
+        // need to reorient the inverse rotation in terms of the current
+        // axes of rotation.
+        bool is_h_flipped = (invTransform & NATIVE_WINDOW_TRANSFORM_FLIP_H) != 0;
+        bool is_v_flipped = (invTransform & NATIVE_WINDOW_TRANSFORM_FLIP_V) != 0;
+        if (is_h_flipped == is_v_flipped) {
+            invTransform ^= NATIVE_WINDOW_TRANSFORM_FLIP_V |
+                    NATIVE_WINDOW_TRANSFORM_FLIP_H;
+        }
+        winWidth = s.active.h;
+        winHeight = s.active.w;
+    }
+    const Rect winCrop = activeCrop.transform(
+            invTransform, s.active.w, s.active.h);
+
+    // below, crop is intersected with winCrop expressed in crop's coordinate space
+    float xScale = crop.getWidth()  / float(winWidth);
+    float yScale = crop.getHeight() / float(winHeight);
+
+    float insetL = winCrop.left                 * xScale;
+    float insetT = winCrop.top                  * yScale;
+    float insetR = (winWidth - winCrop.right )  * xScale;
+    float insetB = (winHeight - winCrop.bottom) * yScale;
+
+    crop.left   += insetL;
+    crop.top    += insetT;
+    crop.right  -= insetR;
+    crop.bottom -= insetB;
+
+    return crop;

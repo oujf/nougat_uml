@@ -1,0 +1,407 @@
+class Parcel
+!!!45571767.cpp!!!	Parcel()
+    LOG_ALLOC("Parcel %p: constructing", this);
+    initState();
+!!!45571895.cpp!!!	~Parcel()
+    freeDataNoInit();
+    LOG_ALLOC("Parcel %p: destroyed", this);
+!!!45572023.cpp!!!	data() : uint8_t
+    return mData;
+!!!45572151.cpp!!!	dataSize() : size_t
+    return (mDataSize > mDataPos ? mDataSize : mDataPos);
+!!!45572279.cpp!!!	dataAvail() : size_t
+    size_t result = dataSize() - dataPosition();
+    if (result > INT32_MAX) {
+        abort();
+    }
+    return result;
+!!!45572407.cpp!!!	dataPosition() : size_t
+    return mDataPos;
+!!!45572535.cpp!!!	dataCapacity() : size_t
+    return mDataCapacity;
+!!!45572663.cpp!!!	setDataSize(in size : size_t) : status_t
+    if (size > INT32_MAX) {
+        // don't accept size_t values which may have come from an
+        // inadvertent conversion from a negative int.
+        return BAD_VALUE;
+    }
+
+    status_t err;
+    err = continueWrite(size);
+    if (err == NO_ERROR) {
+        mDataSize = size;
+        ALOGV("setDataSize Setting data size of %p to %zu", this, mDataSize);
+    }
+    return err;
+!!!45572791.cpp!!!	setDataPosition(in pos : size_t) : void
+    if (pos > INT32_MAX) {
+        // don't accept size_t values which may have come from an
+        // inadvertent conversion from a negative int.
+        abort();
+    }
+
+    mDataPos = pos;
+    mNextObjectHint = 0;
+!!!45572919.cpp!!!	setDataCapacity(in size : size_t) : status_t
+    if (size > INT32_MAX) {
+        // don't accept size_t values which may have come from an
+        // inadvertent conversion from a negative int.
+        return BAD_VALUE;
+    }
+
+    if (size > mDataCapacity) return continueWrite(size);
+    return NO_ERROR;
+!!!45573047.cpp!!!	setData(in buffer : uint8_t, in len : size_t) : status_t
+    if (len > INT32_MAX) {
+        // don't accept size_t values which may have come from an
+        // inadvertent conversion from a negative int.
+        return BAD_VALUE;
+    }
+
+    status_t err = restartWrite(len);
+    if (err == NO_ERROR) {
+        memcpy(const_cast<uint8_t*>(data()), buffer, len);
+        mDataSize = len;
+        mFdsKnown = false;
+    }
+    return err;
+!!!45573175.cpp!!!	appendFrom(in parcel : Parcel, in offset : size_t, in len : size_t) : status_t
+    const sp<ProcessState> proc(ProcessState::self());
+    status_t err;
+    const uint8_t *data = parcel->mData;
+    const binder_size_t *objects = parcel->mObjects;
+    size_t size = parcel->mObjectsSize;
+    int startPos = mDataPos;
+    int firstIndex = -1, lastIndex = -2;
+
+    if (len == 0) {
+        return NO_ERROR;
+    }
+
+    if (len > INT32_MAX) {
+        // don't accept size_t values which may have come from an
+        // inadvertent conversion from a negative int.
+        return BAD_VALUE;
+    }
+
+    // range checks against the source parcel size
+    if ((offset > parcel->mDataSize)
+            || (len > parcel->mDataSize)
+            || (offset + len > parcel->mDataSize)) {
+        return BAD_VALUE;
+    }
+
+    // Count objects in range
+    for (int i = 0; i < (int) size; i++) {
+        size_t off = objects[i];
+        if ((off >= offset) && (off + sizeof(flat_binder_object) <= offset + len)) {
+            if (firstIndex == -1) {
+                firstIndex = i;
+            }
+            lastIndex = i;
+        }
+    }
+    int numObjects = lastIndex - firstIndex + 1;
+
+    if ((mDataSize+len) > mDataCapacity) {
+        // grow data
+        err = growData(len);
+        if (err != NO_ERROR) {
+            return err;
+        }
+    }
+
+    // append data
+    memcpy(mData + mDataPos, data + offset, len);
+    mDataPos += len;
+    mDataSize += len;
+
+    err = NO_ERROR;
+
+    if (numObjects > 0) {
+        // grow objects
+        if (mObjectsCapacity < mObjectsSize + numObjects) {
+            size_t newSize = ((mObjectsSize + numObjects)*3)/2;
+            if (newSize < mObjectsSize) return NO_MEMORY;   // overflow
+            binder_size_t *objects =
+                (binder_size_t*)realloc(mObjects, newSize*sizeof(binder_size_t));
+            if (objects == (binder_size_t*)0) {
+                return NO_MEMORY;
+            }
+            mObjects = objects;
+            mObjectsCapacity = newSize;
+        }
+
+        // append and acquire objects
+        int idx = mObjectsSize;
+        for (int i = firstIndex; i <= lastIndex; i++) {
+            size_t off = objects[i] - offset + startPos;
+            mObjects[idx++] = off;
+            mObjectsSize++;
+
+            flat_binder_object* flat
+                = reinterpret_cast<flat_binder_object*>(mData + off);
+            acquire_object(proc, *flat, this, &mOpenAshmemSize);
+
+            if (flat->type == BINDER_TYPE_FD) {
+                // If this is a file descriptor, we need to dup it so the
+                // new Parcel now owns its own fd, and can declare that we
+                // officially know we have fds.
+                flat->handle = dup(flat->handle);
+                flat->cookie = 1;
+                mHasFds = mFdsKnown = true;
+                if (!mAllowFds) {
+                    err = FDS_NOT_ALLOWED;
+                }
+            }
+        }
+    }
+
+    return err;
+!!!45573303.cpp!!!	allowFds() : bool
+    return mAllowFds;
+!!!45573431.cpp!!!	pushAllowFds(in allowFds : bool) : bool
+    const bool origValue = mAllowFds;
+    if (!allowFds) {
+        mAllowFds = false;
+    }
+    return origValue;
+!!!45573559.cpp!!!	restoreAllowFds(in lastValue : bool) : void
+    mAllowFds = lastValue;
+!!!45573687.cpp!!!	hasFileDescriptors() : bool
+    if (!mFdsKnown) {
+        scanForFds();
+    }
+    return mHasFds;
+!!!45573815.cpp!!!	writeInterfaceToken(in interface : String16) : status_t
+    writeInt32(IPCThreadState::self()->getStrictModePolicy() |
+               STRICT_MODE_PENALTY_GATHER);
+    // currently the interface identification token is just its name as a string
+    return writeString16(interface);
+!!!45573943.cpp!!!	enforceInterface(in interface : String16, inout threadState : IPCThreadState = NULL) : bool
+    int32_t strictPolicy = readInt32();
+    if (threadState == NULL) {
+        threadState = IPCThreadState::self();
+    }
+    if ((threadState->getLastTransactionBinderFlags() &
+         IBinder::FLAG_ONEWAY) != 0) {
+      // For one-way calls, the callee is running entirely
+      // disconnected from the caller, so disable StrictMode entirely.
+      // Not only does disk/network usage not impact the caller, but
+      // there's no way to commuicate back any violations anyway.
+      threadState->setStrictModePolicy(0);
+    } else {
+      threadState->setStrictModePolicy(strictPolicy);
+    }
+    const String16 str(readString16());
+    if (str == interface) {
+        return true;
+    } else {
+        ALOGW("**** enforceInterface() expected '%s' but read '%s'",
+                String8(interface).string(), String8(str).string());
+        return false;
+    }
+!!!45574071.cpp!!!	checkInterface(inout binder : IBinder) : bool
+    return enforceInterface(binder->getInterfaceDescriptor());
+!!!45574199.cpp!!!	freeData() : void
+    freeDataNoInit();
+    initState();
+!!!45574327.cpp!!!	objects() : binder_size_t
+    return mObjects;
+!!!45574455.cpp!!!	objectsCount() : size_t
+    return mObjectsSize;
+!!!45574583.cpp!!!	errorCheck() : status_t
+    return mError;
+!!!45574711.cpp!!!	setError(in err : status_t) : void
+    mError = err;
+!!!45574839.cpp!!!	write(in data : void, in len : size_t) : status_t
+    if (len > INT32_MAX) {
+        // don't accept size_t values which may have come from an
+        // inadvertent conversion from a negative int.
+        return BAD_VALUE;
+    }
+
+    void* const d = writeInplace(len);
+    if (d) {
+        memcpy(d, data, len);
+        return NO_ERROR;
+    }
+    return mError;
+!!!45574967.cpp!!!	writeInplace(in len : size_t) : void
+    if (len > INT32_MAX) {
+        // don't accept size_t values which may have come from an
+        // inadvertent conversion from a negative int.
+        return NULL;
+    }
+
+    const size_t padded = pad_size(len);
+
+    // sanity check for integer overflow
+    if (mDataPos+padded < mDataPos) {
+        return NULL;
+    }
+
+    if ((mDataPos+padded) <= mDataCapacity) {
+restart_write:
+        //printf("Writing %ld bytes, padded to %ld\n", len, padded);
+        uint8_t* const data = mData+mDataPos;
+
+        // Need to pad at end?
+        if (padded != len) {
+#if BYTE_ORDER == BIG_ENDIAN
+            static const uint32_t mask[4] = {
+                0x00000000, 0xffffff00, 0xffff0000, 0xff000000
+            };
+#endif
+#if BYTE_ORDER == LITTLE_ENDIAN
+            static const uint32_t mask[4] = {
+                0x00000000, 0x00ffffff, 0x0000ffff, 0x000000ff
+            };
+#endif
+            //printf("Applying pad mask: %p to %p\n", (void*)mask[padded-len],
+            //    *reinterpret_cast<void**>(data+padded-4));
+            *reinterpret_cast<uint32_t*>(data+padded-4) &= mask[padded-len];
+        }
+
+        finishWrite(padded);
+        return data;
+    }
+
+    status_t err = growData(padded);
+    if (err == NO_ERROR) goto restart_write;
+    return NULL;
+!!!45575095.cpp!!!	writeUnpadded(in data : void, in len : size_t) : status_t
+    if (len > INT32_MAX) {
+        // don't accept size_t values which may have come from an
+        // inadvertent conversion from a negative int.
+        return BAD_VALUE;
+    }
+
+    size_t end = mDataPos + len;
+    if (end < mDataPos) {
+        // integer overflow
+        return BAD_VALUE;
+    }
+
+    if (end <= mDataCapacity) {
+restart_write:
+        memcpy(mData+mDataPos, data, len);
+        return finishWrite(len);
+    }
+
+    status_t err = growData(len);
+    if (err == NO_ERROR) goto restart_write;
+    return err;
+!!!45575223.cpp!!!	writeInt32(in val : int32_t) : status_t
+    return writeAligned(val);
+!!!45575351.cpp!!!	writeUint32(in val : uint32_t) : status_t
+    return writeAligned(val);
+!!!45575479.cpp!!!	writeInt64(in val : int64_t) : status_t
+    return writeAligned(val);
+!!!45575607.cpp!!!	writeUint64(in val : uint64_t) : status_t
+    return writeAligned(val);
+!!!45575735.cpp!!!	writeFloat(in val : float) : status_t
+    return writeAligned(val);
+!!!45575863.cpp!!!	writeDouble(in val : double) : status_t
+    return writeAligned(val);
+!!!45575991.cpp!!!	writeCString(in str : char) : status_t
+    return write(str, strlen(str)+1);
+!!!45576119.cpp!!!	writeString8(in str : String8) : status_t
+    status_t err = writeInt32(str.bytes());
+    // only write string if its length is more than zero characters,
+    // as readString8 will only read if the length field is non-zero.
+    // this is slightly different from how writeString16 works.
+    if (str.bytes() > 0 && err == NO_ERROR) {
+        err = write(str.string(), str.bytes()+1);
+    }
+    return err;
+!!!45576247.cpp!!!	writeString16(in str : String16) : status_t
+    return writeString16(str.string(), str.size());
+!!!45576375.cpp!!!	writeString16(in str : std::unique_ptr<String16>) : status_t
+    if (!str) {
+        return writeInt32(-1);
+    }
+
+    return writeString16(*str);
+!!!45576503.cpp!!!	writeString16(in str : char16_t, in len : size_t) : status_t
+    if (str == NULL) return writeInt32(-1);
+
+    status_t err = writeInt32(len);
+    if (err == NO_ERROR) {
+        len *= sizeof(char16_t);
+        uint8_t* data = (uint8_t*)writeInplace(len+sizeof(char16_t));
+        if (data) {
+            memcpy(data, str, len);
+            *reinterpret_cast<char16_t*>(data+len) = 0;
+            return NO_ERROR;
+        }
+        err = mError;
+    }
+    return err;
+!!!45576631.cpp!!!	writeStrongBinder(in val : sp<IBinder>) : status_t
+    return flatten_binder(ProcessState::self(), val, this);
+!!!45576759.cpp!!!	writeWeakBinder(in val : wp<IBinder>) : status_t
+    return flatten_binder(ProcessState::self(), val, this);
+!!!45576887.cpp!!!	writeInt32Array(in len : size_t, in val : int32_t) : status_t
+    if (len > INT32_MAX) {
+        // don't accept size_t values which may have come from an
+        // inadvertent conversion from a negative int.
+        return BAD_VALUE;
+    }
+
+    if (!val) {
+        return writeInt32(-1);
+    }
+    status_t ret = writeInt32(static_cast<uint32_t>(len));
+    if (ret == NO_ERROR) {
+        ret = write(val, len * sizeof(*val));
+    }
+    return ret;
+!!!45577015.cpp!!!	writeByteArray(in len : size_t, in val : uint8_t) : status_t
+    if (len > INT32_MAX) {
+        // don't accept size_t values which may have come from an
+        // inadvertent conversion from a negative int.
+        return BAD_VALUE;
+    }
+
+    if (!val) {
+        return writeInt32(-1);
+    }
+    status_t ret = writeInt32(static_cast<uint32_t>(len));
+    if (ret == NO_ERROR) {
+        ret = write(val, len * sizeof(*val));
+    }
+    return ret;
+!!!45577143.cpp!!!	writeBool(in val : bool) : status_t
+    return writeInt32(int32_t(val));
+!!!45577271.cpp!!!	writeChar(in val : char16_t) : status_t
+    return writeInt32(int32_t(val));
+!!!45577399.cpp!!!	writeByte(in val : int8_t) : status_t
+    return writeInt32(int32_t(val));
+!!!45577527.cpp!!!	writeUtf8AsUtf16(in str : std::string) : status_t
+    const uint8_t* strData = (uint8_t*)str.data();
+    const size_t strLen= str.length();
+    const ssize_t utf16Len = utf8_to_utf16_length(strData, strLen);
+    if (utf16Len < 0 || utf16Len> std::numeric_limits<int32_t>::max()) {
+        return BAD_VALUE;
+    }
+
+    status_t err = writeInt32(utf16Len);
+    if (err) {
+        return err;
+    }
+
+    // Allocate enough bytes to hold our converted string and its terminating NULL.
+    void* dst = writeInplace((utf16Len + 1) * sizeof(char16_t));
+    if (!dst) {
+        return NO_MEMORY;
+    }
+
+    utf8_to_utf16(strData, strLen, (char16_t*)dst);
+
+    return NO_ERROR;
+!!!45577655.cpp!!!	writeUtf8AsUtf16(in str : std::unique_ptr<std::string>) : status_t
+  if (!str) {
+    return writeInt32(-1);
+  }
+  return writeUtf8AsUtf16(*str);

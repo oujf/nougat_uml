@@ -1,0 +1,135 @@
+class SurfaceFlingerConsumer
+!!!45952183.cpp!!!	updateTexImage(inout rejecter : SurfaceFlingerConsumer::BufferRejecter, in dispSync : DispSync, inout autoRefresh : bool, inout queuedBuffer : bool, in maxFrameNumber : uint64_t = 0) : status_t
+    ATRACE_CALL();
+    ALOGV("updateTexImage");
+    Mutex::Autolock lock(mMutex);
+
+    if (mAbandoned) {
+        ALOGE("updateTexImage: GLConsumer is abandoned!");
+        return NO_INIT;
+    }
+
+    // Make sure the EGL state is the same as in previous calls.
+    status_t err = checkAndUpdateEglStateLocked();
+    if (err != NO_ERROR) {
+        return err;
+    }
+
+    BufferItem item;
+
+    // Acquire the next buffer.
+    // In asynchronous mode the list is guaranteed to be one buffer
+    // deep, while in synchronous mode we use the oldest buffer.
+    err = acquireBufferLocked(&item, computeExpectedPresent(dispSync),
+            maxFrameNumber);
+    if (err != NO_ERROR) {
+        if (err == BufferQueue::NO_BUFFER_AVAILABLE) {
+            err = NO_ERROR;
+        } else if (err == BufferQueue::PRESENT_LATER) {
+            // return the error, without logging
+        } else {
+            ALOGE("updateTexImage: acquire failed: %s (%d)",
+                strerror(-err), err);
+        }
+        return err;
+    }
+
+    // We call the rejecter here, in case the caller has a reason to
+    // not accept this buffer.  This is used by SurfaceFlinger to
+    // reject buffers which have the wrong size
+    int slot = item.mSlot;
+    if (rejecter && rejecter->reject(mSlots[slot].mGraphicBuffer, item)) {
+        releaseBufferLocked(slot, mSlots[slot].mGraphicBuffer, EGL_NO_SYNC_KHR);
+        return BUFFER_REJECTED;
+    }
+
+    if (autoRefresh) {
+        *autoRefresh = item.mAutoRefresh;
+    }
+
+    if (queuedBuffer) {
+        *queuedBuffer = item.mQueuedBuffer;
+    }
+
+    // Release the previous buffer.
+#ifdef USE_HWC2
+    err = updateAndReleaseLocked(item, &mPendingRelease);
+#else
+    err = updateAndReleaseLocked(item);
+#endif
+    if (err != NO_ERROR) {
+        return err;
+    }
+
+    if (!SyncFeatures::getInstance().useNativeFenceSync()) {
+        // Bind the new buffer to the GL texture.
+        //
+        // Older devices require the "implicit" synchronization provided
+        // by glEGLImageTargetTexture2DOES, which this method calls.  Newer
+        // devices will either call this in Layer::onDraw, or (if it's not
+        // a GL-composited layer) not at all.
+        err = bindTextureImageLocked();
+    }
+
+    return err;
+!!!45952311.cpp!!!	bindTextureImage() : status_t
+    Mutex::Autolock lock(mMutex);
+
+    return bindTextureImageLocked();
+!!!45952439.cpp!!!	getTransformToDisplayInverse() : bool
+    return mTransformToDisplayInverse;
+!!!45952567.cpp!!!	getSurfaceDamage() : Region
+    return mSurfaceDamage;
+!!!45952695.cpp!!!	setContentsChangedListener(in listener : wp<ContentsChangedListener>) : void
+    setFrameAvailableListener(listener);
+    Mutex::Autolock lock(mMutex);
+    mContentsChangedListener = listener;
+!!!45952823.cpp!!!	getSidebandStream() : sp<NativeHandle>
+    return mConsumer->getSidebandStream();
+!!!45952951.cpp!!!	computeExpectedPresent(in dispSync : DispSync) : nsecs_t
+    // The HWC doesn't currently have a way to report additional latency.
+    // Assume that whatever we submit now will appear right after the flip.
+    // For a smart panel this might be 1.  This is expressed in frames,
+    // rather than time, because we expect to have a constant frame delay
+    // regardless of the refresh rate.
+    const uint32_t hwcLatency = 0;
+
+    // Ask DispSync when the next refresh will be (CLOCK_MONOTONIC).
+    const nsecs_t nextRefresh = dispSync.computeNextRefresh(hwcLatency);
+
+    // The DispSync time is already adjusted for the difference between
+    // vsync and reported-vsync (PRESENT_TIME_OFFSET_FROM_VSYNC_NS), so
+    // we don't need to factor that in here.  Pad a little to avoid
+    // weird effects if apps might be requesting times right on the edge.
+    nsecs_t extraPadding = 0;
+    if (VSYNC_EVENT_PHASE_OFFSET_NS == 0) {
+        extraPadding = 1000000;        // 1ms (6% of 60Hz)
+    }
+
+    return nextRefresh + extraPadding;
+!!!45953207.cpp!!!	getPrevReleaseFence() : sp<Fence>
+    return mPrevReleaseFence;
+!!!45953335.cpp!!!	releasePendingBuffer() : void
+    if (!mPendingRelease.isPending) {
+        ALOGV("Pending buffer already released");
+        return;
+    }
+    ALOGV("Releasing pending buffer");
+    Mutex::Autolock lock(mMutex);
+    status_t result = releaseBufferLocked(mPendingRelease.currentTexture,
+            mPendingRelease.graphicBuffer, mPendingRelease.display,
+            mPendingRelease.fence);
+    ALOGE_IF(result != NO_ERROR, "releasePendingBuffer failed: %s (%d)",
+            strerror(-result), result);
+    mPendingRelease = PendingRelease();
+!!!45953463.cpp!!!	onSidebandStreamChanged() : void
+    sp<ContentsChangedListener> listener;
+    {   // scope for the lock
+        Mutex::Autolock lock(mMutex);
+        ALOG_ASSERT(mFrameAvailableListener.unsafe_get() == mContentsChangedListener.unsafe_get());
+        listener = mContentsChangedListener.promote();
+    }
+
+    if (listener != NULL) {
+        listener->onSidebandStreamChanged();
+    }

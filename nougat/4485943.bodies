@@ -1,0 +1,236 @@
+class Device
+!!!45960887.cpp!!!	Device(inout device : hwc2_device_t)
+    loadCapabilities();
+    loadFunctionPointers();
+    registerCallbacks();
+!!!45961015.cpp!!!	~Device()
+    if (mHwcDevice == nullptr) {
+        return;
+    }
+
+    for (auto element : mDisplays) {
+        auto display = element.second;
+
+        DisplayType displayType = HWC2::DisplayType::Invalid;
+        auto error = display->getType(&displayType);
+        if (error != Error::None) {
+            ALOGE("~Device: Failed to determine type of display %" PRIu64
+                    ": %s (%d)", display->getId(), to_string(error).c_str(),
+                    static_cast<int32_t>(error));
+            continue;
+        }
+
+        if (displayType == HWC2::DisplayType::Physical) {
+            error = display->setVsyncEnabled(HWC2::Vsync::Disable);
+            if (error != Error::None) {
+                ALOGE("~Device: Failed to disable vsync for display %" PRIu64
+                        ": %s (%d)", display->getId(), to_string(error).c_str(),
+                        static_cast<int32_t>(error));
+            }
+        }
+    }
+
+    hwc2_close(mHwcDevice);
+!!!45961143.cpp!!!	dump() : std::string
+    uint32_t numBytes = 0;
+    mDump(mHwcDevice, &numBytes, nullptr);
+
+    std::vector<char> buffer(numBytes);
+    mDump(mHwcDevice, &numBytes, buffer.data());
+
+    return std::string(buffer.data(), buffer.size());
+!!!45961399.cpp!!!	getMaxVirtualDisplayCount() : uint32_t
+    return mGetMaxVirtualDisplayCount(mHwcDevice);
+!!!45961527.cpp!!!	createVirtualDisplay(in width : uint32_t, in height : uint32_t, inout format : android_pixel_format_t, inout outDisplay : std::shared_ptr<Display>) : Error
+    ALOGI("Creating virtual display");
+
+    hwc2_display_t displayId = 0;
+    int32_t intFormat = static_cast<int32_t>(*format);
+    int32_t intError = mCreateVirtualDisplay(mHwcDevice, width, height,
+            &intFormat, &displayId);
+    auto error = static_cast<Error>(intError);
+    if (error != Error::None) {
+        return error;
+    }
+
+    ALOGI("Created virtual display");
+    *format = static_cast<android_pixel_format_t>(intFormat);
+    *outDisplay = getDisplayById(displayId);
+    (*outDisplay)->setVirtual();
+    return Error::None;
+!!!45961655.cpp!!!	registerHotplugCallback(in hotplug : HotplugCallback) : void
+    ALOGV("registerHotplugCallback");
+    mHotplug = hotplug;
+    for (auto& pending : mPendingHotplugs) {
+        auto& display = pending.first;
+        auto connected = pending.second;
+        ALOGV("Sending pending hotplug(%" PRIu64 ", %s)", display->getId(),
+                to_string(connected).c_str());
+        mHotplug(std::move(display), connected);
+    }
+!!!45961783.cpp!!!	registerRefreshCallback(in refresh : RefreshCallback) : void
+    mRefresh = refresh;
+    for (auto& pending : mPendingRefreshes) {
+        mRefresh(std::move(pending));
+    }
+!!!45961911.cpp!!!	registerVsyncCallback(in vsync : VsyncCallback) : void
+    mVsync = vsync;
+    for (auto& pending : mPendingVsyncs) {
+        auto& display = pending.first;
+        auto timestamp = pending.second;
+        mVsync(std::move(display), timestamp);
+    }
+!!!45962039.cpp!!!	callHotplug(in display : std::shared_ptr<Display>, in connected : Connection) : void
+    if (connected == Connection::Connected) {
+        if (!display->isConnected()) {
+            display->loadConfigs();
+            display->setConnected(true);
+        }
+    } else {
+        display->setConnected(false);
+        mDisplays.erase(display->getId());
+    }
+
+    if (mHotplug) {
+        mHotplug(std::move(display), connected);
+    } else {
+        ALOGV("callHotplug called, but no valid callback registered, storing");
+        mPendingHotplugs.emplace_back(std::move(display), connected);
+    }
+!!!45962167.cpp!!!	callRefresh(in display : std::shared_ptr<Display>) : void
+    if (mRefresh) {
+        mRefresh(std::move(display));
+    } else {
+        ALOGV("callRefresh called, but no valid callback registered, storing");
+        mPendingRefreshes.emplace_back(std::move(display));
+    }
+!!!45962295.cpp!!!	callVsync(in display : std::shared_ptr<Display>, in timestamp : nsecs_t) : void
+    if (mVsync) {
+        mVsync(std::move(display), timestamp);
+    } else {
+        ALOGV("callVsync called, but no valid callback registered, storing");
+        mPendingVsyncs.emplace_back(std::move(display), timestamp);
+    }
+!!!45962423.cpp!!!	getDisplayById(in id : hwc2_display_t) : std::shared_ptr<Display>
+    if (mDisplays.count(id) != 0) {
+        return mDisplays.at(id);
+    }
+
+    auto display = std::make_shared<Display>(*this, id);
+    mDisplays.emplace(id, display);
+    return display;
+!!!45962551.cpp!!!	hasCapability(in capability : HWC2::Capability) : bool
+    return std::find(mCapabilities.cbegin(), mCapabilities.cend(),
+            capability) != mCapabilities.cend();
+!!!45962935.cpp!!!	loadCapabilities() : void
+    static_assert(sizeof(Capability) == sizeof(int32_t),
+            "Capability size has changed");
+    uint32_t numCapabilities = 0;
+    mHwcDevice->getCapabilities(mHwcDevice, &numCapabilities, nullptr);
+    mCapabilities.resize(numCapabilities);
+    auto asInt = reinterpret_cast<int32_t*>(mCapabilities.data());
+    mHwcDevice->getCapabilities(mHwcDevice, &numCapabilities, asInt);
+!!!45963063.cpp!!!	loadFunctionPointers() : void
+    // For all of these early returns, we log an error message inside
+    // loadFunctionPointer specifying which function failed to load
+
+    // Display function pointers
+    if (!loadFunctionPointer(FunctionDescriptor::CreateVirtualDisplay,
+            mCreateVirtualDisplay)) return;
+    if (!loadFunctionPointer(FunctionDescriptor::DestroyVirtualDisplay,
+            mDestroyVirtualDisplay)) return;
+    if (!loadFunctionPointer(FunctionDescriptor::Dump, mDump)) return;
+    if (!loadFunctionPointer(FunctionDescriptor::GetMaxVirtualDisplayCount,
+            mGetMaxVirtualDisplayCount)) return;
+    if (!loadFunctionPointer(FunctionDescriptor::RegisterCallback,
+            mRegisterCallback)) return;
+
+    // Device function pointers
+    if (!loadFunctionPointer(FunctionDescriptor::AcceptDisplayChanges,
+            mAcceptDisplayChanges)) return;
+    if (!loadFunctionPointer(FunctionDescriptor::CreateLayer,
+            mCreateLayer)) return;
+    if (!loadFunctionPointer(FunctionDescriptor::DestroyLayer,
+            mDestroyLayer)) return;
+    if (!loadFunctionPointer(FunctionDescriptor::GetActiveConfig,
+            mGetActiveConfig)) return;
+    if (!loadFunctionPointer(FunctionDescriptor::GetChangedCompositionTypes,
+            mGetChangedCompositionTypes)) return;
+    if (!loadFunctionPointer(FunctionDescriptor::GetColorModes,
+            mGetColorModes)) return;
+    if (!loadFunctionPointer(FunctionDescriptor::GetDisplayAttribute,
+            mGetDisplayAttribute)) return;
+    if (!loadFunctionPointer(FunctionDescriptor::GetDisplayConfigs,
+            mGetDisplayConfigs)) return;
+    if (!loadFunctionPointer(FunctionDescriptor::GetDisplayName,
+            mGetDisplayName)) return;
+    if (!loadFunctionPointer(FunctionDescriptor::GetDisplayRequests,
+            mGetDisplayRequests)) return;
+    if (!loadFunctionPointer(FunctionDescriptor::GetDisplayType,
+            mGetDisplayType)) return;
+    if (!loadFunctionPointer(FunctionDescriptor::GetDozeSupport,
+            mGetDozeSupport)) return;
+    if (!loadFunctionPointer(FunctionDescriptor::GetHdrCapabilities,
+            mGetHdrCapabilities)) return;
+    if (!loadFunctionPointer(FunctionDescriptor::GetReleaseFences,
+            mGetReleaseFences)) return;
+    if (!loadFunctionPointer(FunctionDescriptor::PresentDisplay,
+            mPresentDisplay)) return;
+    if (!loadFunctionPointer(FunctionDescriptor::SetActiveConfig,
+            mSetActiveConfig)) return;
+    if (!loadFunctionPointer(FunctionDescriptor::SetClientTarget,
+            mSetClientTarget)) return;
+    if (!loadFunctionPointer(FunctionDescriptor::SetColorMode,
+            mSetColorMode)) return;
+    if (!loadFunctionPointer(FunctionDescriptor::SetColorTransform,
+            mSetColorTransform)) return;
+    if (!loadFunctionPointer(FunctionDescriptor::SetOutputBuffer,
+            mSetOutputBuffer)) return;
+    if (!loadFunctionPointer(FunctionDescriptor::SetPowerMode,
+            mSetPowerMode)) return;
+    if (!loadFunctionPointer(FunctionDescriptor::SetVsyncEnabled,
+            mSetVsyncEnabled)) return;
+    if (!loadFunctionPointer(FunctionDescriptor::ValidateDisplay,
+            mValidateDisplay)) return;
+
+    // Layer function pointers
+    if (!loadFunctionPointer(FunctionDescriptor::SetCursorPosition,
+            mSetCursorPosition)) return;
+    if (!loadFunctionPointer(FunctionDescriptor::SetLayerBuffer,
+            mSetLayerBuffer)) return;
+    if (!loadFunctionPointer(FunctionDescriptor::SetLayerSurfaceDamage,
+            mSetLayerSurfaceDamage)) return;
+    if (!loadFunctionPointer(FunctionDescriptor::SetLayerBlendMode,
+            mSetLayerBlendMode)) return;
+    if (!loadFunctionPointer(FunctionDescriptor::SetLayerColor,
+            mSetLayerColor)) return;
+    if (!loadFunctionPointer(FunctionDescriptor::SetLayerCompositionType,
+            mSetLayerCompositionType)) return;
+    if (!loadFunctionPointer(FunctionDescriptor::SetLayerDataspace,
+            mSetLayerDataspace)) return;
+    if (!loadFunctionPointer(FunctionDescriptor::SetLayerDisplayFrame,
+            mSetLayerDisplayFrame)) return;
+    if (!loadFunctionPointer(FunctionDescriptor::SetLayerPlaneAlpha,
+            mSetLayerPlaneAlpha)) return;
+    if (hasCapability(Capability::SidebandStream)) {
+        if (!loadFunctionPointer(FunctionDescriptor::SetLayerSidebandStream,
+                mSetLayerSidebandStream)) return;
+    }
+    if (!loadFunctionPointer(FunctionDescriptor::SetLayerSourceCrop,
+            mSetLayerSourceCrop)) return;
+    if (!loadFunctionPointer(FunctionDescriptor::SetLayerTransform,
+            mSetLayerTransform)) return;
+    if (!loadFunctionPointer(FunctionDescriptor::SetLayerVisibleRegion,
+            mSetLayerVisibleRegion)) return;
+    if (!loadFunctionPointer(FunctionDescriptor::SetLayerZOrder,
+            mSetLayerZOrder)) return;
+!!!45963191.cpp!!!	registerCallbacks() : void
+    registerCallback<HWC2_PFN_HOTPLUG>(Callback::Hotplug, hotplug_hook);
+    registerCallback<HWC2_PFN_REFRESH>(Callback::Refresh, refresh_hook);
+    registerCallback<HWC2_PFN_VSYNC>(Callback::Vsync, vsync_hook);
+!!!45963319.cpp!!!	destroyVirtualDisplay(in display : hwc2_display_t) : void
+    ALOGI("Destroying virtual display");
+    int32_t intError = mDestroyVirtualDisplay(mHwcDevice, display);
+    auto error = static_cast<Error>(intError);
+    ALOGE_IF(error != Error::None, "destroyVirtualDisplay(%" PRIu64 ") failed:"
+            " %s (%d)", display, to_string(error).c_str(), intError);

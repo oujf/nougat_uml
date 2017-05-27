@@ -1,0 +1,245 @@
+class SensorService
+!!!45910455.cpp!!!	cleanupConnection(inout c : SensorEventConnection) : void
+    Mutex::Autolock _l(mLock);
+    const wp<SensorEventConnection> connection(c);
+    size_t size = mActiveSensors.size();
+    ALOGD_IF(DEBUG_CONNECTIONS, "%zu active sensors", size);
+    for (size_t i=0 ; i<size ; ) {
+        int handle = mActiveSensors.keyAt(i);
+        if (c->hasSensor(handle)) {
+            ALOGD_IF(DEBUG_CONNECTIONS, "%zu: disabling handle=0x%08x", i, handle);
+            sp<SensorInterface> sensor = getSensorInterfaceFromHandle(handle);
+            if (sensor != nullptr) {
+                sensor->activate(c, false);
+            } else {
+                ALOGE("sensor interface of handle=0x%08x is null!", handle);
+            }
+            c->removeSensor(handle);
+        }
+        SensorRecord* rec = mActiveSensors.valueAt(i);
+        ALOGE_IF(!rec, "mActiveSensors[%zu] is null (handle=0x%08x)!", i, handle);
+        ALOGD_IF(DEBUG_CONNECTIONS,
+                "removing connection %p for sensor[%zu].handle=0x%08x",
+                c, i, handle);
+
+        if (rec && rec->removeConnection(connection)) {
+            ALOGD_IF(DEBUG_CONNECTIONS, "... and it was the last connection");
+            mActiveSensors.removeItemsAt(i, 1);
+            mActiveVirtualSensors.erase(handle);
+            delete rec;
+            size--;
+        } else {
+            i++;
+        }
+    }
+    c->updateLooperRegistration(mLooper);
+    mActiveConnections.remove(connection);
+    BatteryService::cleanup(c->getUid());
+    if (c->needsWakeLock()) {
+        checkWakeLockStateLocked();
+    }
+!!!45910583.cpp!!!	enable(in connection : sp<SensorEventConnection>, in handle : int, in samplingPeriodNs : nsecs_t, in maxBatchReportLatencyNs : nsecs_t, in reservedFlags : int, in opPackageName : String16) : status_t
+    if (mInitCheck != NO_ERROR)
+        return mInitCheck;
+
+    sp<SensorInterface> sensor = getSensorInterfaceFromHandle(handle);
+    if (sensor == nullptr ||
+        !canAccessSensor(sensor->getSensor(), "Tried enabling", opPackageName)) {
+        return BAD_VALUE;
+    }
+
+    Mutex::Autolock _l(mLock);
+    if ((mCurrentOperatingMode == RESTRICTED || mCurrentOperatingMode == DATA_INJECTION)
+           && !isWhiteListedPackage(connection->getPackageName())) {
+        return INVALID_OPERATION;
+    }
+
+    SensorRecord* rec = mActiveSensors.valueFor(handle);
+    if (rec == 0) {
+        rec = new SensorRecord(connection);
+        mActiveSensors.add(handle, rec);
+        if (sensor->isVirtual()) {
+            mActiveVirtualSensors.emplace(handle);
+        }
+    } else {
+        if (rec->addConnection(connection)) {
+            // this sensor is already activated, but we are adding a connection that uses it.
+            // Immediately send down the last known value of the requested sensor if it's not a
+            // "continuous" sensor.
+            if (sensor->getSensor().getReportingMode() == AREPORTING_MODE_ON_CHANGE) {
+                // NOTE: The wake_up flag of this event may get set to
+                // WAKE_UP_SENSOR_EVENT_NEEDS_ACK if this is a wake_up event.
+
+                auto logger = mRecentEvent.find(handle);
+                if (logger != mRecentEvent.end()) {
+                    sensors_event_t event;
+                    // It is unlikely that this buffer is empty as the sensor is already active.
+                    // One possible corner case may be two applications activating an on-change
+                    // sensor at the same time.
+                    if(logger->second->populateLastEvent(&event)) {
+                        event.sensor = handle;
+                        if (event.version == sizeof(sensors_event_t)) {
+                            if (isWakeUpSensorEvent(event) && !mWakeLockAcquired) {
+                                setWakeLockAcquiredLocked(true);
+                            }
+                            connection->sendEvents(&event, 1, NULL);
+                            if (!connection->needsWakeLock() && mWakeLockAcquired) {
+                                checkWakeLockStateLocked();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (connection->addSensor(handle)) {
+        BatteryService::enableSensor(connection->getUid(), handle);
+        // the sensor was added (which means it wasn't already there)
+        // so, see if this connection becomes active
+        if (mActiveConnections.indexOf(connection) < 0) {
+            mActiveConnections.add(connection);
+        }
+    } else {
+        ALOGW("sensor %08x already enabled in connection %p (ignoring)",
+            handle, connection.get());
+    }
+
+    nsecs_t minDelayNs = sensor->getSensor().getMinDelayNs();
+    if (samplingPeriodNs < minDelayNs) {
+        samplingPeriodNs = minDelayNs;
+    }
+
+    ALOGD_IF(DEBUG_CONNECTIONS, "Calling batch handle==%d flags=%d"
+                                "rate=%" PRId64 " timeout== %" PRId64"",
+             handle, reservedFlags, samplingPeriodNs, maxBatchReportLatencyNs);
+
+    status_t err = sensor->batch(connection.get(), handle, 0, samplingPeriodNs,
+                                 maxBatchReportLatencyNs);
+
+    // Call flush() before calling activate() on the sensor. Wait for a first
+    // flush complete event before sending events on this connection. Ignore
+    // one-shot sensors which don't support flush(). Ignore on-change sensors
+    // to maintain the on-change logic (any on-change events except the initial
+    // one should be trigger by a change in value). Also if this sensor isn't
+    // already active, don't call flush().
+    if (err == NO_ERROR &&
+            sensor->getSensor().getReportingMode() == AREPORTING_MODE_CONTINUOUS &&
+            rec->getNumConnections() > 1) {
+        connection->setFirstFlushPending(handle, true);
+        status_t err_flush = sensor->flush(connection.get(), handle);
+        // Flush may return error if the underlying h/w sensor uses an older HAL.
+        if (err_flush == NO_ERROR) {
+            rec->addPendingFlushConnection(connection.get());
+        } else {
+            connection->setFirstFlushPending(handle, false);
+        }
+    }
+
+    if (err == NO_ERROR) {
+        ALOGD_IF(DEBUG_CONNECTIONS, "Calling activate on %d", handle);
+        err = sensor->activate(connection.get(), true);
+    }
+
+    if (err == NO_ERROR) {
+        connection->updateLooperRegistration(mLooper);
+        SensorRegistrationInfo &reg_info =
+            mLastNSensorRegistrations.editItemAt(mNextSensorRegIndex);
+        reg_info.mSensorHandle = handle;
+        reg_info.mSamplingRateUs = samplingPeriodNs/1000;
+        reg_info.mMaxReportLatencyUs = maxBatchReportLatencyNs/1000;
+        reg_info.mActivated = true;
+        reg_info.mPackageName = connection->getPackageName();
+        time_t rawtime = time(NULL);
+        struct tm * timeinfo = localtime(&rawtime);
+        reg_info.mHour = timeinfo->tm_hour;
+        reg_info.mMin = timeinfo->tm_min;
+        reg_info.mSec = timeinfo->tm_sec;
+        mNextSensorRegIndex = (mNextSensorRegIndex + 1) % SENSOR_REGISTRATIONS_BUF_SIZE;
+    }
+
+    if (err != NO_ERROR) {
+        // batch/activate has failed, reset our state.
+        cleanupWithoutDisableLocked(connection, handle);
+    }
+    return err;
+!!!45910711.cpp!!!	disable(in connection : sp<SensorEventConnection>, in handle : int) : status_t
+    if (mInitCheck != NO_ERROR)
+        return mInitCheck;
+
+    Mutex::Autolock _l(mLock);
+    status_t err = cleanupWithoutDisableLocked(connection, handle);
+    if (err == NO_ERROR) {
+        sp<SensorInterface> sensor = getSensorInterfaceFromHandle(handle);
+        err = sensor != nullptr ? sensor->activate(connection.get(), false) : status_t(BAD_VALUE);
+
+    }
+    if (err == NO_ERROR) {
+        SensorRegistrationInfo &reg_info =
+            mLastNSensorRegistrations.editItemAt(mNextSensorRegIndex);
+        reg_info.mActivated = false;
+        reg_info.mPackageName= connection->getPackageName();
+        reg_info.mSensorHandle = handle;
+        time_t rawtime = time(NULL);
+        struct tm * timeinfo = localtime(&rawtime);
+        reg_info.mHour = timeinfo->tm_hour;
+        reg_info.mMin = timeinfo->tm_min;
+        reg_info.mSec = timeinfo->tm_sec;
+        mNextSensorRegIndex = (mNextSensorRegIndex + 1) % SENSOR_REGISTRATIONS_BUF_SIZE;
+    }
+    return err;
+!!!45910839.cpp!!!	setEventRate(in connection : sp<SensorEventConnection>, in handle : int, in ns : nsecs_t, in opPackageName : String16) : status_t
+    if (mInitCheck != NO_ERROR)
+        return mInitCheck;
+
+    sp<SensorInterface> sensor = getSensorInterfaceFromHandle(handle);
+    if (sensor == nullptr ||
+        !canAccessSensor(sensor->getSensor(), "Tried configuring", opPackageName)) {
+        return BAD_VALUE;
+    }
+
+    if (ns < 0)
+        return BAD_VALUE;
+
+    nsecs_t minDelayNs = sensor->getSensor().getMinDelayNs();
+    if (ns < minDelayNs) {
+        ns = minDelayNs;
+    }
+
+    return sensor->setDelay(connection.get(), handle, ns);
+!!!45910967.cpp!!!	flushSensor(in connection : sp<SensorEventConnection>, in opPackageName : String16) : status_t
+    if (mInitCheck != NO_ERROR) return mInitCheck;
+    SensorDevice& dev(SensorDevice::getInstance());
+    const int halVersion = dev.getHalDeviceVersion();
+    status_t err(NO_ERROR);
+    Mutex::Autolock _l(mLock);
+    // Loop through all sensors for this connection and call flush on each of them.
+    for (size_t i = 0; i < connection->mSensorInfo.size(); ++i) {
+        const int handle = connection->mSensorInfo.keyAt(i);
+        sp<SensorInterface> sensor = getSensorInterfaceFromHandle(handle);
+        if (sensor == nullptr) {
+            continue;
+        }
+        if (sensor->getSensor().getReportingMode() == AREPORTING_MODE_ONE_SHOT) {
+            ALOGE("flush called on a one-shot sensor");
+            err = INVALID_OPERATION;
+            continue;
+        }
+        if (halVersion <= SENSORS_DEVICE_API_VERSION_1_0 || isVirtualSensor(handle)) {
+            // For older devices just increment pending flush count which will send a trivial
+            // flush complete event.
+            connection->incrementPendingFlushCount(handle);
+        } else {
+            if (!canAccessSensor(sensor->getSensor(), "Tried flushing", opPackageName)) {
+                err = INVALID_OPERATION;
+                continue;
+            }
+            status_t err_flush = sensor->flush(connection.get(), handle);
+            if (err_flush == NO_ERROR) {
+                SensorRecord* rec = mActiveSensors.valueFor(handle);
+                if (rec != NULL) rec->addPendingFlushConnection(connection);
+            }
+            err = (err_flush != NO_ERROR) ? err_flush : err;
+        }
+    }
+    return err;

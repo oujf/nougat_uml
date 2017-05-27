@@ -1,0 +1,188 @@
+class LayerLibrary
+!!!46099255.cpp!!!	Open() : bool
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (refcount_++ == 0) {
+        ALOGV("opening layer library '%s'", path_.c_str());
+        // Libraries in the system layer library dir can't be loaded into
+        // the application namespace. That causes compatibility problems, since
+        // any symbol dependencies will be resolved by system libraries. They
+        // can't safely use libc++_shared, for example. Which is one reason
+        // (among several) we only allow them in non-user builds.
+        auto app_namespace = LoaderData::GetInstance().app_namespace;
+        if (app_namespace &&
+            !android::base::StartsWith(path_, kSystemLayerLibraryDir)) {
+            android_dlextinfo dlextinfo = {};
+            dlextinfo.flags = ANDROID_DLEXT_USE_NAMESPACE;
+            dlextinfo.library_namespace = app_namespace;
+            dlhandle_ = android_dlopen_ext(path_.c_str(), RTLD_NOW | RTLD_LOCAL,
+                                           &dlextinfo);
+        } else {
+            dlhandle_ = dlopen(path_.c_str(), RTLD_NOW | RTLD_LOCAL);
+        }
+        if (!dlhandle_) {
+            ALOGE("failed to load layer library '%s': %s", path_.c_str(),
+                  dlerror());
+            refcount_ = 0;
+            return false;
+        }
+    }
+    return true;
+!!!46099383.cpp!!!	Close() : void
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (--refcount_ == 0) {
+        ALOGV("closing layer library '%s'", path_.c_str());
+        dlclose(dlhandle_);
+        dlhandle_ = nullptr;
+    }
+!!!46099511.cpp!!!	EnumerateLayers(in library_idx : size_t, inout instance_layers : std::vector<Layer>) : bool
+    PFN_vkEnumerateInstanceLayerProperties enumerate_instance_layers =
+        reinterpret_cast<PFN_vkEnumerateInstanceLayerProperties>(
+            dlsym(dlhandle_, "vkEnumerateInstanceLayerProperties"));
+    PFN_vkEnumerateInstanceExtensionProperties enumerate_instance_extensions =
+        reinterpret_cast<PFN_vkEnumerateInstanceExtensionProperties>(
+            dlsym(dlhandle_, "vkEnumerateInstanceExtensionProperties"));
+    if (!enumerate_instance_layers || !enumerate_instance_extensions) {
+        ALOGE("layer library '%s' missing some instance enumeration functions",
+              path_.c_str());
+        return false;
+    }
+
+    // device functions are optional
+    PFN_vkEnumerateDeviceLayerProperties enumerate_device_layers =
+        reinterpret_cast<PFN_vkEnumerateDeviceLayerProperties>(
+            dlsym(dlhandle_, "vkEnumerateDeviceLayerProperties"));
+    PFN_vkEnumerateDeviceExtensionProperties enumerate_device_extensions =
+        reinterpret_cast<PFN_vkEnumerateDeviceExtensionProperties>(
+            dlsym(dlhandle_, "vkEnumerateDeviceExtensionProperties"));
+
+    // get layer counts
+    uint32_t num_instance_layers = 0;
+    uint32_t num_device_layers = 0;
+    VkResult result = enumerate_instance_layers(&num_instance_layers, nullptr);
+    if (result != VK_SUCCESS || !num_instance_layers) {
+        if (result != VK_SUCCESS) {
+            ALOGE(
+                "vkEnumerateInstanceLayerProperties failed for library '%s': "
+                "%d",
+                path_.c_str(), result);
+        }
+        return false;
+    }
+    if (enumerate_device_layers) {
+        result = enumerate_device_layers(VK_NULL_HANDLE, &num_device_layers,
+                                         nullptr);
+        if (result != VK_SUCCESS) {
+            ALOGE(
+                "vkEnumerateDeviceLayerProperties failed for library '%s': %d",
+                path_.c_str(), result);
+            return false;
+        }
+    }
+
+    // get layer properties
+    VkLayerProperties* properties = static_cast<VkLayerProperties*>(alloca(
+        (num_instance_layers + num_device_layers) * sizeof(VkLayerProperties)));
+    result = enumerate_instance_layers(&num_instance_layers, properties);
+    if (result != VK_SUCCESS) {
+        ALOGE("vkEnumerateInstanceLayerProperties failed for library '%s': %d",
+              path_.c_str(), result);
+        return false;
+    }
+    if (num_device_layers > 0) {
+        result = enumerate_device_layers(VK_NULL_HANDLE, &num_device_layers,
+                                         properties + num_instance_layers);
+        if (result != VK_SUCCESS) {
+            ALOGE(
+                "vkEnumerateDeviceLayerProperties failed for library '%s': %d",
+                path_.c_str(), result);
+            return false;
+        }
+    }
+
+    // append layers to instance_layers
+    size_t prev_num_instance_layers = instance_layers.size();
+    instance_layers.reserve(prev_num_instance_layers + num_instance_layers);
+    for (size_t i = 0; i < num_instance_layers; i++) {
+        const VkLayerProperties& props = properties[i];
+
+        Layer layer;
+        layer.properties = props;
+        layer.library_idx = library_idx;
+        layer.is_global = false;
+
+        uint32_t count = 0;
+        result =
+            enumerate_instance_extensions(props.layerName, &count, nullptr);
+        if (result != VK_SUCCESS) {
+            ALOGE(
+                "vkEnumerateInstanceExtensionProperties(\"%s\") failed for "
+                "library '%s': %d",
+                props.layerName, path_.c_str(), result);
+            instance_layers.resize(prev_num_instance_layers);
+            return false;
+        }
+        layer.instance_extensions.resize(count);
+        result = enumerate_instance_extensions(
+            props.layerName, &count, layer.instance_extensions.data());
+        if (result != VK_SUCCESS) {
+            ALOGE(
+                "vkEnumerateInstanceExtensionProperties(\"%s\") failed for "
+                "library '%s': %d",
+                props.layerName, path_.c_str(), result);
+            instance_layers.resize(prev_num_instance_layers);
+            return false;
+        }
+
+        for (size_t j = 0; j < num_device_layers; j++) {
+            const auto& dev_props = properties[num_instance_layers + j];
+            if (memcmp(&props, &dev_props, sizeof(props)) == 0) {
+                layer.is_global = true;
+                break;
+            }
+        }
+
+        if (layer.is_global && enumerate_device_extensions) {
+            result = enumerate_device_extensions(
+                VK_NULL_HANDLE, props.layerName, &count, nullptr);
+            if (result != VK_SUCCESS) {
+                ALOGE(
+                    "vkEnumerateDeviceExtensionProperties(\"%s\") failed for "
+                    "library '%s': %d",
+                    props.layerName, path_.c_str(), result);
+                instance_layers.resize(prev_num_instance_layers);
+                return false;
+            }
+            layer.device_extensions.resize(count);
+            result = enumerate_device_extensions(
+                VK_NULL_HANDLE, props.layerName, &count,
+                layer.device_extensions.data());
+            if (result != VK_SUCCESS) {
+                ALOGE(
+                    "vkEnumerateDeviceExtensionProperties(\"%s\") failed for "
+                    "library '%s': %d",
+                    props.layerName, path_.c_str(), result);
+                instance_layers.resize(prev_num_instance_layers);
+                return false;
+            }
+        }
+
+        instance_layers.push_back(layer);
+        ALOGD("added %s layer '%s' from library '%s'",
+              (layer.is_global) ? "global" : "instance", props.layerName,
+              path_.c_str());
+    }
+
+    return true;
+!!!46099639.cpp!!!	GetGPA(in layer : Layer, in gpa_name : char, in gpa_name_len : size_t) : void
+    void* gpa;
+    size_t layer_name_len =
+        std::max(size_t{2}, strlen(layer.properties.layerName));
+    char* name = static_cast<char*>(alloca(layer_name_len + gpa_name_len + 1));
+    strcpy(name, layer.properties.layerName);
+    strcpy(name + layer_name_len, gpa_name);
+    if (!(gpa = dlsym(dlhandle_, name))) {
+        strcpy(name, "vk");
+        strcpy(name + 2, gpa_name);
+        gpa = dlsym(dlhandle_, name);
+    }
+    return gpa;

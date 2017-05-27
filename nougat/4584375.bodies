@@ -1,0 +1,699 @@
+class NativeInputManager
+!!!46161335.cpp!!!	~NativeInputManager()
+    JNIEnv* env = jniEnv();
+
+    env->DeleteGlobalRef(mContextObj);
+    env->DeleteGlobalRef(mServiceObj);
+!!!46161463.cpp!!!	NativeInputManager(in contextObj : jobject, in serviceObj : jobject, in looper : sp<Looper>)
+    JNIEnv* env = jniEnv();
+
+    mContextObj = env->NewGlobalRef(contextObj);
+    mServiceObj = env->NewGlobalRef(serviceObj);
+
+    {
+        AutoMutex _l(mLock);
+        mLocked.systemUiVisibility = ASYSTEM_UI_VISIBILITY_STATUS_BAR_VISIBLE;
+        mLocked.pointerSpeed = 0;
+        mLocked.pointerGesturesEnabled = true;
+        mLocked.showTouches = false;
+    }
+    mInteractive = true;
+
+    sp<EventHub> eventHub = new EventHub();
+    mInputManager = new InputManager(eventHub, this, this);
+!!!46161719.cpp!!!	dump(inout dump : String8) : void
+    dump.append("Input Manager State:\n");
+    {
+        dump.appendFormat(INDENT "Interactive: %s\n", toString(mInteractive.load()));
+    }
+    {
+        AutoMutex _l(mLock);
+        dump.appendFormat(INDENT "System UI Visibility: 0x%0" PRIx32 "\n",
+                mLocked.systemUiVisibility);
+        dump.appendFormat(INDENT "Pointer Speed: %" PRId32 "\n", mLocked.pointerSpeed);
+        dump.appendFormat(INDENT "Pointer Gestures Enabled: %s\n",
+                toString(mLocked.pointerGesturesEnabled));
+        dump.appendFormat(INDENT "Show Touches: %s\n", toString(mLocked.showTouches));
+    }
+    dump.append("\n");
+
+    mInputManager->getReader()->dump(dump);
+    dump.append("\n");
+
+    mInputManager->getDispatcher()->dump(dump);
+    dump.append("\n");
+!!!46161847.cpp!!!	setDisplayViewport(in external : bool, in viewport : DisplayViewport) : void
+    bool changed = false;
+    {
+        AutoMutex _l(mLock);
+
+        DisplayViewport& v = external ? mLocked.externalViewport : mLocked.internalViewport;
+        if (v != viewport) {
+            changed = true;
+            v = viewport;
+
+            if (!external) {
+                sp<PointerController> controller = mLocked.pointerController.promote();
+                if (controller != NULL) {
+                    controller->setDisplayViewport(
+                            viewport.logicalRight - viewport.logicalLeft,
+                            viewport.logicalBottom - viewport.logicalTop,
+                            viewport.orientation);
+                }
+            }
+        }
+    }
+
+    if (changed) {
+        mInputManager->getReader()->requestRefreshConfiguration(
+                InputReaderConfiguration::CHANGE_DISPLAY_INFO);
+    }
+!!!46161975.cpp!!!	registerInputChannel(inout env : JNIEnv, in inputChannel : sp<InputChannel>, in inputWindowHandle : sp<InputWindowHandle>, in monitor : bool) : status_t
+    return mInputManager->getDispatcher()->registerInputChannel(
+            inputChannel, inputWindowHandle, monitor);
+!!!46162103.cpp!!!	unregisterInputChannel(inout env : JNIEnv, in inputChannel : sp<InputChannel>) : status_t
+    return mInputManager->getDispatcher()->unregisterInputChannel(inputChannel);
+!!!46162231.cpp!!!	setInputWindows(inout env : JNIEnv, in windowHandleObjArray : jobjectArray) : void
+    Vector<sp<InputWindowHandle> > windowHandles;
+
+    if (windowHandleObjArray) {
+        jsize length = env->GetArrayLength(windowHandleObjArray);
+        for (jsize i = 0; i < length; i++) {
+            jobject windowHandleObj = env->GetObjectArrayElement(windowHandleObjArray, i);
+            if (! windowHandleObj) {
+                break; // found null element indicating end of used portion of the array
+            }
+
+            sp<InputWindowHandle> windowHandle =
+                    android_server_InputWindowHandle_getHandle(env, windowHandleObj);
+            if (windowHandle != NULL) {
+                windowHandles.push(windowHandle);
+            }
+            env->DeleteLocalRef(windowHandleObj);
+        }
+    }
+
+    mInputManager->getDispatcher()->setInputWindows(windowHandles);
+
+    // Do this after the dispatcher has updated the window handle state.
+    bool newPointerGesturesEnabled = true;
+    size_t numWindows = windowHandles.size();
+    for (size_t i = 0; i < numWindows; i++) {
+        const sp<InputWindowHandle>& windowHandle = windowHandles.itemAt(i);
+        const InputWindowInfo* windowInfo = windowHandle->getInfo();
+        if (windowInfo && windowInfo->hasFocus && (windowInfo->inputFeatures
+                & InputWindowInfo::INPUT_FEATURE_DISABLE_TOUCH_PAD_GESTURES)) {
+            newPointerGesturesEnabled = false;
+        }
+    }
+
+    uint32_t changes = 0;
+    { // acquire lock
+        AutoMutex _l(mLock);
+
+        if (mLocked.pointerGesturesEnabled != newPointerGesturesEnabled) {
+            mLocked.pointerGesturesEnabled = newPointerGesturesEnabled;
+            changes |= InputReaderConfiguration::CHANGE_POINTER_GESTURE_ENABLEMENT;
+        }
+    } // release lock
+
+    if (changes) {
+        mInputManager->getReader()->requestRefreshConfiguration(changes);
+    }
+!!!46162359.cpp!!!	setFocusedApplication(inout env : JNIEnv, in applicationHandleObj : jobject) : void
+    sp<InputApplicationHandle> applicationHandle =
+            android_server_InputApplicationHandle_getHandle(env, applicationHandleObj);
+    mInputManager->getDispatcher()->setFocusedApplication(applicationHandle);
+!!!46162487.cpp!!!	setInputDispatchMode(in enabled : bool, in frozen : bool) : void
+    mInputManager->getDispatcher()->setInputDispatchMode(enabled, frozen);
+!!!46162615.cpp!!!	setSystemUiVisibility(in visibility : int32_t) : void
+    AutoMutex _l(mLock);
+
+    if (mLocked.systemUiVisibility != visibility) {
+        mLocked.systemUiVisibility = visibility;
+
+        sp<PointerController> controller = mLocked.pointerController.promote();
+        if (controller != NULL) {
+            updateInactivityTimeoutLocked(controller);
+        }
+    }
+!!!46162743.cpp!!!	setPointerSpeed(in speed : int32_t) : void
+    { // acquire lock
+        AutoMutex _l(mLock);
+
+        if (mLocked.pointerSpeed == speed) {
+            return;
+        }
+
+        ALOGI("Setting pointer speed to %d.", speed);
+        mLocked.pointerSpeed = speed;
+    } // release lock
+
+    mInputManager->getReader()->requestRefreshConfiguration(
+            InputReaderConfiguration::CHANGE_POINTER_SPEED);
+!!!46162871.cpp!!!	setShowTouches(in enabled : bool) : void
+    { // acquire lock
+        AutoMutex _l(mLock);
+
+        if (mLocked.showTouches == enabled) {
+            return;
+        }
+
+        ALOGI("Setting show touches feature to %s.", enabled ? "enabled" : "disabled");
+        mLocked.showTouches = enabled;
+    } // release lock
+
+    mInputManager->getReader()->requestRefreshConfiguration(
+            InputReaderConfiguration::CHANGE_SHOW_TOUCHES);
+!!!46162999.cpp!!!	setInteractive(in interactive : bool) : void
+    mInteractive = interactive;
+!!!46163127.cpp!!!	reloadCalibration() : void
+    mInputManager->getReader()->requestRefreshConfiguration(
+            InputReaderConfiguration::CHANGE_TOUCH_AFFINE_TRANSFORMATION);
+!!!46163255.cpp!!!	setPointerIconType(in iconId : int32_t) : void
+    AutoMutex _l(mLock);
+    sp<PointerController> controller = mLocked.pointerController.promote();
+    if (controller != NULL) {
+        controller->updatePointerIcon(iconId);
+    }
+!!!46163383.cpp!!!	reloadPointerIcons() : void
+    AutoMutex _l(mLock);
+    sp<PointerController> controller = mLocked.pointerController.promote();
+    if (controller != NULL) {
+        controller->reloadPointerResources();
+    }
+!!!46163511.cpp!!!	setCustomPointerIcon(in icon : SpriteIcon) : void
+    AutoMutex _l(mLock);
+    sp<PointerController> controller = mLocked.pointerController.promote();
+    if (controller != NULL) {
+        controller->setCustomPointerIcon(icon);
+    }
+!!!46163639.cpp!!!	getReaderConfiguration(inout outConfig : InputReaderConfiguration) : void
+    JNIEnv* env = jniEnv();
+
+    jint virtualKeyQuietTime = env->CallIntMethod(mServiceObj,
+            gServiceClassInfo.getVirtualKeyQuietTimeMillis);
+    if (!checkAndClearExceptionFromCallback(env, "getVirtualKeyQuietTimeMillis")) {
+        outConfig->virtualKeyQuietTime = milliseconds_to_nanoseconds(virtualKeyQuietTime);
+    }
+
+    outConfig->excludedDeviceNames.clear();
+    jobjectArray excludedDeviceNames = jobjectArray(env->CallObjectMethod(mServiceObj,
+            gServiceClassInfo.getExcludedDeviceNames));
+    if (!checkAndClearExceptionFromCallback(env, "getExcludedDeviceNames") && excludedDeviceNames) {
+        jsize length = env->GetArrayLength(excludedDeviceNames);
+        for (jsize i = 0; i < length; i++) {
+            jstring item = jstring(env->GetObjectArrayElement(excludedDeviceNames, i));
+            const char* deviceNameChars = env->GetStringUTFChars(item, NULL);
+            outConfig->excludedDeviceNames.add(String8(deviceNameChars));
+            env->ReleaseStringUTFChars(item, deviceNameChars);
+            env->DeleteLocalRef(item);
+        }
+        env->DeleteLocalRef(excludedDeviceNames);
+    }
+
+    jint hoverTapTimeout = env->CallIntMethod(mServiceObj,
+            gServiceClassInfo.getHoverTapTimeout);
+    if (!checkAndClearExceptionFromCallback(env, "getHoverTapTimeout")) {
+        jint doubleTapTimeout = env->CallIntMethod(mServiceObj,
+                gServiceClassInfo.getDoubleTapTimeout);
+        if (!checkAndClearExceptionFromCallback(env, "getDoubleTapTimeout")) {
+            jint longPressTimeout = env->CallIntMethod(mServiceObj,
+                    gServiceClassInfo.getLongPressTimeout);
+            if (!checkAndClearExceptionFromCallback(env, "getLongPressTimeout")) {
+                outConfig->pointerGestureTapInterval = milliseconds_to_nanoseconds(hoverTapTimeout);
+
+                // We must ensure that the tap-drag interval is significantly shorter than
+                // the long-press timeout because the tap is held down for the entire duration
+                // of the double-tap timeout.
+                jint tapDragInterval = max(min(longPressTimeout - 100,
+                        doubleTapTimeout), hoverTapTimeout);
+                outConfig->pointerGestureTapDragInterval =
+                        milliseconds_to_nanoseconds(tapDragInterval);
+            }
+        }
+    }
+
+    jint hoverTapSlop = env->CallIntMethod(mServiceObj,
+            gServiceClassInfo.getHoverTapSlop);
+    if (!checkAndClearExceptionFromCallback(env, "getHoverTapSlop")) {
+        outConfig->pointerGestureTapSlop = hoverTapSlop;
+    }
+
+    { // acquire lock
+        AutoMutex _l(mLock);
+
+        outConfig->pointerVelocityControlParameters.scale = exp2f(mLocked.pointerSpeed
+                * POINTER_SPEED_EXPONENT);
+        outConfig->pointerGesturesEnabled = mLocked.pointerGesturesEnabled;
+
+        outConfig->showTouches = mLocked.showTouches;
+
+        outConfig->setDisplayInfo(false /*external*/, mLocked.internalViewport);
+        outConfig->setDisplayInfo(true /*external*/, mLocked.externalViewport);
+    } // release lock
+!!!46163767.cpp!!!	obtainPointerController(in deviceId : int32_t) : sp<PointerControllerInterface>
+    AutoMutex _l(mLock);
+
+    sp<PointerController> controller = mLocked.pointerController.promote();
+    if (controller == NULL) {
+        ensureSpriteControllerLocked();
+
+        controller = new PointerController(this, mLooper, mLocked.spriteController);
+        mLocked.pointerController = controller;
+
+        DisplayViewport& v = mLocked.internalViewport;
+        controller->setDisplayViewport(
+                v.logicalRight - v.logicalLeft,
+                v.logicalBottom - v.logicalTop,
+                v.orientation);
+
+        updateInactivityTimeoutLocked(controller);
+    }
+    return controller;
+!!!46163895.cpp!!!	notifyInputDevicesChanged(in inputDevices : Vector<InputDeviceInfo>) : void
+    JNIEnv* env = jniEnv();
+
+    size_t count = inputDevices.size();
+    jobjectArray inputDevicesObjArray = env->NewObjectArray(
+            count, gInputDeviceClassInfo.clazz, NULL);
+    if (inputDevicesObjArray) {
+        bool error = false;
+        for (size_t i = 0; i < count; i++) {
+            jobject inputDeviceObj = android_view_InputDevice_create(env, inputDevices.itemAt(i));
+            if (!inputDeviceObj) {
+                error = true;
+                break;
+            }
+
+            env->SetObjectArrayElement(inputDevicesObjArray, i, inputDeviceObj);
+            env->DeleteLocalRef(inputDeviceObj);
+        }
+
+        if (!error) {
+            env->CallVoidMethod(mServiceObj, gServiceClassInfo.notifyInputDevicesChanged,
+                    inputDevicesObjArray);
+        }
+
+        env->DeleteLocalRef(inputDevicesObjArray);
+    }
+
+    checkAndClearExceptionFromCallback(env, "notifyInputDevicesChanged");
+!!!46164023.cpp!!!	getKeyboardLayoutOverlay(in identifier : InputDeviceIdentifier) : sp<KeyCharacterMap>
+    JNIEnv* env = jniEnv();
+
+    sp<KeyCharacterMap> result;
+    ScopedLocalRef<jstring> descriptor(env, env->NewStringUTF(identifier.descriptor.string()));
+    ScopedLocalRef<jobject> identifierObj(env, env->NewObject(gInputDeviceIdentifierInfo.clazz,
+            gInputDeviceIdentifierInfo.constructor, descriptor.get(),
+            identifier.vendor, identifier.product));
+    ScopedLocalRef<jobjectArray> arrayObj(env, jobjectArray(env->CallObjectMethod(mServiceObj,
+                gServiceClassInfo.getKeyboardLayoutOverlay, identifierObj.get())));
+    if (arrayObj.get()) {
+        ScopedLocalRef<jstring> filenameObj(env,
+                jstring(env->GetObjectArrayElement(arrayObj.get(), 0)));
+        ScopedLocalRef<jstring> contentsObj(env,
+                jstring(env->GetObjectArrayElement(arrayObj.get(), 1)));
+        ScopedUtfChars filenameChars(env, filenameObj.get());
+        ScopedUtfChars contentsChars(env, contentsObj.get());
+
+        KeyCharacterMap::loadContents(String8(filenameChars.c_str()),
+                String8(contentsChars.c_str()), KeyCharacterMap::FORMAT_OVERLAY, &result);
+    }
+    checkAndClearExceptionFromCallback(env, "getKeyboardLayoutOverlay");
+    return result;
+!!!46164151.cpp!!!	getDeviceAlias(in identifier : InputDeviceIdentifier) : String8
+    JNIEnv* env = jniEnv();
+
+    ScopedLocalRef<jstring> uniqueIdObj(env, env->NewStringUTF(identifier.uniqueId.string()));
+    ScopedLocalRef<jstring> aliasObj(env, jstring(env->CallObjectMethod(mServiceObj,
+            gServiceClassInfo.getDeviceAlias, uniqueIdObj.get())));
+    String8 result;
+    if (aliasObj.get()) {
+        ScopedUtfChars aliasChars(env, aliasObj.get());
+        result.setTo(aliasChars.c_str());
+    }
+    checkAndClearExceptionFromCallback(env, "getDeviceAlias");
+    return result;
+!!!46164279.cpp!!!	getTouchAffineTransformation(inout env : JNIEnv, in matrixArr : jfloatArray) : TouchAffineTransformation
+    ScopedFloatArrayRO matrix(env, matrixArr);
+    assert(matrix.size() == 6);
+
+    TouchAffineTransformation transform;
+    transform.x_scale  = matrix[0];
+    transform.x_ymix   = matrix[1];
+    transform.x_offset = matrix[2];
+    transform.y_xmix   = matrix[3];
+    transform.y_scale  = matrix[4];
+    transform.y_offset = matrix[5];
+
+    return transform;
+!!!46164407.cpp!!!	getTouchAffineTransformation(in inputDeviceDescriptor : String8, in surfaceRotation : int32_t) : TouchAffineTransformation
+    JNIEnv* env = jniEnv();
+
+    ScopedLocalRef<jstring> descriptorObj(env, env->NewStringUTF(inputDeviceDescriptor.string()));
+
+    jobject cal = env->CallObjectMethod(mServiceObj,
+            gServiceClassInfo.getTouchCalibrationForInputDevice, descriptorObj.get(),
+            surfaceRotation);
+
+    jfloatArray matrixArr = jfloatArray(env->CallObjectMethod(cal,
+            gTouchCalibrationClassInfo.getAffineTransform));
+
+    TouchAffineTransformation transform = getTouchAffineTransformation(env, matrixArr);
+
+    env->DeleteLocalRef(matrixArr);
+    env->DeleteLocalRef(cal);
+
+    return transform;
+!!!46164535.cpp!!!	notifySwitch(in when : nsecs_t, in switchValues : uint32_t, in switchMask : uint32_t, in policyFlags : uint32_t) : void
+#if DEBUG_INPUT_DISPATCHER_POLICY
+    ALOGD("notifySwitch - when=%lld, switchValues=0x%08x, switchMask=0x%08x, policyFlags=0x%x",
+            when, switchValues, switchMask, policyFlags);
+#endif
+
+    JNIEnv* env = jniEnv();
+
+    env->CallVoidMethod(mServiceObj, gServiceClassInfo.notifySwitch,
+            when, switchValues, switchMask);
+    checkAndClearExceptionFromCallback(env, "notifySwitch");
+!!!46164663.cpp!!!	notifyConfigurationChanged(in when : nsecs_t) : void
+#if DEBUG_INPUT_DISPATCHER_POLICY
+    ALOGD("notifyConfigurationChanged - when=%lld", when);
+#endif
+
+    JNIEnv* env = jniEnv();
+
+    env->CallVoidMethod(mServiceObj, gServiceClassInfo.notifyConfigurationChanged, when);
+    checkAndClearExceptionFromCallback(env, "notifyConfigurationChanged");
+!!!46164791.cpp!!!	notifyANR(in inputApplicationHandle : sp<InputApplicationHandle>, in inputWindowHandle : sp<InputWindowHandle>, in reason : String8) : nsecs_t
+#if DEBUG_INPUT_DISPATCHER_POLICY
+    ALOGD("notifyANR");
+#endif
+
+    JNIEnv* env = jniEnv();
+
+    jobject inputApplicationHandleObj =
+            getInputApplicationHandleObjLocalRef(env, inputApplicationHandle);
+    jobject inputWindowHandleObj =
+            getInputWindowHandleObjLocalRef(env, inputWindowHandle);
+    jstring reasonObj = env->NewStringUTF(reason.string());
+
+    jlong newTimeout = env->CallLongMethod(mServiceObj,
+                gServiceClassInfo.notifyANR, inputApplicationHandleObj, inputWindowHandleObj,
+                reasonObj);
+    if (checkAndClearExceptionFromCallback(env, "notifyANR")) {
+        newTimeout = 0; // abort dispatch
+    } else {
+        assert(newTimeout >= 0);
+    }
+
+    env->DeleteLocalRef(reasonObj);
+    env->DeleteLocalRef(inputWindowHandleObj);
+    env->DeleteLocalRef(inputApplicationHandleObj);
+    return newTimeout;
+!!!46164919.cpp!!!	notifyInputChannelBroken(in inputWindowHandle : sp<InputWindowHandle>) : void
+#if DEBUG_INPUT_DISPATCHER_POLICY
+    ALOGD("notifyInputChannelBroken");
+#endif
+
+    JNIEnv* env = jniEnv();
+
+    jobject inputWindowHandleObj =
+            getInputWindowHandleObjLocalRef(env, inputWindowHandle);
+    if (inputWindowHandleObj) {
+        env->CallVoidMethod(mServiceObj, gServiceClassInfo.notifyInputChannelBroken,
+                inputWindowHandleObj);
+        checkAndClearExceptionFromCallback(env, "notifyInputChannelBroken");
+
+        env->DeleteLocalRef(inputWindowHandleObj);
+    }
+!!!46165047.cpp!!!	filterInputEvent(in inputEvent : InputEvent, in policyFlags : uint32_t) : bool
+    jobject inputEventObj;
+
+    JNIEnv* env = jniEnv();
+    switch (inputEvent->getType()) {
+    case AINPUT_EVENT_TYPE_KEY:
+        inputEventObj = android_view_KeyEvent_fromNative(env,
+                static_cast<const KeyEvent*>(inputEvent));
+        break;
+    case AINPUT_EVENT_TYPE_MOTION:
+        inputEventObj = android_view_MotionEvent_obtainAsCopy(env,
+                static_cast<const MotionEvent*>(inputEvent));
+        break;
+    default:
+        return true; // dispatch the event normally
+    }
+
+    if (!inputEventObj) {
+        ALOGE("Failed to obtain input event object for filterInputEvent.");
+        return true; // dispatch the event normally
+    }
+
+    // The callee is responsible for recycling the event.
+    jboolean pass = env->CallBooleanMethod(mServiceObj, gServiceClassInfo.filterInputEvent,
+            inputEventObj, policyFlags);
+    if (checkAndClearExceptionFromCallback(env, "filterInputEvent")) {
+        pass = true;
+    }
+    env->DeleteLocalRef(inputEventObj);
+    return pass;
+!!!46165175.cpp!!!	getDispatcherConfiguration(inout outConfig : InputDispatcherConfiguration) : void
+    JNIEnv* env = jniEnv();
+
+    jint keyRepeatTimeout = env->CallIntMethod(mServiceObj,
+            gServiceClassInfo.getKeyRepeatTimeout);
+    if (!checkAndClearExceptionFromCallback(env, "getKeyRepeatTimeout")) {
+        outConfig->keyRepeatTimeout = milliseconds_to_nanoseconds(keyRepeatTimeout);
+    }
+
+    jint keyRepeatDelay = env->CallIntMethod(mServiceObj,
+            gServiceClassInfo.getKeyRepeatDelay);
+    if (!checkAndClearExceptionFromCallback(env, "getKeyRepeatDelay")) {
+        outConfig->keyRepeatDelay = milliseconds_to_nanoseconds(keyRepeatDelay);
+    }
+!!!46165303.cpp!!!	interceptKeyBeforeQueueing(in keyEvent : KeyEvent, inout policyFlags : uint32_t) : void
+    // Policy:
+    // - Ignore untrusted events and pass them along.
+    // - Ask the window manager what to do with normal events and trusted injected events.
+    // - For normal events wake and brighten the screen if currently off or dim.
+    bool interactive = mInteractive.load();
+    if (interactive) {
+        policyFlags |= POLICY_FLAG_INTERACTIVE;
+    }
+    if ((policyFlags & POLICY_FLAG_TRUSTED)) {
+        nsecs_t when = keyEvent->getEventTime();
+        JNIEnv* env = jniEnv();
+        jobject keyEventObj = android_view_KeyEvent_fromNative(env, keyEvent);
+        jint wmActions;
+        if (keyEventObj) {
+            wmActions = env->CallIntMethod(mServiceObj,
+                    gServiceClassInfo.interceptKeyBeforeQueueing,
+                    keyEventObj, policyFlags);
+            if (checkAndClearExceptionFromCallback(env, "interceptKeyBeforeQueueing")) {
+                wmActions = 0;
+            }
+            android_view_KeyEvent_recycle(env, keyEventObj);
+            env->DeleteLocalRef(keyEventObj);
+        } else {
+            ALOGE("Failed to obtain key event object for interceptKeyBeforeQueueing.");
+            wmActions = 0;
+        }
+
+        handleInterceptActions(wmActions, when, /*byref*/ policyFlags);
+    } else {
+        if (interactive) {
+            policyFlags |= POLICY_FLAG_PASS_TO_USER;
+        }
+    }
+!!!46165431.cpp!!!	interceptMotionBeforeQueueing(in when : nsecs_t, inout policyFlags : uint32_t) : void
+    // Policy:
+    // - Ignore untrusted events and pass them along.
+    // - No special filtering for injected events required at this time.
+    // - Filter normal events based on screen state.
+    // - For normal events brighten (but do not wake) the screen if currently dim.
+    bool interactive = mInteractive.load();
+    if (interactive) {
+        policyFlags |= POLICY_FLAG_INTERACTIVE;
+    }
+    if ((policyFlags & POLICY_FLAG_TRUSTED) && !(policyFlags & POLICY_FLAG_INJECTED)) {
+        if (policyFlags & POLICY_FLAG_INTERACTIVE) {
+            policyFlags |= POLICY_FLAG_PASS_TO_USER;
+        } else {
+            JNIEnv* env = jniEnv();
+            jint wmActions = env->CallIntMethod(mServiceObj,
+                        gServiceClassInfo.interceptMotionBeforeQueueingNonInteractive,
+                        when, policyFlags);
+            if (checkAndClearExceptionFromCallback(env,
+                    "interceptMotionBeforeQueueingNonInteractive")) {
+                wmActions = 0;
+            }
+
+            handleInterceptActions(wmActions, when, /*byref*/ policyFlags);
+        }
+    } else {
+        if (interactive) {
+            policyFlags |= POLICY_FLAG_PASS_TO_USER;
+        }
+    }
+!!!46165559.cpp!!!	interceptKeyBeforeDispatching(in inputWindowHandle : sp<InputWindowHandle>, in keyEvent : KeyEvent, in policyFlags : uint32_t) : nsecs_t
+    // Policy:
+    // - Ignore untrusted events and pass them along.
+    // - Filter normal events and trusted injected events through the window manager policy to
+    //   handle the HOME key and the like.
+    nsecs_t result = 0;
+    if (policyFlags & POLICY_FLAG_TRUSTED) {
+        JNIEnv* env = jniEnv();
+
+        // Note: inputWindowHandle may be null.
+        jobject inputWindowHandleObj = getInputWindowHandleObjLocalRef(env, inputWindowHandle);
+        jobject keyEventObj = android_view_KeyEvent_fromNative(env, keyEvent);
+        if (keyEventObj) {
+            jlong delayMillis = env->CallLongMethod(mServiceObj,
+                    gServiceClassInfo.interceptKeyBeforeDispatching,
+                    inputWindowHandleObj, keyEventObj, policyFlags);
+            bool error = checkAndClearExceptionFromCallback(env, "interceptKeyBeforeDispatching");
+            android_view_KeyEvent_recycle(env, keyEventObj);
+            env->DeleteLocalRef(keyEventObj);
+            if (!error) {
+                if (delayMillis < 0) {
+                    result = -1;
+                } else if (delayMillis > 0) {
+                    result = milliseconds_to_nanoseconds(delayMillis);
+                }
+            }
+        } else {
+            ALOGE("Failed to obtain key event object for interceptKeyBeforeDispatching.");
+        }
+        env->DeleteLocalRef(inputWindowHandleObj);
+    }
+    return result;
+!!!46165687.cpp!!!	dispatchUnhandledKey(in inputWindowHandle : sp<InputWindowHandle>, in keyEvent : KeyEvent, in policyFlags : uint32_t, inout outFallbackKeyEvent : KeyEvent) : bool
+    // Policy:
+    // - Ignore untrusted events and do not perform default handling.
+    bool result = false;
+    if (policyFlags & POLICY_FLAG_TRUSTED) {
+        JNIEnv* env = jniEnv();
+
+        // Note: inputWindowHandle may be null.
+        jobject inputWindowHandleObj = getInputWindowHandleObjLocalRef(env, inputWindowHandle);
+        jobject keyEventObj = android_view_KeyEvent_fromNative(env, keyEvent);
+        if (keyEventObj) {
+            jobject fallbackKeyEventObj = env->CallObjectMethod(mServiceObj,
+                    gServiceClassInfo.dispatchUnhandledKey,
+                    inputWindowHandleObj, keyEventObj, policyFlags);
+            if (checkAndClearExceptionFromCallback(env, "dispatchUnhandledKey")) {
+                fallbackKeyEventObj = NULL;
+            }
+            android_view_KeyEvent_recycle(env, keyEventObj);
+            env->DeleteLocalRef(keyEventObj);
+
+            if (fallbackKeyEventObj) {
+                // Note: outFallbackKeyEvent may be the same object as keyEvent.
+                if (!android_view_KeyEvent_toNative(env, fallbackKeyEventObj,
+                        outFallbackKeyEvent)) {
+                    result = true;
+                }
+                android_view_KeyEvent_recycle(env, fallbackKeyEventObj);
+                env->DeleteLocalRef(fallbackKeyEventObj);
+            }
+        } else {
+            ALOGE("Failed to obtain key event object for dispatchUnhandledKey.");
+        }
+        env->DeleteLocalRef(inputWindowHandleObj);
+    }
+    return result;
+!!!46165815.cpp!!!	pokeUserActivity(in eventTime : nsecs_t, in eventType : int32_t) : void
+    android_server_PowerManagerService_userActivity(eventTime, eventType);
+!!!46165943.cpp!!!	checkInjectEventsPermissionNonReentrant(in injectorPid : int32_t, in injectorUid : int32_t) : bool
+    JNIEnv* env = jniEnv();
+    jboolean result = env->CallBooleanMethod(mServiceObj,
+            gServiceClassInfo.checkInjectEventsPermission, injectorPid, injectorUid);
+    if (checkAndClearExceptionFromCallback(env, "checkInjectEventsPermission")) {
+        result = false;
+    }
+    return result;
+!!!46166071.cpp!!!	loadPointerIcon(inout icon : SpriteIcon) : void
+    JNIEnv* env = jniEnv();
+
+    ScopedLocalRef<jobject> pointerIconObj(env, env->CallObjectMethod(
+            mServiceObj, gServiceClassInfo.getPointerIcon));
+    if (checkAndClearExceptionFromCallback(env, "getPointerIcon")) {
+        return;
+    }
+
+    PointerIcon pointerIcon;
+    status_t status = android_view_PointerIcon_load(env, pointerIconObj.get(),
+                                                    mContextObj, &pointerIcon);
+    if (!status && !pointerIcon.isNullIcon()) {
+        *icon = SpriteIcon(pointerIcon.bitmap, pointerIcon.hotSpotX, pointerIcon.hotSpotY);
+    } else {
+        *icon = SpriteIcon();
+    }
+!!!46166199.cpp!!!	loadPointerResources(inout outResources : PointerResources) : void
+    JNIEnv* env = jniEnv();
+
+    loadSystemIconAsSprite(env, mContextObj, POINTER_ICON_STYLE_SPOT_HOVER,
+            &outResources->spotHover);
+    loadSystemIconAsSprite(env, mContextObj, POINTER_ICON_STYLE_SPOT_TOUCH,
+            &outResources->spotTouch);
+    loadSystemIconAsSprite(env, mContextObj, POINTER_ICON_STYLE_SPOT_ANCHOR,
+            &outResources->spotAnchor);
+!!!46166327.cpp!!!	loadAdditionalMouseResources(inout outResources : std::map<int32_t, SpriteIcon>, inout outAnimationResources : std::map<int32_t, PointerAnimation>) : void
+    JNIEnv* env = jniEnv();
+
+    for (int iconId = POINTER_ICON_STYLE_CONTEXT_MENU; iconId <= POINTER_ICON_STYLE_GRABBING;
+             ++iconId) {
+        PointerIcon pointerIcon;
+        loadSystemIconAsSpriteWithPointerIcon(
+                env, mContextObj, iconId, &pointerIcon, &((*outResources)[iconId]));
+        if (!pointerIcon.bitmapFrames.empty()) {
+            PointerAnimation& animationData = (*outAnimationResources)[iconId];
+            size_t numFrames = pointerIcon.bitmapFrames.size() + 1;
+            animationData.durationPerFrame =
+                    milliseconds_to_nanoseconds(pointerIcon.durationPerFrame);
+            animationData.animationFrames.reserve(numFrames);
+            animationData.animationFrames.push_back(SpriteIcon(
+                    pointerIcon.bitmap, pointerIcon.hotSpotX, pointerIcon.hotSpotY));
+            for (size_t i = 0; i < numFrames - 1; ++i) {
+              animationData.animationFrames.push_back(SpriteIcon(
+                      pointerIcon.bitmapFrames[i], pointerIcon.hotSpotX, pointerIcon.hotSpotY));
+            }
+        }
+    }
+    loadSystemIconAsSprite(env, mContextObj, POINTER_ICON_STYLE_NULL,
+            &((*outResources)[POINTER_ICON_STYLE_NULL]));
+!!!46166455.cpp!!!	getDefaultPointerIconId() : int32_t
+    return POINTER_ICON_STYLE_ARROW;
+!!!46166583.cpp!!!	getCustomPointerIconId() : int32_t
+    return POINTER_ICON_STYLE_CUSTOM;
+!!!46166711.cpp!!!	updateInactivityTimeoutLocked(in controller : sp<PointerController>) : void
+    bool lightsOut = mLocked.systemUiVisibility & ASYSTEM_UI_VISIBILITY_STATUS_BAR_HIDDEN;
+    controller->setInactivityTimeout(lightsOut
+            ? PointerController::INACTIVITY_TIMEOUT_SHORT
+            : PointerController::INACTIVITY_TIMEOUT_NORMAL);
+!!!46166839.cpp!!!	handleInterceptActions(in wmActions : jint, in when : nsecs_t, inout policyFlags : uint32_t) : void
+    if (wmActions & WM_ACTION_PASS_TO_USER) {
+        policyFlags |= POLICY_FLAG_PASS_TO_USER;
+    } else {
+#if DEBUG_INPUT_DISPATCHER_POLICY
+        ALOGD("handleInterceptActions: Not passing key to user.");
+#endif
+    }
+!!!46166967.cpp!!!	ensureSpriteControllerLocked() : void
+    if (mLocked.spriteController == NULL) {
+        JNIEnv* env = jniEnv();
+        jint layer = env->CallIntMethod(mServiceObj, gServiceClassInfo.getPointerLayer);
+        if (checkAndClearExceptionFromCallback(env, "getPointerLayer")) {
+            layer = -1;
+        }
+        mLocked.spriteController = new SpriteController(mLooper, layer);
+    }
+!!!46167095.cpp!!!	checkAndClearExceptionFromCallback(inout env : JNIEnv, in methodName : char) : bool
+    if (env->ExceptionCheck()) {
+        ALOGE("An exception was thrown by callback '%s'.", methodName);
+        LOGE_EX(env);
+        env->ExceptionClear();
+        return true;
+    }
+    return false;

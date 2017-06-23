@@ -1,0 +1,262 @@
+class AesEvpOperation
+!!!43082551.cpp!!!	AesEvpOperation(in purpose : keymaster_purpose_t, in block_mode : keymaster_block_mode_t, in padding : keymaster_padding_t, in caller_iv : bool, in tag_length : size_t, in key : uint8_t, in key_size : size_t)
+    memcpy(key_, key, key_size_);
+    EVP_CIPHER_CTX_init(&ctx_);
+!!!43082679.cpp!!!	~AesEvpOperation()
+    EVP_CIPHER_CTX_cleanup(&ctx_);
+    memset_s(aad_block_buf_.get(), AES_BLOCK_SIZE, 0);
+!!!43082807.cpp!!!	Begin(in input_params : AuthorizationSet, inout output_params : AuthorizationSet) : keymaster_error_t
+    if (block_mode_ == KM_MODE_GCM) {
+        aad_block_buf_length_ = 0;
+        aad_block_buf_.reset(new (std::nothrow) uint8_t[AES_BLOCK_SIZE]);
+        if (!aad_block_buf_.get())
+            return KM_ERROR_MEMORY_ALLOCATION_FAILED;
+    }
+
+    return InitializeCipher();
+!!!43082935.cpp!!!	Update(in additional_params : AuthorizationSet, in input : Buffer, inout output_params : AuthorizationSet, inout output : Buffer, inout input_consumed : size_t) : keymaster_error_t
+    keymaster_error_t error;
+    if (block_mode_ == KM_MODE_GCM)
+        if (!HandleAad(additional_params, input, &error))
+            return error;
+
+    if (!InternalUpdate(input.peek_read(), input.available_read(), output, &error))
+        return error;
+    *input_consumed = input.available_read();
+
+    return KM_ERROR_OK;
+!!!43083063.cpp!!!	Finish(in additional_params : AuthorizationSet, in input : Buffer, in signature : Buffer, inout output_params : AuthorizationSet, inout output : Buffer) : keymaster_error_t
+    keymaster_error_t error;
+    if (!UpdateForFinish(additional_params, input, output_params, output, &error))
+        return error;
+
+    if (!output->reserve(AES_BLOCK_SIZE))
+        return KM_ERROR_MEMORY_ALLOCATION_FAILED;
+
+    if (block_mode_ == KM_MODE_GCM && aad_block_buf_length_ > 0 && !ProcessBufferedAadBlock(&error))
+        return error;
+
+    int output_written = -1;
+    if (!EVP_CipherFinal_ex(&ctx_, output->peek_write(), &output_written)) {
+        if (tag_length_ > 0)
+            return KM_ERROR_VERIFICATION_FAILED;
+        LOG_E("Error encrypting final block: %s", ERR_error_string(ERR_peek_last_error(), NULL));
+        return TranslateLastOpenSslError();
+    }
+
+    assert(output_written <= AES_BLOCK_SIZE);
+    if (!output->advance_write(output_written))
+        return KM_ERROR_UNKNOWN_ERROR;
+    return KM_ERROR_OK;
+!!!43083191.cpp!!!	Abort() : keymaster_error_t
+    return KM_ERROR_OK;
+!!!43083447.cpp!!!	need_iv() : bool
+    switch (block_mode_) {
+    case KM_MODE_CBC:
+    case KM_MODE_CTR:
+    case KM_MODE_GCM:
+        return true;
+    case KM_MODE_ECB:
+        return false;
+    default:
+        // Shouldn't get here.
+        assert(false);
+        return false;
+    }
+!!!43083575.cpp!!!	InitializeCipher() : keymaster_error_t
+    const EVP_CIPHER* cipher;
+    switch (block_mode_) {
+    case KM_MODE_ECB:
+        switch (key_size_) {
+        case 16:
+            cipher = EVP_aes_128_ecb();
+            break;
+        case 24:
+            cipher = EVP_aes_192_ecb();
+            break;
+        case 32:
+            cipher = EVP_aes_256_ecb();
+            break;
+        default:
+            return KM_ERROR_UNSUPPORTED_KEY_SIZE;
+        }
+        break;
+    case KM_MODE_CBC:
+        switch (key_size_) {
+        case 16:
+            cipher = EVP_aes_128_cbc();
+            break;
+        case 24:
+            cipher = EVP_aes_192_cbc();
+            break;
+        case 32:
+            cipher = EVP_aes_256_cbc();
+            break;
+        default:
+            return KM_ERROR_UNSUPPORTED_KEY_SIZE;
+        }
+        break;
+    case KM_MODE_CTR:
+        switch (key_size_) {
+        case 16:
+            cipher = EVP_aes_128_ctr();
+            break;
+        case 24:
+            cipher = EVP_aes_192_ctr();
+            break;
+        case 32:
+            cipher = EVP_aes_256_ctr();
+            break;
+        default:
+            return KM_ERROR_UNSUPPORTED_KEY_SIZE;
+        }
+        break;
+    case KM_MODE_GCM:
+        switch (key_size_) {
+        case 16:
+            cipher = EVP_aes_128_gcm();
+            break;
+        case 24:
+            cipher = EVP_aes_192_gcm();
+            break;
+        case 32:
+            cipher = EVP_aes_256_gcm();
+            break;
+        default:
+            return KM_ERROR_UNSUPPORTED_KEY_SIZE;
+        }
+        break;
+    default:
+        return KM_ERROR_UNSUPPORTED_BLOCK_MODE;
+    }
+
+    if (!EVP_CipherInit_ex(&ctx_, cipher, NULL /* engine */, key_, iv_.get(), evp_encrypt_mode()))
+        return TranslateLastOpenSslError();
+
+    switch (padding_) {
+    case KM_PAD_NONE:
+        EVP_CIPHER_CTX_set_padding(&ctx_, 0 /* disable padding */);
+        break;
+    case KM_PAD_PKCS7:
+        // This is the default for OpenSSL EVP cipher operations.
+        break;
+    default:
+        return KM_ERROR_UNSUPPORTED_PADDING_MODE;
+    }
+
+    if (block_mode_ == KM_MODE_GCM) {
+        aad_block_buf_length_ = 0;
+        aad_block_buf_.reset(new (std::nothrow) uint8_t[AES_BLOCK_SIZE]);
+        if (!aad_block_buf_.get())
+            return KM_ERROR_MEMORY_ALLOCATION_FAILED;
+    }
+
+    return KM_ERROR_OK;
+!!!43083703.cpp!!!	GetIv(in input_params : AuthorizationSet) : keymaster_error_t
+    keymaster_blob_t iv_blob;
+    if (!input_params.GetTagValue(TAG_NONCE, &iv_blob)) {
+        LOG_E("No IV provided", 0);
+        return KM_ERROR_INVALID_ARGUMENT;
+    }
+    if (block_mode_ != KM_MODE_GCM && iv_blob.data_length != AES_BLOCK_SIZE) {
+        LOG_E("Expected %d-byte IV for AES operation, but got %d bytes", AES_BLOCK_SIZE,
+              iv_blob.data_length);
+        return KM_ERROR_INVALID_NONCE;
+    }
+    if (block_mode_ == KM_MODE_GCM && iv_blob.data_length != GCM_NONCE_SIZE) {
+        LOG_E("Expected %d-byte nonce for AES-GCM operation, but got %d bytes", GCM_NONCE_SIZE,
+              iv_blob.data_length);
+        return KM_ERROR_INVALID_NONCE;
+    }
+    iv_.reset(dup_array(iv_blob.data, iv_blob.data_length));
+    if (!iv_.get())
+        return KM_ERROR_MEMORY_ALLOCATION_FAILED;
+    iv_length_ = iv_blob.data_length;
+    return KM_ERROR_OK;
+!!!43083831.cpp!!!	HandleAad(in input_params : AuthorizationSet, in input : Buffer, inout error : keymaster_error_t) : bool
+    assert(tag_length_ > 0);
+    assert(error);
+
+    keymaster_blob_t aad;
+    if (input_params.GetTagValue(TAG_ASSOCIATED_DATA, &aad)) {
+        if (data_started_) {
+            *error = KM_ERROR_INVALID_TAG;
+            return false;
+        }
+
+        if (aad_block_buf_length_ > 0) {
+            FillBufferedAadBlock(&aad);
+            if (aad_block_buf_length_ == AES_BLOCK_SIZE && !ProcessBufferedAadBlock(error))
+                return false;
+        }
+
+        size_t blocks_to_process = aad.data_length / AES_BLOCK_SIZE;
+        if (blocks_to_process && !ProcessAadBlocks(aad.data, blocks_to_process, error))
+            return false;
+        aad.data += blocks_to_process * AES_BLOCK_SIZE;
+        aad.data_length -= blocks_to_process * AES_BLOCK_SIZE;
+
+        FillBufferedAadBlock(&aad);
+        assert(aad.data_length == 0);
+    }
+
+    if (input.available_read()) {
+        data_started_ = true;
+        // Data has begun, no more AAD is allowed.  Process any buffered AAD.
+        if (aad_block_buf_length_ > 0 && !ProcessBufferedAadBlock(error))
+            return false;
+    }
+
+    return true;
+!!!43083959.cpp!!!	ProcessAadBlocks(in data : uint8_t, in blocks : size_t, inout error : keymaster_error_t) : bool
+    int output_written;
+    if (EVP_CipherUpdate(&ctx_, nullptr /* out */, &output_written, data, blocks * AES_BLOCK_SIZE))
+        return true;
+    *error = TranslateLastOpenSslError();
+    return false;
+!!!43084087.cpp!!!	FillBufferedAadBlock(inout aad : keymaster_blob_t) : void
+    size_t to_buffer = min(AES_BLOCK_SIZE - aad_block_buf_length_, aad->data_length);
+    memcpy(aad_block_buf_.get() + aad_block_buf_length_, aad->data, to_buffer);
+    aad->data += to_buffer;
+    aad->data_length -= to_buffer;
+    aad_block_buf_length_ += to_buffer;
+!!!43084215.cpp!!!	ProcessBufferedAadBlock(inout error : keymaster_error_t) : bool
+    int output_written;
+    if (EVP_CipherUpdate(&ctx_, nullptr /* out */, &output_written, aad_block_buf_.get(),
+                         aad_block_buf_length_)) {
+        aad_block_buf_length_ = 0;
+        return true;
+    }
+    *error = TranslateLastOpenSslError();
+    return false;
+!!!43084343.cpp!!!	InternalUpdate(in input : uint8_t, in input_length : size_t, inout output : Buffer, inout error : keymaster_error_t) : bool
+    assert(output);
+    assert(error);
+
+    if (!input_length)
+        return true;
+
+    if (!output->reserve(input_length + AES_BLOCK_SIZE)) {
+        *error = KM_ERROR_MEMORY_ALLOCATION_FAILED;
+        return false;
+    }
+
+    int output_written = -1;
+    if (!EVP_CipherUpdate(&ctx_, output->peek_write(), &output_written, input, input_length)) {
+        *error = TranslateLastOpenSslError();
+        return false;
+    }
+    return output->advance_write(output_written);
+!!!43084471.cpp!!!	UpdateForFinish(in additional_params : AuthorizationSet, in input : Buffer, inout output_params : AuthorizationSet, inout output : Buffer, inout error : keymaster_error_t) : bool
+    if (input.available_read() || !additional_params.empty()) {
+        size_t input_consumed;
+        *error = Update(additional_params, input, output_params, output, &input_consumed);
+        if (*error != KM_ERROR_OK)
+            return false;
+        if (input_consumed != input.available_read()) {
+            *error = KM_ERROR_INVALID_INPUT_LENGTH;
+            return false;
+        }
+    }
+
+    return true;

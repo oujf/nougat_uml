@@ -1,0 +1,372 @@
+class LegacyCameraDevice
+!!!79394103.java!!!	getExtrasFromRequest(inout holder : RequestHolder) : CaptureResultExtras
+        return getExtrasFromRequest(holder,
+                /*errorCode*/CameraDeviceState.NO_CAPTURE_ERROR, /*errorArg*/null);
+!!!79394231.java!!!	getExtrasFromRequest(inout holder : RequestHolder, in errorCode : int, inout errorArg : Object) : CaptureResultExtras
+        int errorStreamId = -1;
+        if (errorCode == CameraDeviceImpl.CameraDeviceCallbacks.ERROR_CAMERA_BUFFER) {
+            Surface errorTarget = (Surface) errorArg;
+            int indexOfTarget = mConfiguredSurfaces.indexOfValue(errorTarget);
+            if (indexOfTarget < 0) {
+                Log.e(TAG, "Buffer drop error reported for unknown Surface");
+            } else {
+                errorStreamId = mConfiguredSurfaces.keyAt(indexOfTarget);
+            }
+        }
+        if (holder == null) {
+            return new CaptureResultExtras(ILLEGAL_VALUE, ILLEGAL_VALUE, ILLEGAL_VALUE,
+                    ILLEGAL_VALUE, ILLEGAL_VALUE, ILLEGAL_VALUE, ILLEGAL_VALUE);
+        }
+        return new CaptureResultExtras(holder.getRequestId(), holder.getSubsequeceId(),
+                /*afTriggerId*/0, /*precaptureTriggerId*/0, holder.getFrameNumber(),
+                /*partialResultCount*/1, errorStreamId);
+!!!79394359.java!!!	needsConversion(inout s : Surface) : boolean
+        int nativeType = detectSurfaceType(s);
+        return nativeType == ImageFormat.YUV_420_888 || nativeType == ImageFormat.YV12 ||
+                nativeType == ImageFormat.NV21;
+!!!79394487.java!!!	LegacyCameraDevice(in cameraId : int, inout camera : Camera, inout characteristics : CameraCharacteristics, inout callbacks : ICameraDeviceCallbacks)
+        mCameraId = cameraId;
+        mDeviceCallbacks = callbacks;
+        TAG = String.format("CameraDevice-%d-LE", mCameraId);
+
+        mResultThread.start();
+        mResultHandler = new Handler(mResultThread.getLooper());
+        mCallbackHandlerThread.start();
+        mCallbackHandler = new Handler(mCallbackHandlerThread.getLooper());
+        mDeviceState.setCameraDeviceCallbacks(mCallbackHandler, mStateListener);
+        mStaticCharacteristics = characteristics;
+        mRequestThreadManager =
+                new RequestThreadManager(cameraId, camera, characteristics, mDeviceState);
+        mRequestThreadManager.start();
+!!!79394615.java!!!	configureOutputs(inout outputs : SparseArray) : int
+        List<Pair<Surface, Size>> sizedSurfaces = new ArrayList<>();
+        if (outputs != null) {
+            int count = outputs.size();
+            for (int i = 0; i < count; i++)  {
+                Surface output = outputs.valueAt(i);
+                if (output == null) {
+                    Log.e(TAG, "configureOutputs - null outputs are not allowed");
+                    return BAD_VALUE;
+                }
+                if (!output.isValid()) {
+                    Log.e(TAG, "configureOutputs - invalid output surfaces are not allowed");
+                    return BAD_VALUE;
+                }
+                StreamConfigurationMap streamConfigurations = mStaticCharacteristics.
+                        get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
+
+                // Validate surface size and format.
+                try {
+                    Size s = getSurfaceSize(output);
+                    int surfaceType = detectSurfaceType(output);
+
+                    boolean flexibleConsumer = isFlexibleConsumer(output);
+
+                    Size[] sizes = streamConfigurations.getOutputSizes(surfaceType);
+                    if (sizes == null) {
+                        // WAR: Override default format to IMPLEMENTATION_DEFINED for b/9487482
+                        if ((surfaceType >= LegacyMetadataMapper.HAL_PIXEL_FORMAT_RGBA_8888 &&
+                            surfaceType <= LegacyMetadataMapper.HAL_PIXEL_FORMAT_BGRA_8888)) {
+
+                            // YUV_420_888 is always present in LEGACY for all
+                            // IMPLEMENTATION_DEFINED output sizes, and is publicly visible in the
+                            // API (i.e. {@code #getOutputSizes} works here).
+                            sizes = streamConfigurations.getOutputSizes(ImageFormat.YUV_420_888);
+                        } else if (surfaceType == LegacyMetadataMapper.HAL_PIXEL_FORMAT_BLOB) {
+                            sizes = streamConfigurations.getOutputSizes(ImageFormat.JPEG);
+                        }
+                    }
+
+                    if (!ArrayUtils.contains(sizes, s)) {
+                        if (flexibleConsumer && (s = findClosestSize(s, sizes)) != null) {
+                            sizedSurfaces.add(new Pair<>(output, s));
+                        } else {
+                            String reason = (sizes == null) ? "format is invalid." :
+                                    ("size not in valid set: " + Arrays.toString(sizes));
+                            Log.e(TAG, String.format("Surface with size (w=%d, h=%d) and format " +
+                                    "0x%x is not valid, %s", s.getWidth(), s.getHeight(),
+                                    surfaceType, reason));
+                            return BAD_VALUE;
+                        }
+                    } else {
+                        sizedSurfaces.add(new Pair<>(output, s));
+                    }
+                    // Lock down the size before configuration
+                    setSurfaceDimens(output, s.getWidth(), s.getHeight());
+                } catch (BufferQueueAbandonedException e) {
+                    Log.e(TAG, "Surface bufferqueue is abandoned, cannot configure as output: ", e);
+                    return BAD_VALUE;
+                }
+
+            }
+        }
+
+        boolean success = false;
+        if (mDeviceState.setConfiguring()) {
+            mRequestThreadManager.configure(sizedSurfaces);
+            success = mDeviceState.setIdle();
+        }
+
+        if (success) {
+            mConfiguredSurfaces = outputs;
+        } else {
+            return LegacyExceptionUtils.INVALID_OPERATION;
+        }
+        return LegacyExceptionUtils.NO_ERROR;
+!!!79394743.java!!!	submitRequestList(inout requestList : CaptureRequest [[]], inout repeating : boolean) : SubmitInfo
+        if (requestList == null || requestList.length == 0) {
+            Log.e(TAG, "submitRequestList - Empty/null requests are not allowed");
+            throw new ServiceSpecificException(BAD_VALUE,
+                    "submitRequestList - Empty/null requests are not allowed");
+        }
+
+        List<Long> surfaceIds;
+
+        try {
+            surfaceIds = (mConfiguredSurfaces == null) ? new ArrayList<Long>() :
+                    getSurfaceIds(mConfiguredSurfaces);
+        } catch (BufferQueueAbandonedException e) {
+            throw new ServiceSpecificException(BAD_VALUE,
+                    "submitRequestList - configured surface is abandoned.");
+        }
+
+        // Make sure that there all requests have at least 1 surface; all surfaces are non-null
+        for (CaptureRequest request : requestList) {
+            if (request.getTargets().isEmpty()) {
+                Log.e(TAG, "submitRequestList - "
+                        + "Each request must have at least one Surface target");
+                throw new ServiceSpecificException(BAD_VALUE,
+                        "submitRequestList - "
+                        + "Each request must have at least one Surface target");
+            }
+
+            for (Surface surface : request.getTargets()) {
+                if (surface == null) {
+                    Log.e(TAG, "submitRequestList - Null Surface targets are not allowed");
+                    throw new ServiceSpecificException(BAD_VALUE,
+                            "submitRequestList - Null Surface targets are not allowed");
+                } else if (mConfiguredSurfaces == null) {
+                    Log.e(TAG, "submitRequestList - must configure " +
+                            " device with valid surfaces before submitting requests");
+                    throw new ServiceSpecificException(INVALID_OPERATION,
+                            "submitRequestList - must configure " +
+                            " device with valid surfaces before submitting requests");
+                } else if (!containsSurfaceId(surface, surfaceIds)) {
+                    Log.e(TAG, "submitRequestList - cannot use a surface that wasn't configured");
+                    throw new ServiceSpecificException(BAD_VALUE,
+                            "submitRequestList - cannot use a surface that wasn't configured");
+                }
+            }
+        }
+
+        // TODO: further validation of request here
+        mIdle.close();
+        return mRequestThreadManager.submitCaptureRequests(requestList, repeating);
+!!!79394871.java!!!	submitRequest(inout request : CaptureRequest, inout repeating : boolean) : SubmitInfo
+        CaptureRequest[] requestList = { request };
+        return submitRequestList(requestList, repeating);
+!!!79394999.java!!!	cancelRequest(in requestId : int) : long
+        return mRequestThreadManager.cancelRepeating(requestId);
+!!!79395127.java!!!	waitUntilIdle() : void
+        mIdle.block();
+!!!79395255.java!!!	flush() : long
+        long lastFrame = mRequestThreadManager.flush();
+        waitUntilIdle();
+        return lastFrame;
+!!!79395383.java!!!	isClosed() : boolean
+        return mClosed;
+!!!79395511.java!!!	close() : void
+        mRequestThreadManager.quit();
+        mCallbackHandlerThread.quitSafely();
+        mResultThread.quitSafely();
+
+        try {
+            mCallbackHandlerThread.join();
+        } catch (InterruptedException e) {
+            Log.e(TAG, String.format("Thread %s (%d) interrupted while quitting.",
+                    mCallbackHandlerThread.getName(), mCallbackHandlerThread.getId()));
+        }
+
+        try {
+            mResultThread.join();
+        } catch (InterruptedException e) {
+            Log.e(TAG, String.format("Thread %s (%d) interrupted while quitting.",
+                    mResultThread.getName(), mResultThread.getId()));
+        }
+
+        mClosed = true;
+!!!79395639.java!!!	finalize() : void
+        try {
+            close();
+        } catch (ServiceSpecificException e) {
+            Log.e(TAG, "Got error while trying to finalize, ignoring: " + e.getMessage());
+        } finally {
+            super.finalize();
+        }
+!!!79395767.java!!!	findEuclidDistSquare(inout a : Size, inout b : Size) : long
+        long d0 = a.getWidth() - b.getWidth();
+        long d1 = a.getHeight() - b.getHeight();
+        return d0 * d0 + d1 * d1;
+!!!79395895.java!!!	findClosestSize(inout size : Size, inout supportedSizes : Size [[]]) : Size
+        if (size == null || supportedSizes == null) {
+            return null;
+        }
+        Size bestSize = null;
+        for (Size s : supportedSizes) {
+            if (s.equals(size)) {
+                return size;
+            } else if (s.getWidth() <= MAX_DIMEN_FOR_ROUNDING && (bestSize == null ||
+                    LegacyCameraDevice.findEuclidDistSquare(size, s) <
+                    LegacyCameraDevice.findEuclidDistSquare(bestSize, s))) {
+                bestSize = s;
+            }
+        }
+        return bestSize;
+!!!79396023.java!!!	getSurfaceSize(inout surface : Surface) : Size
+        checkNotNull(surface);
+
+        int[] dimens = new int[2];
+        LegacyExceptionUtils.throwOnError(nativeDetectSurfaceDimens(surface, /*out*/dimens));
+
+        return new Size(dimens[0], dimens[1]);
+!!!79396151.java!!!	isFlexibleConsumer(inout output : Surface) : boolean
+        int usageFlags = detectSurfaceUsageFlags(output);
+
+        // Keep up to date with allowed consumer types in
+        // frameworks/av/services/camera/libcameraservice/api2/CameraDeviceClient.cpp
+        int disallowedFlags = GRALLOC_USAGE_HW_VIDEO_ENCODER | GRALLOC_USAGE_RENDERSCRIPT;
+        int allowedFlags = GRALLOC_USAGE_HW_TEXTURE | GRALLOC_USAGE_SW_READ_OFTEN |
+            GRALLOC_USAGE_HW_COMPOSER;
+        boolean flexibleConsumer = ((usageFlags & disallowedFlags) == 0 &&
+                (usageFlags & allowedFlags) != 0);
+        return flexibleConsumer;
+!!!79396279.java!!!	isPreviewConsumer(inout output : Surface) : boolean
+        int usageFlags = detectSurfaceUsageFlags(output);
+        int disallowedFlags = GRALLOC_USAGE_HW_VIDEO_ENCODER | GRALLOC_USAGE_RENDERSCRIPT |
+                GRALLOC_USAGE_SW_READ_OFTEN;
+        int allowedFlags = GRALLOC_USAGE_HW_TEXTURE | GRALLOC_USAGE_HW_COMPOSER |
+                GRALLOC_USAGE_HW_RENDER;
+        boolean previewConsumer = ((usageFlags & disallowedFlags) == 0 &&
+                (usageFlags & allowedFlags) != 0);
+        int surfaceFormat = ImageFormat.UNKNOWN;
+        try {
+            surfaceFormat = detectSurfaceType(output);
+        } catch(BufferQueueAbandonedException e) {
+            throw new IllegalArgumentException("Surface was abandoned", e);
+        }
+
+        return previewConsumer;
+!!!79396407.java!!!	isVideoEncoderConsumer(inout output : Surface) : boolean
+        int usageFlags = detectSurfaceUsageFlags(output);
+        int disallowedFlags = GRALLOC_USAGE_HW_TEXTURE | GRALLOC_USAGE_HW_COMPOSER |
+                GRALLOC_USAGE_RENDERSCRIPT | GRALLOC_USAGE_SW_READ_OFTEN;
+        int allowedFlags = GRALLOC_USAGE_HW_VIDEO_ENCODER;
+        boolean videoEncoderConsumer = ((usageFlags & disallowedFlags) == 0 &&
+                (usageFlags & allowedFlags) != 0);
+
+        int surfaceFormat = ImageFormat.UNKNOWN;
+        try {
+            surfaceFormat = detectSurfaceType(output);
+        } catch(BufferQueueAbandonedException e) {
+            throw new IllegalArgumentException("Surface was abandoned", e);
+        }
+
+        return videoEncoderConsumer;
+!!!79396535.java!!!	detectSurfaceUsageFlags(inout surface : Surface) : int
+        checkNotNull(surface);
+        return nativeDetectSurfaceUsageFlags(surface);
+!!!79396663.java!!!	detectSurfaceType(inout surface : Surface) : int
+        checkNotNull(surface);
+        return LegacyExceptionUtils.throwOnError(nativeDetectSurfaceType(surface));
+!!!79396791.java!!!	detectSurfaceDataspace(inout surface : Surface) : int
+        checkNotNull(surface);
+        return LegacyExceptionUtils.throwOnError(nativeDetectSurfaceDataspace(surface));
+!!!79396919.java!!!	connectSurface(inout surface : Surface) : void
+        checkNotNull(surface);
+
+        LegacyExceptionUtils.throwOnError(nativeConnectSurface(surface));
+!!!79397047.java!!!	disconnectSurface(inout surface : Surface) : void
+        if (surface == null) return;
+
+        LegacyExceptionUtils.throwOnError(nativeDisconnectSurface(surface));
+!!!79397175.java!!!	produceFrame(inout surface : Surface, inout pixelBuffer : byte [[]], in width : int, in height : int, in pixelFormat : int) : void
+        checkNotNull(surface);
+        checkNotNull(pixelBuffer);
+        checkArgumentPositive(width, "width must be positive.");
+        checkArgumentPositive(height, "height must be positive.");
+
+        LegacyExceptionUtils.throwOnError(nativeProduceFrame(surface, pixelBuffer, width, height,
+                pixelFormat));
+!!!79397303.java!!!	setSurfaceFormat(inout surface : Surface, in pixelFormat : int) : void
+        checkNotNull(surface);
+
+        LegacyExceptionUtils.throwOnError(nativeSetSurfaceFormat(surface, pixelFormat));
+!!!79397431.java!!!	setSurfaceDimens(inout surface : Surface, in width : int, in height : int) : void
+        checkNotNull(surface);
+        checkArgumentPositive(width, "width must be positive.");
+        checkArgumentPositive(height, "height must be positive.");
+
+        LegacyExceptionUtils.throwOnError(nativeSetSurfaceDimens(surface, width, height));
+!!!79397559.java!!!	getSurfaceId(inout surface : Surface) : long
+        checkNotNull(surface);
+        try {
+            return nativeGetSurfaceId(surface);
+        } catch (IllegalArgumentException e) {
+            throw new BufferQueueAbandonedException();
+        }
+!!!79397687.java!!!	getSurfaceIds(inout surfaces : SparseArray) : List<Long>
+        if (surfaces == null) {
+            throw new NullPointerException("Null argument surfaces");
+        }
+        List<Long> surfaceIds = new ArrayList<>();
+        int count = surfaces.size();
+        for (int i = 0; i < count; i++) {
+            long id = getSurfaceId(surfaces.valueAt(i));
+            if (id == 0) {
+                throw new IllegalStateException(
+                        "Configured surface had null native GraphicBufferProducer pointer!");
+            }
+            surfaceIds.add(id);
+        }
+        return surfaceIds;
+!!!79397815.java!!!	getSurfaceIds(inout surfaces : Collection<Surface>) : List<Long>
+        if (surfaces == null) {
+            throw new NullPointerException("Null argument surfaces");
+        }
+        List<Long> surfaceIds = new ArrayList<>();
+        for (Surface s : surfaces) {
+            long id = getSurfaceId(s);
+            if (id == 0) {
+                throw new IllegalStateException(
+                        "Configured surface had null native GraphicBufferProducer pointer!");
+            }
+            surfaceIds.add(id);
+        }
+        return surfaceIds;
+!!!79397943.java!!!	containsSurfaceId(inout s : Surface, inout ids : Collection<Long>) : boolean
+        long id = 0;
+        try {
+            id = getSurfaceId(s);
+        } catch (BufferQueueAbandonedException e) {
+            // If surface is abandoned, return false.
+            return false;
+        }
+        return ids.contains(id);
+!!!79398071.java!!!	setSurfaceOrientation(inout surface : Surface, in facing : int, in sensorOrientation : int) : void
+        checkNotNull(surface);
+        LegacyExceptionUtils.throwOnError(nativeSetSurfaceOrientation(surface, facing,
+                sensorOrientation));
+!!!79398199.java!!!	getTextureSize(inout surfaceTexture : SurfaceTexture) : Size
+        checkNotNull(surfaceTexture);
+
+        int[] dimens = new int[2];
+        LegacyExceptionUtils.throwOnError(nativeDetectTextureDimens(surfaceTexture,
+                /*out*/dimens));
+
+        return new Size(dimens[0], dimens[1]);
+!!!79398327.java!!!	setNextTimestamp(inout surface : Surface, in timestamp : long) : void
+        checkNotNull(surface);
+        LegacyExceptionUtils.throwOnError(nativeSetNextTimestamp(surface, timestamp));
+!!!79398455.java!!!	setScalingMode(inout surface : Surface, in mode : int) : void
+        checkNotNull(surface);
+        LegacyExceptionUtils.throwOnError(nativeSetScalingMode(surface, mode));

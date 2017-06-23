@@ -1,0 +1,1033 @@
+class RenderSessionImpl
+!!!76280631.java!!!	RenderSessionImpl(inout params : SessionParams)
+        super(new SessionParams(params));
+!!!76280759.java!!!	init(in timeout : long) : Result
+        Result result = super.init(timeout);
+        if (!result.isSuccess()) {
+            return result;
+        }
+
+        SessionParams params = getParams();
+        BridgeContext context = getContext();
+
+        // use default of true in case it's not found to use alpha by default
+        mIsAlphaChannelImage = ResourceHelper.getBooleanThemeValue(params.getResources(),
+                "windowIsFloating", true, true);
+
+        mLayoutBuilder = new Layout.Builder(params, context);
+
+        // FIXME: find those out, and possibly add them to the render params
+        boolean hasNavigationBar = true;
+        //noinspection ConstantConditions
+        IWindowManager iwm = new IWindowManagerImpl(getContext().getConfiguration(),
+                context.getMetrics(), Surface.ROTATION_0, hasNavigationBar);
+        WindowManagerGlobal_Delegate.setWindowManagerService(iwm);
+
+        // build the inflater and parser.
+        mInflater = new BridgeInflater(context, params.getLayoutlibCallback());
+        context.setBridgeInflater(mInflater);
+
+        mBlockParser = new BridgeXmlBlockParser(params.getLayoutDescription(), context, false);
+
+        return SUCCESS.createResult();
+!!!76280887.java!!!	measure(inout params : SessionParams) : void
+        // only do the screen measure when needed.
+        if (mMeasuredScreenWidth != -1) {
+            return;
+        }
+
+        RenderingMode renderingMode = params.getRenderingMode();
+        HardwareConfig hardwareConfig = params.getHardwareConfig();
+
+        mNewRenderSize = true;
+        mMeasuredScreenWidth = hardwareConfig.getScreenWidth();
+        mMeasuredScreenHeight = hardwareConfig.getScreenHeight();
+
+        if (renderingMode != RenderingMode.NORMAL) {
+            int widthMeasureSpecMode = renderingMode.isHorizExpand() ?
+                    MeasureSpec.UNSPECIFIED // this lets us know the actual needed size
+                    : MeasureSpec.EXACTLY;
+            int heightMeasureSpecMode = renderingMode.isVertExpand() ?
+                    MeasureSpec.UNSPECIFIED // this lets us know the actual needed size
+                    : MeasureSpec.EXACTLY;
+
+            // We used to compare the measured size of the content to the screen size but
+            // this does not work anymore due to the 2 following issues:
+            // - If the content is in a decor (system bar, title/action bar), the root view
+            //   will not resize even with the UNSPECIFIED because of the embedded layout.
+            // - If there is no decor, but a dialog frame, then the dialog padding prevents
+            //   comparing the size of the content to the screen frame (as it would not
+            //   take into account the dialog padding).
+
+            // The solution is to first get the content size in a normal rendering, inside
+            // the decor or the dialog padding.
+            // Then measure only the content with UNSPECIFIED to see the size difference
+            // and apply this to the screen size.
+
+            // first measure the full layout, with EXACTLY to get the size of the
+            // content as it is inside the decor/dialog
+            @SuppressWarnings("deprecation")
+            Pair<Integer, Integer> exactMeasure = measureView(
+                    mViewRoot, mContentRoot.getChildAt(0),
+                    mMeasuredScreenWidth, MeasureSpec.EXACTLY,
+                    mMeasuredScreenHeight, MeasureSpec.EXACTLY);
+
+            // now measure the content only using UNSPECIFIED (where applicable, based on
+            // the rendering mode). This will give us the size the content needs.
+            @SuppressWarnings("deprecation")
+            Pair<Integer, Integer> result = measureView(
+                    mContentRoot, mContentRoot.getChildAt(0),
+                    mMeasuredScreenWidth, widthMeasureSpecMode,
+                    mMeasuredScreenHeight, heightMeasureSpecMode);
+
+            // now look at the difference and add what is needed.
+            if (renderingMode.isHorizExpand()) {
+                int measuredWidth = exactMeasure.getFirst();
+                int neededWidth = result.getFirst();
+                if (neededWidth > measuredWidth) {
+                    mMeasuredScreenWidth += neededWidth - measuredWidth;
+                }
+                if (mMeasuredScreenWidth < measuredWidth) {
+                    // If the screen width is less than the exact measured width,
+                    // expand to match.
+                    mMeasuredScreenWidth = measuredWidth;
+                }
+            }
+
+            if (renderingMode.isVertExpand()) {
+                int measuredHeight = exactMeasure.getSecond();
+                int neededHeight = result.getSecond();
+                if (neededHeight > measuredHeight) {
+                    mMeasuredScreenHeight += neededHeight - measuredHeight;
+                }
+                if (mMeasuredScreenHeight < measuredHeight) {
+                    // If the screen height is less than the exact measured height,
+                    // expand to match.
+                    mMeasuredScreenHeight = measuredHeight;
+                }
+            }
+        }
+!!!76281015.java!!!	inflate() : Result
+        checkLock();
+
+        try {
+            mViewRoot = new Layout(mLayoutBuilder);
+            mLayoutBuilder = null;  // Done with the builder.
+            mContentRoot = ((Layout) mViewRoot).getContentRoot();
+            SessionParams params = getParams();
+            BridgeContext context = getContext();
+
+            // Sets the project callback (custom view loader) to the fragment delegate so that
+            // it can instantiate the custom Fragment.
+            Fragment_Delegate.setLayoutlibCallback(params.getLayoutlibCallback());
+
+            String rootTag = params.getFlag(RenderParamsFlags.FLAG_KEY_ROOT_TAG);
+            boolean isPreference = "PreferenceScreen".equals(rootTag);
+            View view;
+            if (isPreference) {
+                view = Preference_Delegate.inflatePreference(getContext(), mBlockParser,
+                        mContentRoot);
+            } else {
+                view = mInflater.inflate(mBlockParser, mContentRoot);
+            }
+
+            // done with the parser, pop it.
+            context.popParser();
+
+            Fragment_Delegate.setLayoutlibCallback(null);
+
+            // set the AttachInfo on the root view.
+            AttachInfo_Accessor.setAttachInfo(mViewRoot);
+
+            // post-inflate process. For now this supports TabHost/TabWidget
+            postInflateProcess(view, params.getLayoutlibCallback(), isPreference ? view : null);
+            mInflater.onDoneInflation();
+
+            setActiveToolbar(view, context, params);
+
+            measure(params);
+            measureView(mViewRoot, null /*measuredView*/,
+                    mMeasuredScreenWidth, MeasureSpec.EXACTLY,
+                    mMeasuredScreenHeight, MeasureSpec.EXACTLY);
+            mViewRoot.layout(0, 0, mMeasuredScreenWidth, mMeasuredScreenHeight);
+            mSystemViewInfoList = visitAllChildren(mViewRoot, 0, params.getExtendedViewInfoMode(),
+                    false);
+
+            return SUCCESS.createResult();
+        } catch (PostInflateException e) {
+            return ERROR_INFLATION.createResult(e.getMessage(), e);
+        } catch (Throwable e) {
+            // get the real cause of the exception.
+            Throwable t = e;
+            while (t.getCause() != null) {
+                t = t.getCause();
+            }
+
+            return ERROR_INFLATION.createResult(t.getMessage(), t);
+        }
+!!!76281143.java!!!	setElapsedFrameTimeNanos(in nanos : long) : void
+        mElapsedFrameTimeNanos = nanos;
+!!!76281271.java!!!	render(inout context : BridgeContext, inout viewRoot : ViewGroup, inout canvas : Canvas, in width : int, in height : int) : Result
+        // measure again with the size we need
+        // This must always be done before the call to layout
+        measureView(viewRoot, null /*measuredView*/,
+                width, MeasureSpec.EXACTLY,
+                height, MeasureSpec.EXACTLY);
+
+        // now do the layout.
+        viewRoot.layout(0, 0, width, height);
+        handleScrolling(context, viewRoot);
+
+        if (canvas == null) {
+            return SUCCESS.createResult();
+        }
+
+        AttachInfo_Accessor.dispatchOnPreDraw(viewRoot);
+        viewRoot.draw(canvas);
+
+        return SUCCESS.createResult();
+!!!76281399.java!!!	render(inout freshRender : boolean) : Result
+        checkLock();
+
+        SessionParams params = getParams();
+
+        try {
+            if (mViewRoot == null) {
+                return ERROR_NOT_INFLATED.createResult();
+            }
+
+            measure(params);
+
+            HardwareConfig hardwareConfig = params.getHardwareConfig();
+            Result renderResult = SUCCESS.createResult();
+            if (params.isLayoutOnly()) {
+                // delete the canvas and image to reset them on the next full rendering
+                mImage = null;
+                mCanvas = null;
+            } else {
+                // draw the views
+                // create the BufferedImage into which the layout will be rendered.
+                boolean newImage = false;
+
+                // When disableBitmapCaching is true, we do not reuse mImage and
+                // we create a new one in every render.
+                // This is useful when mImage is just a wrapper of Graphics2D so
+                // it doesn't get cached.
+                boolean disableBitmapCaching = Boolean.TRUE.equals(params.getFlag(
+                    RenderParamsFlags.FLAG_KEY_DISABLE_BITMAP_CACHING));
+                if (mNewRenderSize || mCanvas == null || disableBitmapCaching) {
+                    mNewRenderSize = false;
+                    if (params.getImageFactory() != null) {
+                        mImage = params.getImageFactory().getImage(
+                                mMeasuredScreenWidth,
+                                mMeasuredScreenHeight);
+                    } else {
+                        mImage = new BufferedImage(
+                                mMeasuredScreenWidth,
+                                mMeasuredScreenHeight,
+                                BufferedImage.TYPE_INT_ARGB);
+                        newImage = true;
+                    }
+
+                    if (params.isBgColorOverridden()) {
+                        // since we override the content, it's the same as if it was a new image.
+                        newImage = true;
+                        Graphics2D gc = mImage.createGraphics();
+                        gc.setColor(new Color(params.getOverrideBgColor(), true));
+                        gc.setComposite(AlphaComposite.Src);
+                        gc.fillRect(0, 0, mMeasuredScreenWidth, mMeasuredScreenHeight);
+                        gc.dispose();
+                    }
+
+                    // create an Android bitmap around the BufferedImage
+                    Bitmap bitmap = Bitmap_Delegate.createBitmap(mImage,
+                            true /*isMutable*/, hardwareConfig.getDensity());
+
+                    if (mCanvas == null) {
+                        // create a Canvas around the Android bitmap
+                        mCanvas = new Canvas(bitmap);
+                    } else {
+                        mCanvas.setBitmap(bitmap);
+                    }
+                    mCanvas.setDensity(hardwareConfig.getDensity().getDpiValue());
+                }
+
+                if (freshRender && !newImage) {
+                    Graphics2D gc = mImage.createGraphics();
+                    gc.setComposite(AlphaComposite.Src);
+
+                    gc.setColor(new Color(0x00000000, true));
+                    gc.fillRect(0, 0,
+                            mMeasuredScreenWidth, mMeasuredScreenHeight);
+
+                    // done
+                    gc.dispose();
+                }
+
+                if (mElapsedFrameTimeNanos >= 0) {
+                    long initialTime = System_Delegate.nanoTime();
+                    if (!mFirstFrameExecuted) {
+                        // We need to run an initial draw call to initialize the animations
+                        render(getContext(), mViewRoot, NOP_CANVAS, mMeasuredScreenWidth, mMeasuredScreenHeight);
+
+                        // The first frame will initialize the animations
+                        Choreographer_Delegate.doFrame(initialTime);
+                        mFirstFrameExecuted = true;
+                    }
+                    // Second frame will move the animations
+                    Choreographer_Delegate.doFrame(initialTime + mElapsedFrameTimeNanos);
+                }
+                renderResult = render(getContext(), mViewRoot, mCanvas, mMeasuredScreenWidth,
+                        mMeasuredScreenHeight);
+            }
+
+            mSystemViewInfoList = visitAllChildren(mViewRoot, 0, params.getExtendedViewInfoMode(),
+                    false);
+
+            // success!
+            return renderResult;
+        } catch (Throwable e) {
+            // get the real cause of the exception.
+            Throwable t = e;
+            while (t.getCause() != null) {
+                t = t.getCause();
+            }
+
+            return ERROR_UNKNOWN.createResult(t.getMessage(), t);
+        }
+!!!76281527.java!!!	measureView(inout viewToMeasure : ViewGroup, inout measuredView : View, in width : int, in widthMode : int, in height : int, in heightMode : int) : Pair<Integer, Integer>
+        int w_spec = MeasureSpec.makeMeasureSpec(width, widthMode);
+        int h_spec = MeasureSpec.makeMeasureSpec(height, heightMode);
+        viewToMeasure.measure(w_spec, h_spec);
+
+        if (measuredView != null) {
+            return Pair.of(measuredView.getMeasuredWidth(), measuredView.getMeasuredHeight());
+        }
+
+        return null;
+!!!76281655.java!!!	animate(inout targetObject : Object, inout animationName : String, inout isFrameworkAnimation : boolean, inout listener : IAnimationListener) : Result
+        checkLock();
+
+        BridgeContext context = getContext();
+
+        // find the animation file.
+        ResourceValue animationResource;
+        int animationId = 0;
+        if (isFrameworkAnimation) {
+            animationResource = context.getRenderResources().getFrameworkResource(
+                    ResourceType.ANIMATOR, animationName);
+            if (animationResource != null) {
+                animationId = Bridge.getResourceId(ResourceType.ANIMATOR, animationName);
+            }
+        } else {
+            animationResource = context.getRenderResources().getProjectResource(
+                    ResourceType.ANIMATOR, animationName);
+            if (animationResource != null) {
+                animationId = context.getLayoutlibCallback().getResourceId(
+                        ResourceType.ANIMATOR, animationName);
+            }
+        }
+
+        if (animationResource != null) {
+            try {
+                Animator anim = AnimatorInflater.loadAnimator(context, animationId);
+                if (anim != null) {
+                    anim.setTarget(targetObject);
+
+                    new PlayAnimationThread(anim, this, animationName, listener).start();
+
+                    return SUCCESS.createResult();
+                }
+            } catch (Exception e) {
+                // get the real cause of the exception.
+                Throwable t = e;
+                while (t.getCause() != null) {
+                    t = t.getCause();
+                }
+
+                return ERROR_UNKNOWN.createResult(t.getMessage(), t);
+            }
+        }
+
+        return ERROR_ANIM_NOT_FOUND.createResult();
+!!!76281783.java!!!	insertChild(in parentView : ViewGroup, inout childXml : ILayoutPullParser, in index : int, inout listener : IAnimationListener) : Result
+        checkLock();
+
+        BridgeContext context = getContext();
+
+        // create a block parser for the XML
+        BridgeXmlBlockParser blockParser = new BridgeXmlBlockParser(
+                childXml, context, false /* platformResourceFlag */);
+
+        // inflate the child without adding it to the root since we want to control where it'll
+        // get added. We do pass the parentView however to ensure that the layoutParams will
+        // be created correctly.
+        final View child = mInflater.inflate(blockParser, parentView, false /*attachToRoot*/);
+        blockParser.ensurePopped();
+
+        invalidateRenderingSize();
+
+        if (listener != null) {
+            new AnimationThread(this, "insertChild", listener) {
+
+                @Override
+                public Result preAnimation() {
+                    parentView.setLayoutTransition(new LayoutTransition());
+                    return addView(parentView, child, index);
+                }
+
+                @Override
+                public void postAnimation() {
+                    parentView.setLayoutTransition(null);
+                }
+            }.start();
+
+            // always return success since the real status will come through the listener.
+            return SUCCESS.createResult(child);
+        }
+
+        // add it to the parentView in the correct location
+        Result result = addView(parentView, child, index);
+        if (!result.isSuccess()) {
+            return result;
+        }
+
+        result = render(false /*freshRender*/);
+        if (result.isSuccess()) {
+            result = result.getCopyWithData(child);
+        }
+
+        return result;
+!!!76281911.java!!!	addView(inout parent : ViewGroup, inout view : View, in index : int) : Result
+        try {
+            parent.addView(view, index);
+            return SUCCESS.createResult();
+        } catch (UnsupportedOperationException e) {
+            // looks like this is a view class that doesn't support children manipulation!
+            return ERROR_VIEWGROUP_NO_CHILDREN.createResult();
+        }
+!!!76282039.java!!!	moveChild(in newParentView : ViewGroup, in childView : View, in index : int, inout layoutParamsMap : Map<String, String>, in listener : IAnimationListener) : Result
+        checkLock();
+
+        invalidateRenderingSize();
+
+        LayoutParams layoutParams = null;
+        if (layoutParamsMap != null) {
+            // need to create a new LayoutParams object for the new parent.
+            layoutParams = newParentView.generateLayoutParams(
+                    new BridgeLayoutParamsMapAttributes(layoutParamsMap));
+        }
+
+        // get the current parent of the view that needs to be moved.
+        final ViewGroup previousParent = (ViewGroup) childView.getParent();
+
+        if (listener != null) {
+            final LayoutParams params = layoutParams;
+
+            // there is no support for animating views across layouts, so in case the new and old
+            // parent views are different we fake the animation through a no animation thread.
+            if (previousParent != newParentView) {
+                new Thread("not animated moveChild") {
+                    @Override
+                    public void run() {
+                        Result result = moveView(previousParent, newParentView, childView, index,
+                                params);
+                        if (!result.isSuccess()) {
+                            listener.done(result);
+                        }
+
+                        // ready to do the work, acquire the scene.
+                        result = acquire(250);
+                        if (!result.isSuccess()) {
+                            listener.done(result);
+                            return;
+                        }
+
+                        try {
+                            result = render(false /*freshRender*/);
+                            if (result.isSuccess()) {
+                                listener.onNewFrame(RenderSessionImpl.this.getSession());
+                            }
+                        } finally {
+                            release();
+                        }
+
+                        listener.done(result);
+                    }
+                }.start();
+            } else {
+                new AnimationThread(this, "moveChild", listener) {
+
+                    @Override
+                    public Result preAnimation() {
+                        // set up the transition for the parent.
+                        LayoutTransition transition = new LayoutTransition();
+                        previousParent.setLayoutTransition(transition);
+
+                        // tweak the animation durations and start delays (to match the duration of
+                        // animation playing just before).
+                        // Note: Cannot user Animation.setDuration() directly. Have to set it
+                        // on the LayoutTransition.
+                        transition.setDuration(LayoutTransition.DISAPPEARING, 100);
+                        // CHANGE_DISAPPEARING plays after DISAPPEARING
+                        transition.setStartDelay(LayoutTransition.CHANGE_DISAPPEARING, 100);
+
+                        transition.setDuration(LayoutTransition.CHANGE_DISAPPEARING, 100);
+
+                        transition.setDuration(LayoutTransition.CHANGE_APPEARING, 100);
+                        // CHANGE_APPEARING plays after CHANGE_APPEARING
+                        transition.setStartDelay(LayoutTransition.APPEARING, 100);
+
+                        transition.setDuration(LayoutTransition.APPEARING, 100);
+
+                        return moveView(previousParent, newParentView, childView, index, params);
+                    }
+
+                    @Override
+                    public void postAnimation() {
+                        previousParent.setLayoutTransition(null);
+                        newParentView.setLayoutTransition(null);
+                    }
+                }.start();
+            }
+
+            // always return success since the real status will come through the listener.
+            return SUCCESS.createResult(layoutParams);
+        }
+
+        Result result = moveView(previousParent, newParentView, childView, index, layoutParams);
+        if (!result.isSuccess()) {
+            return result;
+        }
+
+        result = render(false /*freshRender*/);
+        if (layoutParams != null && result.isSuccess()) {
+            result = result.getCopyWithData(layoutParams);
+        }
+
+        return result;
+!!!76282167.java!!!	moveView(inout previousParent : ViewGroup, in newParent : ViewGroup, in movedView : View, in index : int, in params : ViewGroup::LayoutParams) : Result
+        try {
+            // check if there is a transition on the previousParent.
+            LayoutTransition previousTransition = previousParent.getLayoutTransition();
+            if (previousTransition != null) {
+                // in this case there is an animation. This means we have to wait for the child's
+                // parent reference to be null'ed out so that we can add it to the new parent.
+                // It is technically removed right before the DISAPPEARING animation is done (if
+                // the animation of this type is not null, otherwise it's after which is impossible
+                // to handle).
+                // Because there is no move animation, if the new parent is the same as the old
+                // parent, we need to wait until the CHANGE_DISAPPEARING animation is done before
+                // adding the child or the child will appear in its new location before the
+                // other children have made room for it.
+
+                // add a listener to the transition to be notified of the actual removal.
+                previousTransition.addTransitionListener(new TransitionListener() {
+                    private int mChangeDisappearingCount = 0;
+
+                    @Override
+                    public void startTransition(LayoutTransition transition, ViewGroup container,
+                            View view, int transitionType) {
+                        if (transitionType == LayoutTransition.CHANGE_DISAPPEARING) {
+                            mChangeDisappearingCount++;
+                        }
+                    }
+
+                    @Override
+                    public void endTransition(LayoutTransition transition, ViewGroup container,
+                            View view, int transitionType) {
+                        if (transitionType == LayoutTransition.CHANGE_DISAPPEARING) {
+                            mChangeDisappearingCount--;
+                        }
+
+                        if (transitionType == LayoutTransition.CHANGE_DISAPPEARING &&
+                                mChangeDisappearingCount == 0) {
+                            // add it to the parentView in the correct location
+                            if (params != null) {
+                                newParent.addView(movedView, index, params);
+                            } else {
+                                newParent.addView(movedView, index);
+                            }
+                        }
+                    }
+                });
+
+                // remove the view from the current parent.
+                previousParent.removeView(movedView);
+
+                // and return since adding the view to the new parent is done in the listener.
+                return SUCCESS.createResult();
+            } else {
+                // standard code with no animation. pretty simple.
+                previousParent.removeView(movedView);
+
+                // add it to the parentView in the correct location
+                if (params != null) {
+                    newParent.addView(movedView, index, params);
+                } else {
+                    newParent.addView(movedView, index);
+                }
+
+                return SUCCESS.createResult();
+            }
+        } catch (UnsupportedOperationException e) {
+            // looks like this is a view class that doesn't support children manipulation!
+            return ERROR_VIEWGROUP_NO_CHILDREN.createResult();
+        }
+!!!76282295.java!!!	removeChild(in childView : View, inout listener : IAnimationListener) : Result
+        checkLock();
+
+        invalidateRenderingSize();
+
+        final ViewGroup parent = (ViewGroup) childView.getParent();
+
+        if (listener != null) {
+            new AnimationThread(this, "moveChild", listener) {
+
+                @Override
+                public Result preAnimation() {
+                    parent.setLayoutTransition(new LayoutTransition());
+                    return removeView(parent, childView);
+                }
+
+                @Override
+                public void postAnimation() {
+                    parent.setLayoutTransition(null);
+                }
+            }.start();
+
+            // always return success since the real status will come through the listener.
+            return SUCCESS.createResult();
+        }
+
+        Result result = removeView(parent, childView);
+        if (!result.isSuccess()) {
+            return result;
+        }
+
+        return render(false /*freshRender*/);
+!!!76282423.java!!!	removeView(inout parent : ViewGroup, inout view : View) : Result
+        try {
+            parent.removeView(view);
+            return SUCCESS.createResult();
+        } catch (UnsupportedOperationException e) {
+            // looks like this is a view class that doesn't support children manipulation!
+            return ERROR_VIEWGROUP_NO_CHILDREN.createResult();
+        }
+!!!76282551.java!!!	postInflateProcess(inout view : View, inout layoutlibCallback : LayoutlibCallback, inout skip : View) : void
+        if (view == skip) {
+            return;
+        }
+        if (view instanceof TabHost) {
+            setupTabHost((TabHost) view, layoutlibCallback);
+        } else if (view instanceof QuickContactBadge) {
+            QuickContactBadge badge = (QuickContactBadge) view;
+            badge.setImageToDefault();
+        } else if (view instanceof AdapterView<?>) {
+            // get the view ID.
+            int id = view.getId();
+
+            BridgeContext context = getContext();
+
+            // get a ResourceReference from the integer ID.
+            ResourceReference listRef = context.resolveId(id);
+
+            if (listRef != null) {
+                SessionParams params = getParams();
+                AdapterBinding binding = params.getAdapterBindings().get(listRef);
+
+                // if there was no adapter binding, trying to get it from the call back.
+                if (binding == null) {
+                    binding = layoutlibCallback.getAdapterBinding(
+                            listRef, context.getViewKey(view), view);
+                }
+
+                if (binding != null) {
+
+                    if (view instanceof AbsListView) {
+                        if ((binding.getFooterCount() > 0 || binding.getHeaderCount() > 0) &&
+                                view instanceof ListView) {
+                            ListView list = (ListView) view;
+
+                            boolean skipCallbackParser = false;
+
+                            int count = binding.getHeaderCount();
+                            for (int i = 0; i < count; i++) {
+                                Pair<View, Boolean> pair = context.inflateView(
+                                        binding.getHeaderAt(i),
+                                        list, false, skipCallbackParser);
+                                if (pair.getFirst() != null) {
+                                    list.addHeaderView(pair.getFirst());
+                                }
+
+                                skipCallbackParser |= pair.getSecond();
+                            }
+
+                            count = binding.getFooterCount();
+                            for (int i = 0; i < count; i++) {
+                                Pair<View, Boolean> pair = context.inflateView(
+                                        binding.getFooterAt(i),
+                                        list, false, skipCallbackParser);
+                                if (pair.getFirst() != null) {
+                                    list.addFooterView(pair.getFirst());
+                                }
+
+                                skipCallbackParser |= pair.getSecond();
+                            }
+                        }
+
+                        if (view instanceof ExpandableListView) {
+                            ((ExpandableListView) view).setAdapter(
+                                    new FakeExpandableAdapter(listRef, binding, layoutlibCallback));
+                        } else {
+                            ((AbsListView) view).setAdapter(
+                                    new FakeAdapter(listRef, binding, layoutlibCallback));
+                        }
+                    } else if (view instanceof AbsSpinner) {
+                        ((AbsSpinner) view).setAdapter(
+                                new FakeAdapter(listRef, binding, layoutlibCallback));
+                    }
+                }
+            }
+        } else if (view instanceof ViewGroup) {
+            mInflater.postInflateProcess(view);
+            ViewGroup group = (ViewGroup) view;
+            final int count = group.getChildCount();
+            for (int c = 0; c < count; c++) {
+                View child = group.getChildAt(c);
+                postInflateProcess(child, layoutlibCallback, skip);
+            }
+        }
+!!!76282679.java!!!	setActiveToolbar(inout view : View, inout context : BridgeContext, inout params : SessionParams) : void
+        View coordinatorLayout = findChildView(view, DesignLibUtil.CN_COORDINATOR_LAYOUT);
+        if (coordinatorLayout == null) {
+            return;
+        }
+        View appBar = findChildView(coordinatorLayout, DesignLibUtil.CN_APPBAR_LAYOUT);
+        if (appBar == null) {
+            return;
+        }
+        ViewGroup collapsingToolbar =
+                (ViewGroup) findChildView(appBar, DesignLibUtil.CN_COLLAPSING_TOOLBAR_LAYOUT);
+        if (collapsingToolbar == null) {
+            return;
+        }
+        if (!hasToolbar(collapsingToolbar)) {
+            return;
+        }
+        RenderResources res = context.getRenderResources();
+        String title = params.getAppLabel();
+        ResourceValue titleValue = res.findResValue(title, false);
+        if (titleValue != null && titleValue.getValue() != null) {
+            title = titleValue.getValue();
+        }
+        DesignLibUtil.setTitle(collapsingToolbar, title);
+!!!76282807.java!!!	findChildView(inout view : View, inout className : String) : View
+        if (!(view instanceof ViewGroup)) {
+            return null;
+        }
+        ViewGroup group = (ViewGroup) view;
+        for (int i = 0; i < group.getChildCount(); i++) {
+            if (isInstanceOf(group.getChildAt(i), className)) {
+                return group.getChildAt(i);
+            }
+        }
+        return null;
+!!!76282935.java!!!	hasToolbar(inout collapsingToolbar : View) : boolean
+        if (!(collapsingToolbar instanceof ViewGroup)) {
+            return false;
+        }
+        ViewGroup group = (ViewGroup) collapsingToolbar;
+        for (int i = 0; i < group.getChildCount(); i++) {
+            if (isInstanceOf(group.getChildAt(i), DesignLibUtil.CN_TOOLBAR)) {
+                return true;
+            }
+        }
+        return false;
+!!!76283063.java!!!	handleScrolling(inout context : BridgeContext, inout view : View) : void
+        int scrollPosX = context.getScrollXPos(view);
+        int scrollPosY = context.getScrollYPos(view);
+        if (scrollPosX != 0 || scrollPosY != 0) {
+            if (view.isNestedScrollingEnabled()) {
+                int[] consumed = new int[2];
+                int axis = scrollPosX != 0 ? View.SCROLL_AXIS_HORIZONTAL : 0;
+                axis |= scrollPosY != 0 ? View.SCROLL_AXIS_VERTICAL : 0;
+                if (view.startNestedScroll(axis)) {
+                    view.dispatchNestedPreScroll(scrollPosX, scrollPosY, consumed, null);
+                    view.dispatchNestedScroll(consumed[0], consumed[1], scrollPosX, scrollPosY,
+                            null);
+                    view.stopNestedScroll();
+                    scrollPosX -= consumed[0];
+                    scrollPosY -= consumed[1];
+                }
+            }
+            if (scrollPosX != 0 || scrollPosY != 0) {
+                view.scrollTo(scrollPosX, scrollPosY);
+            }
+        }
+
+        if (!(view instanceof ViewGroup)) {
+            return;
+        }
+        ViewGroup group = (ViewGroup) view;
+        for (int i = 0; i < group.getChildCount(); i++) {
+            View child = group.getChildAt(i);
+            handleScrolling(context, child);
+        }
+!!!76283191.java!!!	setupTabHost(inout tabHost : TabHost, inout layoutlibCallback : LayoutlibCallback) : void
+        // look for the TabWidget, and the FrameLayout. They have their own specific names
+        View v = tabHost.findViewById(android.R.id.tabs);
+
+        if (v == null) {
+            throw new PostInflateException(
+                    "TabHost requires a TabWidget with id \"android:id/tabs\".\n");
+        }
+
+        if (!(v instanceof TabWidget)) {
+            throw new PostInflateException(String.format(
+                    "TabHost requires a TabWidget with id \"android:id/tabs\".\n" +
+                    "View found with id 'tabs' is '%s'", v.getClass().getCanonicalName()));
+        }
+
+        v = tabHost.findViewById(android.R.id.tabcontent);
+
+        if (v == null) {
+            // TODO: see if we can fake tabs even without the FrameLayout (same below when the frameLayout is empty)
+            //noinspection SpellCheckingInspection
+            throw new PostInflateException(
+                    "TabHost requires a FrameLayout with id \"android:id/tabcontent\".");
+        }
+
+        if (!(v instanceof FrameLayout)) {
+            //noinspection SpellCheckingInspection
+            throw new PostInflateException(String.format(
+                    "TabHost requires a FrameLayout with id \"android:id/tabcontent\".\n" +
+                    "View found with id 'tabcontent' is '%s'", v.getClass().getCanonicalName()));
+        }
+
+        FrameLayout content = (FrameLayout)v;
+
+        // now process the content of the frameLayout and dynamically create tabs for it.
+        final int count = content.getChildCount();
+
+        // this must be called before addTab() so that the TabHost searches its TabWidget
+        // and FrameLayout.
+        tabHost.setup();
+
+        if (count == 0) {
+            // Create a dummy child to get a single tab
+            TabSpec spec = tabHost.newTabSpec("tag")
+                    .setIndicator("Tab Label", tabHost.getResources()
+                            .getDrawable(android.R.drawable.ic_menu_info_details, null))
+                    .setContent(new TabHost.TabContentFactory() {
+                        @Override
+                        public View createTabContent(String tag) {
+                            return new LinearLayout(getContext());
+                        }
+                    });
+            tabHost.addTab(spec);
+        } else {
+            // for each child of the frameLayout, add a new TabSpec
+            for (int i = 0 ; i < count ; i++) {
+                View child = content.getChildAt(i);
+                String tabSpec = String.format("tab_spec%d", i+1);
+                @SuppressWarnings("ConstantConditions")  // child cannot be null.
+                int id = child.getId();
+                @SuppressWarnings("deprecation")
+                Pair<ResourceType, String> resource = layoutlibCallback.resolveResourceId(id);
+                String name;
+                if (resource != null) {
+                    name = resource.getSecond();
+                } else {
+                    name = String.format("Tab %d", i+1); // default name if id is unresolved.
+                }
+                tabHost.addTab(tabHost.newTabSpec(tabSpec).setIndicator(name).setContent(id));
+            }
+        }
+!!!76283319.java!!!	visit(inout view : View, in offset : int, inout setExtendedInfo : boolean, inout isContentFrame : boolean) : ViewInfo
+        ViewInfo result = createViewInfo(view, offset, setExtendedInfo, isContentFrame);
+
+        if (view instanceof ViewGroup) {
+            ViewGroup group = ((ViewGroup) view);
+            result.setChildren(visitAllChildren(group, isContentFrame ? 0 : offset,
+                    setExtendedInfo, isContentFrame));
+        }
+        return result;
+!!!76283447.java!!!	visitAllChildren(inout viewGroup : ViewGroup, in offset : int, inout setExtendedInfo : boolean, inout isContentFrame : boolean) : List<ViewInfo>
+        if (viewGroup == null) {
+            return null;
+        }
+
+        if (!isContentFrame) {
+            offset += viewGroup.getTop();
+        }
+
+        int childCount = viewGroup.getChildCount();
+        if (viewGroup == mContentRoot) {
+            List<ViewInfo> childrenWithoutOffset = new ArrayList<ViewInfo>(childCount);
+            List<ViewInfo> childrenWithOffset = new ArrayList<ViewInfo>(childCount);
+            for (int i = 0; i < childCount; i++) {
+                ViewInfo[] childViewInfo = visitContentRoot(viewGroup.getChildAt(i), offset,
+                        setExtendedInfo);
+                childrenWithoutOffset.add(childViewInfo[0]);
+                childrenWithOffset.add(childViewInfo[1]);
+            }
+            mViewInfoList = childrenWithOffset;
+            return childrenWithoutOffset;
+        } else {
+            List<ViewInfo> children = new ArrayList<ViewInfo>(childCount);
+            for (int i = 0; i < childCount; i++) {
+                children.add(visit(viewGroup.getChildAt(i), offset, setExtendedInfo,
+                        isContentFrame));
+            }
+            return children;
+        }
+!!!76283575.java!!!	visitContentRoot(inout view : View, in offset : int, inout setExtendedInfo : boolean) : ViewInfo
+        ViewInfo[] result = new ViewInfo[2];
+        if (view == null) {
+            return result;
+        }
+
+        result[0] = createViewInfo(view, 0, setExtendedInfo, true);
+        result[1] = createViewInfo(view, offset, setExtendedInfo, true);
+        if (view instanceof ViewGroup) {
+            List<ViewInfo> children = visitAllChildren((ViewGroup) view, 0, setExtendedInfo, true);
+            result[0].setChildren(children);
+            result[1].setChildren(children);
+        }
+        return result;
+!!!76283703.java!!!	createViewInfo(inout view : View, in offset : int, inout setExtendedInfo : boolean, inout isContentFrame : boolean) : ViewInfo
+        if (view == null) {
+            return null;
+        }
+
+        ViewParent parent = view.getParent();
+        ViewInfo result;
+        if (isContentFrame) {
+            // Account for parent scroll values when calculating the bounding box
+            int scrollX = parent != null ? ((View)parent).getScrollX() : 0;
+            int scrollY = parent != null ? ((View)parent).getScrollY() : 0;
+
+            // The view is part of the layout added by the user. Hence,
+            // the ViewCookie may be obtained only through the Context.
+            result = new ViewInfo(view.getClass().getName(),
+                    getContext().getViewKey(view),
+                    -scrollX + view.getLeft(), -scrollY + view.getTop() + offset,
+                    -scrollX + view.getRight(), -scrollY + view.getBottom() + offset,
+                    view, view.getLayoutParams());
+        } else {
+            // We are part of the system decor.
+            SystemViewInfo r = new SystemViewInfo(view.getClass().getName(),
+                    getViewKey(view),
+                    view.getLeft(), view.getTop(), view.getRight(),
+                    view.getBottom(), view, view.getLayoutParams());
+            result = r;
+            // We currently mark three kinds of views:
+            // 1. Menus in the Action Bar
+            // 2. Menus in the Overflow popup.
+            // 3. The overflow popup button.
+            if (view instanceof ListMenuItemView) {
+                // Mark 2.
+                // All menus in the popup are of type ListMenuItemView.
+                r.setViewType(ViewType.ACTION_BAR_OVERFLOW_MENU);
+            } else {
+                // Mark 3.
+                ViewGroup.LayoutParams lp = view.getLayoutParams();
+                if (lp instanceof ActionMenuView.LayoutParams &&
+                        ((ActionMenuView.LayoutParams) lp).isOverflowButton) {
+                    r.setViewType(ViewType.ACTION_BAR_OVERFLOW);
+                } else {
+                    // Mark 1.
+                    // A view is a menu in the Action Bar is it is not the overflow button and of
+                    // its parent is of type ActionMenuView. We can also check if the view is
+                    // instanceof ActionMenuItemView but that will fail for menus using
+                    // actionProviderClass.
+                    while (parent != mViewRoot && parent instanceof ViewGroup) {
+                        if (parent instanceof ActionMenuView) {
+                            r.setViewType(ViewType.ACTION_BAR_MENU);
+                            break;
+                        }
+                        parent = parent.getParent();
+                    }
+                }
+            }
+        }
+
+        if (setExtendedInfo) {
+            MarginLayoutParams marginParams = null;
+            LayoutParams params = view.getLayoutParams();
+            if (params instanceof MarginLayoutParams) {
+                marginParams = (MarginLayoutParams) params;
+            }
+            result.setExtendedInfo(view.getBaseline(),
+                    marginParams != null ? marginParams.leftMargin : 0,
+                    marginParams != null ? marginParams.topMargin : 0,
+                    marginParams != null ? marginParams.rightMargin : 0,
+                    marginParams != null ? marginParams.bottomMargin : 0);
+        }
+
+        return result;
+!!!76283831.java!!!	getViewKey(inout view : View) : Object
+        BridgeContext context = getContext();
+        if (!(view instanceof MenuView.ItemView)) {
+            return context.getViewKey(view);
+        }
+        MenuItemImpl menuItem;
+        if (view instanceof ActionMenuItemView) {
+            menuItem = ((ActionMenuItemView) view).getItemData();
+        } else if (view instanceof ListMenuItemView) {
+            menuItem = ((ListMenuItemView) view).getItemData();
+        } else if (view instanceof IconMenuItemView) {
+            menuItem = ((IconMenuItemView) view).getItemData();
+        } else {
+            menuItem = null;
+        }
+        if (menuItem instanceof BridgeMenuItemImpl) {
+            return ((BridgeMenuItemImpl) menuItem).getViewCookie();
+        }
+
+        return null;
+!!!76283959.java!!!	invalidateRenderingSize() : void
+        mMeasuredScreenWidth = mMeasuredScreenHeight = -1;
+!!!76284087.java!!!	getImage() : BufferedImage
+        return mImage;
+!!!76284215.java!!!	isAlphaChannelImage() : boolean
+        return mIsAlphaChannelImage;
+!!!76284343.java!!!	getViewInfos() : List<ViewInfo>
+        return mViewInfoList;
+!!!76284471.java!!!	getSystemViewInfos() : List<ViewInfo>
+        return mSystemViewInfoList;
+!!!76284599.java!!!	getDefaultProperties() : Object
+        return getContext().getDefaultProperties();
+!!!76284727.java!!!	setScene(inout session : RenderSession) : void
+        mScene = session;
+!!!76284855.java!!!	getSession() : RenderSession
+        return mScene;
+!!!76284983.java!!!	dispose() : void
+        boolean createdLooper = false;
+        if (Looper.myLooper() == null) {
+            // Detaching the root view from the window will try to stop any running animations.
+            // The stop method checks that it can run in the looper so, if there is no current
+            // looper, we create a temporary one to complete the shutdown.
+            Bridge.prepareThread();
+            createdLooper = true;
+        }
+        AttachInfo_Accessor.detachFromWindow(mViewRoot);
+        if (mCanvas != null) {
+            mCanvas.release();
+            mCanvas = null;
+        }
+        if (mViewInfoList != null) {
+            mViewInfoList.clear();
+        }
+        if (mSystemViewInfoList != null) {
+            mSystemViewInfoList.clear();
+        }
+        mImage = null;
+        mViewRoot = null;
+        mContentRoot = null;
+
+        if (createdLooper) {
+            Bridge.cleanupThread();
+            Choreographer_Delegate.dispose();
+        }

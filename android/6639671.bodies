@@ -1,0 +1,130 @@
+class NetlinkSocketObserver
+!!!74950327.java!!!	run() : void
+            if (VDBG) { Log.d(TAG, "Starting observing thread."); }
+            synchronized (mLock) { mRunning = true; }
+
+            try {
+                setupNetlinkSocket();
+            } catch (ErrnoException | SocketException e) {
+                Log.e(TAG, "Failed to suitably initialize a netlink socket", e);
+                synchronized (mLock) { mRunning = false; }
+            }
+
+            ByteBuffer byteBuffer;
+            while (stillRunning()) {
+                try {
+                    byteBuffer = recvKernelReply();
+                } catch (ErrnoException e) {
+                    if (stillRunning()) { Log.w(TAG, "ErrnoException: ", e); }
+                    break;
+                }
+                final long whenMs = SystemClock.elapsedRealtime();
+                if (byteBuffer == null) {
+                    continue;
+                }
+                parseNetlinkMessageBuffer(byteBuffer, whenMs);
+            }
+
+            clearNetlinkSocket();
+
+            synchronized (mLock) { mRunning = false; }
+            if (VDBG) { Log.d(TAG, "Finishing observing thread."); }
+!!!74950455.java!!!	clearNetlinkSocket() : void
+            if (mSocket != null) {
+                mSocket.close();
+            }
+!!!74950583.java!!!	setupNetlinkSocket() : void
+            clearNetlinkSocket();
+            mSocket = new NetlinkSocket(OsConstants.NETLINK_ROUTE);
+
+            final NetlinkSocketAddress listenAddr = new NetlinkSocketAddress(
+                    0, OsConstants.RTMGRP_NEIGH);
+            mSocket.bind(listenAddr);
+
+            if (VDBG) {
+                final NetlinkSocketAddress nlAddr = mSocket.getLocalAddress();
+                Log.d(TAG, "bound to sockaddr_nl{"
+                        + ((long) (nlAddr.getPortId() & 0xffffffff)) + ", "
+                        + nlAddr.getGroupsMask()
+                        + "}");
+            }
+!!!74950711.java!!!	recvKernelReply() : ByteBuffer
+            try {
+                return mSocket.recvMessage(0);
+            } catch (InterruptedIOException e) {
+                // Interruption or other error, e.g. another thread closed our file descriptor.
+            } catch (ErrnoException e) {
+                if (e.errno != OsConstants.EAGAIN) {
+                    throw e;
+                }
+            }
+            return null;
+!!!74950839.java!!!	parseNetlinkMessageBuffer(inout byteBuffer : ByteBuffer, in whenMs : long) : void
+            while (byteBuffer.remaining() > 0) {
+                final int position = byteBuffer.position();
+                final NetlinkMessage nlMsg = NetlinkMessage.parse(byteBuffer);
+                if (nlMsg == null || nlMsg.getHeader() == null) {
+                    byteBuffer.position(position);
+                    Log.e(TAG, "unparsable netlink msg: " + NetlinkConstants.hexify(byteBuffer));
+                    break;
+                }
+
+                final int srcPortId = nlMsg.getHeader().nlmsg_pid;
+                if (srcPortId !=  0) {
+                    Log.e(TAG, "non-kernel source portId: " + ((long) (srcPortId & 0xffffffff)));
+                    break;
+                }
+
+                if (nlMsg instanceof NetlinkErrorMessage) {
+                    Log.e(TAG, "netlink error: " + nlMsg);
+                    continue;
+                } else if (!(nlMsg instanceof RtNetlinkNeighborMessage)) {
+                    if (DBG) {
+                        Log.d(TAG, "non-rtnetlink neighbor msg: " + nlMsg);
+                    }
+                    continue;
+                }
+
+                evaluateRtNetlinkNeighborMessage((RtNetlinkNeighborMessage) nlMsg, whenMs);
+            }
+!!!74950967.java!!!	evaluateRtNetlinkNeighborMessage(inout neighMsg : RtNetlinkNeighborMessage, in whenMs : long) : void
+            final StructNdMsg ndMsg = neighMsg.getNdHeader();
+            if (ndMsg == null || ndMsg.ndm_ifindex != mInterfaceIndex) {
+                return;
+            }
+
+            final InetAddress destination = neighMsg.getDestination();
+            if (!isWatching(destination)) {
+                return;
+            }
+
+            final short msgType = neighMsg.getHeader().nlmsg_type;
+            final short nudState = ndMsg.ndm_state;
+            final String eventMsg = "NeighborEvent{"
+                    + "elapsedMs=" + whenMs + ", "
+                    + destination.getHostAddress() + ", "
+                    + "[" + NetlinkConstants.hexify(neighMsg.getLinkLayerAddress()) + "], "
+                    + NetlinkConstants.stringForNlMsgType(msgType) + ", "
+                    + StructNdMsg.stringForNudState(nudState)
+                    + "}";
+
+            if (VDBG) {
+                Log.d(TAG, neighMsg.toString());
+            } else if (DBG) {
+                Log.d(TAG, eventMsg);
+            }
+
+            synchronized (mLock) {
+                if (mIpWatchList.containsKey(destination)) {
+                    final short value =
+                            (msgType == NetlinkConstants.RTM_DELNEIGH)
+                            ? StructNdMsg.NUD_NONE
+                            : nudState;
+                    mIpWatchList.put(destination, value);
+                }
+            }
+
+            if (nudState == StructNdMsg.NUD_FAILED) {
+                Log.w(TAG, "ALERT: " + eventMsg);
+                handleNeighborLost(eventMsg);
+            }

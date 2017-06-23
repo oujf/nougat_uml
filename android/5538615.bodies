@@ -1,0 +1,189 @@
+class Batch
+!!!46904631.cpp!!!	Batch(inout group : CpuScriptGroup2Impl, in name : char)
+    mName = strndup(name, strlen(name));
+!!!46904759.cpp!!!	~Batch()
+    for (CPUClosure* c : mClosures) {
+        delete c;
+    }
+    free(mName);
+!!!46904887.cpp!!!	conflict(inout cpuClosure : CPUClosure) : bool
+    if (mClosures.empty()) {
+        return false;
+    }
+
+    const Closure* closure = cpuClosure->mClosure;
+
+    if (!closure->mIsKernel || !mClosures.front()->mClosure->mIsKernel) {
+        // An invoke should be in a batch by itself, so it conflicts with any other
+        // closure.
+        return true;
+    }
+
+    const auto& globalDeps = closure->mGlobalDeps;
+    const auto& argDeps = closure->mArgDeps;
+
+    for (CPUClosure* c : mClosures) {
+        const Closure* batched = c->mClosure;
+        if (globalDeps.find(batched) != globalDeps.end()) {
+            return true;
+        }
+        const auto& it = argDeps.find(batched);
+        if (it != argDeps.end()) {
+            const auto& args = (*it).second;
+            for (const auto &p1 : *args) {
+                if (p1.second.get() != nullptr) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    // The compiler fusion pass in bcc expects that kernels chained up through
+    // (1st) input and output.
+
+    const Closure* lastBatched = mClosures.back()->mClosure;
+    const auto& it = argDeps.find(lastBatched);
+
+    if (it == argDeps.end()) {
+        return true;
+    }
+
+    const auto& args = (*it).second;
+    for (const auto &p1 : *args) {
+        if (p1.first == 0 && p1.second.get() == nullptr) {
+            // The new closure depends on the last batched closure's return
+            // value (fieldId being nullptr) for its first argument (argument 0)
+            return false;
+        }
+    }
+
+    return true;
+!!!46905015.cpp!!!	resolveFuncPtr(inout sharedObj : void) : void
+    std::string funcName(mName);
+    if (mClosures.front()->mClosure->mIsKernel) {
+        funcName.append(".expand");
+    }
+    mFunc = dlsym(sharedObj, funcName.c_str());
+    rsAssert (mFunc != nullptr);
+!!!46905143.cpp!!!	setGlobalsForBatch() : void
+    for (CPUClosure* cpuClosure : mClosures) {
+        const Closure* closure = cpuClosure->mClosure;
+        const IDBase* funcID = closure->mFunctionID.get();
+        Script* s = funcID->mScript;;
+        for (const auto& p : closure->mGlobals) {
+            const int64_t value = p.second.first;
+            int size = p.second.second;
+            if (value == 0 && size == 0) {
+                // This indicates the current closure depends on another closure for a
+                // global in their shared module (script). In this case we don't need to
+                // copy the value. For example, an invoke intializes a global variable
+                // which a kernel later reads.
+                continue;
+            }
+            rsAssert(p.first != nullptr);
+            Script* script = p.first->mScript;
+            rsAssert(script == s);
+            RsdCpuReferenceImpl* ctxt = mGroup->getCpuRefImpl();
+            const RsdCpuScriptImpl *cpuScript =
+                    (const RsdCpuScriptImpl *)ctxt->lookupScript(script);
+            int slot = p.first->mSlot;
+            ScriptExecutable* exec = mGroup->getExecutable();
+            if (exec != nullptr) {
+                const char* varName = cpuScript->getFieldName(slot);
+                void* addr = exec->getFieldAddress(varName);
+                if (size < 0) {
+                    rsrSetObject(mGroup->getCpuRefImpl()->getContext(),
+                                 (rs_object_base*)addr, (ObjectBase*)value);
+                } else {
+                    memcpy(addr, (const void*)&value, size);
+                }
+            } else {
+                // We use -1 size to indicate an ObjectBase rather than a primitive type
+                if (size < 0) {
+                    s->setVarObj(slot, (ObjectBase*)value);
+                } else {
+                    s->setVar(slot, (const void*)&value, size);
+                }
+            }
+        }
+    }
+!!!46905271.cpp!!!	run() : void
+    if (!mClosures.front()->mClosure->mIsKernel) {
+        rsAssert(mClosures.size() == 1);
+
+        // This batch contains a single closure for an invoke function
+        CPUClosure* cc = mClosures.front();
+        const Closure* c = cc->mClosure;
+
+        if (mFunc != nullptr) {
+            // TODO: Need align pointers for x86_64.
+            // See RsdCpuScriptImpl::invokeFunction in rsCpuScript.cpp
+            ((InvokeFuncTy)mFunc)(c->mParams, c->mParamLength);
+        } else {
+            const ScriptInvokeID* invokeID = (const ScriptInvokeID*)c->mFunctionID.get();
+            rsAssert(invokeID != nullptr);
+            cc->mSi->invokeFunction(invokeID->mSlot, c->mParams, c->mParamLength);
+        }
+
+        return;
+    }
+
+    if (mFunc != nullptr) {
+        MTLaunchStructForEach mtls;
+        const CPUClosure* firstCpuClosure = mClosures.front();
+        const CPUClosure* lastCpuClosure = mClosures.back();
+
+        firstCpuClosure->mSi->forEachMtlsSetup(
+                (const Allocation**)firstCpuClosure->mClosure->mArgs,
+                firstCpuClosure->mClosure->mNumArg,
+                lastCpuClosure->mClosure->mReturnValue,
+                nullptr, 0, nullptr, &mtls);
+
+        mtls.script = nullptr;
+        mtls.fep.usr = nullptr;
+        mtls.kernel = (ForEachFunc_t)mFunc;
+
+        mGroup->getCpuRefImpl()->launchForEach(
+                (const Allocation**)firstCpuClosure->mClosure->mArgs,
+                firstCpuClosure->mClosure->mNumArg,
+                lastCpuClosure->mClosure->mReturnValue,
+                nullptr, &mtls);
+
+        return;
+    }
+
+    for (CPUClosure* cpuClosure : mClosures) {
+        const Closure* closure = cpuClosure->mClosure;
+        const ScriptKernelID* kernelID =
+                (const ScriptKernelID*)closure->mFunctionID.get();
+        cpuClosure->mSi->preLaunch(kernelID->mSlot,
+                                   (const Allocation**)closure->mArgs,
+                                   closure->mNumArg, closure->mReturnValue,
+                                   nullptr, 0, nullptr);
+    }
+
+    const CPUClosure* cpuClosure = mClosures.front();
+    const Closure* closure = cpuClosure->mClosure;
+    MTLaunchStructForEach mtls;
+
+    if (cpuClosure->mSi->forEachMtlsSetup((const Allocation**)closure->mArgs,
+                                          closure->mNumArg,
+                                          closure->mReturnValue,
+                                          nullptr, 0, nullptr, &mtls)) {
+
+        mtls.script = nullptr;
+        mtls.kernel = &groupRoot;
+        mtls.fep.usr = &mClosures;
+
+        mGroup->getCpuRefImpl()->launchForEach(nullptr, 0, nullptr, nullptr, &mtls);
+    }
+
+    for (CPUClosure* cpuClosure : mClosures) {
+        const Closure* closure = cpuClosure->mClosure;
+        const ScriptKernelID* kernelID =
+                (const ScriptKernelID*)closure->mFunctionID.get();
+        cpuClosure->mSi->postLaunch(kernelID->mSlot,
+                                    (const Allocation**)closure->mArgs,
+                                    closure->mNumArg, closure->mReturnValue,
+                                    nullptr, 0, nullptr);
+    }

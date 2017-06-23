@@ -1,0 +1,605 @@
+class SystemServicesProxy
+!!!71768759.java!!!	SystemServicesProxy(inout context : Context)
+        mAccm = AccessibilityManager.getInstance(context);
+        mAm = (ActivityManager) context.getSystemService(Context.ACTIVITY_SERVICE);
+        mIam = ActivityManagerNative.getDefault();
+        mPm = context.getPackageManager();
+        mIpm = AppGlobals.getPackageManager();
+        mAssistUtils = new AssistUtils(context);
+        mWm = (WindowManager) context.getSystemService(Context.WINDOW_SERVICE);
+        mUm = UserManager.get(context);
+        mDisplay = mWm.getDefaultDisplay();
+        mRecentsPackage = context.getPackageName();
+        mHasFreeformWorkspaceSupport =
+                mPm.hasSystemFeature(PackageManager.FEATURE_FREEFORM_WINDOW_MANAGEMENT) ||
+                        Settings.Global.getInt(context.getContentResolver(),
+                                DEVELOPMENT_ENABLE_FREEFORM_WINDOWS_SUPPORT, 0) != 0;
+        mIsSafeMode = mPm.isSafeMode();
+
+        // Get the dummy thumbnail width/heights
+        Resources res = context.getResources();
+        int wId = com.android.internal.R.dimen.thumbnail_width;
+        int hId = com.android.internal.R.dimen.thumbnail_height;
+        mDummyThumbnailWidth = res.getDimensionPixelSize(wId);
+        mDummyThumbnailHeight = res.getDimensionPixelSize(hId);
+
+        // Create the protection paints
+        mBgProtectionPaint = new Paint();
+        mBgProtectionPaint.setXfermode(new PorterDuffXfermode(PorterDuff.Mode.DST_ATOP));
+        mBgProtectionPaint.setColor(0xFFffffff);
+        mBgProtectionCanvas = new Canvas();
+
+        // Resolve the assist intent
+        mAssistComponent = mAssistUtils.getAssistComponentForUser(UserHandle.myUserId());
+
+        if (RecentsDebugFlags.Static.EnableMockTasks) {
+            // Create a dummy icon
+            mDummyIcon = Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888);
+            mDummyIcon.eraseColor(0xFF999999);
+        }
+
+        UiModeManager uiModeManager = (UiModeManager) context.
+                getSystemService(Context.UI_MODE_SERVICE);
+        if (uiModeManager.getCurrentModeType() == Configuration.UI_MODE_TYPE_TELEVISION) {
+            Collections.addAll(sRecentsBlacklist,
+                    res.getStringArray(R.array.recents_tv_blacklist_array));
+        }
+!!!71768887.java!!!	getInstance(inout context : Context) : SystemServicesProxy
+        if (!Looper.getMainLooper().isCurrentThread()) {
+            throw new RuntimeException("Must be called on the UI thread");
+        }
+        if (sSystemServicesProxy == null) {
+            sSystemServicesProxy = new SystemServicesProxy(context);
+        }
+        return sSystemServicesProxy;
+!!!71769015.java!!!	getRecentTasks(in numLatestTasks : int, in userId : int, inout includeFrontMostExcludedTask : boolean, inout quietProfileIds : ArraySet) : ActivityManager::RecentTaskInfo
+        if (mAm == null) return null;
+
+        // If we are mocking, then create some recent tasks
+        if (RecentsDebugFlags.Static.EnableMockTasks) {
+            ArrayList<ActivityManager.RecentTaskInfo> tasks =
+                    new ArrayList<ActivityManager.RecentTaskInfo>();
+            int count = Math.min(numLatestTasks, RecentsDebugFlags.Static.MockTaskCount);
+            for (int i = 0; i < count; i++) {
+                // Create a dummy component name
+                int packageIndex = i % RecentsDebugFlags.Static.MockTasksPackageCount;
+                ComponentName cn = new ComponentName("com.android.test" + packageIndex,
+                        "com.android.test" + i + ".Activity");
+                String description = "" + i + " - " +
+                        Long.toString(Math.abs(new Random().nextLong()), 36);
+                // Create the recent task info
+                ActivityManager.RecentTaskInfo rti = new ActivityManager.RecentTaskInfo();
+                rti.id = rti.persistentId = rti.affiliatedTaskId = i;
+                rti.baseIntent = new Intent();
+                rti.baseIntent.setComponent(cn);
+                rti.description = description;
+                rti.firstActiveTime = rti.lastActiveTime = i;
+                if (i % 2 == 0) {
+                    rti.taskDescription = new ActivityManager.TaskDescription(description,
+                        Bitmap.createBitmap(mDummyIcon), null,
+                        0xFF000000 | (0xFFFFFF & new Random().nextInt()),
+                        0xFF000000 | (0xFFFFFF & new Random().nextInt()));
+                } else {
+                    rti.taskDescription = new ActivityManager.TaskDescription();
+                }
+                tasks.add(rti);
+            }
+            return tasks;
+        }
+
+        // Remove home/recents/excluded tasks
+        int minNumTasksToQuery = 10;
+        int numTasksToQuery = Math.max(minNumTasksToQuery, numLatestTasks);
+        int flags = ActivityManager.RECENT_IGNORE_HOME_STACK_TASKS |
+                ActivityManager.RECENT_INGORE_DOCKED_STACK_TOP_TASK |
+                ActivityManager.RECENT_INGORE_PINNED_STACK_TASKS |
+                ActivityManager.RECENT_IGNORE_UNAVAILABLE |
+                ActivityManager.RECENT_INCLUDE_PROFILES;
+        if (includeFrontMostExcludedTask) {
+            flags |= ActivityManager.RECENT_WITH_EXCLUDED;
+        }
+        List<ActivityManager.RecentTaskInfo> tasks = null;
+        try {
+            tasks = mAm.getRecentTasksForUser(numTasksToQuery, flags, userId);
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to get recent tasks", e);
+        }
+
+        // Break early if we can't get a valid set of tasks
+        if (tasks == null) {
+            return new ArrayList<>();
+        }
+
+        boolean isFirstValidTask = true;
+        Iterator<ActivityManager.RecentTaskInfo> iter = tasks.iterator();
+        while (iter.hasNext()) {
+            ActivityManager.RecentTaskInfo t = iter.next();
+
+            // NOTE: The order of these checks happens in the expected order of the traversal of the
+            // tasks
+
+            // Remove the task if it or it's package are blacklsited
+            if (sRecentsBlacklist.contains(t.realActivity.getClassName()) ||
+                    sRecentsBlacklist.contains(t.realActivity.getPackageName())) {
+                iter.remove();
+                continue;
+            }
+
+            // Remove the task if it is marked as excluded, unless it is the first most task and we
+            // are requested to include it
+            boolean isExcluded = (t.baseIntent.getFlags() & Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS)
+                    == Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS;
+            isExcluded |= quietProfileIds.contains(t.userId);
+            if (isExcluded && (!isFirstValidTask || !includeFrontMostExcludedTask)) {
+                iter.remove();
+            }
+
+            isFirstValidTask = false;
+        }
+
+        return tasks.subList(0, Math.min(tasks.size(), numLatestTasks));
+!!!71769143.java!!!	getRunningTask() : ActivityManager::RunningTaskInfo
+        List<ActivityManager.RunningTaskInfo> tasks = mAm.getRunningTasks(1);
+        if (tasks != null && !tasks.isEmpty()) {
+            return tasks.get(0);
+        }
+        return null;
+!!!71769271.java!!!	isRecentsActivityVisible() : boolean
+        return isRecentsActivityVisible(null);
+!!!71769399.java!!!	isRecentsActivityVisible(inout isHomeStackVisible : MutableBoolean) : boolean
+        if (mIam == null) return false;
+
+        try {
+            ActivityManager.StackInfo stackInfo = mIam.getStackInfo(
+                    ActivityManager.StackId.HOME_STACK_ID);
+            ActivityManager.StackInfo fullscreenStackInfo = mIam.getStackInfo(
+                    ActivityManager.StackId.FULLSCREEN_WORKSPACE_STACK_ID);
+            ComponentName topActivity = stackInfo.topActivity;
+            boolean homeStackVisibleNotOccluded = stackInfo.visible;
+            if (fullscreenStackInfo != null) {
+                boolean isFullscreenStackOccludingHome = fullscreenStackInfo.visible &&
+                        fullscreenStackInfo.position > stackInfo.position;
+                homeStackVisibleNotOccluded &= !isFullscreenStackOccludingHome;
+            }
+            if (isHomeStackVisible != null) {
+                isHomeStackVisible.value = homeStackVisibleNotOccluded;
+            }
+            return (homeStackVisibleNotOccluded && topActivity != null
+                    && topActivity.getPackageName().equals(RecentsImpl.RECENTS_PACKAGE)
+                    && (topActivity.getClassName().equals(RecentsImpl.RECENTS_ACTIVITY)
+                        || topActivity.getClassName().equals(RecentsTvImpl.RECENTS_TV_ACTIVITY)));
+        } catch (RemoteException e) {
+            e.printStackTrace();
+        }
+        return false;
+!!!71769527.java!!!	hasFreeformWorkspaceSupport() : boolean
+        return mHasFreeformWorkspaceSupport;
+!!!71769655.java!!!	isInSafeMode() : boolean
+        return mIsSafeMode;
+!!!71769783.java!!!	startTaskInDockedMode(in taskId : int, in createMode : int) : boolean
+        if (mIam == null) return false;
+
+        try {
+            final ActivityOptions options = ActivityOptions.makeBasic();
+            options.setDockCreateMode(createMode);
+            options.setLaunchStackId(DOCKED_STACK_ID);
+            mIam.startActivityFromRecents(taskId, options.toBundle());
+            return true;
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to dock task: " + taskId + " with createMode: " + createMode, e);
+        }
+        return false;
+!!!71769911.java!!!	moveTaskToDockedStack(in taskId : int, in createMode : int, inout initialBounds : Rect) : boolean
+        if (mIam == null) {
+            return false;
+        }
+
+        try {
+            return mIam.moveTaskToDockedStack(taskId, createMode, true /* onTop */,
+                    false /* animate */, initialBounds, true /* moveHomeStackFront */ );
+        } catch (RemoteException e) {
+            e.printStackTrace();
+        }
+        return false;
+!!!71770039.java!!!	isHomeStack(in stackId : int) : boolean
+        return stackId == HOME_STACK_ID;
+!!!71770167.java!!!	isPinnedStack(in stackId : int) : boolean
+        return stackId == PINNED_STACK_ID;
+!!!71770295.java!!!	isDockedStack(in stackId : int) : boolean
+        return stackId == DOCKED_STACK_ID;
+!!!71770423.java!!!	isFreeformStack(in stackId : int) : boolean
+        return stackId == FREEFORM_WORKSPACE_STACK_ID;
+!!!71770551.java!!!	hasDockedTask() : boolean
+        if (mIam == null) return false;
+
+        ActivityManager.StackInfo stackInfo = null;
+        try {
+            stackInfo = mIam.getStackInfo(DOCKED_STACK_ID);
+        } catch (RemoteException e) {
+            e.printStackTrace();
+        }
+
+        if (stackInfo != null) {
+            int userId = getCurrentUser();
+            boolean hasUserTask = false;
+            for (int i = stackInfo.taskUserIds.length - 1; i >= 0 && !hasUserTask; i--) {
+                hasUserTask = (stackInfo.taskUserIds[i] == userId);
+            }
+            return hasUserTask;
+        }
+        return false;
+!!!71770679.java!!!	hasSoftNavigationBar() : boolean
+        try {
+            return WindowManagerGlobal.getWindowManagerService().hasNavigationBar();
+        } catch (RemoteException e) {
+            e.printStackTrace();
+        }
+        return false;
+!!!71770807.java!!!	hasTransposedNavigationBar() : boolean
+        Rect insets = new Rect();
+        getStableInsets(insets);
+        return insets.right > 0;
+!!!71770935.java!!!	cancelWindowTransition(in taskId : int) : void
+        if (mWm == null) return;
+
+        try {
+            WindowManagerGlobal.getWindowManagerService().cancelTaskWindowTransition(taskId);
+        } catch (RemoteException e) {
+            e.printStackTrace();
+        }
+!!!71771063.java!!!	cancelThumbnailTransition(in taskId : int) : void
+        if (mWm == null) return;
+
+        try {
+            WindowManagerGlobal.getWindowManagerService().cancelTaskThumbnailTransition(taskId);
+        } catch (RemoteException e) {
+            e.printStackTrace();
+        }
+!!!71771191.java!!!	getTaskThumbnail(in taskId : int) : ThumbnailData
+        if (mAm == null) return null;
+        ThumbnailData thumbnailData = new ThumbnailData();
+
+        // If we are mocking, then just return a dummy thumbnail
+        if (RecentsDebugFlags.Static.EnableMockTasks) {
+            thumbnailData.thumbnail = Bitmap.createBitmap(mDummyThumbnailWidth,
+                    mDummyThumbnailHeight, Bitmap.Config.ARGB_8888);
+            thumbnailData.thumbnail.eraseColor(0xff333333);
+            return thumbnailData;
+        }
+
+        getThumbnail(taskId, thumbnailData);
+        if (thumbnailData.thumbnail != null) {
+            thumbnailData.thumbnail.setHasAlpha(false);
+            // We use a dumb heuristic for now, if the thumbnail is purely transparent in the top
+            // left pixel, then assume the whole thumbnail is transparent. Generally, proper
+            // screenshots are always composed onto a bitmap that has no alpha.
+            if (Color.alpha(thumbnailData.thumbnail.getPixel(0, 0)) == 0) {
+                mBgProtectionCanvas.setBitmap(thumbnailData.thumbnail);
+                mBgProtectionCanvas.drawRect(0, 0, thumbnailData.thumbnail.getWidth(),
+                        thumbnailData.thumbnail.getHeight(), mBgProtectionPaint);
+                mBgProtectionCanvas.setBitmap(null);
+                Log.e(TAG, "Invalid screenshot detected from getTaskThumbnail()");
+            }
+        }
+        return thumbnailData;
+!!!71771319.java!!!	getThumbnail(in taskId : int, inout thumbnailDataOut : ThumbnailData) : void
+        if (mAm == null) {
+            return;
+        }
+
+        ActivityManager.TaskThumbnail taskThumbnail = mAm.getTaskThumbnail(taskId);
+        if (taskThumbnail == null) {
+            return;
+        }
+
+        Bitmap thumbnail = taskThumbnail.mainThumbnail;
+        ParcelFileDescriptor descriptor = taskThumbnail.thumbnailFileDescriptor;
+        if (thumbnail == null && descriptor != null) {
+            thumbnail = BitmapFactory.decodeFileDescriptor(descriptor.getFileDescriptor(),
+                    null, sBitmapOptions);
+        }
+        if (descriptor != null) {
+            try {
+                descriptor.close();
+            } catch (IOException e) {
+            }
+        }
+        thumbnailDataOut.thumbnail = thumbnail;
+        thumbnailDataOut.thumbnailInfo = taskThumbnail.thumbnailInfo;
+!!!71771447.java!!!	moveTaskToStack(in taskId : int, in stackId : int) : void
+        if (mIam == null) return;
+
+        try {
+            mIam.positionTaskInStack(taskId, stackId, 0);
+        } catch (RemoteException | IllegalArgumentException e) {
+            e.printStackTrace();
+        }
+!!!71771575.java!!!	removeTask(in taskId : int) : void
+        if (mAm == null) return;
+        if (RecentsDebugFlags.Static.EnableMockTasks) return;
+
+        // Remove the task.
+        BackgroundThread.getHandler().post(new Runnable() {
+            @Override
+            public void run() {
+                mAm.removeTask(taskId);
+            }
+        });
+!!!71771703.java!!!	sendCloseSystemWindows(inout reason : String) : void
+        if (ActivityManagerNative.isSystemReady()) {
+            try {
+                mIam.closeSystemDialogs(reason);
+            } catch (RemoteException e) {
+            }
+        }
+!!!71771831.java!!!	getActivityInfo(inout cn : ComponentName, in userId : int) : ActivityInfo
+        if (mIpm == null) return null;
+        if (RecentsDebugFlags.Static.EnableMockTasks) return new ActivityInfo();
+
+        try {
+            return mIpm.getActivityInfo(cn, PackageManager.GET_META_DATA, userId);
+        } catch (RemoteException e) {
+            e.printStackTrace();
+            return null;
+        }
+!!!71771959.java!!!	getActivityInfo(inout cn : ComponentName) : ActivityInfo
+        if (mPm == null) return null;
+        if (RecentsDebugFlags.Static.EnableMockTasks) return new ActivityInfo();
+
+        try {
+            return mPm.getActivityInfo(cn, PackageManager.GET_META_DATA);
+        } catch (PackageManager.NameNotFoundException e) {
+            e.printStackTrace();
+            return null;
+        }
+!!!71772087.java!!!	getBadgedActivityLabel(inout info : ActivityInfo, in userId : int) : String
+        if (mPm == null) return null;
+
+        // If we are mocking, then return a mock label
+        if (RecentsDebugFlags.Static.EnableMockTasks) {
+            return "Recent Task: " + userId;
+        }
+
+        return getBadgedLabel(info.loadLabel(mPm).toString(), userId);
+!!!71772215.java!!!	getBadgedApplicationLabel(inout appInfo : ApplicationInfo, in userId : int) : String
+        if (mPm == null) return null;
+
+        // If we are mocking, then return a mock label
+        if (RecentsDebugFlags.Static.EnableMockTasks) {
+            return "Recent Task App: " + userId;
+        }
+
+        return getBadgedLabel(appInfo.loadLabel(mPm).toString(), userId);
+!!!71772343.java!!!	getBadgedContentDescription(inout info : ActivityInfo, in userId : int, inout res : Resources) : String
+        // If we are mocking, then return a mock label
+        if (RecentsDebugFlags.Static.EnableMockTasks) {
+            return "Recent Task Content Description: " + userId;
+        }
+
+        String activityLabel = info.loadLabel(mPm).toString();
+        String applicationLabel = info.applicationInfo.loadLabel(mPm).toString();
+        String badgedApplicationLabel = getBadgedLabel(applicationLabel, userId);
+        return applicationLabel.equals(activityLabel) ? badgedApplicationLabel
+                : res.getString(R.string.accessibility_recents_task_header,
+                        badgedApplicationLabel, activityLabel);
+!!!71772471.java!!!	getBadgedActivityIcon(inout info : ActivityInfo, in userId : int) : Drawable
+        if (mPm == null) return null;
+
+        // If we are mocking, then return a mock label
+        if (RecentsDebugFlags.Static.EnableMockTasks) {
+            return new ColorDrawable(0xFF666666);
+        }
+
+        Drawable icon = info.loadIcon(mPm);
+        return getBadgedIcon(icon, userId);
+!!!71772599.java!!!	getBadgedApplicationIcon(inout appInfo : ApplicationInfo, in userId : int) : Drawable
+        if (mPm == null) return null;
+
+        // If we are mocking, then return a mock label
+        if (RecentsDebugFlags.Static.EnableMockTasks) {
+            return new ColorDrawable(0xFF666666);
+        }
+
+        Drawable icon = appInfo.loadIcon(mPm);
+        return getBadgedIcon(icon, userId);
+!!!71772727.java!!!	getBadgedTaskDescriptionIcon(inout taskDescription : ActivityManager::TaskDescription, in userId : int, inout res : Resources) : Drawable
+
+        // If we are mocking, then return a mock label
+        if (RecentsDebugFlags.Static.EnableMockTasks) {
+            return new ColorDrawable(0xFF666666);
+        }
+
+        Bitmap tdIcon = taskDescription.getInMemoryIcon();
+        if (tdIcon == null) {
+            tdIcon = ActivityManager.TaskDescription.loadTaskDescriptionIcon(
+                    taskDescription.getIconFilename(), userId);
+        }
+        if (tdIcon != null) {
+            return getBadgedIcon(new BitmapDrawable(res, tdIcon), userId);
+        }
+        return null;
+!!!71772855.java!!!	getBadgedIcon(inout icon : Drawable, in userId : int) : Drawable
+        if (userId != UserHandle.myUserId()) {
+            icon = mPm.getUserBadgedIcon(icon, new UserHandle(userId));
+        }
+        return icon;
+!!!71772983.java!!!	getActivityBanner(inout info : ActivityInfo) : Drawable
+        if (mPm == null) return null;
+
+        // If we are mocking, then return a mock banner
+        if (RecentsDebugFlags.Static.EnableMockTasks) {
+            return new ColorDrawable(0xFF666666);
+        }
+
+        Drawable banner = info.loadBanner(mPm);
+        return banner;
+!!!71773111.java!!!	getActivityLogo(inout info : ActivityInfo) : Drawable
+        if (mPm == null) return null;
+
+        // If we are mocking, then return a mock logo
+        if (RecentsDebugFlags.Static.EnableMockTasks) {
+            return new ColorDrawable(0xFF666666);
+        }
+
+        Drawable logo = info.loadLogo(mPm);
+        return logo;
+!!!71773239.java!!!	getBadgedLabel(inout label : String, in userId : int) : String
+        if (userId != UserHandle.myUserId()) {
+            label = mPm.getUserBadgedLabel(label, new UserHandle(userId)).toString();
+        }
+        return label;
+!!!71773367.java!!!	getHomeActivityPackageName() : String
+        if (mPm == null) return null;
+        if (RecentsDebugFlags.Static.EnableMockTasks) return null;
+
+        ArrayList<ResolveInfo> homeActivities = new ArrayList<>();
+        ComponentName defaultHomeActivity = mPm.getHomeActivities(homeActivities);
+        if (defaultHomeActivity != null) {
+            return defaultHomeActivity.getPackageName();
+        } else if (homeActivities.size() == 1) {
+            ResolveInfo info = homeActivities.get(0);
+            if (info.activityInfo != null) {
+                return info.activityInfo.packageName;
+            }
+        }
+        return null;
+!!!71773495.java!!!	isSystemUser(in userId : int) : boolean
+        return userId == UserHandle.USER_SYSTEM;
+!!!71773623.java!!!	getCurrentUser() : int
+        if (mAm == null) return 0;
+
+        return mAm.getCurrentUser();
+!!!71773751.java!!!	getProcessUser() : int
+        if (mUm == null) return 0;
+        return mUm.getUserHandle();
+!!!71773879.java!!!	isTouchExplorationEnabled() : boolean
+        if (mAccm == null) return false;
+
+        return mAccm.isEnabled() && mAccm.isTouchExplorationEnabled();
+!!!71774007.java!!!	isScreenPinningActive() : boolean
+        if (mIam == null) return false;
+
+        try {
+            return mIam.isInLockTaskMode();
+        } catch (RemoteException e) {
+            return false;
+        }
+!!!71774135.java!!!	getGlobalSetting(inout context : Context, inout setting : String) : int
+        ContentResolver cr = context.getContentResolver();
+        return Settings.Global.getInt(cr, setting, 0);
+!!!71774263.java!!!	getSystemSetting(inout context : Context, inout setting : String) : int
+        ContentResolver cr = context.getContentResolver();
+        return Settings.System.getInt(cr, setting, 0);
+!!!71774391.java!!!	getSystemProperty(inout key : String) : String
+        return SystemProperties.get(key);
+!!!71774519.java!!!	getDeviceSmallestWidth() : int
+        if (mDisplay == null) return 0;
+
+        Point smallestSizeRange = new Point();
+        Point largestSizeRange = new Point();
+        mDisplay.getCurrentSizeRange(smallestSizeRange, largestSizeRange);
+        return smallestSizeRange.x;
+!!!71774647.java!!!	getDisplayRect() : Rect
+        Rect displayRect = new Rect();
+        if (mDisplay == null) return displayRect;
+
+        Point p = new Point();
+        mDisplay.getRealSize(p);
+        displayRect.set(0, 0, p.x, p.y);
+        return displayRect;
+!!!71774775.java!!!	getWindowRect() : Rect
+        Rect windowRect = new Rect();
+        if (mIam == null) return windowRect;
+
+        try {
+            // Use the home stack bounds
+            ActivityManager.StackInfo stackInfo = mIam.getStackInfo(HOME_STACK_ID);
+            if (stackInfo != null) {
+                windowRect.set(stackInfo.bounds);
+            }
+        } catch (RemoteException e) {
+            e.printStackTrace();
+        } finally {
+            return windowRect;
+        }
+!!!71774903.java!!!	startActivityFromRecents(inout context : Context, inout taskKey : Task::TaskKey, inout taskName : String, inout options : ActivityOptions) : boolean
+        if (mIam != null) {
+            try {
+                if (taskKey.stackId == DOCKED_STACK_ID) {
+                    // We show non-visible docked tasks in Recents, but we always want to launch
+                    // them in the fullscreen stack.
+                    if (options == null) {
+                        options = ActivityOptions.makeBasic();
+                    }
+                    options.setLaunchStackId(FULLSCREEN_WORKSPACE_STACK_ID);
+                }
+                mIam.startActivityFromRecents(
+                        taskKey.id, options == null ? null : options.toBundle());
+                return true;
+            } catch (Exception e) {
+                Log.e(TAG, context.getString(R.string.recents_launch_error_message, taskName), e);
+            }
+        }
+        return false;
+!!!71775031.java!!!	startInPlaceAnimationOnFrontMostApplication(inout opts : ActivityOptions) : void
+        if (mIam == null) return;
+
+        try {
+            mIam.startInPlaceAnimationOnFrontMostApplication(opts);
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+!!!71775159.java!!!	registerTaskStackListener(inout listener : SystemServicesProxy::TaskStackListener) : void
+        if (mIam == null) return;
+
+        mTaskStackListeners.add(listener);
+        if (mTaskStackListeners.size() == 1) {
+            // Register mTaskStackListener to IActivityManager only once if needed.
+            try {
+                mIam.registerTaskStackListener(mTaskStackListener);
+            } catch (Exception e) {
+                Log.w(TAG, "Failed to call registerTaskStackListener", e);
+            }
+        }
+!!!71775287.java!!!	endProlongedAnimations() : void
+        if (mWm == null) {
+            return;
+        }
+        try {
+            WindowManagerGlobal.getWindowManagerService().endProlongedAnimations();
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+!!!71775415.java!!!	registerDockedStackListener(inout listener : IDockedStackListener) : void
+        if (mWm == null) return;
+
+        try {
+            WindowManagerGlobal.getWindowManagerService().registerDockedStackListener(listener);
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+!!!71775543.java!!!	getDockedDividerSize(inout context : Context) : int
+        Resources res = context.getResources();
+        int dividerWindowWidth = res.getDimensionPixelSize(
+                com.android.internal.R.dimen.docked_stack_divider_thickness);
+        int dividerInsets = res.getDimensionPixelSize(
+                com.android.internal.R.dimen.docked_stack_divider_insets);
+        return dividerWindowWidth - 2 * dividerInsets;
+!!!71775671.java!!!	requestKeyboardShortcuts(inout context : Context, inout receiver : WindowManager::KeyboardShortcutsReceiver, in deviceId : int) : void
+        mWm.requestAppKeyboardShortcuts(receiver, deviceId);
+!!!71775799.java!!!	getStableInsets(inout outStableInsets : Rect) : void
+        if (mWm == null) return;
+
+        try {
+            WindowManagerGlobal.getWindowManagerService().getStableInsets(outStableInsets);
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+!!!71775927.java!!!	overridePendingAppTransitionMultiThumbFuture(inout future : IAppTransitionAnimationSpecsFuture, inout animStartedListener : IRemoteCallback, inout scaleUp : boolean) : void
+        try {
+            WindowManagerGlobal.getWindowManagerService()
+                    .overridePendingAppTransitionMultiThumbFuture(future, animStartedListener,
+                            scaleUp);
+        } catch (RemoteException e) {
+            Log.w(TAG, "Failed to override transition: " + e);
+        }

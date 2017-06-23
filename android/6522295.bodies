@@ -1,0 +1,337 @@
+class VolumeStreamState
+!!!73583927.java!!!	VolumeStreamState(inout settingName : String, in streamType : int)
+
+            mVolumeIndexSettingName = settingName;
+
+            mStreamType = streamType;
+            mIndexMin = MIN_STREAM_VOLUME[streamType] * 10;
+            mIndexMax = MAX_STREAM_VOLUME[streamType] * 10;
+            AudioSystem.initStreamVolume(streamType, mIndexMin / 10, mIndexMax / 10);
+
+            readSettings();
+            mVolumeChanged = new Intent(AudioManager.VOLUME_CHANGED_ACTION);
+            mVolumeChanged.putExtra(AudioManager.EXTRA_VOLUME_STREAM_TYPE, mStreamType);
+            mStreamDevicesChanged = new Intent(AudioManager.STREAM_DEVICES_CHANGED_ACTION);
+            mStreamDevicesChanged.putExtra(AudioManager.EXTRA_VOLUME_STREAM_TYPE, mStreamType);
+!!!73584055.java!!!	observeDevicesForStream_syncVSS(inout checkOthers : boolean) : int
+            final int devices = AudioSystem.getDevicesForStream(mStreamType);
+            if (devices == mObservedDevices) {
+                return devices;
+            }
+            final int prevDevices = mObservedDevices;
+            mObservedDevices = devices;
+            if (checkOthers) {
+                // one stream's devices have changed, check the others
+                observeDevicesForStreams(mStreamType);
+            }
+            // log base stream changes to the event log
+            if (mStreamVolumeAlias[mStreamType] == mStreamType) {
+                EventLogTags.writeStreamDevicesChanged(mStreamType, prevDevices, devices);
+            }
+            sendBroadcastToAll(mStreamDevicesChanged
+                    .putExtra(AudioManager.EXTRA_PREV_VOLUME_STREAM_DEVICES, prevDevices)
+                    .putExtra(AudioManager.EXTRA_VOLUME_STREAM_DEVICES, devices));
+            return devices;
+!!!73584183.java!!!	getSettingNameForDevice(in device : int) : String
+            String name = mVolumeIndexSettingName;
+            String suffix = AudioSystem.getOutputDeviceName(device);
+            if (suffix.isEmpty()) {
+                return name;
+            }
+            return name + "_" + suffix;
+!!!73584311.java!!!	readSettings() : void
+            synchronized (VolumeStreamState.class) {
+                // force maximum volume on all streams if fixed volume property is set
+                if (mUseFixedVolume) {
+                    mIndexMap.put(AudioSystem.DEVICE_OUT_DEFAULT, mIndexMax);
+                    return;
+                }
+                // do not read system stream volume from settings: this stream is always aliased
+                // to another stream type and its volume is never persisted. Values in settings can
+                // only be stale values
+                if ((mStreamType == AudioSystem.STREAM_SYSTEM) ||
+                        (mStreamType == AudioSystem.STREAM_SYSTEM_ENFORCED)) {
+                    int index = 10 * AudioSystem.DEFAULT_STREAM_VOLUME[mStreamType];
+                    synchronized (mCameraSoundForced) {
+                        if (mCameraSoundForced) {
+                            index = mIndexMax;
+                        }
+                    }
+                    mIndexMap.put(AudioSystem.DEVICE_OUT_DEFAULT, index);
+                    return;
+                }
+
+                int remainingDevices = AudioSystem.DEVICE_OUT_ALL;
+
+                for (int i = 0; remainingDevices != 0; i++) {
+                    int device = (1 << i);
+                    if ((device & remainingDevices) == 0) {
+                        continue;
+                    }
+                    remainingDevices &= ~device;
+
+                    // retrieve current volume for device
+                    String name = getSettingNameForDevice(device);
+                    // if no volume stored for current stream and device, use default volume if default
+                    // device, continue otherwise
+                    int defaultIndex = (device == AudioSystem.DEVICE_OUT_DEFAULT) ?
+                            AudioSystem.DEFAULT_STREAM_VOLUME[mStreamType] : -1;
+                    int index = Settings.System.getIntForUser(
+                            mContentResolver, name, defaultIndex, UserHandle.USER_CURRENT);
+                    if (index == -1) {
+                        continue;
+                    }
+
+                    mIndexMap.put(device, getValidIndex(10 * index));
+                }
+            }
+!!!73584439.java!!!	getAbsoluteVolumeIndex(in index : int) : int
+            /* Special handling for Bluetooth Absolute Volume scenario
+             * If we send full audio gain, some accessories are too loud even at its lowest
+             * volume. We are not able to enumerate all such accessories, so here is the
+             * workaround from phone side.
+             * Pre-scale volume at lowest volume steps 1 2 and 3.
+             * For volume step 0, set audio gain to 0 as some accessories won't mute on their end.
+             */
+            if (index == 0) {
+                // 0% for volume 0
+                index = 0;
+            } else if (index == 1) {
+                // 50% for volume 1
+                index = (int)(mIndexMax * 0.5) /10;
+            } else if (index == 2) {
+                // 70% for volume 2
+                index = (int)(mIndexMax * 0.70) /10;
+            } else if (index == 3) {
+                // 85% for volume 3
+                index = (int)(mIndexMax * 0.85) /10;
+            } else {
+                // otherwise, full gain
+                index = (mIndexMax + 5)/10;
+            }
+            return index;
+!!!73584567.java!!!	applyDeviceVolume_syncVSS(in device : int) : void
+            int index;
+            if (mIsMuted) {
+                index = 0;
+            } else if ((device & AudioSystem.DEVICE_OUT_ALL_A2DP) != 0 && mAvrcpAbsVolSupported) {
+                index = getAbsoluteVolumeIndex((getIndex(device) + 5)/10);
+            } else if ((device & mFullVolumeDevices) != 0) {
+                index = (mIndexMax + 5)/10;
+            } else {
+                index = (getIndex(device) + 5)/10;
+            }
+            AudioSystem.setStreamVolumeIndex(mStreamType, index, device);
+!!!73584695.java!!!	applyAllVolumes() : void
+            synchronized (VolumeStreamState.class) {
+                // apply device specific volumes first
+                int index;
+                for (int i = 0; i < mIndexMap.size(); i++) {
+                    final int device = mIndexMap.keyAt(i);
+                    if (device != AudioSystem.DEVICE_OUT_DEFAULT) {
+                        if (mIsMuted) {
+                            index = 0;
+                        } else if ((device & AudioSystem.DEVICE_OUT_ALL_A2DP) != 0 &&
+                                mAvrcpAbsVolSupported) {
+                            index = getAbsoluteVolumeIndex((getIndex(device) + 5)/10);
+                        } else if ((device & mFullVolumeDevices) != 0) {
+                            index = (mIndexMax + 5)/10;
+                        } else {
+                            index = (mIndexMap.valueAt(i) + 5)/10;
+                        }
+                        AudioSystem.setStreamVolumeIndex(mStreamType, index, device);
+                    }
+                }
+                // apply default volume last: by convention , default device volume will be used
+                // by audio policy manager if no explicit volume is present for a given device type
+                if (mIsMuted) {
+                    index = 0;
+                } else {
+                    index = (getIndex(AudioSystem.DEVICE_OUT_DEFAULT) + 5)/10;
+                }
+                AudioSystem.setStreamVolumeIndex(
+                        mStreamType, index, AudioSystem.DEVICE_OUT_DEFAULT);
+            }
+!!!73584823.java!!!	adjustIndex(in deltaIndex : int, in device : int, inout caller : String) : boolean
+            return setIndex(getIndex(device) + deltaIndex, device, caller);
+!!!73584951.java!!!	setIndex(in index : int, in device : int, inout caller : String) : boolean
+            boolean changed = false;
+            int oldIndex;
+            synchronized (VolumeStreamState.class) {
+                oldIndex = getIndex(device);
+                index = getValidIndex(index);
+                synchronized (mCameraSoundForced) {
+                    if ((mStreamType == AudioSystem.STREAM_SYSTEM_ENFORCED) && mCameraSoundForced) {
+                        index = mIndexMax;
+                    }
+                }
+                mIndexMap.put(device, index);
+
+                changed = oldIndex != index;
+                if (changed) {
+                    // Apply change to all streams using this one as alias
+                    // if changing volume of current device, also change volume of current
+                    // device on aliased stream
+                    boolean currentDevice = (device == getDeviceForStream(mStreamType));
+                    int numStreamTypes = AudioSystem.getNumStreamTypes();
+                    for (int streamType = numStreamTypes - 1; streamType >= 0; streamType--) {
+                        if (streamType != mStreamType &&
+                                mStreamVolumeAlias[streamType] == mStreamType) {
+                            int scaledIndex = rescaleIndex(index, mStreamType, streamType);
+                            mStreamStates[streamType].setIndex(scaledIndex, device, caller);
+                            if (currentDevice) {
+                                mStreamStates[streamType].setIndex(scaledIndex,
+                                        getDeviceForStream(streamType), caller);
+                            }
+                        }
+                    }
+                }
+            }
+            if (changed) {
+                oldIndex = (oldIndex + 5) / 10;
+                index = (index + 5) / 10;
+                // log base stream changes to the event log
+                if (mStreamVolumeAlias[mStreamType] == mStreamType) {
+                    if (caller == null) {
+                        Log.w(TAG, "No caller for volume_changed event", new Throwable());
+                    }
+                    EventLogTags.writeVolumeChanged(mStreamType, oldIndex, index, mIndexMax / 10,
+                            caller);
+                }
+                // fire changed intents for all streams
+                mVolumeChanged.putExtra(AudioManager.EXTRA_VOLUME_STREAM_VALUE, index);
+                mVolumeChanged.putExtra(AudioManager.EXTRA_PREV_VOLUME_STREAM_VALUE, oldIndex);
+                mVolumeChanged.putExtra(AudioManager.EXTRA_VOLUME_STREAM_TYPE_ALIAS,
+                        mStreamVolumeAlias[mStreamType]);
+                sendBroadcastToAll(mVolumeChanged);
+            }
+            return changed;
+!!!73585079.java!!!	getIndex(in device : int) : int
+            synchronized (VolumeStreamState.class) {
+                int index = mIndexMap.get(device, -1);
+                if (index == -1) {
+                    // there is always an entry for AudioSystem.DEVICE_OUT_DEFAULT
+                    index = mIndexMap.get(AudioSystem.DEVICE_OUT_DEFAULT);
+                }
+                return index;
+            }
+!!!73585207.java!!!	getMaxIndex() : int
+            return mIndexMax;
+!!!73585335.java!!!	getMinIndex() : int
+            return mIndexMin;
+!!!73585463.java!!!	setAllIndexes(inout srcStream : AudioService::VolumeStreamState, inout caller : String) : void
+            synchronized (VolumeStreamState.class) {
+                int srcStreamType = srcStream.getStreamType();
+                // apply default device volume from source stream to all devices first in case
+                // some devices are present in this stream state but not in source stream state
+                int index = srcStream.getIndex(AudioSystem.DEVICE_OUT_DEFAULT);
+                index = rescaleIndex(index, srcStreamType, mStreamType);
+                for (int i = 0; i < mIndexMap.size(); i++) {
+                    mIndexMap.put(mIndexMap.keyAt(i), index);
+                }
+                // Now apply actual volume for devices in source stream state
+                SparseIntArray srcMap = srcStream.mIndexMap;
+                for (int i = 0; i < srcMap.size(); i++) {
+                    int device = srcMap.keyAt(i);
+                    index = srcMap.valueAt(i);
+                    index = rescaleIndex(index, srcStreamType, mStreamType);
+
+                    setIndex(index, device, caller);
+                }
+            }
+!!!73585591.java!!!	setAllIndexesToMax() : void
+            synchronized (VolumeStreamState.class) {
+                for (int i = 0; i < mIndexMap.size(); i++) {
+                    mIndexMap.put(mIndexMap.keyAt(i), mIndexMax);
+                }
+            }
+!!!73585719.java!!!	mute(inout state : boolean) : void
+            boolean changed = false;
+            synchronized (VolumeStreamState.class) {
+                if (state != mIsMuted) {
+                    changed = true;
+                    mIsMuted = state;
+
+                    // Set the new mute volume. This propagates the values to
+                    // the audio system, otherwise the volume won't be changed
+                    // at the lower level.
+                    sendMsg(mAudioHandler,
+                            MSG_SET_ALL_VOLUMES,
+                            SENDMSG_QUEUE,
+                            0,
+                            0,
+                            this, 0);
+                }
+            }
+            if (changed) {
+                // Stream mute changed, fire the intent.
+                Intent intent = new Intent(AudioManager.STREAM_MUTE_CHANGED_ACTION);
+                intent.putExtra(AudioManager.EXTRA_VOLUME_STREAM_TYPE, mStreamType);
+                intent.putExtra(AudioManager.EXTRA_STREAM_VOLUME_MUTED, state);
+                sendBroadcastToAll(intent);
+            }
+!!!73585847.java!!!	getStreamType() : int
+            return mStreamType;
+!!!73585975.java!!!	checkFixedVolumeDevices() : void
+            synchronized (VolumeStreamState.class) {
+                // ignore settings for fixed volume devices: volume should always be at max or 0
+                if (mStreamVolumeAlias[mStreamType] == AudioSystem.STREAM_MUSIC) {
+                    for (int i = 0; i < mIndexMap.size(); i++) {
+                        int device = mIndexMap.keyAt(i);
+                        int index = mIndexMap.valueAt(i);
+                        if (((device & mFullVolumeDevices) != 0)
+                                || (((device & mFixedVolumeDevices) != 0) && index != 0)) {
+                            mIndexMap.put(device, mIndexMax);
+                        }
+                        applyDeviceVolume_syncVSS(device);
+                    }
+                }
+            }
+!!!73586103.java!!!	getValidIndex(in index : int) : int
+            if (index < mIndexMin) {
+                return mIndexMin;
+            } else if (mUseFixedVolume || index > mIndexMax) {
+                return mIndexMax;
+            }
+
+            return index;
+!!!73586231.java!!!	dump(inout pw : PrintWriter) : void
+            pw.print("   Muted: ");
+            pw.println(mIsMuted);
+            pw.print("   Min: ");
+            pw.println((mIndexMin + 5) / 10);
+            pw.print("   Max: ");
+            pw.println((mIndexMax + 5) / 10);
+            pw.print("   Current: ");
+            for (int i = 0; i < mIndexMap.size(); i++) {
+                if (i > 0) {
+                    pw.print(", ");
+                }
+                final int device = mIndexMap.keyAt(i);
+                pw.print(Integer.toHexString(device));
+                final String deviceName = device == AudioSystem.DEVICE_OUT_DEFAULT ? "default"
+                        : AudioSystem.getOutputDeviceName(device);
+                if (!deviceName.isEmpty()) {
+                    pw.print(" (");
+                    pw.print(deviceName);
+                    pw.print(")");
+                }
+                pw.print(": ");
+                final int index = (mIndexMap.valueAt(i) + 5) / 10;
+                pw.print(index);
+            }
+            pw.println();
+            pw.print("   Devices: ");
+            final int devices = getDevicesForStream(mStreamType);
+            int device, i = 0, n = 0;
+            // iterate all devices from 1 to DEVICE_OUT_DEFAULT exclusive
+            // (the default device is not returned by getDevicesForStream)
+            while ((device = 1 << i) != AudioSystem.DEVICE_OUT_DEFAULT) {
+                if ((devices & device) != 0) {
+                    if (n++ > 0) {
+                        pw.print(", ");
+                    }
+                    pw.print(AudioSystem.getOutputDeviceName(device));
+                }
+                i++;
+            }

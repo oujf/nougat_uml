@@ -1,0 +1,167 @@
+class Blob
+!!!43283255.cpp!!!	Blob(in value : uint8_t, in valueLength : size_t, in info : uint8_t, in infoLength : uint8_t, in type : BlobType)
+    memset(&mBlob, 0, sizeof(mBlob));
+    if (valueLength > VALUE_SIZE) {
+        valueLength = VALUE_SIZE;
+        ALOGW("Provided blob length too large");
+    }
+    if (infoLength + valueLength > VALUE_SIZE) {
+        infoLength = VALUE_SIZE - valueLength;
+        ALOGW("Provided info length too large");
+    }
+    mBlob.length = valueLength;
+    memcpy(mBlob.value, value, valueLength);
+
+    mBlob.info = infoLength;
+    memcpy(mBlob.value + valueLength, info, infoLength);
+
+    mBlob.version = CURRENT_BLOB_VERSION;
+    mBlob.type = uint8_t(type);
+
+    if (type == TYPE_MASTER_KEY) {
+        mBlob.flags = KEYSTORE_FLAG_ENCRYPTED;
+    } else {
+        mBlob.flags = KEYSTORE_FLAG_NONE;
+    }
+!!!43283383.cpp!!!	Blob(in b : blob)
+    mBlob = b;
+!!!43283511.cpp!!!	Blob()
+    memset(&mBlob, 0, sizeof(mBlob));
+!!!43284279.cpp!!!	isEncrypted() : bool
+    if (mBlob.version < 2) {
+        return true;
+    }
+
+    return mBlob.flags & KEYSTORE_FLAG_ENCRYPTED;
+!!!43284407.cpp!!!	setEncrypted(in encrypted : bool) : void
+    if (encrypted) {
+        mBlob.flags |= KEYSTORE_FLAG_ENCRYPTED;
+    } else {
+        mBlob.flags &= ~KEYSTORE_FLAG_ENCRYPTED;
+    }
+!!!43284663.cpp!!!	setFallback(in fallback : bool) : void
+    if (fallback) {
+        mBlob.flags |= KEYSTORE_FLAG_FALLBACK;
+    } else {
+        mBlob.flags &= ~KEYSTORE_FLAG_FALLBACK;
+    }
+!!!43285175.cpp!!!	writeBlob(in filename : char, inout aes_key : AES_KEY, in state : State, inout entropy : Entropy) : ResponseCode
+    ALOGV("writing blob %s", filename);
+    if (isEncrypted()) {
+        if (state != STATE_NO_ERROR) {
+            ALOGD("couldn't insert encrypted blob while not unlocked");
+            return LOCKED;
+        }
+
+        if (!entropy->generate_random_data(mBlob.vector, AES_BLOCK_SIZE)) {
+            ALOGW("Could not read random data for: %s", filename);
+            return SYSTEM_ERROR;
+        }
+    }
+
+    // data includes the value and the value's length
+    size_t dataLength = mBlob.length + sizeof(mBlob.length);
+    // pad data to the AES_BLOCK_SIZE
+    size_t digestedLength = ((dataLength + AES_BLOCK_SIZE - 1) / AES_BLOCK_SIZE * AES_BLOCK_SIZE);
+    // encrypted data includes the digest value
+    size_t encryptedLength = digestedLength + MD5_DIGEST_LENGTH;
+    // move info after space for padding
+    memmove(&mBlob.encrypted[encryptedLength], &mBlob.value[mBlob.length], mBlob.info);
+    // zero padding area
+    memset(mBlob.value + mBlob.length, 0, digestedLength - dataLength);
+
+    mBlob.length = htonl(mBlob.length);
+
+    if (isEncrypted()) {
+        MD5(mBlob.digested, digestedLength, mBlob.digest);
+
+        uint8_t vector[AES_BLOCK_SIZE];
+        memcpy(vector, mBlob.vector, AES_BLOCK_SIZE);
+        AES_cbc_encrypt(mBlob.encrypted, mBlob.encrypted, encryptedLength, aes_key, vector,
+                        AES_ENCRYPT);
+    }
+
+    size_t headerLength = (mBlob.encrypted - (uint8_t*)&mBlob);
+    size_t fileLength = encryptedLength + headerLength + mBlob.info;
+
+    const char* tmpFileName = ".tmp";
+    int out =
+        TEMP_FAILURE_RETRY(open(tmpFileName, O_WRONLY | O_TRUNC | O_CREAT, S_IRUSR | S_IWUSR));
+    if (out < 0) {
+        ALOGW("could not open file: %s: %s", tmpFileName, strerror(errno));
+        return SYSTEM_ERROR;
+    }
+    size_t writtenBytes = writeFully(out, (uint8_t*)&mBlob, fileLength);
+    if (close(out) != 0) {
+        return SYSTEM_ERROR;
+    }
+    if (writtenBytes != fileLength) {
+        ALOGW("blob not fully written %zu != %zu", writtenBytes, fileLength);
+        unlink(tmpFileName);
+        return SYSTEM_ERROR;
+    }
+    if (rename(tmpFileName, filename) == -1) {
+        ALOGW("could not rename blob to %s: %s", filename, strerror(errno));
+        return SYSTEM_ERROR;
+    }
+    return NO_ERROR;
+!!!43285303.cpp!!!	readBlob(in filename : char, inout aes_key : AES_KEY, in state : State) : ResponseCode
+    ALOGV("reading blob %s", filename);
+    int in = TEMP_FAILURE_RETRY(open(filename, O_RDONLY));
+    if (in < 0) {
+        return (errno == ENOENT) ? KEY_NOT_FOUND : SYSTEM_ERROR;
+    }
+    // fileLength may be less than sizeof(mBlob) since the in
+    // memory version has extra padding to tolerate rounding up to
+    // the AES_BLOCK_SIZE
+    size_t fileLength = readFully(in, (uint8_t*)&mBlob, sizeof(mBlob));
+    if (close(in) != 0) {
+        return SYSTEM_ERROR;
+    }
+
+    if (fileLength == 0) {
+        return VALUE_CORRUPTED;
+    }
+
+    if (isEncrypted() && (state != STATE_NO_ERROR)) {
+        return LOCKED;
+    }
+
+    size_t headerLength = (mBlob.encrypted - (uint8_t*)&mBlob);
+    if (fileLength < headerLength) {
+        return VALUE_CORRUPTED;
+    }
+
+    ssize_t encryptedLength = fileLength - (headerLength + mBlob.info);
+    if (encryptedLength < 0) {
+        return VALUE_CORRUPTED;
+    }
+
+    ssize_t digestedLength;
+    if (isEncrypted()) {
+        if (encryptedLength % AES_BLOCK_SIZE != 0) {
+            return VALUE_CORRUPTED;
+        }
+
+        AES_cbc_encrypt(mBlob.encrypted, mBlob.encrypted, encryptedLength, aes_key, mBlob.vector,
+                        AES_DECRYPT);
+        digestedLength = encryptedLength - MD5_DIGEST_LENGTH;
+        uint8_t computedDigest[MD5_DIGEST_LENGTH];
+        MD5(mBlob.digested, digestedLength, computedDigest);
+        if (memcmp(mBlob.digest, computedDigest, MD5_DIGEST_LENGTH) != 0) {
+            return VALUE_CORRUPTED;
+        }
+    } else {
+        digestedLength = encryptedLength;
+    }
+
+    ssize_t maxValueLength = digestedLength - sizeof(mBlob.length);
+    mBlob.length = ntohl(mBlob.length);
+    if (mBlob.length < 0 || mBlob.length > maxValueLength) {
+        return VALUE_CORRUPTED;
+    }
+    if (mBlob.info != 0) {
+        // move info from after padding to after data
+        memmove(&mBlob.value[mBlob.length], &mBlob.value[maxValueLength], mBlob.info);
+    }
+    return ::NO_ERROR;

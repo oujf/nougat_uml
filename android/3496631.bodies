@@ -1,0 +1,245 @@
+class ReadoutThread
+!!!43953463.cpp!!!	~ReadoutThread()
+    for (List<Request>::iterator i = mInFlightQueue.begin();
+         i != mInFlightQueue.end(); i++) {
+        delete i->buffers;
+        delete i->sensorBuffers;
+    }
+!!!43953591.cpp!!!	queueCaptureRequest(in r : EmulatedFakeCamera3::ReadoutThread::Request) : void
+    Mutex::Autolock l(mLock);
+
+    mInFlightQueue.push_back(r);
+    mInFlightSignal.signal();
+!!!43953719.cpp!!!	isIdle() : bool
+    Mutex::Autolock l(mLock);
+    return mInFlightQueue.empty() && !mThreadActive;
+!!!43953847.cpp!!!	waitForReadout() : status_t
+    status_t res;
+    Mutex::Autolock l(mLock);
+    int loopCount = 0;
+    while (mInFlightQueue.size() >= kMaxQueueSize) {
+        res = mInFlightSignal.waitRelative(mLock, kWaitPerLoop);
+        if (res != OK && res != TIMED_OUT) {
+            ALOGE("%s: Error waiting for in-flight queue to shrink",
+                    __FUNCTION__);
+            return INVALID_OPERATION;
+        }
+        if (loopCount == kMaxWaitLoops) {
+            ALOGE("%s: Timed out waiting for in-flight queue to shrink",
+                    __FUNCTION__);
+            return TIMED_OUT;
+        }
+        loopCount++;
+    }
+    return OK;
+!!!43953975.cpp!!!	threadLoop() : bool
+    status_t res;
+
+    ALOGVV("%s: ReadoutThread waiting for request", __FUNCTION__);
+
+    // First wait for a request from the in-flight queue
+
+    if (mCurrentRequest.settings.isEmpty()) {
+        Mutex::Autolock l(mLock);
+        if (mInFlightQueue.empty()) {
+            res = mInFlightSignal.waitRelative(mLock, kWaitPerLoop);
+            if (res == TIMED_OUT) {
+                ALOGVV("%s: ReadoutThread: Timed out waiting for request",
+                        __FUNCTION__);
+                return true;
+            } else if (res != NO_ERROR) {
+                ALOGE("%s: Error waiting for capture requests: %d",
+                        __FUNCTION__, res);
+                return false;
+            }
+        }
+        mCurrentRequest.frameNumber = mInFlightQueue.begin()->frameNumber;
+        mCurrentRequest.settings.acquire(mInFlightQueue.begin()->settings);
+        mCurrentRequest.buffers = mInFlightQueue.begin()->buffers;
+        mCurrentRequest.sensorBuffers = mInFlightQueue.begin()->sensorBuffers;
+        mInFlightQueue.erase(mInFlightQueue.begin());
+        mInFlightSignal.signal();
+        mThreadActive = true;
+        ALOGVV("%s: Beginning readout of frame %d", __FUNCTION__,
+                mCurrentRequest.frameNumber);
+    }
+
+    // Then wait for it to be delivered from the sensor
+    ALOGVV("%s: ReadoutThread: Wait for frame to be delivered from sensor",
+            __FUNCTION__);
+
+    nsecs_t captureTime;
+    bool gotFrame =
+            mParent->mSensor->waitForNewFrame(kWaitPerLoop, &captureTime);
+    if (!gotFrame) {
+        ALOGVV("%s: ReadoutThread: Timed out waiting for sensor frame",
+                __FUNCTION__);
+        return true;
+    }
+
+    ALOGVV("Sensor done with readout for frame %d, captured at %lld ",
+            mCurrentRequest.frameNumber, captureTime);
+
+    // Check if we need to JPEG encode a buffer, and send it for async
+    // compression if so. Otherwise prepare the buffer for return.
+    bool needJpeg = false;
+    HalBufferVector::iterator buf = mCurrentRequest.buffers->begin();
+    while(buf != mCurrentRequest.buffers->end()) {
+        bool goodBuffer = true;
+        if ( buf->stream->format ==
+                HAL_PIXEL_FORMAT_BLOB && buf->stream->data_space != HAL_DATASPACE_DEPTH) {
+            Mutex::Autolock jl(mJpegLock);
+            if (mJpegWaiting) {
+                // This shouldn't happen, because processCaptureRequest should
+                // be stalling until JPEG compressor is free.
+                ALOGE("%s: Already processing a JPEG!", __FUNCTION__);
+                goodBuffer = false;
+            }
+            if (goodBuffer) {
+                // Compressor takes ownership of sensorBuffers here
+                res = mParent->mJpegCompressor->start(mCurrentRequest.sensorBuffers,
+                        this);
+                goodBuffer = (res == OK);
+            }
+            if (goodBuffer) {
+                needJpeg = true;
+
+                mJpegHalBuffer = *buf;
+                mJpegFrameNumber = mCurrentRequest.frameNumber;
+                mJpegWaiting = true;
+
+                mCurrentRequest.sensorBuffers = NULL;
+                buf = mCurrentRequest.buffers->erase(buf);
+
+                continue;
+            }
+            ALOGE("%s: Error compressing output buffer: %s (%d)",
+                        __FUNCTION__, strerror(-res), res);
+            // fallthrough for cleanup
+        }
+        GraphicBufferMapper::get().unlock(*(buf->buffer));
+
+        buf->status = goodBuffer ? CAMERA3_BUFFER_STATUS_OK :
+                CAMERA3_BUFFER_STATUS_ERROR;
+        buf->acquire_fence = -1;
+        buf->release_fence = -1;
+
+        ++buf;
+    } // end while
+
+    // Construct result for all completed buffers and results
+
+    camera3_capture_result result;
+
+    if (mParent->hasCapability(BACKWARD_COMPATIBLE)) {
+        static const uint8_t sceneFlicker = ANDROID_STATISTICS_SCENE_FLICKER_NONE;
+        mCurrentRequest.settings.update(ANDROID_STATISTICS_SCENE_FLICKER,
+                &sceneFlicker, 1);
+
+        static const uint8_t flashState = ANDROID_FLASH_STATE_UNAVAILABLE;
+        mCurrentRequest.settings.update(ANDROID_FLASH_STATE,
+                &flashState, 1);
+
+        nsecs_t rollingShutterSkew = Sensor::kFrameDurationRange[0];
+        mCurrentRequest.settings.update(ANDROID_SENSOR_ROLLING_SHUTTER_SKEW,
+                &rollingShutterSkew, 1);
+
+        float focusRange[] = { 1.0f/5.0f, 0 }; // 5 m to infinity in focus
+        mCurrentRequest.settings.update(ANDROID_LENS_FOCUS_RANGE,
+                focusRange, sizeof(focusRange)/sizeof(float));
+    }
+
+    if (mParent->hasCapability(DEPTH_OUTPUT)) {
+        camera_metadata_entry_t entry;
+
+        find_camera_metadata_entry(mParent->mCameraInfo, ANDROID_LENS_POSE_TRANSLATION, &entry);
+        mCurrentRequest.settings.update(ANDROID_LENS_POSE_TRANSLATION,
+                entry.data.f, entry.count);
+
+        find_camera_metadata_entry(mParent->mCameraInfo, ANDROID_LENS_POSE_ROTATION, &entry);
+        mCurrentRequest.settings.update(ANDROID_LENS_POSE_ROTATION,
+                entry.data.f, entry.count);
+
+        find_camera_metadata_entry(mParent->mCameraInfo, ANDROID_LENS_INTRINSIC_CALIBRATION, &entry);
+        mCurrentRequest.settings.update(ANDROID_LENS_INTRINSIC_CALIBRATION,
+                entry.data.f, entry.count);
+
+        find_camera_metadata_entry(mParent->mCameraInfo, ANDROID_LENS_RADIAL_DISTORTION, &entry);
+        mCurrentRequest.settings.update(ANDROID_LENS_RADIAL_DISTORTION,
+                entry.data.f, entry.count);
+    }
+
+    mCurrentRequest.settings.update(ANDROID_SENSOR_TIMESTAMP,
+            &captureTime, 1);
+
+
+    // JPEGs take a stage longer
+    const uint8_t pipelineDepth = needJpeg ? kMaxBufferCount : kMaxBufferCount - 1;
+    mCurrentRequest.settings.update(ANDROID_REQUEST_PIPELINE_DEPTH,
+            &pipelineDepth, 1);
+
+    result.frame_number = mCurrentRequest.frameNumber;
+    result.result = mCurrentRequest.settings.getAndLock();
+    result.num_output_buffers = mCurrentRequest.buffers->size();
+    result.output_buffers = mCurrentRequest.buffers->array();
+    result.input_buffer = nullptr;
+    result.partial_result = 1;
+
+    // Go idle if queue is empty, before sending result
+    bool signalIdle = false;
+    {
+        Mutex::Autolock l(mLock);
+        if (mInFlightQueue.empty()) {
+            mThreadActive = false;
+            signalIdle = true;
+        }
+    }
+    if (signalIdle) mParent->signalReadoutIdle();
+
+    // Send it off to the framework
+    ALOGVV("%s: ReadoutThread: Send result to framework",
+            __FUNCTION__);
+    mParent->sendCaptureResult(&result);
+
+    // Clean up
+    mCurrentRequest.settings.unlock(result.result);
+
+    delete mCurrentRequest.buffers;
+    mCurrentRequest.buffers = NULL;
+    if (!needJpeg) {
+        delete mCurrentRequest.sensorBuffers;
+        mCurrentRequest.sensorBuffers = NULL;
+    }
+    mCurrentRequest.settings.clear();
+
+    return true;
+!!!43954103.cpp!!!	onJpegDone(in jpegBuffer : StreamBuffer, in success : bool) : void
+    Mutex::Autolock jl(mJpegLock);
+
+    GraphicBufferMapper::get().unlock(*(jpegBuffer.buffer));
+
+    mJpegHalBuffer.status = success ?
+            CAMERA3_BUFFER_STATUS_OK : CAMERA3_BUFFER_STATUS_ERROR;
+    mJpegHalBuffer.acquire_fence = -1;
+    mJpegHalBuffer.release_fence = -1;
+    mJpegWaiting = false;
+
+    camera3_capture_result result;
+    result.frame_number = mJpegFrameNumber;
+    result.result = NULL;
+    result.num_output_buffers = 1;
+    result.output_buffers = &mJpegHalBuffer;
+
+    if (!success) {
+        ALOGE("%s: Compression failure, returning error state buffer to"
+                " framework", __FUNCTION__);
+    } else {
+        ALOGV("%s: Compression complete, returning buffer to framework",
+                __FUNCTION__);
+    }
+
+    mParent->sendCaptureResult(&result);
+!!!43954231.cpp!!!	onJpegInputDone(in inputBuffer : StreamBuffer) : void
+    // Should never get here, since the input buffer has to be returned
+    // by end of processCaptureRequest
+    ALOGE("%s: Unexpected input buffer from JPEG compressor!", __FUNCTION__);

@@ -1,0 +1,195 @@
+class AsyncRenderer
+!!!71219895.java!!!	AsyncRenderer(inout context : Context)
+            mContext = context;
+
+            ActivityManager activityManager = (ActivityManager)
+                    mContext.getSystemService(Context.ACTIVITY_SERVICE);
+            final int cacheSizeInBytes = activityManager.getMemoryClass() * BYTES_PER_MEGABYTE / 4;
+            mPageContentCache = new PageContentLruCache(cacheSizeInBytes);
+!!!71220023.java!!!	onServiceConnected(inout name : ComponentName, inout service : IBinder) : void
+            synchronized (mLock) {
+                mRenderer = IPdfRenderer.Stub.asInterface(service);
+                mLock.notifyAll();
+            }
+!!!71220151.java!!!	onServiceDisconnected(inout name : ComponentName) : void
+            synchronized (mLock) {
+                mRenderer = null;
+            }
+!!!71220279.java!!!	open(inout source : ParcelFileDescriptor, inout callback : OpenDocumentCallback) : void
+            // Opening a new document invalidates the cache as it has pages
+            // from the last document. We keep the cache even when the document
+            // is closed to show pages while the other side is writing the new
+            // document.
+            mPageContentCache.invalidate();
+
+            mOpenTask = new OpenTask(source, callback);
+            mOpenTask.executeOnExecutor(AsyncTask.SERIAL_EXECUTOR);
+!!!71220407.java!!!	close(in callback : Runnable) : void
+            cancelAllRendering();
+
+            if (mOpenTask != null) {
+                mOpenTask.cancel();
+            }
+
+            new AsyncTask<Void, Void, Void>() {
+                @Override
+                protected void onPreExecute() {
+                    if (mDestroyed) {
+                        cancel(true);
+                        return;
+                    }
+                }
+
+                @Override
+                protected Void doInBackground(Void... params) {
+                    synchronized (mLock) {
+                        try {
+                            if (mRenderer != null) {
+                                mRenderer.closeDocument();
+                            }
+                        } catch (RemoteException re) {
+                            /* ignore */
+                        }
+                    }
+                    return null;
+                }
+
+                @Override
+                public void onPostExecute(Void result) {
+                    mPageCount = PrintDocumentInfo.PAGE_COUNT_UNKNOWN;
+                    if (callback != null) {
+                        callback.run();
+                    }
+                }
+            }.executeOnExecutor(AsyncTask.SERIAL_EXECUTOR);
+!!!71220535.java!!!	destroy() : void
+            if (mBoundToService) {
+                mBoundToService = false;
+                try {
+                    mContext.unbindService(AsyncRenderer.this);
+                } catch (IllegalArgumentException e) {
+                    // Service might have been forcefully unbound in onDestroy()
+                    Log.e(LOG_TAG, "Cannot unbind service", e);
+                }
+            }
+
+            mPageContentCache.invalidate();
+            mPageContentCache.clear();
+            mDestroyed = true;
+!!!71220663.java!!!	startPreload(in firstShownPage : int, in lastShownPage : int, inout renderSpec : PageContentRepository::RenderSpec) : void
+            if (DEBUG) {
+                Log.i(LOG_TAG, "Preloading pages around [" + firstShownPage
+                        + "-" + lastShownPage + "]");
+            }
+
+            final int bitmapSizeInBytes = renderSpec.bitmapWidth * renderSpec.bitmapHeight
+                    * BYTES_PER_PIXEL;
+            final int maxCachedPageCount = mPageContentCache.getMaxSizeInBytes()
+                    / bitmapSizeInBytes;
+            final int halfPreloadCount = (maxCachedPageCount
+                    - (lastShownPage - firstShownPage)) / 2 - 1;
+
+            final int excessFromStart;
+            if (firstShownPage - halfPreloadCount < 0) {
+                excessFromStart = halfPreloadCount - firstShownPage;
+            } else {
+                excessFromStart = 0;
+            }
+
+            final int excessFromEnd;
+            if (lastShownPage + halfPreloadCount >= mPageCount) {
+                excessFromEnd = (lastShownPage + halfPreloadCount) - mPageCount;
+            } else {
+                excessFromEnd = 0;
+            }
+
+            final int fromIndex = Math.max(firstShownPage - halfPreloadCount - excessFromEnd, 0);
+            final int toIndex = Math.min(lastShownPage + halfPreloadCount + excessFromStart,
+                    mPageCount - 1);
+
+            for (int i = fromIndex; i <= toIndex; i++) {
+                renderPage(i, renderSpec, null);
+            }
+!!!71220791.java!!!	stopPreload() : void
+            final int taskCount = mPageToRenderTaskMap.size();
+            for (int i = 0; i < taskCount; i++) {
+                RenderPageTask task = mPageToRenderTaskMap.valueAt(i);
+                if (task.isPreload() && !task.isCancelled()) {
+                    task.cancel(true);
+                }
+            }
+!!!71220919.java!!!	getPageCount() : int
+            return mPageCount;
+!!!71221047.java!!!	getCachedPage(in pageIndex : int, inout renderSpec : PageContentRepository::RenderSpec, inout callback : PageContentRepository::OnPageContentAvailableCallback) : void
+            RenderedPage renderedPage = mPageContentCache.getRenderedPage(pageIndex);
+            if (renderedPage != null && renderedPage.state == RenderedPage.STATE_RENDERED
+                    && renderedPage.renderSpec.equals(renderSpec)) {
+                if (DEBUG) {
+                    Log.i(LOG_TAG, "Cache hit for page: " + pageIndex);
+                }
+
+                // Announce if needed.
+                if (callback != null) {
+                    callback.onPageContentAvailable(renderedPage.content);
+                }
+            }
+!!!71221175.java!!!	renderPage(in pageIndex : int, inout renderSpec : PageContentRepository::RenderSpec, inout callback : PageContentRepository::OnPageContentAvailableCallback) : void
+            // First, check if we have a rendered page for this index.
+            RenderedPage renderedPage = mPageContentCache.getRenderedPage(pageIndex);
+            if (renderedPage != null && renderedPage.state == RenderedPage.STATE_RENDERED) {
+                // If we have rendered page with same constraints - done.
+                if (renderedPage.renderSpec.equals(renderSpec)) {
+                    if (DEBUG) {
+                        Log.i(LOG_TAG, "Cache hit for page: " + pageIndex);
+                    }
+
+                    // Announce if needed.
+                    if (callback != null) {
+                        callback.onPageContentAvailable(renderedPage.content);
+                    }
+                    return;
+                } else {
+                    // If the constraints changed, mark the page obsolete.
+                    renderedPage.state = RenderedPage.STATE_SCRAP;
+                }
+            }
+
+            // Next, check if rendering this page is scheduled.
+            RenderPageTask renderTask = mPageToRenderTaskMap.get(pageIndex);
+            if (renderTask != null && !renderTask.isCancelled()) {
+                // If not rendered and constraints same....
+                if (renderTask.mRenderSpec.equals(renderSpec)) {
+                    if (renderTask.mCallback != null) {
+                        // If someone else is already waiting for this page - bad state.
+                        if (callback != null && renderTask.mCallback != callback) {
+                            throw new IllegalStateException("Page rendering not cancelled");
+                        }
+                    } else {
+                        // No callback means we are preloading so just let the argument
+                        // callback be attached to our work in progress.
+                        renderTask.mCallback = callback;
+                    }
+                    return;
+                } else {
+                    // If not rendered and constraints changed - cancel rendering.
+                    renderTask.cancel(true);
+                }
+            }
+
+            // Oh well, we will have work to do...
+            renderTask = new RenderPageTask(pageIndex, renderSpec, callback);
+            mPageToRenderTaskMap.put(pageIndex, renderTask);
+            renderTask.executeOnExecutor(AsyncTask.SERIAL_EXECUTOR);
+!!!71221303.java!!!	cancelRendering(in pageIndex : int) : void
+            RenderPageTask task = mPageToRenderTaskMap.get(pageIndex);
+            if (task != null && !task.isCancelled()) {
+                task.cancel(true);
+            }
+!!!71221431.java!!!	cancelAllRendering() : void
+            final int taskCount = mPageToRenderTaskMap.size();
+            for (int i = 0; i < taskCount; i++) {
+                RenderPageTask task = mPageToRenderTaskMap.valueAt(i);
+                if (!task.isCancelled()) {
+                    task.cancel(true);
+                }
+            }

@@ -1,0 +1,517 @@
+class VirtualDisplaySurface
+!!!40991927.cpp!!!	VirtualDisplaySurface(inout hwc : HWComposer, in dispId : int32_t, in sink : sp<IGraphicBufferProducer>, in bqProducer : sp<IGraphicBufferProducer>, in bqConsumer : sp<IGraphicBufferConsumer>, in name : String8)
+    mSource[SOURCE_SINK] = sink;
+    mSource[SOURCE_SCRATCH] = bqProducer;
+
+    resetPerFrameState();
+
+    int sinkWidth, sinkHeight;
+    sink->query(NATIVE_WINDOW_WIDTH, &sinkWidth);
+    sink->query(NATIVE_WINDOW_HEIGHT, &sinkHeight);
+    mSinkBufferWidth = sinkWidth;
+    mSinkBufferHeight = sinkHeight;
+
+    // Pick the buffer format to request from the sink when not rendering to it
+    // with GLES. If the consumer needs CPU access, use the default format
+    // set by the consumer. Otherwise allow gralloc to decide the format based
+    // on usage bits.
+    int sinkUsage;
+    sink->query(NATIVE_WINDOW_CONSUMER_USAGE_BITS, &sinkUsage);
+    if (sinkUsage & (GRALLOC_USAGE_SW_READ_MASK | GRALLOC_USAGE_SW_WRITE_MASK)) {
+        int sinkFormat;
+        sink->query(NATIVE_WINDOW_FORMAT, &sinkFormat);
+        mDefaultOutputFormat = sinkFormat;
+    } else {
+        mDefaultOutputFormat = HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED;
+    }
+    mOutputFormat = mDefaultOutputFormat;
+
+    ConsumerBase::mName = String8::format("VDS: %s", mDisplayName.string());
+    mConsumer->setConsumerName(ConsumerBase::mName);
+    mConsumer->setConsumerUsageBits(GRALLOC_USAGE_HW_COMPOSER);
+    mConsumer->setDefaultBufferSize(sinkWidth, sinkHeight);
+    sink->setAsyncMode(true);
+    IGraphicBufferProducer::QueueBufferOutput output;
+    mSource[SOURCE_SCRATCH]->connect(NULL, NATIVE_WINDOW_API_EGL, false, &output);
+!!!40992055.cpp!!!	beginFrame(in mustRecompose : bool) : status_t
+    if (mDisplayId < 0)
+        return NO_ERROR;
+
+    mMustRecompose = mustRecompose;
+
+    VDS_LOGW_IF(mDbgState != DBG_STATE_IDLE,
+            "Unexpected beginFrame() in %s state", dbgStateStr());
+    mDbgState = DBG_STATE_BEGUN;
+
+    return refreshOutputBuffer();
+!!!40992183.cpp!!!	prepareFrame(in compositionType : CompositionType) : status_t
+    if (mDisplayId < 0)
+        return NO_ERROR;
+
+    VDS_LOGW_IF(mDbgState != DBG_STATE_BEGUN,
+            "Unexpected prepareFrame() in %s state", dbgStateStr());
+    mDbgState = DBG_STATE_PREPARED;
+
+    mCompositionType = compositionType;
+    if (sForceHwcCopy && mCompositionType == COMPOSITION_GLES) {
+        // Some hardware can do RGB->YUV conversion more efficiently in hardware
+        // controlled by HWC than in hardware controlled by the video encoder.
+        // Forcing GLES-composed frames to go through an extra copy by the HWC
+        // allows the format conversion to happen there, rather than passing RGB
+        // directly to the consumer.
+        //
+        // On the other hand, when the consumer prefers RGB or can consume RGB
+        // inexpensively, this forces an unnecessary copy.
+        mCompositionType = COMPOSITION_MIXED;
+    }
+
+    if (mCompositionType != mDbgLastCompositionType) {
+        VDS_LOGV("prepareFrame: composition type changed to %s",
+                dbgCompositionTypeStr(mCompositionType));
+        mDbgLastCompositionType = mCompositionType;
+    }
+
+    if (mCompositionType != COMPOSITION_GLES &&
+            (mOutputFormat != mDefaultOutputFormat ||
+             mOutputUsage != GRALLOC_USAGE_HW_COMPOSER)) {
+        // We must have just switched from GLES-only to MIXED or HWC
+        // composition. Stop using the format and usage requested by the GLES
+        // driver; they may be suboptimal when HWC is writing to the output
+        // buffer. For example, if the output is going to a video encoder, and
+        // HWC can write directly to YUV, some hardware can skip a
+        // memory-to-memory RGB-to-YUV conversion step.
+        //
+        // If we just switched *to* GLES-only mode, we'll change the
+        // format/usage and get a new buffer when the GLES driver calls
+        // dequeueBuffer().
+        mOutputFormat = mDefaultOutputFormat;
+        mOutputUsage = GRALLOC_USAGE_HW_COMPOSER;
+        refreshOutputBuffer();
+    }
+
+    return NO_ERROR;
+!!!40992311.cpp!!!	compositionComplete() : status_t
+    return NO_ERROR;
+!!!40992439.cpp!!!	advanceFrame() : status_t
+    if (mDisplayId < 0)
+        return NO_ERROR;
+
+    if (mCompositionType == COMPOSITION_HWC) {
+        VDS_LOGW_IF(mDbgState != DBG_STATE_PREPARED,
+                "Unexpected advanceFrame() in %s state on HWC frame",
+                dbgStateStr());
+    } else {
+        VDS_LOGW_IF(mDbgState != DBG_STATE_GLES_DONE,
+                "Unexpected advanceFrame() in %s state on GLES/MIXED frame",
+                dbgStateStr());
+    }
+    mDbgState = DBG_STATE_HWC;
+
+    if (mOutputProducerSlot < 0 ||
+            (mCompositionType != COMPOSITION_HWC && mFbProducerSlot < 0)) {
+        // Last chance bailout if something bad happened earlier. For example,
+        // in a GLES configuration, if the sink disappears then dequeueBuffer
+        // will fail, the GLES driver won't queue a buffer, but SurfaceFlinger
+        // will soldier on. So we end up here without a buffer. There should
+        // be lots of scary messages in the log just before this.
+        VDS_LOGE("advanceFrame: no buffer, bailing out");
+        return NO_MEMORY;
+    }
+
+    sp<GraphicBuffer> fbBuffer = mFbProducerSlot >= 0 ?
+            mProducerBuffers[mFbProducerSlot] : sp<GraphicBuffer>(NULL);
+    sp<GraphicBuffer> outBuffer = mProducerBuffers[mOutputProducerSlot];
+    VDS_LOGV("advanceFrame: fb=%d(%p) out=%d(%p)",
+            mFbProducerSlot, fbBuffer.get(),
+            mOutputProducerSlot, outBuffer.get());
+
+    // At this point we know the output buffer acquire fence,
+    // so update HWC state with it.
+    mHwc.setOutputBuffer(mDisplayId, mOutputFence, outBuffer);
+
+    status_t result = NO_ERROR;
+    if (fbBuffer != NULL) {
+#ifdef USE_HWC2
+        // TODO: Correctly propagate the dataspace from GL composition
+        result = mHwc.setClientTarget(mDisplayId, mFbFence, fbBuffer,
+                HAL_DATASPACE_UNKNOWN);
+#else
+        result = mHwc.fbPost(mDisplayId, mFbFence, fbBuffer);
+#endif
+    }
+
+    return result;
+!!!40992567.cpp!!!	onFrameCommitted() : void
+    if (mDisplayId < 0)
+        return;
+
+    VDS_LOGW_IF(mDbgState != DBG_STATE_HWC,
+            "Unexpected onFrameCommitted() in %s state", dbgStateStr());
+    mDbgState = DBG_STATE_IDLE;
+
+#ifdef USE_HWC2
+    sp<Fence> retireFence = mHwc.getRetireFence(mDisplayId);
+#else
+    sp<Fence> fbFence = mHwc.getAndResetReleaseFence(mDisplayId);
+#endif
+    if (mCompositionType == COMPOSITION_MIXED && mFbProducerSlot >= 0) {
+        // release the scratch buffer back to the pool
+        Mutex::Autolock lock(mMutex);
+        int sslot = mapProducer2SourceSlot(SOURCE_SCRATCH, mFbProducerSlot);
+        VDS_LOGV("onFrameCommitted: release scratch sslot=%d", sslot);
+#ifdef USE_HWC2
+        addReleaseFenceLocked(sslot, mProducerBuffers[mFbProducerSlot],
+                retireFence);
+#else
+        addReleaseFenceLocked(sslot, mProducerBuffers[mFbProducerSlot], fbFence);
+#endif
+        releaseBufferLocked(sslot, mProducerBuffers[mFbProducerSlot],
+                EGL_NO_DISPLAY, EGL_NO_SYNC_KHR);
+    }
+
+    if (mOutputProducerSlot >= 0) {
+        int sslot = mapProducer2SourceSlot(SOURCE_SINK, mOutputProducerSlot);
+        QueueBufferOutput qbo;
+#ifndef USE_HWC2
+        sp<Fence> outFence = mHwc.getLastRetireFence(mDisplayId);
+#endif
+        VDS_LOGV("onFrameCommitted: queue sink sslot=%d", sslot);
+        if (mMustRecompose) {
+            status_t result = mSource[SOURCE_SINK]->queueBuffer(sslot,
+                    QueueBufferInput(
+                        systemTime(), false /* isAutoTimestamp */,
+                        HAL_DATASPACE_UNKNOWN,
+                        Rect(mSinkBufferWidth, mSinkBufferHeight),
+                        NATIVE_WINDOW_SCALING_MODE_FREEZE, 0 /* transform */,
+#ifdef USE_HWC2
+                        retireFence),
+#else
+                        outFence),
+#endif
+                    &qbo);
+            if (result == NO_ERROR) {
+                updateQueueBufferOutput(qbo);
+            }
+        } else {
+            // If the surface hadn't actually been updated, then we only went
+            // through the motions of updating the display to keep our state
+            // machine happy. We cancel the buffer to avoid triggering another
+            // re-composition and causing an infinite loop.
+#ifdef USE_HWC2
+            mSource[SOURCE_SINK]->cancelBuffer(sslot, retireFence);
+#else
+            mSource[SOURCE_SINK]->cancelBuffer(sslot, outFence);
+#endif
+        }
+    }
+
+    resetPerFrameState();
+!!!40992823.cpp!!!	resizeBuffers(in w : uint32_t, in h : uint32_t) : void
+    uint32_t tmpW, tmpH, transformHint, numPendingBuffers;
+    mQueueBufferOutput.deflate(&tmpW, &tmpH, &transformHint, &numPendingBuffers);
+    mQueueBufferOutput.inflate(w, h, transformHint, numPendingBuffers);
+
+    mSinkBufferWidth = w;
+    mSinkBufferHeight = h;
+!!!40992951.cpp!!!	getClientTargetAcquireFence() : sp<Fence>
+    return mFbFence;
+!!!40993079.cpp!!!	~VirtualDisplaySurface()
+    mSource[SOURCE_SCRATCH]->disconnect(NATIVE_WINDOW_API_EGL);
+!!!40993207.cpp!!!	requestBuffer(in pslot : int, inout outBuf : sp<GraphicBuffer>) : status_t
+    if (mDisplayId < 0)
+        return mSource[SOURCE_SINK]->requestBuffer(pslot, outBuf);
+
+    VDS_LOGW_IF(mDbgState != DBG_STATE_GLES,
+            "Unexpected requestBuffer pslot=%d in %s state",
+            pslot, dbgStateStr());
+
+    *outBuf = mProducerBuffers[pslot];
+    return NO_ERROR;
+!!!40993335.cpp!!!	setMaxDequeuedBufferCount(in maxDequeuedBuffers : int) : status_t
+    return mSource[SOURCE_SINK]->setMaxDequeuedBufferCount(maxDequeuedBuffers);
+!!!40993463.cpp!!!	setAsyncMode(in async : bool) : status_t
+    return mSource[SOURCE_SINK]->setAsyncMode(async);
+!!!40993591.cpp!!!	dequeueBuffer(inout pslot : int, inout fence : sp<Fence>, in w : uint32_t, in h : uint32_t, in format : PixelFormat, in usage : uint32_t) : status_t
+    if (mDisplayId < 0)
+        return mSource[SOURCE_SINK]->dequeueBuffer(pslot, fence, w, h, format, usage);
+
+    VDS_LOGW_IF(mDbgState != DBG_STATE_PREPARED,
+            "Unexpected dequeueBuffer() in %s state", dbgStateStr());
+    mDbgState = DBG_STATE_GLES;
+
+    VDS_LOGV("dequeueBuffer %dx%d fmt=%d usage=%#x", w, h, format, usage);
+
+    status_t result = NO_ERROR;
+    Source source = fbSourceForCompositionType(mCompositionType);
+
+    if (source == SOURCE_SINK) {
+
+        if (mOutputProducerSlot < 0) {
+            // Last chance bailout if something bad happened earlier. For example,
+            // in a GLES configuration, if the sink disappears then dequeueBuffer
+            // will fail, the GLES driver won't queue a buffer, but SurfaceFlinger
+            // will soldier on. So we end up here without a buffer. There should
+            // be lots of scary messages in the log just before this.
+            VDS_LOGE("dequeueBuffer: no buffer, bailing out");
+            return NO_MEMORY;
+        }
+
+        // We already dequeued the output buffer. If the GLES driver wants
+        // something incompatible, we have to cancel and get a new one. This
+        // will mean that HWC will see a different output buffer between
+        // prepare and set, but since we're in GLES-only mode already it
+        // shouldn't matter.
+
+        usage |= GRALLOC_USAGE_HW_COMPOSER;
+        const sp<GraphicBuffer>& buf = mProducerBuffers[mOutputProducerSlot];
+        if ((usage & ~buf->getUsage()) != 0 ||
+                (format != 0 && format != buf->getPixelFormat()) ||
+                (w != 0 && w != mSinkBufferWidth) ||
+                (h != 0 && h != mSinkBufferHeight)) {
+            VDS_LOGV("dequeueBuffer: dequeueing new output buffer: "
+                    "want %dx%d fmt=%d use=%#x, "
+                    "have %dx%d fmt=%d use=%#x",
+                    w, h, format, usage,
+                    mSinkBufferWidth, mSinkBufferHeight,
+                    buf->getPixelFormat(), buf->getUsage());
+            mOutputFormat = format;
+            mOutputUsage = usage;
+            result = refreshOutputBuffer();
+            if (result < 0)
+                return result;
+        }
+    }
+
+    if (source == SOURCE_SINK) {
+        *pslot = mOutputProducerSlot;
+        *fence = mOutputFence;
+    } else {
+        int sslot;
+        result = dequeueBuffer(source, format, usage, &sslot, fence);
+        if (result >= 0) {
+            *pslot = mapSource2ProducerSlot(source, sslot);
+        }
+    }
+    return result;
+!!!40993719.cpp!!!	detachBuffer(in slot : int) : status_t
+    VDS_LOGE("detachBuffer is not available for VirtualDisplaySurface");
+    return INVALID_OPERATION;
+!!!40993847.cpp!!!	detachNextBuffer(inout outBuffer : sp<GraphicBuffer>, inout outFence : sp<Fence>) : status_t
+    VDS_LOGE("detachNextBuffer is not available for VirtualDisplaySurface");
+    return INVALID_OPERATION;
+!!!40993975.cpp!!!	attachBuffer(inout slot : int, in buffer : sp<GraphicBuffer>) : status_t
+    VDS_LOGE("attachBuffer is not available for VirtualDisplaySurface");
+    return INVALID_OPERATION;
+!!!40994103.cpp!!!	queueBuffer(in pslot : int, in input : QueueBufferInput, inout output : QueueBufferOutput) : status_t
+    if (mDisplayId < 0)
+        return mSource[SOURCE_SINK]->queueBuffer(pslot, input, output);
+
+    VDS_LOGW_IF(mDbgState != DBG_STATE_GLES,
+            "Unexpected queueBuffer(pslot=%d) in %s state", pslot,
+            dbgStateStr());
+    mDbgState = DBG_STATE_GLES_DONE;
+
+    VDS_LOGV("queueBuffer pslot=%d", pslot);
+
+    status_t result;
+    if (mCompositionType == COMPOSITION_MIXED) {
+        // Queue the buffer back into the scratch pool
+        QueueBufferOutput scratchQBO;
+        int sslot = mapProducer2SourceSlot(SOURCE_SCRATCH, pslot);
+        result = mSource[SOURCE_SCRATCH]->queueBuffer(sslot, input, &scratchQBO);
+        if (result != NO_ERROR)
+            return result;
+
+        // Now acquire the buffer from the scratch pool -- should be the same
+        // slot and fence as we just queued.
+        Mutex::Autolock lock(mMutex);
+        BufferItem item;
+        result = acquireBufferLocked(&item, 0);
+        if (result != NO_ERROR)
+            return result;
+        VDS_LOGW_IF(item.mSlot != sslot,
+                "queueBuffer: acquired sslot %d from SCRATCH after queueing sslot %d",
+                item.mSlot, sslot);
+        mFbProducerSlot = mapSource2ProducerSlot(SOURCE_SCRATCH, item.mSlot);
+        mFbFence = mSlots[item.mSlot].mFence;
+
+    } else {
+        LOG_FATAL_IF(mCompositionType != COMPOSITION_GLES,
+                "Unexpected queueBuffer in state %s for compositionType %s",
+                dbgStateStr(), dbgCompositionTypeStr(mCompositionType));
+
+        // Extract the GLES release fence for HWC to acquire
+        int64_t timestamp;
+        bool isAutoTimestamp;
+        android_dataspace dataSpace;
+        Rect crop;
+        int scalingMode;
+        uint32_t transform;
+        input.deflate(&timestamp, &isAutoTimestamp, &dataSpace, &crop,
+                &scalingMode, &transform, &mFbFence);
+
+        mFbProducerSlot = pslot;
+        mOutputFence = mFbFence;
+    }
+
+    *output = mQueueBufferOutput;
+    return NO_ERROR;
+!!!40994231.cpp!!!	cancelBuffer(in pslot : int, in fence : sp<Fence>) : status_t
+    if (mDisplayId < 0)
+        return mSource[SOURCE_SINK]->cancelBuffer(mapProducer2SourceSlot(SOURCE_SINK, pslot), fence);
+
+    VDS_LOGW_IF(mDbgState != DBG_STATE_GLES,
+            "Unexpected cancelBuffer(pslot=%d) in %s state", pslot,
+            dbgStateStr());
+    VDS_LOGV("cancelBuffer pslot=%d", pslot);
+    Source source = fbSourceForCompositionType(mCompositionType);
+    return mSource[source]->cancelBuffer(
+            mapProducer2SourceSlot(source, pslot), fence);
+!!!40994359.cpp!!!	query(in what : int, inout value : int) : int
+    switch (what) {
+        case NATIVE_WINDOW_WIDTH:
+            *value = mSinkBufferWidth;
+            break;
+        case NATIVE_WINDOW_HEIGHT:
+            *value = mSinkBufferHeight;
+            break;
+        default:
+            return mSource[SOURCE_SINK]->query(what, value);
+    }
+    return NO_ERROR;
+!!!40994487.cpp!!!	connect(in listener : sp<IProducerListener>, in api : int, in producerControlledByApp : bool, inout output : QueueBufferOutput) : status_t
+    QueueBufferOutput qbo;
+    status_t result = mSource[SOURCE_SINK]->connect(listener, api,
+            producerControlledByApp, &qbo);
+    if (result == NO_ERROR) {
+        updateQueueBufferOutput(qbo);
+        *output = mQueueBufferOutput;
+    }
+    return result;
+!!!40994615.cpp!!!	disconnect(in api : int) : status_t
+    return mSource[SOURCE_SINK]->disconnect(api);
+!!!40994743.cpp!!!	setSidebandStream(in stream : sp<NativeHandle>) : status_t
+    return INVALID_OPERATION;
+!!!40994871.cpp!!!	allocateBuffers(in width : uint32_t, in height : uint32_t, in format : PixelFormat, in usage : uint32_t) : void
+    // TODO: Should we actually allocate buffers for a virtual display?
+!!!40994999.cpp!!!	allowAllocation(in allow : bool) : status_t
+    return INVALID_OPERATION;
+!!!40995127.cpp!!!	setGenerationNumber(in generationNumber : uint32_t) : status_t
+    ALOGE("setGenerationNumber not supported on VirtualDisplaySurface");
+    return INVALID_OPERATION;
+!!!40995255.cpp!!!	getConsumerName() : String8
+    return String8("VirtualDisplaySurface");
+!!!40995383.cpp!!!	getNextFrameNumber() : uint64_t
+    return 0;
+!!!40995511.cpp!!!	setSharedBufferMode(in sharedBufferMode : bool) : status_t
+    ALOGE("setSharedBufferMode not supported on VirtualDisplaySurface");
+    return INVALID_OPERATION;
+!!!40995639.cpp!!!	setAutoRefresh(in autoRefresh : bool) : status_t
+    ALOGE("setAutoRefresh not supported on VirtualDisplaySurface");
+    return INVALID_OPERATION;
+!!!40995767.cpp!!!	setDequeueTimeout(in timeout : nsecs_t) : status_t
+    ALOGE("setDequeueTimeout not supported on VirtualDisplaySurface");
+    return INVALID_OPERATION;
+!!!40995895.cpp!!!	getLastQueuedBuffer(inout outBuffer : sp<GraphicBuffer>, inout outFence : sp<Fence>, in outTransformMatrix : float) : status_t
+    ALOGE("getLastQueuedBuffer not supported on VirtualDisplaySurface");
+    return INVALID_OPERATION;
+!!!40996023.cpp!!!	getUniqueId(inout outId : uint64_t) : status_t
+    ALOGE("getUniqueId not supported on VirtualDisplaySurface");
+    return INVALID_OPERATION;
+!!!40996151.cpp!!!	fbSourceForCompositionType(in type : CompositionType) : VirtualDisplaySurface::Source
+    return type == COMPOSITION_MIXED ? SOURCE_SCRATCH : SOURCE_SINK;
+!!!40996279.cpp!!!	dequeueBuffer(in source : VirtualDisplaySurface::Source, in format : PixelFormat, in usage : uint32_t, inout sslot : int, inout fence : sp<Fence>) : status_t
+    LOG_FATAL_IF(mDisplayId < 0, "mDisplayId=%d but should not be < 0.", mDisplayId);
+
+    status_t result = mSource[source]->dequeueBuffer(sslot, fence,
+            mSinkBufferWidth, mSinkBufferHeight, format, usage);
+    if (result < 0)
+        return result;
+    int pslot = mapSource2ProducerSlot(source, *sslot);
+    VDS_LOGV("dequeueBuffer(%s): sslot=%d pslot=%d result=%d",
+            dbgSourceStr(source), *sslot, pslot, result);
+    uint64_t sourceBit = static_cast<uint64_t>(source) << pslot;
+
+    if ((mProducerSlotSource & (1ULL << pslot)) != sourceBit) {
+        // This slot was previously dequeued from the other source; must
+        // re-request the buffer.
+        result |= BUFFER_NEEDS_REALLOCATION;
+        mProducerSlotSource &= ~(1ULL << pslot);
+        mProducerSlotSource |= sourceBit;
+    }
+
+    if (result & RELEASE_ALL_BUFFERS) {
+        for (uint32_t i = 0; i < BufferQueue::NUM_BUFFER_SLOTS; i++) {
+            if ((mProducerSlotSource & (1ULL << i)) == sourceBit)
+                mProducerBuffers[i].clear();
+        }
+    }
+    if (result & BUFFER_NEEDS_REALLOCATION) {
+        result = mSource[source]->requestBuffer(*sslot, &mProducerBuffers[pslot]);
+        if (result < 0) {
+            mProducerBuffers[pslot].clear();
+            mSource[source]->cancelBuffer(*sslot, *fence);
+            return result;
+        }
+        VDS_LOGV("dequeueBuffer(%s): buffers[%d]=%p fmt=%d usage=%#x",
+                dbgSourceStr(source), pslot, mProducerBuffers[pslot].get(),
+                mProducerBuffers[pslot]->getPixelFormat(),
+                mProducerBuffers[pslot]->getUsage());
+    }
+
+    return result;
+!!!40996407.cpp!!!	updateQueueBufferOutput(in qbo : QueueBufferOutput) : void
+    uint32_t w, h, transformHint, numPendingBuffers;
+    qbo.deflate(&w, &h, &transformHint, &numPendingBuffers);
+    mQueueBufferOutput.inflate(w, h, 0, numPendingBuffers);
+!!!40996535.cpp!!!	resetPerFrameState() : void
+    mCompositionType = COMPOSITION_UNKNOWN;
+    mFbFence = Fence::NO_FENCE;
+    mOutputFence = Fence::NO_FENCE;
+    mOutputProducerSlot = -1;
+    mFbProducerSlot = -1;
+!!!40996663.cpp!!!	refreshOutputBuffer() : status_t
+    if (mOutputProducerSlot >= 0) {
+        mSource[SOURCE_SINK]->cancelBuffer(
+                mapProducer2SourceSlot(SOURCE_SINK, mOutputProducerSlot),
+                mOutputFence);
+    }
+
+    int sslot;
+    status_t result = dequeueBuffer(SOURCE_SINK, mOutputFormat, mOutputUsage,
+            &sslot, &mOutputFence);
+    if (result < 0)
+        return result;
+    mOutputProducerSlot = mapSource2ProducerSlot(SOURCE_SINK, sslot);
+
+    // On GLES-only frames, we don't have the right output buffer acquire fence
+    // until after GLES calls queueBuffer(). So here we just set the buffer
+    // (for use in HWC prepare) but not the fence; we'll call this again with
+    // the proper fence once we have it.
+    result = mHwc.setOutputBuffer(mDisplayId, Fence::NO_FENCE,
+            mProducerBuffers[mOutputProducerSlot]);
+
+    return result;
+!!!40996791.cpp!!!	mapSource2ProducerSlot(in source : VirtualDisplaySurface::Source, in sslot : int) : int
+    if (source == SOURCE_SCRATCH) {
+        return BufferQueue::NUM_BUFFER_SLOTS - sslot - 1;
+    } else {
+        return sslot;
+    }
+!!!40996919.cpp!!!	mapProducer2SourceSlot(in source : VirtualDisplaySurface::Source, in pslot : int) : int
+    return mapSource2ProducerSlot(source, pslot);
+!!!40997047.cpp!!!	dbgStateStr() : char
+    switch (mDbgState) {
+        case DBG_STATE_IDLE:      return "IDLE";
+        case DBG_STATE_PREPARED:  return "PREPARED";
+        case DBG_STATE_GLES:      return "GLES";
+        case DBG_STATE_GLES_DONE: return "GLES_DONE";
+        case DBG_STATE_HWC:       return "HWC";
+        default:                  return "INVALID";
+    }
+!!!40997175.cpp!!!	dbgSourceStr(in s : VirtualDisplaySurface::Source) : char
+    switch (s) {
+        case SOURCE_SINK:    return "SINK";
+        case SOURCE_SCRATCH: return "SCRATCH";
+        default:             return "INVALID";
+    }

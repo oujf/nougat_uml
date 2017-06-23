@@ -1,0 +1,367 @@
+class SQLiteSession
+!!!79222583.java!!!	SQLiteSession(inout connectionPool : SQLiteConnectionPool)
+        if (connectionPool == null) {
+            throw new IllegalArgumentException("connectionPool must not be null");
+        }
+
+        mConnectionPool = connectionPool;
+!!!79222711.java!!!	hasTransaction() : boolean
+        return mTransactionStack != null;
+!!!79222839.java!!!	hasNestedTransaction() : boolean
+        return mTransactionStack != null && mTransactionStack.mParent != null;
+!!!79222967.java!!!	hasConnection() : boolean
+        return mConnection != null;
+!!!79223095.java!!!	beginTransaction(in transactionMode : int, inout transactionListener : SQLiteTransactionListener, in connectionFlags : int, inout cancellationSignal : CancellationSignal) : void
+        throwIfTransactionMarkedSuccessful();
+        beginTransactionUnchecked(transactionMode, transactionListener, connectionFlags,
+                cancellationSignal);
+!!!79223223.java!!!	beginTransactionUnchecked(in transactionMode : int, inout transactionListener : SQLiteTransactionListener, in connectionFlags : int, inout cancellationSignal : CancellationSignal) : void
+        if (cancellationSignal != null) {
+            cancellationSignal.throwIfCanceled();
+        }
+
+        if (mTransactionStack == null) {
+            acquireConnection(null, connectionFlags, cancellationSignal); // might throw
+        }
+        try {
+            // Set up the transaction such that we can back out safely
+            // in case we fail part way.
+            if (mTransactionStack == null) {
+                // Execute SQL might throw a runtime exception.
+                switch (transactionMode) {
+                    case TRANSACTION_MODE_IMMEDIATE:
+                        mConnection.execute("BEGIN IMMEDIATE;", null,
+                                cancellationSignal); // might throw
+                        break;
+                    case TRANSACTION_MODE_EXCLUSIVE:
+                        mConnection.execute("BEGIN EXCLUSIVE;", null,
+                                cancellationSignal); // might throw
+                        break;
+                    default:
+                        mConnection.execute("BEGIN;", null, cancellationSignal); // might throw
+                        break;
+                }
+            }
+
+            // Listener might throw a runtime exception.
+            if (transactionListener != null) {
+                try {
+                    transactionListener.onBegin(); // might throw
+                } catch (RuntimeException ex) {
+                    if (mTransactionStack == null) {
+                        mConnection.execute("ROLLBACK;", null, cancellationSignal); // might throw
+                    }
+                    throw ex;
+                }
+            }
+
+            // Bookkeeping can't throw, except an OOM, which is just too bad...
+            Transaction transaction = obtainTransaction(transactionMode, transactionListener);
+            transaction.mParent = mTransactionStack;
+            mTransactionStack = transaction;
+        } finally {
+            if (mTransactionStack == null) {
+                releaseConnection(); // might throw
+            }
+        }
+!!!79223351.java!!!	setTransactionSuccessful() : void
+        throwIfNoTransaction();
+        throwIfTransactionMarkedSuccessful();
+
+        mTransactionStack.mMarkedSuccessful = true;
+!!!79223479.java!!!	endTransaction(inout cancellationSignal : CancellationSignal) : void
+        throwIfNoTransaction();
+        assert mConnection != null;
+
+        endTransactionUnchecked(cancellationSignal, false);
+!!!79223607.java!!!	endTransactionUnchecked(inout cancellationSignal : CancellationSignal, inout yielding : boolean) : void
+        if (cancellationSignal != null) {
+            cancellationSignal.throwIfCanceled();
+        }
+
+        final Transaction top = mTransactionStack;
+        boolean successful = (top.mMarkedSuccessful || yielding) && !top.mChildFailed;
+
+        RuntimeException listenerException = null;
+        final SQLiteTransactionListener listener = top.mListener;
+        if (listener != null) {
+            try {
+                if (successful) {
+                    listener.onCommit(); // might throw
+                } else {
+                    listener.onRollback(); // might throw
+                }
+            } catch (RuntimeException ex) {
+                listenerException = ex;
+                successful = false;
+            }
+        }
+
+        mTransactionStack = top.mParent;
+        recycleTransaction(top);
+
+        if (mTransactionStack != null) {
+            if (!successful) {
+                mTransactionStack.mChildFailed = true;
+            }
+        } else {
+            try {
+                if (successful) {
+                    mConnection.execute("COMMIT;", null, cancellationSignal); // might throw
+                } else {
+                    mConnection.execute("ROLLBACK;", null, cancellationSignal); // might throw
+                }
+            } finally {
+                releaseConnection(); // might throw
+            }
+        }
+
+        if (listenerException != null) {
+            throw listenerException;
+        }
+!!!79223735.java!!!	yieldTransaction(in sleepAfterYieldDelayMillis : long, inout throwIfUnsafe : boolean, inout cancellationSignal : CancellationSignal) : boolean
+        if (throwIfUnsafe) {
+            throwIfNoTransaction();
+            throwIfTransactionMarkedSuccessful();
+            throwIfNestedTransaction();
+        } else {
+            if (mTransactionStack == null || mTransactionStack.mMarkedSuccessful
+                    || mTransactionStack.mParent != null) {
+                return false;
+            }
+        }
+        assert mConnection != null;
+
+        if (mTransactionStack.mChildFailed) {
+            return false;
+        }
+
+        return yieldTransactionUnchecked(sleepAfterYieldDelayMillis,
+                cancellationSignal); // might throw
+!!!79223863.java!!!	yieldTransactionUnchecked(in sleepAfterYieldDelayMillis : long, inout cancellationSignal : CancellationSignal) : boolean
+        if (cancellationSignal != null) {
+            cancellationSignal.throwIfCanceled();
+        }
+
+        if (!mConnectionPool.shouldYieldConnection(mConnection, mConnectionFlags)) {
+            return false;
+        }
+
+        final int transactionMode = mTransactionStack.mMode;
+        final SQLiteTransactionListener listener = mTransactionStack.mListener;
+        final int connectionFlags = mConnectionFlags;
+        endTransactionUnchecked(cancellationSignal, true); // might throw
+
+        if (sleepAfterYieldDelayMillis > 0) {
+            try {
+                Thread.sleep(sleepAfterYieldDelayMillis);
+            } catch (InterruptedException ex) {
+                // we have been interrupted, that's all we need to do
+            }
+        }
+
+        beginTransactionUnchecked(transactionMode, listener, connectionFlags,
+                cancellationSignal); // might throw
+        return true;
+!!!79223991.java!!!	prepare(inout sql : String, in connectionFlags : int, inout cancellationSignal : CancellationSignal, inout outStatementInfo : SQLiteStatementInfo) : void
+        if (sql == null) {
+            throw new IllegalArgumentException("sql must not be null.");
+        }
+
+        if (cancellationSignal != null) {
+            cancellationSignal.throwIfCanceled();
+        }
+
+        acquireConnection(sql, connectionFlags, cancellationSignal); // might throw
+        try {
+            mConnection.prepare(sql, outStatementInfo); // might throw
+        } finally {
+            releaseConnection(); // might throw
+        }
+!!!79224119.java!!!	execute(inout sql : String, inout bindArgs : Object [[]], in connectionFlags : int, inout cancellationSignal : CancellationSignal) : void
+        if (sql == null) {
+            throw new IllegalArgumentException("sql must not be null.");
+        }
+
+        if (executeSpecial(sql, bindArgs, connectionFlags, cancellationSignal)) {
+            return;
+        }
+
+        acquireConnection(sql, connectionFlags, cancellationSignal); // might throw
+        try {
+            mConnection.execute(sql, bindArgs, cancellationSignal); // might throw
+        } finally {
+            releaseConnection(); // might throw
+        }
+!!!79224247.java!!!	executeForLong(inout sql : String, inout bindArgs : Object [[]], in connectionFlags : int, inout cancellationSignal : CancellationSignal) : long
+        if (sql == null) {
+            throw new IllegalArgumentException("sql must not be null.");
+        }
+
+        if (executeSpecial(sql, bindArgs, connectionFlags, cancellationSignal)) {
+            return 0;
+        }
+
+        acquireConnection(sql, connectionFlags, cancellationSignal); // might throw
+        try {
+            return mConnection.executeForLong(sql, bindArgs, cancellationSignal); // might throw
+        } finally {
+            releaseConnection(); // might throw
+        }
+!!!79224375.java!!!	executeForString(inout sql : String, inout bindArgs : Object [[]], in connectionFlags : int, inout cancellationSignal : CancellationSignal) : String
+        if (sql == null) {
+            throw new IllegalArgumentException("sql must not be null.");
+        }
+
+        if (executeSpecial(sql, bindArgs, connectionFlags, cancellationSignal)) {
+            return null;
+        }
+
+        acquireConnection(sql, connectionFlags, cancellationSignal); // might throw
+        try {
+            return mConnection.executeForString(sql, bindArgs, cancellationSignal); // might throw
+        } finally {
+            releaseConnection(); // might throw
+        }
+!!!79224503.java!!!	executeForBlobFileDescriptor(inout sql : String, inout bindArgs : Object [[]], in connectionFlags : int, inout cancellationSignal : CancellationSignal) : ParcelFileDescriptor
+        if (sql == null) {
+            throw new IllegalArgumentException("sql must not be null.");
+        }
+
+        if (executeSpecial(sql, bindArgs, connectionFlags, cancellationSignal)) {
+            return null;
+        }
+
+        acquireConnection(sql, connectionFlags, cancellationSignal); // might throw
+        try {
+            return mConnection.executeForBlobFileDescriptor(sql, bindArgs,
+                    cancellationSignal); // might throw
+        } finally {
+            releaseConnection(); // might throw
+        }
+!!!79224631.java!!!	executeForChangedRowCount(inout sql : String, inout bindArgs : Object [[]], in connectionFlags : int, inout cancellationSignal : CancellationSignal) : int
+        if (sql == null) {
+            throw new IllegalArgumentException("sql must not be null.");
+        }
+
+        if (executeSpecial(sql, bindArgs, connectionFlags, cancellationSignal)) {
+            return 0;
+        }
+
+        acquireConnection(sql, connectionFlags, cancellationSignal); // might throw
+        try {
+            return mConnection.executeForChangedRowCount(sql, bindArgs,
+                    cancellationSignal); // might throw
+        } finally {
+            releaseConnection(); // might throw
+        }
+!!!79224759.java!!!	executeForLastInsertedRowId(inout sql : String, inout bindArgs : Object [[]], in connectionFlags : int, inout cancellationSignal : CancellationSignal) : long
+        if (sql == null) {
+            throw new IllegalArgumentException("sql must not be null.");
+        }
+
+        if (executeSpecial(sql, bindArgs, connectionFlags, cancellationSignal)) {
+            return 0;
+        }
+
+        acquireConnection(sql, connectionFlags, cancellationSignal); // might throw
+        try {
+            return mConnection.executeForLastInsertedRowId(sql, bindArgs,
+                    cancellationSignal); // might throw
+        } finally {
+            releaseConnection(); // might throw
+        }
+!!!79224887.java!!!	executeForCursorWindow(inout sql : String, inout bindArgs : Object [[]], inout window : CursorWindow, in startPos : int, in requiredPos : int, inout countAllRows : boolean, in connectionFlags : int, inout cancellationSignal : CancellationSignal) : int
+        if (sql == null) {
+            throw new IllegalArgumentException("sql must not be null.");
+        }
+        if (window == null) {
+            throw new IllegalArgumentException("window must not be null.");
+        }
+
+        if (executeSpecial(sql, bindArgs, connectionFlags, cancellationSignal)) {
+            window.clear();
+            return 0;
+        }
+
+        acquireConnection(sql, connectionFlags, cancellationSignal); // might throw
+        try {
+            return mConnection.executeForCursorWindow(sql, bindArgs,
+                    window, startPos, requiredPos, countAllRows,
+                    cancellationSignal); // might throw
+        } finally {
+            releaseConnection(); // might throw
+        }
+!!!79225015.java!!!	executeSpecial(inout sql : String, inout bindArgs : Object [[]], in connectionFlags : int, inout cancellationSignal : CancellationSignal) : boolean
+        if (cancellationSignal != null) {
+            cancellationSignal.throwIfCanceled();
+        }
+
+        final int type = DatabaseUtils.getSqlStatementType(sql);
+        switch (type) {
+            case DatabaseUtils.STATEMENT_BEGIN:
+                beginTransaction(TRANSACTION_MODE_EXCLUSIVE, null, connectionFlags,
+                        cancellationSignal);
+                return true;
+
+            case DatabaseUtils.STATEMENT_COMMIT:
+                setTransactionSuccessful();
+                endTransaction(cancellationSignal);
+                return true;
+
+            case DatabaseUtils.STATEMENT_ABORT:
+                endTransaction(cancellationSignal);
+                return true;
+        }
+        return false;
+!!!79225143.java!!!	acquireConnection(inout sql : String, in connectionFlags : int, inout cancellationSignal : CancellationSignal) : void
+        if (mConnection == null) {
+            assert mConnectionUseCount == 0;
+            mConnection = mConnectionPool.acquireConnection(sql, connectionFlags,
+                    cancellationSignal); // might throw
+            mConnectionFlags = connectionFlags;
+        }
+        mConnectionUseCount += 1;
+!!!79225271.java!!!	releaseConnection() : void
+        assert mConnection != null;
+        assert mConnectionUseCount > 0;
+        if (--mConnectionUseCount == 0) {
+            try {
+                mConnectionPool.releaseConnection(mConnection); // might throw
+            } finally {
+                mConnection = null;
+            }
+        }
+!!!79225399.java!!!	throwIfNoTransaction() : void
+        if (mTransactionStack == null) {
+            throw new IllegalStateException("Cannot perform this operation because "
+                    + "there is no current transaction.");
+        }
+!!!79225527.java!!!	throwIfTransactionMarkedSuccessful() : void
+        if (mTransactionStack != null && mTransactionStack.mMarkedSuccessful) {
+            throw new IllegalStateException("Cannot perform this operation because "
+                    + "the transaction has already been marked successful.  The only "
+                    + "thing you can do now is call endTransaction().");
+        }
+!!!79225655.java!!!	throwIfNestedTransaction() : void
+        if (hasNestedTransaction()) {
+            throw new IllegalStateException("Cannot perform this operation because "
+                    + "a nested transaction is in progress.");
+        }
+!!!79225783.java!!!	obtainTransaction(in mode : int, inout listener : SQLiteTransactionListener) : SQLiteSession::Transaction
+        Transaction transaction = mTransactionPool;
+        if (transaction != null) {
+            mTransactionPool = transaction.mParent;
+            transaction.mParent = null;
+            transaction.mMarkedSuccessful = false;
+            transaction.mChildFailed = false;
+        } else {
+            transaction = new Transaction();
+        }
+        transaction.mMode = mode;
+        transaction.mListener = listener;
+        return transaction;
+!!!79225911.java!!!	recycleTransaction(inout transaction : SQLiteSession::Transaction) : void
+        transaction.mParent = mTransactionPool;
+        transaction.mListener = null;
+        mTransactionPool = transaction;

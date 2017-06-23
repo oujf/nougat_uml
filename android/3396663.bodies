@@ -1,0 +1,257 @@
+class CryptfsCmd
+!!!43703351.cpp!!!	runCommand(inout cli : SocketClient, in argc : int, inout argv : char) : int
+    if ((cli->getUid() != 0) && (cli->getUid() != AID_SYSTEM)) {
+        cli->sendMsg(ResponseCode::CommandNoPermission, "No permission to run cryptfs commands", false);
+        return 0;
+    }
+
+    if (argc < 2) {
+        cli->sendMsg(ResponseCode::CommandSyntaxError, "Missing subcommand", false);
+        return 0;
+    }
+
+    int rc = 0;
+
+    std::string subcommand(argv[1]);
+    if (subcommand == "checkpw") {
+        if (!check_argc(cli, subcommand, argc, 3, "<passwd>")) return 0;
+        dumpArgs(argc, argv, 2);
+        rc = cryptfs_check_passwd(argv[2]);
+    } else if (subcommand == "restart") {
+        if (!check_argc(cli, subcommand, argc, 2, "")) return 0;
+        dumpArgs(argc, argv, -1);
+
+        // Spawn as thread so init can issue commands back to vold without
+        // causing deadlock, usually as a result of prep_data_fs.
+        std::thread(&cryptfs_restart).detach();
+    } else if (subcommand == "cryptocomplete") {
+        if (!check_argc(cli, subcommand, argc, 2, "")) return 0;
+        dumpArgs(argc, argv, -1);
+        rc = cryptfs_crypto_complete();
+    } else if (subcommand == "enablecrypto") {
+        const char* syntax = "Usage: cryptfs enablecrypto <wipe|inplace> "
+                             "default|password|pin|pattern [passwd] [noui]";
+
+        // This should be replaced with a command line parser if more options
+        // are added
+        bool valid = true;
+        bool no_ui = false;
+        int type = CRYPT_TYPE_DEFAULT;
+        int options = 4; // Optional parameters are at this offset
+        if (argc < 4) {
+            // Minimum 4 parameters
+            valid = false;
+        } else if (strcmp(argv[2], "wipe") && strcmp(argv[2], "inplace") ) {
+            // Second parameter must be wipe or inplace
+            valid = false;
+        } else {
+            // Third parameter must be valid type
+            type = getType(argv[3]);
+            if (type == -1) {
+                valid = false;
+            } else if (type != CRYPT_TYPE_DEFAULT) {
+                options++;
+            }
+        }
+
+        if (valid) {
+            if(argc < options) {
+                // Too few parameters
+                valid = false;
+            } else if (argc == options) {
+                // No more, done
+            } else if (argc == options + 1) {
+                // One option, must be noui
+                if (!strcmp(argv[options], "noui")) {
+                    no_ui = true;
+                } else {
+                    valid = false;
+                }
+            } else {
+                // Too many options
+                valid = false;
+            }
+        }
+
+        if (!valid) {
+            cli->sendMsg(ResponseCode::CommandSyntaxError, syntax, false);
+            return 0;
+        }
+
+        dumpArgs(argc, argv, 4);
+
+        // Spawn as thread so init can issue commands back to vold without
+        // causing deadlock, usually as a result of prep_data_fs.
+        char* arg2 = argc > 2 ? strdup(argv[2]) : NULL;
+        char* arg4 = argc > 4 ? strdup(argv[4]) : NULL;
+        std::thread(&do_enablecrypto, arg2, arg4, type, no_ui).detach();
+    } else if (subcommand == "enablefilecrypto") {
+        if (!check_argc(cli, subcommand, argc, 2, "")) return 0;
+        dumpArgs(argc, argv, -1);
+        rc = cryptfs_enable_file();
+    } else if (subcommand == "changepw") {
+        const char* syntax = "Usage: cryptfs changepw "
+                             "default|password|pin|pattern [newpasswd]";
+        const char* password;
+        if (argc == 3) {
+            password = "";
+        } else if (argc == 4) {
+            password = argv[3];
+        } else {
+            cli->sendMsg(ResponseCode::CommandSyntaxError, syntax, false);
+            return 0;
+        }
+        int type = getType(argv[2]);
+        if (type == -1) {
+            cli->sendMsg(ResponseCode::CommandSyntaxError, syntax, false);
+            return 0;
+        }
+        SLOGD("cryptfs changepw %s {}", argv[2]);
+        rc = cryptfs_changepw(type, password);
+    } else if (subcommand == "verifypw") {
+        if (!check_argc(cli, subcommand, argc, 3, "<passwd>")) return 0;
+        SLOGD("cryptfs verifypw {}");
+        rc = cryptfs_verify_passwd(argv[2]);
+    } else if (subcommand == "getfield") {
+        if (!check_argc(cli, subcommand, argc, 3, "<fieldname>")) return 0;
+        char *valbuf;
+        int valbuf_len = PROPERTY_VALUE_MAX;
+
+        dumpArgs(argc, argv, -1);
+
+        // Increase the buffer size until it is big enough for the field value stored.
+        while (1) {
+            valbuf = (char*)malloc(valbuf_len);
+            if (valbuf == NULL) {
+                cli->sendMsg(ResponseCode::OperationFailed, "Failed to allocate memory", false);
+                return 0;
+            }
+            rc = cryptfs_getfield(argv[2], valbuf, valbuf_len);
+            if (rc != CRYPTO_GETFIELD_ERROR_BUF_TOO_SMALL) {
+                break;
+            }
+            free(valbuf);
+            valbuf_len *= 2;
+        }
+        if (rc == CRYPTO_GETFIELD_OK) {
+            cli->sendMsg(ResponseCode::CryptfsGetfieldResult, valbuf, false);
+        }
+        free(valbuf);
+    } else if (subcommand == "setfield") {
+        if (!check_argc(cli, subcommand, argc, 4, "<fieldname> <value>")) return 0;
+        dumpArgs(argc, argv, -1);
+        rc = cryptfs_setfield(argv[2], argv[3]);
+    } else if (subcommand == "mountdefaultencrypted") {
+        if (!check_argc(cli, subcommand, argc, 2, "")) return 0;
+        SLOGD("cryptfs mountdefaultencrypted");
+        dumpArgs(argc, argv, -1);
+
+        // Spawn as thread so init can issue commands back to vold without
+        // causing deadlock, usually as a result of prep_data_fs.
+        std::thread(&cryptfs_mount_default_encrypted).detach();
+    } else if (subcommand == "getpwtype") {
+        if (!check_argc(cli, subcommand, argc, 2, "")) return 0;
+        SLOGD("cryptfs getpwtype");
+        dumpArgs(argc, argv, -1);
+        switch(cryptfs_get_password_type()) {
+        case CRYPT_TYPE_PASSWORD:
+            cli->sendMsg(ResponseCode::PasswordTypeResult, "password", false);
+            return 0;
+        case CRYPT_TYPE_PATTERN:
+            cli->sendMsg(ResponseCode::PasswordTypeResult, "pattern", false);
+            return 0;
+        case CRYPT_TYPE_PIN:
+            cli->sendMsg(ResponseCode::PasswordTypeResult, "pin", false);
+            return 0;
+        case CRYPT_TYPE_DEFAULT:
+            cli->sendMsg(ResponseCode::PasswordTypeResult, "default", false);
+            return 0;
+        default:
+          /** @TODO better error and make sure handled by callers */
+            cli->sendMsg(ResponseCode::OpFailedStorageNotFound, "Error", false);
+            return 0;
+        }
+    } else if (subcommand == "getpw") {
+        if (!check_argc(cli, subcommand, argc, 2, "")) return 0;
+        SLOGD("cryptfs getpw");
+        dumpArgs(argc, argv, -1);
+        const char* password = cryptfs_get_password();
+        if (password) {
+            char* message = 0;
+            int size = asprintf(&message, "{{sensitive}} %s", password);
+            if (size != -1) {
+                cli->sendMsg(ResponseCode::CommandOkay, message, false);
+                memset(message, 0, size);
+                free (message);
+                return 0;
+            }
+        }
+        rc = -1;
+    } else if (subcommand == "clearpw") {
+        if (!check_argc(cli, subcommand, argc, 2, "")) return 0;
+        SLOGD("cryptfs clearpw");
+        dumpArgs(argc, argv, -1);
+        cryptfs_clear_password();
+        rc = 0;
+
+    } else if (subcommand == "isConvertibleToFBE") {
+        if (!check_argc(cli, subcommand, argc, 2, "")) return 0;
+        // ext4enc:TODO: send a CommandSyntaxError if argv[2] not an integer
+        SLOGD("cryptfs isConvertibleToFBE");
+        dumpArgs(argc, argv, -1);
+        rc = cryptfs_isConvertibleToFBE();
+
+    } else if (subcommand == "init_user0") {
+        if (!check_argc(cli, subcommand, argc, 2, "")) return 0;
+        return sendGenericOkFailOnBool(cli, e4crypt_init_user0());
+
+    } else if (subcommand == "create_user_key") {
+        if (!check_argc(cli, subcommand, argc, 5, "<user> <serial> <ephemeral>")) return 0;
+        return sendGenericOkFailOnBool(cli, e4crypt_vold_create_user_key(
+            atoi(argv[2]), atoi(argv[3]), atoi(argv[4]) != 0));
+
+    } else if (subcommand == "destroy_user_key") {
+        if (!check_argc(cli, subcommand, argc, 3, "<user>")) return 0;
+        return sendGenericOkFailOnBool(cli, e4crypt_destroy_user_key(atoi(argv[2])));
+
+    } else if (subcommand == "add_user_key_auth") {
+        if (!check_argc(cli, subcommand, argc, 6, "<user> <serial> <token> <secret>")) return 0;
+        return sendGenericOkFailOnBool(cli, e4crypt_add_user_key_auth(
+            atoi(argv[2]), atoi(argv[3]), argv[4], argv[5]));
+
+    } else if (subcommand == "fixate_newest_user_key_auth") {
+        if (!check_argc(cli, subcommand, argc, 3, "<user>")) return 0;
+        return sendGenericOkFailOnBool(cli, e4crypt_fixate_newest_user_key_auth(atoi(argv[2])));
+
+    } else if (subcommand == "unlock_user_key") {
+        if (!check_argc(cli, subcommand, argc, 6, "<user> <serial> <token> <secret>")) return 0;
+        return sendGenericOkFailOnBool(cli, e4crypt_unlock_user_key(
+            atoi(argv[2]), atoi(argv[3]), argv[4], argv[5]));
+
+    } else if (subcommand == "lock_user_key") {
+        if (!check_argc(cli, subcommand, argc, 3, "<user>")) return 0;
+        return sendGenericOkFailOnBool(cli, e4crypt_lock_user_key(atoi(argv[2])));
+
+    } else if (subcommand == "prepare_user_storage") {
+        if (!check_argc(cli, subcommand, argc, 6, "<uuid> <user> <serial> <flags>")) return 0;
+        return sendGenericOkFailOnBool(cli, e4crypt_prepare_user_storage(
+            parseNull(argv[2]), atoi(argv[3]), atoi(argv[4]), atoi(argv[5])));
+
+    } else if (subcommand == "destroy_user_storage") {
+        if (!check_argc(cli, subcommand, argc, 5, "<uuid> <user> <flags>")) return 0;
+        return sendGenericOkFailOnBool(cli,
+                e4crypt_destroy_user_storage(parseNull(argv[2]), atoi(argv[3]), atoi(argv[4])));
+
+    } else {
+        dumpArgs(argc, argv, -1);
+        cli->sendMsg(ResponseCode::CommandSyntaxError, "Unknown cryptfs subcommand", false);
+        return 0;
+    }
+
+    // Always report that the command succeeded and return the error code.
+    // The caller will check the return value to see what the error was.
+    char msg[255];
+    snprintf(msg, sizeof(msg), "%d", rc);
+    cli->sendMsg(ResponseCode::CommandOkay, msg, false);
+
+    return 0;

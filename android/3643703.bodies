@@ -1,0 +1,242 @@
+class QCameraCbNotifier
+!!!44124215.cpp!!!	notifyCallback(inout cbArgs : qcamera_callback_argm_t) : int32_t
+    if (!mActive) {
+        ALOGE("%s: notify thread is not active", __func__);
+        return UNKNOWN_ERROR;
+    }
+
+    qcamera_callback_argm_t *cbArg = new qcamera_callback_argm_t();
+    if (NULL == cbArg) {
+        ALOGE("%s: no mem for qcamera_callback_argm_t", __func__);
+        return NO_MEMORY;
+    }
+    memset(cbArg, 0, sizeof(qcamera_callback_argm_t));
+    *cbArg = cbArgs;
+
+    if (mDataQ.enqueue((void *)cbArg)) {
+        return mProcTh.sendCmd(CAMERA_CMD_TYPE_DO_NEXT_JOB, FALSE, FALSE);
+    } else {
+        ALOGE("%s: Error adding cb data into queue", __func__);
+        delete cbArg;
+        return UNKNOWN_ERROR;
+    }
+!!!44124343.cpp!!!	setCallbacks(in notifyCb : camera_notify_callback, in dataCb : camera_data_callback, in dataCbTimestamp : camera_data_timestamp_callback, inout callbackCookie : void) : void
+    if ( ( NULL == mNotifyCb ) &&
+         ( NULL == mDataCb ) &&
+         ( NULL == mDataCbTimestamp ) &&
+         ( NULL == mCallbackCookie ) ) {
+        mNotifyCb = notifyCb;
+        mDataCb = dataCb;
+        mDataCbTimestamp = dataCbTimestamp;
+        mCallbackCookie = callbackCookie;
+        mActive = true;
+        mProcTh.launch(cbNotifyRoutine, this);
+    } else {
+        ALOGE("%s : Camera callback notifier already initialized!",
+              __func__);
+    }
+!!!44124471.cpp!!!	startSnapshots() : int32_t
+    return mProcTh.sendCmd(CAMERA_CMD_TYPE_START_DATA_PROC, FALSE, TRUE);
+!!!44124599.cpp!!!	stopSnapshots() : void
+    mProcTh.sendCmd(CAMERA_CMD_TYPE_STOP_DATA_PROC, FALSE, TRUE);
+!!!44124727.cpp!!!	exit() : void
+    mActive = false;
+    mProcTh.exit();
+!!!44124855.cpp!!!	cbNotifyRoutine(inout data : void) : void
+    int running = 1;
+    int ret;
+    QCameraCbNotifier *pme = (QCameraCbNotifier *)data;
+    QCameraCmdThread *cmdThread = &pme->mProcTh;
+    uint8_t isSnapshotActive = FALSE;
+    bool longShotEnabled = false;
+    uint32_t numOfSnapshotExpected = 0;
+    uint32_t numOfSnapshotRcvd = 0;
+    int32_t cbStatus = NO_ERROR;
+
+    CDBG("%s: E", __func__);
+    do {
+        do {
+            ret = cam_sem_wait(&cmdThread->cmd_sem);
+            if (ret != 0 && errno != EINVAL) {
+                CDBG("%s: cam_sem_wait error (%s)",
+                           __func__, strerror(errno));
+                return NULL;
+            }
+        } while (ret != 0);
+
+        camera_cmd_type_t cmd = cmdThread->getCmd();
+        CDBG("%s: get cmd %d", __func__, cmd);
+        switch (cmd) {
+        case CAMERA_CMD_TYPE_START_DATA_PROC:
+            {
+                isSnapshotActive = TRUE;
+                numOfSnapshotExpected = pme->mParent->numOfSnapshotsExpected();
+                longShotEnabled = pme->mParent->isLongshotEnabled();
+                CDBG_HIGH("%s: Num Snapshots Expected = %d",
+                  __func__, numOfSnapshotExpected);
+                numOfSnapshotRcvd = 0;
+            }
+            break;
+        case CAMERA_CMD_TYPE_STOP_DATA_PROC:
+            {
+                pme->mDataQ.flushNodes(matchSnapshotNotifications);
+                isSnapshotActive = FALSE;
+
+                numOfSnapshotExpected = 0;
+                numOfSnapshotRcvd = 0;
+            }
+            break;
+        case CAMERA_CMD_TYPE_DO_NEXT_JOB:
+            {
+                qcamera_callback_argm_t *cb =
+                    (qcamera_callback_argm_t *)pme->mDataQ.dequeue();
+                cbStatus = NO_ERROR;
+                if (NULL != cb) {
+                    CDBG("%s: cb type %d received",
+                          __func__,
+                          cb->cb_type);
+
+                    if (pme->mParent->msgTypeEnabledWithLock(cb->msg_type)) {
+                        switch (cb->cb_type) {
+                        case QCAMERA_NOTIFY_CALLBACK:
+                            {
+                                if (cb->msg_type == CAMERA_MSG_FOCUS) {
+                                    CDBG_HIGH("[KPI Perf] %s : PROFILE_SENDING_FOCUS_EVT_TO APP",
+                                        __func__);
+                                }
+                                if (pme->mNotifyCb) {
+                                    pme->mNotifyCb(cb->msg_type,
+                                                  cb->ext1,
+                                                  cb->ext2,
+                                                  pme->mCallbackCookie);
+                                } else {
+                                    ALOGE("%s : notify callback not set!",
+                                          __func__);
+                                }
+                            }
+                            break;
+                        case QCAMERA_DATA_CALLBACK:
+                            {
+                                if (pme->mDataCb) {
+                                    pme->mDataCb(cb->msg_type,
+                                                 cb->data,
+                                                 cb->index,
+                                                 cb->metadata,
+                                                 pme->mCallbackCookie);
+                                } else {
+                                    ALOGE("%s : data callback not set!",
+                                          __func__);
+                                }
+                            }
+                            break;
+                        case QCAMERA_DATA_TIMESTAMP_CALLBACK:
+                            {
+                                if(pme->mDataCbTimestamp) {
+                                    pme->mDataCbTimestamp(cb->timestamp,
+                                                          cb->msg_type,
+                                                          cb->data,
+                                                          cb->index,
+                                                          pme->mCallbackCookie);
+                                } else {
+                                    ALOGE("%s:data cb with tmp not set!",
+                                          __func__);
+                                }
+                            }
+                            break;
+                        case QCAMERA_DATA_SNAPSHOT_CALLBACK:
+                            {
+                                if (TRUE == isSnapshotActive && pme->mDataCb ) {
+                                    if (!longShotEnabled) {
+                                        numOfSnapshotRcvd++;
+                                        CDBG_HIGH("%s: [ZSL Retro] Num Snapshots Received = %d", __func__,
+                                                numOfSnapshotRcvd);
+                                        if (numOfSnapshotExpected > 0 &&
+                                           (numOfSnapshotExpected == numOfSnapshotRcvd)) {
+                                            CDBG_HIGH("%s: [ZSL Retro] Expected snapshot received = %d",
+                                                    __func__, numOfSnapshotRcvd);
+                                            // notify HWI that snapshot is done
+                                            pme->mParent->processSyncEvt(QCAMERA_SM_EVT_SNAPSHOT_DONE,
+                                                                         NULL);
+                                        }
+                                    }
+                                    pme->mDataCb(cb->msg_type,
+                                                 cb->data,
+                                                 cb->index,
+                                                 cb->metadata,
+                                                 pme->mCallbackCookie);
+                                }
+                            }
+                            break;
+                        default:
+                            {
+                                ALOGE("%s : invalid cb type %d",
+                                      __func__,
+                                      cb->cb_type);
+                                cbStatus = BAD_VALUE;
+                            }
+                            break;
+                        };
+                    } else {
+                        ALOGE("%s : cb message type %d not enabled!",
+                              __func__,
+                              cb->msg_type);
+                        cbStatus = INVALID_OPERATION;
+                    }
+                    if ( cb->release_cb ) {
+                        cb->release_cb(cb->user_data, cb->cookie, cbStatus);
+                    }
+                    delete cb;
+                } else {
+                    ALOGE("%s: invalid cb type passed", __func__);
+                }
+            }
+            break;
+        case CAMERA_CMD_TYPE_EXIT:
+            {
+                running = 0;
+                pme->mDataQ.flush();
+            }
+            break;
+        default:
+            break;
+        }
+    } while (running);
+    CDBG("%s: X", __func__);
+
+    return NULL;
+!!!44124983.cpp!!!	releaseNotifications(inout data : void, inout user_data : void) : void
+    qcamera_callback_argm_t *arg = ( qcamera_callback_argm_t * ) data;
+
+    if ( ( NULL != arg ) && ( NULL != user_data ) ) {
+        if ( arg->release_cb ) {
+            arg->release_cb(arg->user_data, arg->cookie, FAILED_TRANSACTION);
+        }
+    }
+!!!44125111.cpp!!!	matchSnapshotNotifications(inout data : void, inout user_data : void) : bool
+    qcamera_callback_argm_t *arg = ( qcamera_callback_argm_t * ) data;
+    if ( NULL != arg ) {
+        if ( QCAMERA_DATA_SNAPSHOT_CALLBACK == arg->cb_type ) {
+            return true;
+        }
+    }
+
+    return false;
+!!!44125239.cpp!!!	matchPreviewNotifications(inout data : void, inout user_data : void) : bool
+    qcamera_callback_argm_t *arg = ( qcamera_callback_argm_t * ) data;
+    if (NULL != arg) {
+        if ((QCAMERA_DATA_CALLBACK == arg->cb_type) &&
+                (CAMERA_MSG_PREVIEW_FRAME == arg->msg_type)) {
+            return true;
+        }
+    }
+
+    return false;
+!!!44125367.cpp!!!	flushPreviewNotifications() : int32_t
+    if (!mActive) {
+        ALOGE("%s: notify thread is not active", __func__);
+        return UNKNOWN_ERROR;
+    }
+
+    mDataQ.flushNodes(matchPreviewNotifications);
+
+    return NO_ERROR;

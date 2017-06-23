@@ -1,0 +1,199 @@
+class PacManager
+!!!84603703.java!!!	PacManager(inout context : Context, inout handler : Handler, in proxyMessage : int)
+        mContext = context;
+        mLastPort = -1;
+
+        mPacRefreshIntent = PendingIntent.getBroadcast(
+                context, 0, new Intent(ACTION_PAC_REFRESH), 0);
+        context.registerReceiver(new PacRefreshIntentReceiver(),
+                new IntentFilter(ACTION_PAC_REFRESH));
+        mConnectivityHandler = handler;
+        mProxyMessage = proxyMessage;
+!!!84603831.java!!!	getAlarmManager() : AlarmManager
+        if (mAlarmManager == null) {
+            mAlarmManager = (AlarmManager)mContext.getSystemService(Context.ALARM_SERVICE);
+        }
+        return mAlarmManager;
+!!!84603959.java!!!	setCurrentProxyScriptUrl(inout proxy : ProxyInfo) : boolean
+        if (!Uri.EMPTY.equals(proxy.getPacFileUrl())) {
+            if (proxy.getPacFileUrl().equals(mPacUrl) && (proxy.getPort() > 0)) {
+                // Allow to send broadcast, nothing to do.
+                return false;
+            }
+            synchronized (mProxyLock) {
+                mPacUrl = proxy.getPacFileUrl();
+            }
+            mCurrentDelay = DELAY_1;
+            mHasSentBroadcast = false;
+            mHasDownloaded = false;
+            getAlarmManager().cancel(mPacRefreshIntent);
+            bind();
+            return true;
+        } else {
+            getAlarmManager().cancel(mPacRefreshIntent);
+            synchronized (mProxyLock) {
+                mPacUrl = Uri.EMPTY;
+                mCurrentPac = null;
+                if (mProxyService != null) {
+                    try {
+                        mProxyService.stopPacSystem();
+                    } catch (RemoteException e) {
+                        Log.w(TAG, "Failed to stop PAC service", e);
+                    } finally {
+                        unbind();
+                    }
+                }
+            }
+            return false;
+        }
+!!!84604087.java!!!	get(inout pacUri : Uri) : String
+        URL url = new URL(pacUri.toString());
+        URLConnection urlConnection = url.openConnection(java.net.Proxy.NO_PROXY);
+        return new String(Streams.readFully(urlConnection.getInputStream()));
+!!!84604215.java!!!	getNextDelay(in currentDelay : int) : int
+       if (++currentDelay > DELAY_4) {
+           return DELAY_4;
+       }
+       return currentDelay;
+!!!84604343.java!!!	longSchedule() : void
+        mCurrentDelay = DELAY_1;
+        setDownloadIn(DELAY_LONG);
+!!!84604471.java!!!	reschedule() : void
+        mCurrentDelay = getNextDelay(mCurrentDelay);
+        setDownloadIn(mCurrentDelay);
+!!!84604599.java!!!	getPacChangeDelay() : String
+        final ContentResolver cr = mContext.getContentResolver();
+
+        /** Check system properties for the default value then use secure settings value, if any. */
+        String defaultDelay = SystemProperties.get(
+                "conn." + Settings.Global.PAC_CHANGE_DELAY,
+                DEFAULT_DELAYS);
+        String val = Settings.Global.getString(cr, Settings.Global.PAC_CHANGE_DELAY);
+        return (val == null) ? defaultDelay : val;
+!!!84604727.java!!!	getDownloadDelay(in delayIndex : int) : long
+        String[] list = getPacChangeDelay().split(" ");
+        if (delayIndex < list.length) {
+            return Long.parseLong(list[delayIndex]);
+        }
+        return 0;
+!!!84604855.java!!!	setDownloadIn(in delayIndex : int) : void
+        long delay = getDownloadDelay(delayIndex);
+        long timeTillTrigger = 1000 * delay + SystemClock.elapsedRealtime();
+        getAlarmManager().set(AlarmManager.ELAPSED_REALTIME, timeTillTrigger, mPacRefreshIntent);
+!!!84604983.java!!!	setCurrentProxyScript(inout script : String) : boolean
+        if (mProxyService == null) {
+            Log.e(TAG, "setCurrentProxyScript: no proxy service");
+            return false;
+        }
+        try {
+            mProxyService.setPacFile(script);
+            mCurrentPac = script;
+        } catch (RemoteException e) {
+            Log.e(TAG, "Unable to set PAC file", e);
+        }
+        return true;
+!!!84605111.java!!!	bind() : void
+        if (mContext == null) {
+            Log.e(TAG, "No context for binding");
+            return;
+        }
+        Intent intent = new Intent();
+        intent.setClassName(PAC_PACKAGE, PAC_SERVICE);
+        if ((mProxyConnection != null) && (mConnection != null)) {
+            // Already bound no need to bind again, just download the new file.
+            IoThread.getHandler().post(mPacDownloader);
+            return;
+        }
+        mConnection = new ServiceConnection() {
+            @Override
+            public void onServiceDisconnected(ComponentName component) {
+                synchronized (mProxyLock) {
+                    mProxyService = null;
+                }
+            }
+
+            @Override
+            public void onServiceConnected(ComponentName component, IBinder binder) {
+                synchronized (mProxyLock) {
+                    try {
+                        Log.d(TAG, "Adding service " + PAC_SERVICE_NAME + " "
+                                + binder.getInterfaceDescriptor());
+                    } catch (RemoteException e1) {
+                        Log.e(TAG, "Remote Exception", e1);
+                    }
+                    ServiceManager.addService(PAC_SERVICE_NAME, binder);
+                    mProxyService = IProxyService.Stub.asInterface(binder);
+                    if (mProxyService == null) {
+                        Log.e(TAG, "No proxy service");
+                    } else {
+                        try {
+                            mProxyService.startPacSystem();
+                        } catch (RemoteException e) {
+                            Log.e(TAG, "Unable to reach ProxyService - PAC will not be started", e);
+                        }
+                        IoThread.getHandler().post(mPacDownloader);
+                    }
+                }
+            }
+        };
+        mContext.bindService(intent, mConnection,
+                Context.BIND_AUTO_CREATE | Context.BIND_NOT_FOREGROUND | Context.BIND_NOT_VISIBLE);
+
+        intent = new Intent();
+        intent.setClassName(PROXY_PACKAGE, PROXY_SERVICE);
+        mProxyConnection = new ServiceConnection() {
+            @Override
+            public void onServiceDisconnected(ComponentName component) {
+            }
+
+            @Override
+            public void onServiceConnected(ComponentName component, IBinder binder) {
+                IProxyCallback callbackService = IProxyCallback.Stub.asInterface(binder);
+                if (callbackService != null) {
+                    try {
+                        callbackService.getProxyPort(new IProxyPortListener.Stub() {
+                            @Override
+                            public void setProxyPort(int port) throws RemoteException {
+                                if (mLastPort != -1) {
+                                    // Always need to send if port changed
+                                    mHasSentBroadcast = false;
+                                }
+                                mLastPort = port;
+                                if (port != -1) {
+                                    Log.d(TAG, "Local proxy is bound on " + port);
+                                    sendProxyIfNeeded();
+                                } else {
+                                    Log.e(TAG, "Received invalid port from Local Proxy,"
+                                            + " PAC will not be operational");
+                                }
+                            }
+                        });
+                    } catch (RemoteException e) {
+                        e.printStackTrace();
+                    }
+                }
+            }
+        };
+        mContext.bindService(intent, mProxyConnection,
+                Context.BIND_AUTO_CREATE | Context.BIND_NOT_FOREGROUND | Context.BIND_NOT_VISIBLE);
+!!!84605239.java!!!	unbind() : void
+        if (mConnection != null) {
+            mContext.unbindService(mConnection);
+            mConnection = null;
+        }
+        if (mProxyConnection != null) {
+            mContext.unbindService(mProxyConnection);
+            mProxyConnection = null;
+        }
+        mProxyService = null;
+        mLastPort = -1;
+!!!84605367.java!!!	sendPacBroadcast(inout proxy : ProxyInfo) : void
+        mConnectivityHandler.sendMessage(mConnectivityHandler.obtainMessage(mProxyMessage, proxy));
+!!!84605495.java!!!	sendProxyIfNeeded() : void
+        if (!mHasDownloaded || (mLastPort == -1)) {
+            return;
+        }
+        if (!mHasSentBroadcast) {
+            sendPacBroadcast(new ProxyInfo(mPacUrl, mLastPort));
+            mHasSentBroadcast = true;
+        }

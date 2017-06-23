@@ -1,0 +1,175 @@
+class BidiRenderer
+!!!76001975.java!!!	BidiRenderer(inout graphics : Graphics2D, inout paint : Paint_Delegate, inout text : char [[]])
+        assert (paint != null);
+        mGraphics = graphics;
+        mPaint = paint;
+        mText = text;
+        mFonts = new ArrayList<Font>(paint.getFonts().size());
+        for (FontInfo fontInfo : paint.getFonts()) {
+            if (fontInfo == null) {
+                mFonts.add(null);
+                continue;
+            }
+            mFonts.add(fontInfo.mFont);
+        }
+        mBounds = new RectF();
+!!!76002103.java!!!	setRenderLocation(in x : float, in y : float) : BidiRenderer
+        mBounds = new RectF(x, y, x, y);
+        mBaseline = y;
+        return this;
+!!!76002231.java!!!	renderText(in start : int, in limit : int, in bidiFlags : int, inout advances : float [[]], in advancesIndex : int, inout draw : boolean) : RectF
+        Bidi bidi = new Bidi(mText, start, null, 0, limit - start, getIcuFlags(bidiFlags));
+        for (int i = 0; i < bidi.countRuns(); i++) {
+            BidiRun visualRun = bidi.getVisualRun(i);
+            boolean isRtl = visualRun.getDirection() == Bidi.RTL;
+            renderText(visualRun.getStart(), visualRun.getLimit(), isRtl, advances,
+                    advancesIndex, draw);
+        }
+        return mBounds;
+!!!76002359.java!!!	renderText(in start : int, in limit : int, inout isRtl : boolean, inout advances : float [[]], in advancesIndex : int, inout draw : boolean) : RectF
+        // We break the text into scripts and then select font based on it and then render each of
+        // the script runs.
+        for (ScriptRun run : getScriptRuns(mText, start, limit, isRtl, mFonts)) {
+            int flag = Font.LAYOUT_NO_LIMIT_CONTEXT | Font.LAYOUT_NO_START_CONTEXT;
+            flag |= isRtl ? Font.LAYOUT_RIGHT_TO_LEFT : Font.LAYOUT_LEFT_TO_RIGHT;
+            renderScript(run.start, run.limit, run.font, flag, advances, advancesIndex, draw);
+            advancesIndex += run.limit - run.start;
+        }
+        return mBounds;
+!!!76002487.java!!!	renderScript(in start : int, in limit : int, inout preferredFont : Font, in flag : int, inout advances : float [[]], in advancesIndex : int, inout draw : boolean) : void
+        if (mFonts.size() == 0 || preferredFont == null) {
+            return;
+        }
+
+        while (start < limit) {
+            boolean foundFont = false;
+            int canDisplayUpTo = preferredFont.canDisplayUpTo(mText, start, limit);
+            if (canDisplayUpTo == -1) {
+                // We can draw all characters in the text.
+                render(start, limit, preferredFont, flag, advances, advancesIndex, draw);
+                return;
+            }
+            if (canDisplayUpTo > start) {
+                // We can draw something.
+                render(start, canDisplayUpTo, preferredFont, flag, advances, advancesIndex, draw);
+                advancesIndex += canDisplayUpTo - start;
+                start = canDisplayUpTo;
+            }
+
+            // The current character cannot be drawn with the preferred font. Cycle through all the
+            // fonts to check which one can draw it.
+            int charCount = Character.isHighSurrogate(mText[start]) ? 2 : 1;
+            for (Font font : mFonts) {
+                if (font == null) {
+                    logFontWarning();
+                    continue;
+                }
+                canDisplayUpTo = font.canDisplayUpTo(mText, start, start + charCount);
+                if (canDisplayUpTo == -1) {
+                    render(start, start+charCount, font, flag, advances, advancesIndex, draw);
+                    start += charCount;
+                    advancesIndex += charCount;
+                    foundFont = true;
+                    break;
+                }
+            }
+            if (!foundFont) {
+                // No font can display this char. Use the preferred font. The char will most
+                // probably appear as a box or a blank space. We could, probably, use some
+                // heuristics and break the character into the base character and diacritics and
+                // then draw it, but it's probably not worth the effort.
+                render(start, start + charCount, preferredFont, flag, advances, advancesIndex,
+                        draw);
+                start += charCount;
+                advancesIndex += charCount;
+            }
+        }
+!!!76002615.java!!!	logFontWarning() : void
+        Bridge.getLog().fidelityWarning(LayoutLog.TAG_BROKEN,
+                "Some fonts could not be loaded. The rendering may not be perfect. " +
+                        "Try running the IDE with JRE 7.", null, null);
+!!!76002743.java!!!	render(in start : int, in limit : int, inout font : Font, in flag : int, inout advances : float [[]], in advancesIndex : int, inout draw : boolean) : void
+
+        FontRenderContext frc;
+        if (mGraphics != null) {
+            frc = mGraphics.getFontRenderContext();
+        } else {
+            frc = Toolkit.getDefaultToolkit().getFontMetrics(font).getFontRenderContext();
+            // Metrics obtained this way don't have anti-aliasing set. So,
+            // we create a new FontRenderContext with anti-aliasing set.
+            frc = new FontRenderContext(font.getTransform(), mPaint.isAntiAliased(), frc.usesFractionalMetrics());
+        }
+        GlyphVector gv = font.layoutGlyphVector(frc, mText, start, limit, flag);
+        int ng = gv.getNumGlyphs();
+        int[] ci = gv.getGlyphCharIndices(0, ng, null);
+        if (advances != null) {
+            for (int i = 0; i < ng; i++) {
+                int adv_idx = advancesIndex + ci[i];
+                advances[adv_idx] += gv.getGlyphMetrics(i).getAdvanceX();
+            }
+        }
+        if (draw && mGraphics != null) {
+            mGraphics.drawGlyphVector(gv, mBounds.right, mBaseline);
+        }
+
+        // Update the bounds.
+        Rectangle2D awtBounds = gv.getLogicalBounds();
+        RectF bounds = awtRectToAndroidRect(awtBounds, mBounds.right, mBaseline);
+        // If the width of the bounds is zero, no text had been drawn earlier. Hence, use the
+        // coordinates from the bounds as an offset.
+        if (Math.abs(mBounds.right - mBounds.left) == 0) {
+            mBounds = bounds;
+        } else {
+            mBounds.union(bounds);
+        }
+!!!76002871.java!!!	awtRectToAndroidRect(inout awtRec : Rectangle2D, in offsetX : float, in offsetY : float) : RectF
+        float left = (float) awtRec.getX();
+        float top = (float) awtRec.getY();
+        float right = (float) (left + awtRec.getWidth());
+        float bottom = (float) (top + awtRec.getHeight());
+        RectF androidRect = new RectF(left, top, right, bottom);
+        androidRect.offset(offsetX, offsetY);
+        return androidRect;
+!!!76002999.java!!!	getScriptRuns(inout text : char [[]], in start : int, in limit : int, inout isRtl : boolean, inout fonts : List<Font>) : BidiRenderer::ScriptRun
+        LinkedList<ScriptRun> scriptRuns = new LinkedList<ScriptRun>();
+
+        int count = limit - start;
+        UScriptRun uScriptRun = new UScriptRun(text, start, count);
+        while (uScriptRun.next()) {
+            int scriptStart = uScriptRun.getScriptStart();
+            int scriptLimit = uScriptRun.getScriptLimit();
+            ScriptRun run = new ScriptRun(scriptStart, scriptLimit, isRtl);
+            run.scriptCode = uScriptRun.getScriptCode();
+            setScriptFont(text, run, fonts);
+            scriptRuns.add(run);
+        }
+
+        return scriptRuns;
+!!!76003127.java!!!	setScriptFont(inout text : char [[]], inout run : BidiRenderer::ScriptRun, inout fonts : List<Font>) : void
+        for (Font font : fonts) {
+            if (font == null) {
+                logFontWarning();
+                continue;
+            }
+            if (font.canDisplayUpTo(text, run.start, run.limit) == -1) {
+                run.font = font;
+                return;
+            }
+        }
+        run.font = fonts.get(0);
+!!!76003255.java!!!	getIcuFlags(in bidiFlag : int) : int
+        switch (bidiFlag) {
+            case Paint.BIDI_LTR:
+            case Paint.BIDI_FORCE_LTR:
+                return Bidi.DIRECTION_LEFT_TO_RIGHT;
+            case Paint.BIDI_RTL:
+            case Paint.BIDI_FORCE_RTL:
+                return Bidi.DIRECTION_RIGHT_TO_LEFT;
+            case Paint.BIDI_DEFAULT_LTR:
+                return Bidi.DIRECTION_DEFAULT_LEFT_TO_RIGHT;
+            case Paint.BIDI_DEFAULT_RTL:
+                return Bidi.DIRECTION_DEFAULT_RIGHT_TO_LEFT;
+            default:
+                assert false;
+                return Bidi.DIRECTION_DEFAULT_LEFT_TO_RIGHT;
+        }

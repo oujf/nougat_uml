@@ -1,0 +1,824 @@
+class DirectoryFragment
+!!!70789431.java!!!	onCreateView(inout inflater : LayoutInflater, inout container : ViewGroup, inout savedInstanceState : Bundle) : View
+        mInflater = inflater;
+        final View view = inflater.inflate(R.layout.fragment_directory, container, false);
+
+        mMessageBar = MessageBar.create(getChildFragmentManager());
+        mProgressBar = view.findViewById(R.id.progressbar);
+        mEmptyView = view.findViewById(android.R.id.empty);
+        mRecView = (RecyclerView) view.findViewById(R.id.dir_list);
+        mRecView.setRecyclerListener(
+                new RecyclerListener() {
+                    @Override
+                    public void onViewRecycled(ViewHolder holder) {
+                        cancelThumbnailTask(holder.itemView);
+                    }
+                });
+
+        mRecView.setItemAnimator(new DirectoryItemAnimator(getActivity()));
+
+        // Make the recycler and the empty views responsive to drop events.
+        mRecView.setOnDragListener(mOnDragListener);
+        mEmptyView.setOnDragListener(mOnDragListener);
+
+        return view;
+!!!70789559.java!!!	onDestroyView() : void
+        mSelectionManager.clearSelection();
+
+        // Cancel any outstanding thumbnail requests
+        final int count = mRecView.getChildCount();
+        for (int i = 0; i < count; i++) {
+            final View view = mRecView.getChildAt(i);
+            cancelThumbnailTask(view);
+        }
+
+        super.onDestroyView();
+!!!70789687.java!!!	onActivityCreated(inout savedInstanceState : Bundle) : void
+        super.onActivityCreated(savedInstanceState);
+
+        final Context context = getActivity();
+        final State state = getDisplayState();
+
+        // Read arguments when object created for the first time.
+        // Restore state if fragment recreated.
+        Bundle args = savedInstanceState == null ? getArguments() : savedInstanceState;
+        mRoot = args.getParcelable(Shared.EXTRA_ROOT);
+        mDocument = args.getParcelable(Shared.EXTRA_DOC);
+        mStateKey = buildStateKey(mRoot, mDocument);
+        mQuery = args.getString(Shared.EXTRA_QUERY);
+        mType = args.getInt(Shared.EXTRA_TYPE);
+        final Selection selection = args.getParcelable(Shared.EXTRA_SELECTION);
+        mSelection = selection != null ? selection : new Selection();
+        mSearchMode = args.getBoolean(Shared.EXTRA_SEARCH_MODE);
+
+        mIconHelper = new IconHelper(context, MODE_GRID);
+
+        mAdapter = new SectionBreakDocumentsAdapterWrapper(
+                this, new ModelBackedDocumentsAdapter(this, mIconHelper));
+
+        mRecView.setAdapter(mAdapter);
+
+        mLayout = new GridLayoutManager(getContext(), mColumnCount);
+        SpanSizeLookup lookup = mAdapter.createSpanSizeLookup();
+        if (lookup != null) {
+            mLayout.setSpanSizeLookup(lookup);
+        }
+        mRecView.setLayoutManager(mLayout);
+
+        mGestureDetector =
+                new ListeningGestureDetector(this.getContext(), mDragHelper, new GestureListener());
+
+        mRecView.addOnItemTouchListener(mGestureDetector);
+
+        // TODO: instead of inserting the view into the constructor, extract listener-creation code
+        // and set the listener on the view after the fact.  Then the view doesn't need to be passed
+        // into the selection manager.
+        mSelectionManager = new MultiSelectManager(
+                mRecView,
+                mAdapter,
+                state.allowMultiple
+                    ? MultiSelectManager.MODE_MULTIPLE
+                    : MultiSelectManager.MODE_SINGLE,
+                null);
+
+        mSelectionManager.addCallback(new SelectionModeListener());
+
+        mModel = new Model();
+        mModel.addUpdateListener(mAdapter);
+        mModel.addUpdateListener(mModelUpdateListener);
+
+        // Make sure this is done after the RecyclerView is set up.
+        mFocusManager = new FocusManager(context, mRecView, mModel);
+
+        mTuner = FragmentTuner.pick(getContext(), state);
+        mClipper = new DocumentClipper(context);
+
+        final ActivityManager am = (ActivityManager) context.getSystemService(
+                Context.ACTIVITY_SERVICE);
+        boolean svelte = am.isLowRamDevice() && (mType == TYPE_RECENT_OPEN);
+        mIconHelper.setThumbnailsEnabled(!svelte);
+
+        // Kick off loader at least once
+        getLoaderManager().restartLoader(LOADER_ID, null, this);
+!!!70789815.java!!!	onSaveInstanceState(inout outState : Bundle) : void
+        super.onSaveInstanceState(outState);
+
+        mSelectionManager.getSelection(mSelection);
+
+        outState.putInt(Shared.EXTRA_TYPE, mType);
+        outState.putParcelable(Shared.EXTRA_ROOT, mRoot);
+        outState.putParcelable(Shared.EXTRA_DOC, mDocument);
+        outState.putString(Shared.EXTRA_QUERY, mQuery);
+
+        // Workaround. To avoid crash, write only up to 512 KB of selection.
+        // If more files are selected, then the selection will be lost.
+        final Parcel parcel = Parcel.obtain();
+        try {
+            mSelection.writeToParcel(parcel, 0);
+            if (parcel.dataSize() <= 512 * 1024) {
+                outState.putParcelable(Shared.EXTRA_SELECTION, mSelection);
+            }
+        } finally {
+            parcel.recycle();
+        }
+
+        outState.putBoolean(Shared.EXTRA_SEARCH_MODE, mSearchMode);
+!!!70789943.java!!!	onActivityResult(in requestCode : int, in resultCode : int, inout data : Intent) : void
+        switch (requestCode) {
+            case REQUEST_COPY_DESTINATION:
+                handleCopyResult(resultCode, data);
+                break;
+            default:
+                throw new UnsupportedOperationException("Unknown request code: " + requestCode);
+        }
+!!!70790071.java!!!	handleCopyResult(in resultCode : int, inout data : Intent) : void
+        if (resultCode == Activity.RESULT_CANCELED || data == null) {
+            // User pressed the back button or otherwise cancelled the destination pick. Don't
+            // proceed with the copy.
+            return;
+        }
+
+        @OpType int operationType = data.getIntExtra(
+                FileOperationService.EXTRA_OPERATION,
+                FileOperationService.OPERATION_COPY);
+
+        FileOperations.start(
+                getActivity(),
+                getDisplayState().selectedDocumentsForCopy,
+                getDisplayState().stack.peek(),
+                (DocumentStack) data.getParcelableExtra(Shared.EXTRA_STACK),
+                operationType);
+!!!70790199.java!!!	onDoubleTap(inout e : MotionEvent) : boolean
+        if (Events.isMouseEvent(e)) {
+            String id = getModelId(e);
+            if (id != null) {
+                return handleViewItem(id);
+            }
+        }
+        return false;
+!!!70790327.java!!!	handleViewItem(inout id : String) : boolean
+        final Cursor cursor = mModel.getItem(id);
+
+        if (cursor == null) {
+            Log.w(TAG, "Can't view item. Can't obtain cursor for modeId" + id);
+            return false;
+        }
+
+        final String docMimeType = getCursorString(cursor, Document.COLUMN_MIME_TYPE);
+        final int docFlags = getCursorInt(cursor, Document.COLUMN_FLAGS);
+        if (mTuner.isDocumentEnabled(docMimeType, docFlags)) {
+            final DocumentInfo doc = DocumentInfo.fromDirectoryCursor(cursor);
+            ((BaseActivity) getActivity()).onDocumentPicked(doc, mModel);
+            mSelectionManager.clearSelection();
+            return true;
+        }
+        return false;
+!!!70790455.java!!!	onStop() : void
+        super.onStop();
+
+        // Remember last scroll location
+        final SparseArray<Parcelable> container = new SparseArray<Parcelable>();
+        getView().saveHierarchyState(container);
+        final State state = getDisplayState();
+        state.dirState.put(mStateKey, container);
+!!!70790583.java!!!	onDisplayStateChanged() : void
+        updateDisplayState();
+!!!70790711.java!!!	onSortOrderChanged() : void
+        // Sort order is implemented as a sorting wrapper around directory
+        // results. So when sort order changes, we force a reload of the directory.
+        getLoaderManager().restartLoader(LOADER_ID, null, this);
+!!!70790839.java!!!	onViewModeChanged() : void
+        // Mode change is just visual change; no need to kick loader.
+        updateDisplayState();
+!!!70790967.java!!!	updateDisplayState() : void
+        State state = getDisplayState();
+        updateLayout(state.derivedMode);
+        mRecView.setAdapter(mAdapter);
+!!!70791095.java!!!	updateLayout(in mode : int) : void
+        mColumnCount = calculateColumnCount(mode);
+        if (mLayout != null) {
+            mLayout.setSpanCount(mColumnCount);
+        }
+
+        int pad = getDirectoryPadding(mode);
+        mRecView.setPadding(pad, pad, pad, pad);
+        mRecView.requestLayout();
+        mSelectionManager.handleLayoutChanged();  // RecyclerView doesn't do this for us
+        mIconHelper.setViewMode(mode);
+!!!70791223.java!!!	calculateColumnCount(in mode : int) : int
+        if (mode == MODE_LIST) {
+            // List mode is a "grid" with 1 column.
+            return 1;
+        }
+
+        int cellWidth = getResources().getDimensionPixelSize(R.dimen.grid_width);
+        int cellMargin = 2 * getResources().getDimensionPixelSize(R.dimen.grid_item_margin);
+        int viewPadding = mRecView.getPaddingLeft() + mRecView.getPaddingRight();
+
+        // RecyclerView sometimes gets a width of 0 (see b/27150284).  Clamp so that we always lay
+        // out the grid with at least 2 columns.
+        int columnCount = Math.max(2,
+                (mRecView.getWidth() - viewPadding) / (cellWidth + cellMargin));
+
+        return columnCount;
+!!!70791351.java!!!	getDirectoryPadding(in mode : int) : int
+        switch (mode) {
+            case MODE_GRID:
+                return getResources().getDimensionPixelSize(R.dimen.grid_container_padding);
+            case MODE_LIST:
+                return getResources().getDimensionPixelSize(R.dimen.list_container_padding);
+            default:
+                throw new IllegalArgumentException("Unsupported layout mode: " + mode);
+        }
+!!!70791479.java!!!	getColumnCount() : int
+        return mColumnCount;
+!!!70815287.java!!!	onBackPressed() : boolean
+        if (mSelectionManager.hasSelection()) {
+            if (DEBUG) Log.d(TAG, "Clearing selection on selection manager.");
+            mSelectionManager.clearSelection();
+            return true;
+        }
+        return false;
+!!!70815415.java!!!	cancelThumbnailTask(inout view : View) : void
+        final ImageView iconThumb = (ImageView) view.findViewById(R.id.icon_thumb);
+        if (iconThumb != null) {
+            mIconHelper.stopLoading(iconThumb);
+        }
+!!!70815543.java!!!	openDocuments(in selected : MultiSelectManager::Selection) : void
+        Metrics.logUserAction(getContext(), Metrics.USER_ACTION_OPEN);
+
+        new GetDocumentsTask() {
+            @Override
+            void onDocumentsReady(List<DocumentInfo> docs) {
+                // TODO: Implement support in Files activity for opening multiple docs.
+                BaseActivity.get(DirectoryFragment.this).onDocumentsPicked(docs);
+            }
+        }.execute(selected);
+!!!70815671.java!!!	shareDocuments(in selected : MultiSelectManager::Selection) : void
+        Metrics.logUserAction(getContext(), Metrics.USER_ACTION_SHARE);
+
+        new GetDocumentsTask() {
+            @Override
+            void onDocumentsReady(List<DocumentInfo> docs) {
+                Intent intent;
+
+                // Filter out directories and virtual files - those can't be shared.
+                List<DocumentInfo> docsForSend = new ArrayList<>();
+                for (DocumentInfo doc: docs) {
+                    if (!doc.isDirectory() && !doc.isVirtualDocument()) {
+                        docsForSend.add(doc);
+                    }
+                }
+
+                if (docsForSend.size() == 1) {
+                    final DocumentInfo doc = docsForSend.get(0);
+
+                    intent = new Intent(Intent.ACTION_SEND);
+                    intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                    intent.addCategory(Intent.CATEGORY_DEFAULT);
+                    intent.setType(doc.mimeType);
+                    intent.putExtra(Intent.EXTRA_STREAM, doc.derivedUri);
+
+                } else if (docsForSend.size() > 1) {
+                    intent = new Intent(Intent.ACTION_SEND_MULTIPLE);
+                    intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                    intent.addCategory(Intent.CATEGORY_DEFAULT);
+
+                    final ArrayList<String> mimeTypes = new ArrayList<>();
+                    final ArrayList<Uri> uris = new ArrayList<>();
+                    for (DocumentInfo doc : docsForSend) {
+                        mimeTypes.add(doc.mimeType);
+                        uris.add(doc.derivedUri);
+                    }
+
+                    intent.setType(findCommonMimeType(mimeTypes));
+                    intent.putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris);
+
+                } else {
+                    return;
+                }
+
+                intent = Intent.createChooser(intent, getActivity().getText(R.string.share_via));
+                startActivity(intent);
+            }
+        }.execute(selected);
+!!!70815799.java!!!	generateDeleteMessage(in docs : List<DocumentInfo>) : String
+        String message;
+        int dirsCount = 0;
+
+        for (DocumentInfo doc : docs) {
+            if (doc.isDirectory()) {
+                ++dirsCount;
+            }
+        }
+
+        if (docs.size() == 1) {
+            // Deleteing 1 file xor 1 folder in cwd
+
+            // Address b/28772371, where including user strings in message can result in
+            // broken bidirectional support.
+            String displayName = BidiFormatter.getInstance().unicodeWrap(docs.get(0).displayName);
+            message = dirsCount == 0
+                    ? getActivity().getString(R.string.delete_filename_confirmation_message,
+                            displayName)
+                    : getActivity().getString(R.string.delete_foldername_confirmation_message,
+                            displayName);
+        } else if (dirsCount == 0) {
+            // Deleting only files in cwd
+            message = Shared.getQuantityString(getActivity(),
+                    R.plurals.delete_files_confirmation_message, docs.size());
+        } else if (dirsCount == docs.size()) {
+            // Deleting only folders in cwd
+            message = Shared.getQuantityString(getActivity(),
+                    R.plurals.delete_folders_confirmation_message, docs.size());
+        } else {
+            // Deleting mixed items (files and folders) in cwd
+            message = Shared.getQuantityString(getActivity(),
+                    R.plurals.delete_items_confirmation_message, docs.size());
+        }
+        return message;
+!!!70815927.java!!!	deleteDocuments(in selected : MultiSelectManager::Selection) : void
+        Metrics.logUserAction(getContext(), Metrics.USER_ACTION_DELETE);
+
+        assert(!selected.isEmpty());
+
+        final DocumentInfo srcParent = getDisplayState().stack.peek();
+        new GetDocumentsTask() {
+            @Override
+            void onDocumentsReady(final List<DocumentInfo> docs) {
+
+                TextView message =
+                        (TextView) mInflater.inflate(R.layout.dialog_delete_confirmation, null);
+                message.setText(generateDeleteMessage(docs));
+
+                // This "insta-hides" files that are being deleted, because
+                // the delete operation may be not execute immediately (it
+                // may be queued up on the FileOperationService.)
+                // To hide the files locally, we call the hide method on the adapter
+                // ...which a live object...cannot be parceled.
+                // For that reason, for now, we implement this dialog NOT
+                // as a fragment (which can survive rotation and have its own state),
+                // but as a simple runtime dialog. So rotating a device with an
+                // active delete dialog...results in that dialog disappearing.
+                // We can do better, but don't have cycles for it now.
+                new AlertDialog.Builder(getActivity())
+                    .setView(message)
+                    .setPositiveButton(
+                         android.R.string.yes,
+                         new DialogInterface.OnClickListener() {
+                            public void onClick(DialogInterface dialog, int id) {
+                                // Finish selection mode first which clears selection so we
+                                // don't end up trying to deselect deleted documents.
+                                // This is done here, rather in the onActionItemClicked
+                                // so we can avoid de-selecting items in the case where
+                                // the user cancels the delete.
+                                if (mActionMode != null) {
+                                    mActionMode.finish();
+                                } else {
+                                    Log.w(TAG, "Action mode is null before deleting documents.");
+                                }
+                                // Hide the files in the UI...since the operation
+                                // might be queued up on FileOperationService.
+                                // We're walking a line here.
+                                mAdapter.hide(selected.getAll());
+                                FileOperations.delete(
+                                        getActivity(), docs, srcParent, getDisplayState().stack);
+                            }
+                        })
+                    .setNegativeButton(android.R.string.no, null)
+                    .show();
+            }
+        }.execute(selected);
+!!!70816055.java!!!	transferDocuments(in selected : MultiSelectManager::Selection, in mode : int) : void
+        if(mode == FileOperationService.OPERATION_COPY) {
+            Metrics.logUserAction(getContext(), Metrics.USER_ACTION_COPY_TO);
+        } else if (mode == FileOperationService.OPERATION_MOVE) {
+            Metrics.logUserAction(getContext(), Metrics.USER_ACTION_MOVE_TO);
+        }
+
+        // Pop up a dialog to pick a destination.  This is inadequate but works for now.
+        // TODO: Implement a picker that is to spec.
+        final Intent intent = new Intent(
+                Shared.ACTION_PICK_COPY_DESTINATION,
+                Uri.EMPTY,
+                getActivity(),
+                DocumentsActivity.class);
+
+
+        // Relay any config overrides bits present in the original intent.
+        Intent original = getActivity().getIntent();
+        if (original != null && original.hasExtra(Shared.EXTRA_PRODUCTIVITY_MODE)) {
+            intent.putExtra(
+                    Shared.EXTRA_PRODUCTIVITY_MODE,
+                    original.getBooleanExtra(Shared.EXTRA_PRODUCTIVITY_MODE, false));
+        }
+
+        // Set an appropriate title on the drawer when it is shown in the picker.
+        // Coupled with the fact that we auto-open the drawer for copy/move operations
+        // it should basically be the thing people see first.
+        int drawerTitleId = mode == FileOperationService.OPERATION_MOVE
+                ? R.string.menu_move : R.string.menu_copy;
+        intent.putExtra(DocumentsContract.EXTRA_PROMPT, getResources().getString(drawerTitleId));
+
+        new GetDocumentsTask() {
+            @Override
+            void onDocumentsReady(List<DocumentInfo> docs) {
+                // TODO: Can this move to Fragment bundle state?
+                getDisplayState().selectedDocumentsForCopy = docs;
+
+                // Determine if there is a directory in the set of documents
+                // to be copied? Why? Directory creation isn't supported by some roots
+                // (like Downloads). This informs DocumentsActivity (the "picker")
+                // to restrict available roots to just those with support.
+                intent.putExtra(Shared.EXTRA_DIRECTORY_COPY, hasDirectory(docs));
+                intent.putExtra(FileOperationService.EXTRA_OPERATION, mode);
+
+                // This just identifies the type of request...we'll check it
+                // when we reveive a response.
+                startActivityForResult(intent, REQUEST_COPY_DESTINATION);
+            }
+
+        }.execute(selected);
+!!!70816183.java!!!	hasDirectory(inout docs : List<DocumentInfo>) : boolean
+        for (DocumentInfo info : docs) {
+            if (Document.MIME_TYPE_DIR.equals(info.mimeType)) {
+                return true;
+            }
+        }
+        return false;
+!!!70816311.java!!!	renameDocuments(inout selected : MultiSelectManager::Selection) : void
+        Metrics.logUserAction(getContext(), Metrics.USER_ACTION_RENAME);
+
+        // Batch renaming not supported
+        // Rename option is only available in menu when 1 document selected
+        assert(selected.size() == 1);
+
+        new GetDocumentsTask() {
+            @Override
+            void onDocumentsReady(List<DocumentInfo> docs) {
+                RenameDocumentFragment.show(getFragmentManager(), docs.get(0));
+            }
+        }.execute(selected);
+!!!70816439.java!!!	initDocumentHolder(inout holder : DocumentHolder) : void
+        holder.addEventListener(mItemEventListener);
+        holder.itemView.setOnFocusChangeListener(mFocusManager);
+!!!70816567.java!!!	onBindDocumentHolder(inout holder : DocumentHolder, inout cursor : Cursor) : void
+        setupDragAndDropOnDocumentView(holder.itemView, cursor);
+!!!70816695.java!!!	getDisplayState() : State
+        return ((BaseActivity) getActivity()).getDisplayState();
+!!!70816823.java!!!	getModel() : Model
+        return mModel;
+!!!70816951.java!!!	isDocumentEnabled(inout docMimeType : String, in docFlags : int) : boolean
+        return mTuner.isDocumentEnabled(docMimeType, docFlags);
+!!!70817079.java!!!	showEmptyDirectory() : void
+        showEmptyView(R.string.empty, R.drawable.cabinet);
+!!!70817207.java!!!	showNoResults(inout root : RootInfo) : void
+        CharSequence msg = getContext().getResources().getText(R.string.no_results);
+        showEmptyView(String.format(String.valueOf(msg), root.title), R.drawable.cabinet);
+!!!70817335.java!!!	showQueryError() : void
+        showEmptyView(R.string.query_error, R.drawable.hourglass);
+!!!70817463.java!!!	showEmptyView(in id : int, in drawable : int) : void
+        showEmptyView(getContext().getResources().getText(id), drawable);
+!!!70817591.java!!!	showEmptyView(inout msg : CharSequence, in drawable : int) : void
+        View content = mEmptyView.findViewById(R.id.content);
+        TextView msgView = (TextView) mEmptyView.findViewById(R.id.message);
+        ImageView imageView = (ImageView) mEmptyView.findViewById(R.id.artwork);
+        msgView.setText(msg);
+        imageView.setImageResource(drawable);
+
+        mEmptyView.setVisibility(View.VISIBLE);
+        mEmptyView.requestFocus();
+        mRecView.setVisibility(View.GONE);
+!!!70817719.java!!!	showDirectory() : void
+        mEmptyView.setVisibility(View.GONE);
+        mRecView.setVisibility(View.VISIBLE);
+        mRecView.requestFocus();
+!!!70817847.java!!!	findCommonMimeType(inout mimeTypes : List<String>) : String
+        String[] commonType = mimeTypes.get(0).split("/");
+        if (commonType.length != 2) {
+            return "*/*";
+        }
+
+        for (int i = 1; i < mimeTypes.size(); i++) {
+            String[] type = mimeTypes.get(i).split("/");
+            if (type.length != 2) continue;
+
+            if (!commonType[1].equals(type[1])) {
+                commonType[1] = "*";
+            }
+
+            if (!commonType[0].equals(type[0])) {
+                commonType[0] = "*";
+                commonType[1] = "*";
+                break;
+            }
+        }
+
+        return commonType[0] + "/" + commonType[1];
+!!!70817975.java!!!	copyFromClipboard() : void
+        new AsyncTask<Void, Void, List<DocumentInfo>>() {
+
+            @Override
+            protected List<DocumentInfo> doInBackground(Void... params) {
+                return mClipper.getClippedDocuments();
+            }
+
+            @Override
+            protected void onPostExecute(List<DocumentInfo> docs) {
+                DocumentInfo destination =
+                        ((BaseActivity) getActivity()).getCurrentDirectory();
+                copyDocuments(docs, destination);
+            }
+        }.execute();
+!!!70818103.java!!!	copyFromClipData(in clipData : ClipData, in destination : DocumentInfo) : void
+        assert(clipData != null);
+
+        new AsyncTask<Void, Void, List<DocumentInfo>>() {
+
+            @Override
+            protected List<DocumentInfo> doInBackground(Void... params) {
+                return mClipper.getDocumentsFromClipData(clipData);
+            }
+
+            @Override
+            protected void onPostExecute(List<DocumentInfo> docs) {
+                copyDocuments(docs, destination);
+            }
+        }.execute();
+!!!70818231.java!!!	copyDocuments(in docs : List<DocumentInfo>, in destination : DocumentInfo) : void
+        BaseActivity activity = (BaseActivity) getActivity();
+        if (!canCopy(docs, activity.getCurrentRoot(), destination)) {
+            Snackbars.makeSnackbar(
+                    getActivity(),
+                    R.string.clipboard_files_cannot_paste,
+                    Snackbar.LENGTH_SHORT)
+                    .show();
+            return;
+        }
+
+        if (docs.isEmpty()) {
+            return;
+        }
+
+        final DocumentStack curStack = getDisplayState().stack;
+        DocumentStack tmpStack = new DocumentStack();
+        if (destination != null) {
+            tmpStack.push(destination);
+            tmpStack.addAll(curStack);
+        } else {
+            tmpStack = curStack;
+        }
+
+        FileOperations.copy(getActivity(), docs, tmpStack);
+!!!70818359.java!!!	copySelectedToClipboard() : void
+        Metrics.logUserAction(getContext(), Metrics.USER_ACTION_COPY_CLIPBOARD);
+
+        Selection selection = mSelectionManager.getSelection(new Selection());
+        if (!selection.isEmpty()) {
+            copySelectionToClipboard(selection);
+            mSelectionManager.clearSelection();
+        }
+!!!70818487.java!!!	copySelectionToClipboard(inout selection : MultiSelectManager::Selection) : void
+        assert(!selection.isEmpty());
+        new GetDocumentsTask() {
+            @Override
+            void onDocumentsReady(List<DocumentInfo> docs) {
+                mClipper.clipDocuments(docs);
+                Activity activity = getActivity();
+                Snackbars.makeSnackbar(activity,
+                        activity.getResources().getQuantityString(
+                                R.plurals.clipboard_files_clipped, docs.size(), docs.size()),
+                        Snackbar.LENGTH_SHORT).show();
+            }
+        }.execute(selection);
+!!!70818615.java!!!	pasteFromClipboard() : void
+        Metrics.logUserAction(getContext(), Metrics.USER_ACTION_PASTE_CLIPBOARD);
+
+        copyFromClipboard();
+        getActivity().invalidateOptionsMenu();
+!!!70818743.java!!!	canCopy(inout files : List<DocumentInfo>, inout root : RootInfo, inout dest : DocumentInfo) : boolean
+        if (dest == null || !dest.isDirectory() || !dest.isCreateSupported()) {
+            return false;
+        }
+
+        // Can't copy folders to downloads, because we don't show folders there.
+        if (root.isDownloads()) {
+            for (DocumentInfo docs : files) {
+                if (docs.isDirectory()) {
+                    return false;
+                }
+            }
+        }
+
+        return true;
+!!!70818871.java!!!	selectAllFiles() : void
+        Metrics.logUserAction(getContext(), Metrics.USER_ACTION_SELECT_ALL);
+
+        // Exclude disabled files.
+        Set<String> enabled = new HashSet<String>();
+        List<String> modelIds = mAdapter.getModelIds();
+
+        // Get the current selection.
+        String[] alreadySelected = mSelectionManager.getSelection().getAll();
+        for (String id : alreadySelected) {
+           enabled.add(id);
+        }
+
+        for (String id : modelIds) {
+            Cursor cursor = getModel().getItem(id);
+            if (cursor == null) {
+                Log.w(TAG, "Skipping selection. Can't obtain cursor for modeId: " + id);
+                continue;
+            }
+            String docMimeType = getCursorString(cursor, Document.COLUMN_MIME_TYPE);
+            int docFlags = getCursorInt(cursor, Document.COLUMN_FLAGS);
+            if (mTuner.canSelectType(docMimeType, docFlags)) {
+                if (enabled.size() >= MAX_DOCS_IN_INTENT) {
+                    Snackbars.makeSnackbar(
+                        getActivity(),
+                        R.string.too_many_in_select_all,
+                        Snackbar.LENGTH_SHORT)
+                        .show();
+                    break;
+                }
+                enabled.add(id);
+            }
+        }
+
+        // Only select things currently visible in the adapter.
+        boolean changed = mSelectionManager.setItemsSelected(enabled, true);
+        if (changed) {
+            updateDisplayState();
+        }
+!!!70818999.java!!!	requestFocus() : void
+        mFocusManager.restoreLastFocus();
+!!!70819127.java!!!	setupDragAndDropOnDocumentView(inout view : View, inout cursor : Cursor) : void
+        final String docMimeType = getCursorString(cursor, Document.COLUMN_MIME_TYPE);
+        if (Document.MIME_TYPE_DIR.equals(docMimeType)) {
+            // Make a directory item a drop target. Drop on non-directories and empty space
+            // is handled at the list/grid view level.
+            view.setOnDragListener(mOnDragListener);
+        }
+
+        if (mTuner.dragAndDropEnabled()) {
+            // Make all items draggable.
+            view.setOnLongClickListener(onLongClickListener);
+        }
+!!!70819255.java!!!	getModelId(inout e : MotionEvent) : String
+        View view = mRecView.findChildViewUnder(e.getX(), e.getY());
+        if (view == null) {
+            return null;
+        }
+        RecyclerView.ViewHolder vh = mRecView.getChildViewHolder(view);
+        if (vh instanceof DocumentHolder) {
+            return ((DocumentHolder) vh).modelId;
+        } else {
+            return null;
+        }
+!!!70819383.java!!!	getModelId(inout view : View) : String
+        View itemView = mRecView.findContainingItemView(view);
+        if (itemView != null) {
+            RecyclerView.ViewHolder vh = mRecView.getChildViewHolder(itemView);
+            if (vh instanceof DocumentHolder) {
+                return ((DocumentHolder) vh).modelId;
+            }
+        }
+        return null;
+!!!70819511.java!!!	getDraggableDocuments(inout currentItemView : View) : DocumentInfo
+        String modelId = getModelId(currentItemView);
+        if (modelId == null) {
+            return Collections.EMPTY_LIST;
+        }
+
+        final List<DocumentInfo> selectedDocs =
+                mModel.getDocuments(mSelectionManager.getSelection());
+        if (!selectedDocs.isEmpty()) {
+            if (!isSelected(modelId)) {
+                // There is a selection that does not include the current item, drag nothing.
+                return Collections.EMPTY_LIST;
+            }
+            return selectedDocs;
+        }
+
+        final Cursor cursor = mModel.getItem(modelId);
+        if (cursor == null) {
+            Log.w(TAG, "Undraggable document. Can't obtain cursor for modelId " + modelId);
+            return Collections.EMPTY_LIST;
+        }
+
+        return Lists.newArrayList(
+                DocumentInfo.fromDirectoryCursor(cursor));
+!!!70820663.java!!!	isSelected(inout modelId : String) : boolean
+        return mSelectionManager.getSelection().contains(modelId);
+!!!70824759.java!!!	showDirectory(inout fm : FragmentManager, inout root : RootInfo, inout doc : DocumentInfo, in anim : int) : void
+        create(fm, TYPE_NORMAL, root, doc, null, anim);
+!!!70824887.java!!!	showRecentsOpen(inout fm : FragmentManager, in anim : int) : void
+        create(fm, TYPE_RECENT_OPEN, null, null, null, anim);
+!!!70825015.java!!!	reloadSearch(inout fm : FragmentManager, inout root : RootInfo, inout doc : DocumentInfo, inout query : String) : void
+        DirectoryFragment df = get(fm);
+
+        df.mQuery = query;
+        df.mRoot = root;
+        df.mDocument = doc;
+        df.mSearchMode =  query != null;
+        df.getLoaderManager().restartLoader(LOADER_ID, null, df);
+!!!70825143.java!!!	reload(inout fm : FragmentManager, in type : int, inout root : RootInfo, inout doc : DocumentInfo, inout query : String) : void
+        DirectoryFragment df = get(fm);
+        df.mType = type;
+        df.mQuery = query;
+        df.mRoot = root;
+        df.mDocument = doc;
+        df.mSearchMode =  query != null;
+        df.getLoaderManager().restartLoader(LOADER_ID, null, df);
+!!!70825271.java!!!	create(inout fm : FragmentManager, in type : int, inout root : RootInfo, inout doc : DocumentInfo, inout query : String, in anim : int) : void
+        final Bundle args = new Bundle();
+        args.putInt(Shared.EXTRA_TYPE, type);
+        args.putParcelable(Shared.EXTRA_ROOT, root);
+        args.putParcelable(Shared.EXTRA_DOC, doc);
+        args.putString(Shared.EXTRA_QUERY, query);
+        args.putParcelable(Shared.EXTRA_SELECTION, new Selection());
+
+        final FragmentTransaction ft = fm.beginTransaction();
+        AnimationView.setupAnimations(ft, anim, args);
+
+        final DirectoryFragment fragment = new DirectoryFragment();
+        fragment.setArguments(args);
+
+        ft.replace(getFragmentId(), fragment);
+        ft.commitAllowingStateLoss();
+!!!70825399.java!!!	buildStateKey(inout root : RootInfo, inout doc : DocumentInfo) : String
+        final StringBuilder builder = new StringBuilder();
+        builder.append(root != null ? root.authority : "null").append(';');
+        builder.append(root != null ? root.rootId : "null").append(';');
+        builder.append(doc != null ? doc.documentId : "null");
+        return builder.toString();
+!!!70825527.java!!!	get(inout fm : FragmentManager) : DirectoryFragment
+        // TODO: deal with multiple directories shown at once
+        Fragment fragment = fm.findFragmentById(getFragmentId());
+        return fragment instanceof DirectoryFragment
+                ? (DirectoryFragment) fragment
+                : null;
+!!!70825655.java!!!	getFragmentId() : int
+        return R.id.container_directory;
+!!!70825783.java!!!	onCreateLoader(in id : int, inout args : Bundle) : Loader
+        Context context = getActivity();
+        State state = getDisplayState();
+
+        Uri contentsUri;
+        switch (mType) {
+            case TYPE_NORMAL:
+                contentsUri = mSearchMode ? DocumentsContract.buildSearchDocumentsUri(
+                        mRoot.authority, mRoot.rootId, mQuery)
+                        : DocumentsContract.buildChildDocumentsUri(
+                                mDocument.authority, mDocument.documentId);
+                if (mTuner.managedModeEnabled()) {
+                    contentsUri = DocumentsContract.setManageMode(contentsUri);
+                }
+                return new DirectoryLoader(
+                        context, mType, mRoot, mDocument, contentsUri, state.userSortOrder,
+                        mSearchMode);
+            case TYPE_RECENT_OPEN:
+                final RootsCache roots = DocumentsApplication.getRootsCache(context);
+                return new RecentsLoader(context, roots, state);
+
+            default:
+                throw new IllegalStateException("Unknown type " + mType);
+        }
+!!!70825911.java!!!	onLoadFinished(inout loader : Loader, inout result : DirectoryResult) : void
+        if (!isAdded()) return;
+
+        if (mSearchMode) {
+            Metrics.logUserAction(getContext(), Metrics.USER_ACTION_SEARCH);
+        }
+
+        State state = getDisplayState();
+
+        mAdapter.notifyDataSetChanged();
+        mModel.update(result);
+
+        state.derivedSortOrder = result.sortOrder;
+
+        updateLayout(state.derivedMode);
+
+        if (mSelection != null) {
+            mSelectionManager.setItemsSelected(mSelection.toList(), true);
+            mSelection.clear();
+        }
+
+        // Restore any previous instance state
+        final SparseArray<Parcelable> container = state.dirState.remove(mStateKey);
+        if (container != null && !getArguments().getBoolean(Shared.EXTRA_IGNORE_STATE, false)) {
+            getView().restoreHierarchyState(container);
+        } else if (mLastSortOrder != state.derivedSortOrder) {
+            // The derived sort order takes the user sort order into account, but applies
+            // directory-specific defaults when the user doesn't explicitly set the sort
+            // order. Scroll to the top if the sort order actually changed.
+            mRecView.smoothScrollToPosition(0);
+        }
+
+        mLastSortOrder = state.derivedSortOrder;
+
+        mTuner.onModelLoaded(mModel, mType, mSearchMode);
+
+!!!70826039.java!!!	onLoaderReset(inout loader : Loader) : void
+        mModel.update(null);

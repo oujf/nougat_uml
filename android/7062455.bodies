@@ -1,0 +1,125 @@
+class ParcelTransferWriter
+!!!78360503.java!!!	ParcelTransferWriter(inout as : AssistStructure, inout out : Parcel)
+            mWriteStructure = as.waitForReady();
+            ComponentName.writeToParcel(as.mActivityComponent, out);
+            mNumWindows = as.mWindowNodes.size();
+            if (mWriteStructure && mNumWindows > 0) {
+                out.writeInt(mNumWindows);
+            } else {
+                out.writeInt(0);
+            }
+!!!78360631.java!!!	writeToParcel(inout as : AssistStructure, inout out : Parcel) : void
+            int start = out.dataPosition();
+            mNumWrittenWindows = 0;
+            mNumWrittenViews = 0;
+            boolean more = writeToParcelInner(as, out);
+            Log.i(TAG, "Flattened " + (more ? "partial" : "final") + " assist data: "
+                    + (out.dataPosition() - start)
+                    + " bytes, containing " + mNumWrittenWindows + " windows, "
+                    + mNumWrittenViews + " views");
+!!!78360759.java!!!	writeToParcelInner(inout as : AssistStructure, inout out : Parcel) : boolean
+            if (mNumWindows == 0) {
+                return false;
+            }
+            if (DEBUG_PARCEL) Log.d(TAG, "Creating PooledStringWriter @ " + out.dataPosition());
+            PooledStringWriter pwriter = new PooledStringWriter(out);
+            while (writeNextEntryToParcel(as, out, pwriter)) {
+                // If the parcel is above the IPC limit, then we are getting too
+                // large for a single IPC so stop here and let the caller come back when it
+                // is ready for more.
+                if (out.dataSize() > IBinder.MAX_IPC_SIZE) {
+                    if (DEBUG_PARCEL) Log.d(TAG, "Assist data size is " + out.dataSize()
+                            + " @ pos " + out.dataPosition() + "; returning partial result");
+                    out.writeInt(0);
+                    out.writeStrongBinder(this);
+                    if (DEBUG_PARCEL) Log.d(TAG, "Finishing PooledStringWriter @ "
+                            + out.dataPosition() + ", size " + pwriter.getStringCount());
+                    pwriter.finish();
+                    return true;
+                }
+            }
+            if (DEBUG_PARCEL) Log.d(TAG, "Finishing PooledStringWriter @ "
+                    + out.dataPosition() + ", size " + pwriter.getStringCount());
+            pwriter.finish();
+            mViewStack.clear();
+            return false;
+!!!78360887.java!!!	pushViewStackEntry(inout node : AssistStructure::ViewNode, in pos : int) : void
+            ViewStackEntry entry;
+            if (pos >= mViewStack.size()) {
+                entry = new ViewStackEntry();
+                mViewStack.add(entry);
+                if (DEBUG_PARCEL_TREE) Log.d(TAG, "New stack entry at " + pos + ": " + entry);
+            } else {
+                entry = mViewStack.get(pos);
+                if (DEBUG_PARCEL_TREE) Log.d(TAG, "Existing stack entry at " + pos + ": " + entry);
+            }
+            entry.node = node;
+            entry.numChildren = node.getChildCount();
+            entry.curChild = 0;
+            mCurViewStackEntry = entry;
+!!!78361015.java!!!	writeView(inout child : AssistStructure::ViewNode, inout out : Parcel, inout pwriter : PooledStringWriter, in levelAdj : int) : void
+            if (DEBUG_PARCEL) Log.d(TAG, "write view: at " + out.dataPosition()
+                    + ", windows=" + mNumWrittenWindows
+                    + ", views=" + mNumWrittenViews
+                    + ", level=" + (mCurViewStackPos+levelAdj));
+            out.writeInt(VALIDATE_VIEW_TOKEN);
+            int flags = child.writeSelfToParcel(out, pwriter, mTmpMatrix);
+            mNumWrittenViews++;
+            // If the child has children, push it on the stack to write them next.
+            if ((flags&ViewNode.FLAGS_HAS_CHILDREN) != 0) {
+                if (DEBUG_PARCEL_TREE || DEBUG_PARCEL_CHILDREN) Log.d(TAG,
+                        "Preparing to write " + child.mChildren.length
+                                + " children: @ #" + mNumWrittenViews
+                                + ", level " + (mCurViewStackPos+levelAdj));
+                out.writeInt(child.mChildren.length);
+                int pos = ++mCurViewStackPos;
+                pushViewStackEntry(child, pos);
+            }
+!!!78361143.java!!!	writeNextEntryToParcel(inout as : AssistStructure, inout out : Parcel, inout pwriter : PooledStringWriter) : boolean
+            // Write next view node if appropriate.
+            if (mCurViewStackEntry != null) {
+                if (mCurViewStackEntry.curChild < mCurViewStackEntry.numChildren) {
+                    // Write the next child in the current view.
+                    if (DEBUG_PARCEL_TREE) Log.d(TAG, "Writing child #"
+                            + mCurViewStackEntry.curChild + " in " + mCurViewStackEntry.node);
+                    ViewNode child = mCurViewStackEntry.node.mChildren[mCurViewStackEntry.curChild];
+                    mCurViewStackEntry.curChild++;
+                    writeView(child, out, pwriter, 1);
+                    return true;
+                }
+
+                // We are done writing children of the current view; pop off the stack.
+                do {
+                    int pos = --mCurViewStackPos;
+                    if (DEBUG_PARCEL_TREE) Log.d(TAG, "Done with " + mCurViewStackEntry.node
+                            + "; popping up to " + pos);
+                    if (pos < 0) {
+                        // Reached the last view; step to next window.
+                        if (DEBUG_PARCEL_TREE) Log.d(TAG, "Done with view hierarchy!");
+                        mCurViewStackEntry = null;
+                        break;
+                    }
+                    mCurViewStackEntry = mViewStack.get(pos);
+                } while (mCurViewStackEntry.curChild >= mCurViewStackEntry.numChildren);
+                return true;
+            }
+
+            // Write the next window if appropriate.
+            int pos = mCurWindow;
+            if (pos < mNumWindows) {
+                WindowNode win = as.mWindowNodes.get(pos);
+                mCurWindow++;
+                if (DEBUG_PARCEL) Log.d(TAG, "write window #" + pos + ": at " + out.dataPosition()
+                        + ", windows=" + mNumWrittenWindows
+                        + ", views=" + mNumWrittenViews);
+                out.writeInt(VALIDATE_WINDOW_TOKEN);
+                win.writeSelfToParcel(out, pwriter, mTmpMatrix);
+                mNumWrittenWindows++;
+                ViewNode root = win.mRoot;
+                mCurViewStackPos = 0;
+                if (DEBUG_PARCEL_TREE) Log.d(TAG, "Writing initial root view " + root);
+                writeView(root, out, pwriter, 0);
+                return true;
+            }
+
+            return false;

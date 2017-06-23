@@ -1,0 +1,188 @@
+class AudioHardwareInput
+!!!43892279.cpp!!!	AudioHardwareInput()
+    mHotplugThread = new AudioHotplugThread(*this);
+    if (mHotplugThread == NULL) {
+        ALOGE("Unable to create ATV Remote audio hotplug thread. "
+              "Pluggable audio input devices will not function.");
+    } else if (!mHotplugThread->start()) {
+        ALOGE("Unable to start ATV Remote audio hotplug thread. "
+              "Pluggable audio input devices will not function.");
+        mHotplugThread.clear();
+    }
+
+    for (int i=0; i<kMaxDevices; i++) {
+        mDeviceInfos[i].valid = false;
+    }
+!!!43892407.cpp!!!	~AudioHardwareInput()
+    if (mHotplugThread != NULL) {
+        mHotplugThread->shutdown();
+        mHotplugThread.clear();
+    }
+
+    closeAllInputStreams();
+!!!43892535.cpp!!!	setMicMute(in mute : bool) : status_t
+    mMicMute = mute;
+    return NO_ERROR;
+!!!43892663.cpp!!!	getMicMute(inout mute : bool) : status_t
+    *mute = mMicMute;
+    return NO_ERROR;
+!!!43892791.cpp!!!	getInputBufferSize(in config : audio_config) : status_t
+    size_t size = calculateInputBufferSize(config->sample_rate,
+                                           config->format,
+                                           audio_channel_count_from_in_mask(config->channel_mask));
+    return size;
+!!!43892919.cpp!!!	openInputStream(in devices : uint32_t, inout format : audio_format_t, inout channelMask : uint32_t, inout sampleRate : uint32_t, inout status : status_t) : AudioStreamIn
+    (void) devices;
+    Mutex::Autolock _l(mLock);
+
+    AudioStreamIn* in;
+
+    in = new AudioStreamIn(*this);
+    if (in == NULL) {
+        *status = NO_MEMORY;
+        return NULL;
+    }
+
+    *status = in->set(format, channelMask, sampleRate);
+
+    if (*status != NO_ERROR) {
+        delete in;
+        return NULL;
+    }
+
+    mInputStreams.add(in);
+
+    return in;
+!!!43893047.cpp!!!	closeInputStream(inout in : AudioStreamIn) : void
+    Mutex::Autolock _l(mLock);
+
+    for (size_t i = 0; i < mInputStreams.size(); i++) {
+        if (in == mInputStreams[i]) {
+            mInputStreams.removeAt(i);
+            in->standby();
+            delete in;
+            break;
+        }
+    }
+!!!43893175.cpp!!!	dump(in fd : int) : status_t
+    const size_t SIZE = 256;
+    char buffer[SIZE];
+    String8 result;
+
+    DUMP("\nAudioHardwareInput::dump\n");
+
+    for (int i=0; i<kMaxDevices; i++) {
+        if (mDeviceInfos[i].valid) {
+            DUMP("device[%d] is valid\n", i);
+            DUMP("\tcapture card: %d\n", mDeviceInfos[i].pcmCard);
+            DUMP("\tcapture device: %d\n", mDeviceInfos[i].pcmDevice);
+        }
+    }
+
+    ::write(fd, result.string(), result.size());
+
+    {
+        Mutex::Autolock _l(mLock);
+        for (size_t i = 0; i < mInputStreams.size(); i++) {
+            mInputStreams[i]->dump(fd);
+        }
+    }
+
+    return NO_ERROR;
+!!!43893303.cpp!!!	onDeviceFound(in devInfo : AudioHotplugThread::DeviceInfo) : void
+    bool foundSlot = false;
+    Mutex::Autolock _l(mLock);
+
+    ALOGD("AudioHardwareInput::onDeviceFound pcmCard = %d", devInfo.pcmCard);
+
+    for (int i=0; i<kMaxDevices; i++) {
+        if (mDeviceInfos[i].valid) {
+            if ((mDeviceInfos[i].pcmCard == devInfo.pcmCard)
+                && (mDeviceInfos[i].pcmDevice == devInfo.pcmDevice)) {
+                ALOGW("AudioHardwareInput::onDeviceFound already has  %d:%d",
+                    devInfo.pcmCard, devInfo.pcmDevice);
+                return; // Got it already so no action needed.
+            }
+        }
+    }
+
+    // New device so find an empty slot and save it.
+    for (int i=0; i<kMaxDevices; i++) {
+        if (!mDeviceInfos[i].valid) {
+            ALOGD("AudioHardwareInput::onDeviceFound saving as device #%d", i);
+            mDeviceInfos[i] = devInfo;
+            mDeviceInfos[i].valid = true;
+            foundSlot = true;
+            /* Restart any currently running streams. */
+            standbyAllInputStreams(NULL);
+            break;
+        }
+    }
+
+    if (!foundSlot) {
+        ALOGW("AudioHardwareInput::onDeviceFound found more devices than expected! Dropped");
+    }
+!!!43893431.cpp!!!	onDeviceRemoved(in pcmCard : uint, in pcmDevice : uint) : void
+    Mutex::Autolock _l(mLock);
+
+    ALOGD("AudioHardwareInput::onDeviceRemoved pcmCard = %d", pcmCard);
+    // Find matching DeviceInfo.
+    for (int i=0; i<kMaxDevices; i++) {
+        if (mDeviceInfos[i].valid) {
+            if ((mDeviceInfos[i].pcmCard == pcmCard) && (mDeviceInfos[i].pcmDevice == pcmDevice)) {
+                ALOGD("AudioHardwareInput::onDeviceRemoved matches #%d", i);
+                mDeviceInfos[i].valid = false;
+                /* If currently active stream is using this device then restart. */
+                standbyAllInputStreams(&mDeviceInfos[i]);
+                break;
+            }
+        }
+    }
+!!!43893559.cpp!!!	calculateInputBufferSize(in outputSampleRate : uint32_t, in format : audio_format_t, in channelCount : uint32_t) : size_t
+    size_t size;
+
+    // AudioFlinger expects audio buffers to be a multiple of 16 frames
+    size = (kPeriodMsec * outputSampleRate) / 1000;
+    size = ((size + 15) / 16) * 16;
+
+    return size * channelCount * audio_bytes_per_sample(format);
+!!!43893687.cpp!!!	getBestDevice(in inputSource : int) : AudioHotplugThread::DeviceInfo
+    bool doVoiceRecognition = (inputSource == AUDIO_SOURCE_VOICE_RECOGNITION);
+    int chosenDeviceIndex = -1;
+    Mutex::Autolock _l(mLock);
+
+    ALOGD("AudioHardwareInput::getBestDevice inputSource = %d, doVoiceRecognition = %d",
+        inputSource, (doVoiceRecognition ? 1 : 0));
+    // RemoteControl is the only input device usable for voice recognition
+    // and no other devices are used for voice recognition.
+    // Currently the RemoteControl is the only device marked with forVoiceRecognition=true.
+    // A connected USB mic could be used for anything but voice recognition.
+    for (int i=0; i<kMaxDevices; i++) {
+        if (mDeviceInfos[i].valid) {
+            if (mDeviceInfos[i].forVoiceRecognition == doVoiceRecognition) {
+                chosenDeviceIndex = i;
+                break;
+            }
+        }
+    }
+
+    if (chosenDeviceIndex < 0) {
+        ALOGE("ERROR AudioHardwareInput::getBestDevice, none for source %d", inputSource);
+    } else {
+        ALOGD("AudioHardwareInput::getBestDevice chose #%d", chosenDeviceIndex);
+    }
+
+    return (chosenDeviceIndex >= 0) ? &mDeviceInfos[chosenDeviceIndex] : NULL;
+!!!43893815.cpp!!!	closeAllInputStreams() : void
+    while (mInputStreams.size() != 0) {
+        AudioStreamIn* in = mInputStreams[0];
+        mInputStreams.removeAt(0);
+        in->standby();
+        delete in;
+    }
+!!!43893943.cpp!!!	standbyAllInputStreams(in deviceInfo : AudioHotplugThread::DeviceInfo) : void
+    for (size_t i = 0; i < mInputStreams.size(); i++) {
+        if (deviceInfo == NULL || deviceInfo == mInputStreams[i]->getDeviceInfo()) {
+            mInputStreams[i]->standby();
+        }
+    }

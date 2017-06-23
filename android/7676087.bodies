@@ -1,0 +1,599 @@
+class BatteryService
+!!!83988151.java!!!	BatteryService(inout context : Context)
+        super(context);
+
+        mContext = context;
+        mHandler = new Handler(true /*async*/);
+        mLed = new Led(context, getLocalService(LightsManager.class));
+        mBatteryStats = BatteryStatsService.getService();
+
+        mCriticalBatteryLevel = mContext.getResources().getInteger(
+                com.android.internal.R.integer.config_criticalBatteryWarningLevel);
+        mLowBatteryWarningLevel = mContext.getResources().getInteger(
+                com.android.internal.R.integer.config_lowBatteryWarningLevel);
+        mLowBatteryCloseWarningLevel = mLowBatteryWarningLevel + mContext.getResources().getInteger(
+                com.android.internal.R.integer.config_lowBatteryCloseWarningBump);
+        mShutdownBatteryTemperature = mContext.getResources().getInteger(
+                com.android.internal.R.integer.config_shutdownBatteryTemperature);
+
+        // watch for invalid charger messages if the invalid_charger switch exists
+        if (new File("/sys/devices/virtual/switch/invalid_charger/state").exists()) {
+            UEventObserver invalidChargerObserver = new UEventObserver() {
+                @Override
+                public void onUEvent(UEvent event) {
+                    final int invalidCharger = "1".equals(event.get("SWITCH_STATE")) ? 1 : 0;
+                    synchronized (mLock) {
+                        if (mInvalidCharger != invalidCharger) {
+                            mInvalidCharger = invalidCharger;
+                        }
+                    }
+                }
+            };
+            invalidChargerObserver.startObserving(
+                    "DEVPATH=/devices/virtual/switch/invalid_charger");
+        }
+!!!83988279.java!!!	onStart() : void
+        IBinder b = ServiceManager.getService("batteryproperties");
+        final IBatteryPropertiesRegistrar batteryPropertiesRegistrar =
+                IBatteryPropertiesRegistrar.Stub.asInterface(b);
+        try {
+            batteryPropertiesRegistrar.registerListener(new BatteryListener());
+        } catch (RemoteException e) {
+            // Should never happen.
+        }
+
+        mBinderService = new BinderService();
+        publishBinderService("battery", mBinderService);
+        publishLocalService(BatteryManagerInternal.class, new LocalService());
+!!!83988407.java!!!	onBootPhase(in phase : int) : void
+        if (phase == PHASE_ACTIVITY_MANAGER_READY) {
+            // check our power situation now that it is safe to display the shutdown dialog.
+            synchronized (mLock) {
+                ContentObserver obs = new ContentObserver(mHandler) {
+                    @Override
+                    public void onChange(boolean selfChange) {
+                        synchronized (mLock) {
+                            updateBatteryWarningLevelLocked();
+                        }
+                    }
+                };
+                final ContentResolver resolver = mContext.getContentResolver();
+                resolver.registerContentObserver(Settings.Global.getUriFor(
+                        Settings.Global.LOW_POWER_MODE_TRIGGER_LEVEL),
+                        false, obs, UserHandle.USER_ALL);
+                updateBatteryWarningLevelLocked();
+            }
+        }
+!!!83988535.java!!!	updateBatteryWarningLevelLocked() : void
+        final ContentResolver resolver = mContext.getContentResolver();
+        int defWarnLevel = mContext.getResources().getInteger(
+                com.android.internal.R.integer.config_lowBatteryWarningLevel);
+        mLowBatteryWarningLevel = Settings.Global.getInt(resolver,
+                Settings.Global.LOW_POWER_MODE_TRIGGER_LEVEL, defWarnLevel);
+        if (mLowBatteryWarningLevel == 0) {
+            mLowBatteryWarningLevel = defWarnLevel;
+        }
+        if (mLowBatteryWarningLevel < mCriticalBatteryLevel) {
+            mLowBatteryWarningLevel = mCriticalBatteryLevel;
+        }
+        mLowBatteryCloseWarningLevel = mLowBatteryWarningLevel + mContext.getResources().getInteger(
+                com.android.internal.R.integer.config_lowBatteryCloseWarningBump);
+        processValuesLocked(true);
+!!!83988663.java!!!	isPoweredLocked(in plugTypeSet : int) : boolean
+        // assume we are powered if battery state is unknown so
+        // the "stay on while plugged in" option will work.
+        if (mBatteryProps.batteryStatus == BatteryManager.BATTERY_STATUS_UNKNOWN) {
+            return true;
+        }
+        if ((plugTypeSet & BatteryManager.BATTERY_PLUGGED_AC) != 0 && mBatteryProps.chargerAcOnline) {
+            return true;
+        }
+        if ((plugTypeSet & BatteryManager.BATTERY_PLUGGED_USB) != 0 && mBatteryProps.chargerUsbOnline) {
+            return true;
+        }
+        if ((plugTypeSet & BatteryManager.BATTERY_PLUGGED_WIRELESS) != 0 && mBatteryProps.chargerWirelessOnline) {
+            return true;
+        }
+        return false;
+!!!83988791.java!!!	shouldSendBatteryLowLocked() : boolean
+        final boolean plugged = mPlugType != BATTERY_PLUGGED_NONE;
+        final boolean oldPlugged = mLastPlugType != BATTERY_PLUGGED_NONE;
+
+        /* The ACTION_BATTERY_LOW broadcast is sent in these situations:
+         * - is just un-plugged (previously was plugged) and battery level is
+         *   less than or equal to WARNING, or
+         * - is not plugged and battery level falls to WARNING boundary
+         *   (becomes <= mLowBatteryWarningLevel).
+         */
+        return !plugged
+                && mBatteryProps.batteryStatus != BatteryManager.BATTERY_STATUS_UNKNOWN
+                && mBatteryProps.batteryLevel <= mLowBatteryWarningLevel
+                && (oldPlugged || mLastBatteryLevel > mLowBatteryWarningLevel);
+!!!83988919.java!!!	shutdownIfNoPowerLocked() : void
+        // shut down gracefully if our battery is critically low and we are not powered.
+        // wait until the system has booted before attempting to display the shutdown dialog.
+        if (mBatteryProps.batteryLevel == 0 && !isPoweredLocked(BatteryManager.BATTERY_PLUGGED_ANY)) {
+            mHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    if (ActivityManagerNative.isSystemReady()) {
+                        Intent intent = new Intent(Intent.ACTION_REQUEST_SHUTDOWN);
+                        intent.putExtra(Intent.EXTRA_KEY_CONFIRM, false);
+                        intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                        mContext.startActivityAsUser(intent, UserHandle.CURRENT);
+                    }
+                }
+            });
+        }
+!!!83989047.java!!!	shutdownIfOverTempLocked() : void
+        // shut down gracefully if temperature is too high (> 68.0C by default)
+        // wait until the system has booted before attempting to display the
+        // shutdown dialog.
+        if (mBatteryProps.batteryTemperature > mShutdownBatteryTemperature) {
+            mHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    if (ActivityManagerNative.isSystemReady()) {
+                        Intent intent = new Intent(Intent.ACTION_REQUEST_SHUTDOWN);
+                        intent.putExtra(Intent.EXTRA_KEY_CONFIRM, false);
+                        intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                        mContext.startActivityAsUser(intent, UserHandle.CURRENT);
+                    }
+                }
+            });
+        }
+!!!83989175.java!!!	update(inout props : BatteryProperties) : void
+        synchronized (mLock) {
+            if (!mUpdatesStopped) {
+                mBatteryProps = props;
+                // Process the new values.
+                processValuesLocked(false);
+            } else {
+                mLastBatteryProps.set(props);
+            }
+        }
+!!!83989303.java!!!	processValuesLocked(inout force : boolean) : void
+        boolean logOutlier = false;
+        long dischargeDuration = 0;
+
+        mBatteryLevelCritical = (mBatteryProps.batteryLevel <= mCriticalBatteryLevel);
+        if (mBatteryProps.chargerAcOnline) {
+            mPlugType = BatteryManager.BATTERY_PLUGGED_AC;
+        } else if (mBatteryProps.chargerUsbOnline) {
+            mPlugType = BatteryManager.BATTERY_PLUGGED_USB;
+        } else if (mBatteryProps.chargerWirelessOnline) {
+            mPlugType = BatteryManager.BATTERY_PLUGGED_WIRELESS;
+        } else {
+            mPlugType = BATTERY_PLUGGED_NONE;
+        }
+
+        if (DEBUG) {
+            Slog.d(TAG, "Processing new values: "
+                    + "chargerAcOnline=" + mBatteryProps.chargerAcOnline
+                    + ", chargerUsbOnline=" + mBatteryProps.chargerUsbOnline
+                    + ", chargerWirelessOnline=" + mBatteryProps.chargerWirelessOnline
+                    + ", maxChargingCurrent" + mBatteryProps.maxChargingCurrent
+                    + ", maxChargingVoltage" + mBatteryProps.maxChargingVoltage
+                    + ", chargeCounter" + mBatteryProps.batteryChargeCounter
+                    + ", batteryStatus=" + mBatteryProps.batteryStatus
+                    + ", batteryHealth=" + mBatteryProps.batteryHealth
+                    + ", batteryPresent=" + mBatteryProps.batteryPresent
+                    + ", batteryLevel=" + mBatteryProps.batteryLevel
+                    + ", batteryTechnology=" + mBatteryProps.batteryTechnology
+                    + ", batteryVoltage=" + mBatteryProps.batteryVoltage
+                    + ", batteryTemperature=" + mBatteryProps.batteryTemperature
+                    + ", mBatteryLevelCritical=" + mBatteryLevelCritical
+                    + ", mPlugType=" + mPlugType);
+        }
+
+        // Let the battery stats keep track of the current level.
+        try {
+            mBatteryStats.setBatteryState(mBatteryProps.batteryStatus, mBatteryProps.batteryHealth,
+                    mPlugType, mBatteryProps.batteryLevel, mBatteryProps.batteryTemperature,
+                    mBatteryProps.batteryVoltage, mBatteryProps.batteryChargeCounter);
+        } catch (RemoteException e) {
+            // Should never happen.
+        }
+
+        shutdownIfNoPowerLocked();
+        shutdownIfOverTempLocked();
+
+        if (force || (mBatteryProps.batteryStatus != mLastBatteryStatus ||
+                mBatteryProps.batteryHealth != mLastBatteryHealth ||
+                mBatteryProps.batteryPresent != mLastBatteryPresent ||
+                mBatteryProps.batteryLevel != mLastBatteryLevel ||
+                mPlugType != mLastPlugType ||
+                mBatteryProps.batteryVoltage != mLastBatteryVoltage ||
+                mBatteryProps.batteryTemperature != mLastBatteryTemperature ||
+                mBatteryProps.maxChargingCurrent != mLastMaxChargingCurrent ||
+                mBatteryProps.maxChargingVoltage != mLastMaxChargingVoltage ||
+                mBatteryProps.batteryChargeCounter != mLastChargeCounter ||
+                mInvalidCharger != mLastInvalidCharger)) {
+
+            if (mPlugType != mLastPlugType) {
+                if (mLastPlugType == BATTERY_PLUGGED_NONE) {
+                    // discharging -> charging
+
+                    // There's no value in this data unless we've discharged at least once and the
+                    // battery level has changed; so don't log until it does.
+                    if (mDischargeStartTime != 0 && mDischargeStartLevel != mBatteryProps.batteryLevel) {
+                        dischargeDuration = SystemClock.elapsedRealtime() - mDischargeStartTime;
+                        logOutlier = true;
+                        EventLog.writeEvent(EventLogTags.BATTERY_DISCHARGE, dischargeDuration,
+                                mDischargeStartLevel, mBatteryProps.batteryLevel);
+                        // make sure we see a discharge event before logging again
+                        mDischargeStartTime = 0;
+                    }
+                } else if (mPlugType == BATTERY_PLUGGED_NONE) {
+                    // charging -> discharging or we just powered up
+                    mDischargeStartTime = SystemClock.elapsedRealtime();
+                    mDischargeStartLevel = mBatteryProps.batteryLevel;
+                }
+            }
+            if (mBatteryProps.batteryStatus != mLastBatteryStatus ||
+                    mBatteryProps.batteryHealth != mLastBatteryHealth ||
+                    mBatteryProps.batteryPresent != mLastBatteryPresent ||
+                    mPlugType != mLastPlugType) {
+                EventLog.writeEvent(EventLogTags.BATTERY_STATUS,
+                        mBatteryProps.batteryStatus, mBatteryProps.batteryHealth, mBatteryProps.batteryPresent ? 1 : 0,
+                        mPlugType, mBatteryProps.batteryTechnology);
+            }
+            if (mBatteryProps.batteryLevel != mLastBatteryLevel) {
+                // Don't do this just from voltage or temperature changes, that is
+                // too noisy.
+                EventLog.writeEvent(EventLogTags.BATTERY_LEVEL,
+                        mBatteryProps.batteryLevel, mBatteryProps.batteryVoltage, mBatteryProps.batteryTemperature);
+            }
+            if (mBatteryLevelCritical && !mLastBatteryLevelCritical &&
+                    mPlugType == BATTERY_PLUGGED_NONE) {
+                // We want to make sure we log discharge cycle outliers
+                // if the battery is about to die.
+                dischargeDuration = SystemClock.elapsedRealtime() - mDischargeStartTime;
+                logOutlier = true;
+            }
+
+            if (!mBatteryLevelLow) {
+                // Should we now switch in to low battery mode?
+                if (mPlugType == BATTERY_PLUGGED_NONE
+                        && mBatteryProps.batteryLevel <= mLowBatteryWarningLevel) {
+                    mBatteryLevelLow = true;
+                }
+            } else {
+                // Should we now switch out of low battery mode?
+                if (mPlugType != BATTERY_PLUGGED_NONE) {
+                    mBatteryLevelLow = false;
+                } else if (mBatteryProps.batteryLevel >= mLowBatteryCloseWarningLevel)  {
+                    mBatteryLevelLow = false;
+                } else if (force && mBatteryProps.batteryLevel >= mLowBatteryWarningLevel) {
+                    // If being forced, the previous state doesn't matter, we will just
+                    // absolutely check to see if we are now above the warning level.
+                    mBatteryLevelLow = false;
+                }
+            }
+
+            sendIntentLocked();
+
+            // Separate broadcast is sent for power connected / not connected
+            // since the standard intent will not wake any applications and some
+            // applications may want to have smart behavior based on this.
+            if (mPlugType != 0 && mLastPlugType == 0) {
+                mHandler.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        Intent statusIntent = new Intent(Intent.ACTION_POWER_CONNECTED);
+                        statusIntent.setFlags(Intent.FLAG_RECEIVER_REGISTERED_ONLY_BEFORE_BOOT);
+                        mContext.sendBroadcastAsUser(statusIntent, UserHandle.ALL);
+                    }
+                });
+            }
+            else if (mPlugType == 0 && mLastPlugType != 0) {
+                mHandler.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        Intent statusIntent = new Intent(Intent.ACTION_POWER_DISCONNECTED);
+                        statusIntent.setFlags(Intent.FLAG_RECEIVER_REGISTERED_ONLY_BEFORE_BOOT);
+                        mContext.sendBroadcastAsUser(statusIntent, UserHandle.ALL);
+                    }
+                });
+            }
+
+            if (shouldSendBatteryLowLocked()) {
+                mSentLowBatteryBroadcast = true;
+                mHandler.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        Intent statusIntent = new Intent(Intent.ACTION_BATTERY_LOW);
+                        statusIntent.setFlags(Intent.FLAG_RECEIVER_REGISTERED_ONLY_BEFORE_BOOT);
+                        mContext.sendBroadcastAsUser(statusIntent, UserHandle.ALL);
+                    }
+                });
+            } else if (mSentLowBatteryBroadcast && mLastBatteryLevel >= mLowBatteryCloseWarningLevel) {
+                mSentLowBatteryBroadcast = false;
+                mHandler.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        Intent statusIntent = new Intent(Intent.ACTION_BATTERY_OKAY);
+                        statusIntent.setFlags(Intent.FLAG_RECEIVER_REGISTERED_ONLY_BEFORE_BOOT);
+                        mContext.sendBroadcastAsUser(statusIntent, UserHandle.ALL);
+                    }
+                });
+            }
+
+            // Update the battery LED
+            mLed.updateLightsLocked();
+
+            // This needs to be done after sendIntent() so that we get the lastest battery stats.
+            if (logOutlier && dischargeDuration != 0) {
+                logOutlierLocked(dischargeDuration);
+            }
+
+            mLastBatteryStatus = mBatteryProps.batteryStatus;
+            mLastBatteryHealth = mBatteryProps.batteryHealth;
+            mLastBatteryPresent = mBatteryProps.batteryPresent;
+            mLastBatteryLevel = mBatteryProps.batteryLevel;
+            mLastPlugType = mPlugType;
+            mLastBatteryVoltage = mBatteryProps.batteryVoltage;
+            mLastBatteryTemperature = mBatteryProps.batteryTemperature;
+            mLastMaxChargingCurrent = mBatteryProps.maxChargingCurrent;
+            mLastMaxChargingVoltage = mBatteryProps.maxChargingVoltage;
+            mLastChargeCounter = mBatteryProps.batteryChargeCounter;
+            mLastBatteryLevelCritical = mBatteryLevelCritical;
+            mLastInvalidCharger = mInvalidCharger;
+        }
+!!!83989431.java!!!	sendIntentLocked() : void
+        //  Pack up the values and broadcast them to everyone
+        final Intent intent = new Intent(Intent.ACTION_BATTERY_CHANGED);
+        intent.addFlags(Intent.FLAG_RECEIVER_REGISTERED_ONLY
+                | Intent.FLAG_RECEIVER_REPLACE_PENDING);
+
+        int icon = getIconLocked(mBatteryProps.batteryLevel);
+
+        intent.putExtra(BatteryManager.EXTRA_STATUS, mBatteryProps.batteryStatus);
+        intent.putExtra(BatteryManager.EXTRA_HEALTH, mBatteryProps.batteryHealth);
+        intent.putExtra(BatteryManager.EXTRA_PRESENT, mBatteryProps.batteryPresent);
+        intent.putExtra(BatteryManager.EXTRA_LEVEL, mBatteryProps.batteryLevel);
+        intent.putExtra(BatteryManager.EXTRA_SCALE, BATTERY_SCALE);
+        intent.putExtra(BatteryManager.EXTRA_ICON_SMALL, icon);
+        intent.putExtra(BatteryManager.EXTRA_PLUGGED, mPlugType);
+        intent.putExtra(BatteryManager.EXTRA_VOLTAGE, mBatteryProps.batteryVoltage);
+        intent.putExtra(BatteryManager.EXTRA_TEMPERATURE, mBatteryProps.batteryTemperature);
+        intent.putExtra(BatteryManager.EXTRA_TECHNOLOGY, mBatteryProps.batteryTechnology);
+        intent.putExtra(BatteryManager.EXTRA_INVALID_CHARGER, mInvalidCharger);
+        intent.putExtra(BatteryManager.EXTRA_MAX_CHARGING_CURRENT, mBatteryProps.maxChargingCurrent);
+        intent.putExtra(BatteryManager.EXTRA_MAX_CHARGING_VOLTAGE, mBatteryProps.maxChargingVoltage);
+        intent.putExtra(BatteryManager.EXTRA_CHARGE_COUNTER, mBatteryProps.batteryChargeCounter);
+        if (DEBUG) {
+            Slog.d(TAG, "Sending ACTION_BATTERY_CHANGED.  level:" + mBatteryProps.batteryLevel +
+                    ", scale:" + BATTERY_SCALE + ", status:" + mBatteryProps.batteryStatus +
+                    ", health:" + mBatteryProps.batteryHealth +
+                    ", present:" + mBatteryProps.batteryPresent +
+                    ", voltage: " + mBatteryProps.batteryVoltage +
+                    ", temperature: " + mBatteryProps.batteryTemperature +
+                    ", technology: " + mBatteryProps.batteryTechnology +
+                    ", AC powered:" + mBatteryProps.chargerAcOnline +
+                    ", USB powered:" + mBatteryProps.chargerUsbOnline +
+                    ", Wireless powered:" + mBatteryProps.chargerWirelessOnline +
+                    ", icon:" + icon  + ", invalid charger:" + mInvalidCharger +
+                    ", maxChargingCurrent:" + mBatteryProps.maxChargingCurrent +
+                    ", maxChargingVoltage:" + mBatteryProps.maxChargingVoltage +
+                    ", chargeCounter:" + mBatteryProps.batteryChargeCounter);
+        }
+
+        mHandler.post(new Runnable() {
+            @Override
+            public void run() {
+                ActivityManagerNative.broadcastStickyIntent(intent, null, UserHandle.USER_ALL);
+            }
+        });
+!!!83989559.java!!!	logBatteryStatsLocked() : void
+        IBinder batteryInfoService = ServiceManager.getService(BatteryStats.SERVICE_NAME);
+        if (batteryInfoService == null) return;
+
+        DropBoxManager db = (DropBoxManager) mContext.getSystemService(Context.DROPBOX_SERVICE);
+        if (db == null || !db.isTagEnabled("BATTERY_DISCHARGE_INFO")) return;
+
+        File dumpFile = null;
+        FileOutputStream dumpStream = null;
+        try {
+            // dump the service to a file
+            dumpFile = new File(DUMPSYS_DATA_PATH + BatteryStats.SERVICE_NAME + ".dump");
+            dumpStream = new FileOutputStream(dumpFile);
+            batteryInfoService.dump(dumpStream.getFD(), DUMPSYS_ARGS);
+            FileUtils.sync(dumpStream);
+
+            // add dump file to drop box
+            db.addFile("BATTERY_DISCHARGE_INFO", dumpFile, DropBoxManager.IS_TEXT);
+        } catch (RemoteException e) {
+            Slog.e(TAG, "failed to dump battery service", e);
+        } catch (IOException e) {
+            Slog.e(TAG, "failed to write dumpsys file", e);
+        } finally {
+            // make sure we clean up
+            if (dumpStream != null) {
+                try {
+                    dumpStream.close();
+                } catch (IOException e) {
+                    Slog.e(TAG, "failed to close dumpsys output stream");
+                }
+            }
+            if (dumpFile != null && !dumpFile.delete()) {
+                Slog.e(TAG, "failed to delete temporary dumpsys file: "
+                        + dumpFile.getAbsolutePath());
+            }
+        }
+!!!83989687.java!!!	logOutlierLocked(in duration : long) : void
+        ContentResolver cr = mContext.getContentResolver();
+        String dischargeThresholdString = Settings.Global.getString(cr,
+                Settings.Global.BATTERY_DISCHARGE_THRESHOLD);
+        String durationThresholdString = Settings.Global.getString(cr,
+                Settings.Global.BATTERY_DISCHARGE_DURATION_THRESHOLD);
+
+        if (dischargeThresholdString != null && durationThresholdString != null) {
+            try {
+                long durationThreshold = Long.parseLong(durationThresholdString);
+                int dischargeThreshold = Integer.parseInt(dischargeThresholdString);
+                if (duration <= durationThreshold &&
+                        mDischargeStartLevel - mBatteryProps.batteryLevel >= dischargeThreshold) {
+                    // If the discharge cycle is bad enough we want to know about it.
+                    logBatteryStatsLocked();
+                }
+                if (DEBUG) Slog.v(TAG, "duration threshold: " + durationThreshold +
+                        " discharge threshold: " + dischargeThreshold);
+                if (DEBUG) Slog.v(TAG, "duration: " + duration + " discharge: " +
+                        (mDischargeStartLevel - mBatteryProps.batteryLevel));
+            } catch (NumberFormatException e) {
+                Slog.e(TAG, "Invalid DischargeThresholds GService string: " +
+                        durationThresholdString + " or " + dischargeThresholdString);
+            }
+        }
+!!!83989815.java!!!	getIconLocked(in level : int) : int
+        if (mBatteryProps.batteryStatus == BatteryManager.BATTERY_STATUS_CHARGING) {
+            return com.android.internal.R.drawable.stat_sys_battery_charge;
+        } else if (mBatteryProps.batteryStatus == BatteryManager.BATTERY_STATUS_DISCHARGING) {
+            return com.android.internal.R.drawable.stat_sys_battery;
+        } else if (mBatteryProps.batteryStatus == BatteryManager.BATTERY_STATUS_NOT_CHARGING
+                || mBatteryProps.batteryStatus == BatteryManager.BATTERY_STATUS_FULL) {
+            if (isPoweredLocked(BatteryManager.BATTERY_PLUGGED_ANY)
+                    && mBatteryProps.batteryLevel >= 100) {
+                return com.android.internal.R.drawable.stat_sys_battery_charge;
+            } else {
+                return com.android.internal.R.drawable.stat_sys_battery;
+            }
+        } else {
+            return com.android.internal.R.drawable.stat_sys_battery_unknown;
+        }
+!!!83990199.java!!!	dumpHelp(inout pw : PrintWriter) : void
+        pw.println("Battery service (battery) commands:");
+        pw.println("  help");
+        pw.println("    Print this help text.");
+        pw.println("  set [ac|usb|wireless|status|level|invalid] <value>");
+        pw.println("    Force a battery property value, freezing battery state.");
+        pw.println("  unplug");
+        pw.println("    Force battery unplugged, freezing battery state.");
+        pw.println("  reset");
+        pw.println("    Unfreeze battery state, returning to current hardware values.");
+!!!83990327.java!!!	onShellCommand(inout shell : BatteryService::Shell, inout cmd : String) : int
+        if (cmd == null) {
+            return shell.handleDefaultCommands(cmd);
+        }
+        PrintWriter pw = shell.getOutPrintWriter();
+        switch (cmd) {
+            case "unplug": {
+                getContext().enforceCallingOrSelfPermission(
+                        android.Manifest.permission.DEVICE_POWER, null);
+                if (!mUpdatesStopped) {
+                    mLastBatteryProps.set(mBatteryProps);
+                }
+                mBatteryProps.chargerAcOnline = false;
+                mBatteryProps.chargerUsbOnline = false;
+                mBatteryProps.chargerWirelessOnline = false;
+                long ident = Binder.clearCallingIdentity();
+                try {
+                    mUpdatesStopped = true;
+                    processValuesLocked(false);
+                } finally {
+                    Binder.restoreCallingIdentity(ident);
+                }
+            } break;
+            case "set": {
+                getContext().enforceCallingOrSelfPermission(
+                        android.Manifest.permission.DEVICE_POWER, null);
+                final String key = shell.getNextArg();
+                if (key == null) {
+                    pw.println("No property specified");
+                    return -1;
+
+                }
+                final String value = shell.getNextArg();
+                if (value == null) {
+                    pw.println("No value specified");
+                    return -1;
+
+                }
+                try {
+                    if (!mUpdatesStopped) {
+                        mLastBatteryProps.set(mBatteryProps);
+                    }
+                    boolean update = true;
+                    switch (key) {
+                        case "ac":
+                            mBatteryProps.chargerAcOnline = Integer.parseInt(value) != 0;
+                            break;
+                        case "usb":
+                            mBatteryProps.chargerUsbOnline = Integer.parseInt(value) != 0;
+                            break;
+                        case "wireless":
+                            mBatteryProps.chargerWirelessOnline = Integer.parseInt(value) != 0;
+                            break;
+                        case "status":
+                            mBatteryProps.batteryStatus = Integer.parseInt(value);
+                            break;
+                        case "level":
+                            mBatteryProps.batteryLevel = Integer.parseInt(value);
+                            break;
+                        case "invalid":
+                            mInvalidCharger = Integer.parseInt(value);
+                            break;
+                        default:
+                            pw.println("Unknown set option: " + key);
+                            update = false;
+                            break;
+                    }
+                    if (update) {
+                        long ident = Binder.clearCallingIdentity();
+                        try {
+                            mUpdatesStopped = true;
+                            processValuesLocked(false);
+                        } finally {
+                            Binder.restoreCallingIdentity(ident);
+                        }
+                    }
+                } catch (NumberFormatException ex) {
+                    pw.println("Bad value: " + value);
+                    return -1;
+                }
+            } break;
+            case "reset": {
+                getContext().enforceCallingOrSelfPermission(
+                        android.Manifest.permission.DEVICE_POWER, null);
+                long ident = Binder.clearCallingIdentity();
+                try {
+                    if (mUpdatesStopped) {
+                        mUpdatesStopped = false;
+                        mBatteryProps.set(mLastBatteryProps);
+                        processValuesLocked(false);
+                    }
+                } finally {
+                    Binder.restoreCallingIdentity(ident);
+                }
+            } break;
+            default:
+                return shell.handleDefaultCommands(cmd);
+        }
+        return 0;
+!!!83990455.java!!!	dumpInternal(inout fd : FileDescriptor, inout pw : PrintWriter, inout args : String [[]]) : void
+        synchronized (mLock) {
+            if (args == null || args.length == 0 || "-a".equals(args[0])) {
+                pw.println("Current Battery Service state:");
+                if (mUpdatesStopped) {
+                    pw.println("  (UPDATES STOPPED -- use 'reset' to restart)");
+                }
+                pw.println("  AC powered: " + mBatteryProps.chargerAcOnline);
+                pw.println("  USB powered: " + mBatteryProps.chargerUsbOnline);
+                pw.println("  Wireless powered: " + mBatteryProps.chargerWirelessOnline);
+                pw.println("  Max charging current: " + mBatteryProps.maxChargingCurrent);
+                pw.println("  Max charging voltage: " + mBatteryProps.maxChargingVoltage);
+                pw.println("  Charge counter: " + mBatteryProps.batteryChargeCounter);
+                pw.println("  status: " + mBatteryProps.batteryStatus);
+                pw.println("  health: " + mBatteryProps.batteryHealth);
+                pw.println("  present: " + mBatteryProps.batteryPresent);
+                pw.println("  level: " + mBatteryProps.batteryLevel);
+                pw.println("  scale: " + BATTERY_SCALE);
+                pw.println("  voltage: " + mBatteryProps.batteryVoltage);
+                pw.println("  temperature: " + mBatteryProps.batteryTemperature);
+                pw.println("  technology: " + mBatteryProps.batteryTechnology);
+            } else {
+                Shell shell = new Shell();
+                shell.exec(mBinderService, null, fd, null, args, new ResultReceiver(null));
+            }
+        }

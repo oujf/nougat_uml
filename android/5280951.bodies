@@ -1,0 +1,293 @@
+class EvdevDeviceNode
+!!!46007607.cpp!!!	openDeviceNode(in path : std::string) : EvdevDeviceNode
+    auto fd = TEMP_FAILURE_RETRY(::open(path.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC));
+    if (fd < 0) {
+        ALOGE("could not open evdev device %s. err=%d", path.c_str(), errno);
+        return nullptr;
+    }
+
+    // Tell the kernel that we want to use the monotonic clock for reporting
+    // timestamps associated with input events. This is important because the
+    // input system uses the timestamps extensively and assumes they were
+    // recorded using the monotonic clock.
+    //
+    // The EVIOCSCLOCKID ioctl was introduced in Linux 3.4.
+    int clockId = CLOCK_MONOTONIC;
+    if (TEMP_FAILURE_RETRY(ioctl(fd, EVIOCSCLOCKID, &clockId)) < 0) {
+        ALOGW("Could not set input clock id to CLOCK_MONOTONIC. errno=%d", errno);
+    }
+
+    auto node = new EvdevDeviceNode(path, fd);
+    status_t ret = node->queryProperties();
+    if (ret != OK) {
+        ALOGE("could not open evdev device %s: failed to read properties. errno=%d",
+                path.c_str(), ret);
+        delete node;
+        return nullptr;
+    }
+    return node;
+!!!46009015.cpp!!!	hasKey(in key : int32_t) : bool
+    if (key >= 0 && key <= KEY_MAX) {
+        return testBit(key, mKeyBitmask);
+    }
+    return false;
+!!!46009143.cpp!!!	hasKeyInRange(in startKey : int32_t, in endKey : int32_t) : bool
+    return testBitInRange(mKeyBitmask, startKey, endKey);
+!!!46009527.cpp!!!	hasSwitch(in sw : int32_t) : bool
+    if (sw >= 0 && sw <= SW_MAX) {
+        return testBit(sw, mSwBitmask);
+    }
+    return false;
+!!!46009655.cpp!!!	hasForceFeedback(in ff : int32_t) : bool
+    if (ff >= 0 && ff <= FF_MAX) {
+        return testBit(ff, mFfBitmask);
+    }
+    return false;
+!!!46009783.cpp!!!	hasInputProperty(in property : int) : bool
+    if (property >= 0 && property <= INPUT_PROP_MAX) {
+        return testBit(property, mPropBitmask);
+    }
+    return false;
+!!!46009911.cpp!!!	getKeyState(in key : int32_t) : int32_t
+    if (key >= 0 && key <= KEY_MAX) {
+        if (testBit(key, mKeyBitmask)) {
+            uint8_t keyState[sizeofBitArray(KEY_CNT)];
+            memset(keyState, 0, sizeof(keyState));
+            if (TEMP_FAILURE_RETRY(ioctl(mFd, EVIOCGKEY(sizeof(keyState)), keyState)) >= 0) {
+                return testBit(key, keyState) ? AKEY_STATE_DOWN : AKEY_STATE_UP;
+            }
+        }
+    }
+    return AKEY_STATE_UNKNOWN;
+!!!46010039.cpp!!!	getSwitchState(in sw : int32_t) : int32_t
+    if (sw >= 0 && sw <= SW_MAX) {
+        if (testBit(sw, mSwBitmask)) {
+            uint8_t swState[sizeofBitArray(SW_CNT)];
+            memset(swState, 0, sizeof(swState));
+            if (TEMP_FAILURE_RETRY(ioctl(mFd, EVIOCGSW(sizeof(swState)), swState)) >= 0) {
+                return testBit(sw, swState) ? AKEY_STATE_DOWN : AKEY_STATE_UP;
+            }
+        }
+    }
+    return AKEY_STATE_UNKNOWN;
+!!!46010167.cpp!!!	getAbsoluteAxisInfo(in axis : int32_t) : AbsoluteAxisInfo
+    if (axis < 0 || axis > ABS_MAX) {
+        return nullptr;
+    }
+
+    const auto absInfo = mAbsInfo.find(axis);
+    if (absInfo != mAbsInfo.end()) {
+        return absInfo->second.get();
+    }
+    return nullptr;
+!!!46010295.cpp!!!	getAbsoluteAxisValue(in axis : int32_t, inout outValue : int32_t) : status_t
+    *outValue = 0;
+
+    if (axis >= 0 && axis <= ABS_MAX) {
+        if (testBit(axis, mAbsBitmask)) {
+            struct input_absinfo info;
+            if (TEMP_FAILURE_RETRY(ioctl(mFd, EVIOCGABS(axis), &info))) {
+                ALOGW("Error reading absolute controller %d for device %s fd %d, errno=%d",
+                        axis, mPath.c_str(), mFd, errno);
+                return -errno;
+            }
+
+            *outValue = info.value;
+            return OK;
+        }
+    }
+    return -1;
+!!!46010423.cpp!!!	vibrate(in duration : nsecs_t) : void
+    ff_effect effect{};
+    effect.type = FF_RUMBLE;
+    effect.id = mFfEffectId;
+    effect.u.rumble.strong_magnitude = 0xc000;
+    effect.u.rumble.weak_magnitude = 0xc000;
+    effect.replay.length = (duration + 999'999LL) / 1'000'000LL;
+    effect.replay.delay = 0;
+    if (TEMP_FAILURE_RETRY(ioctl(mFd, EVIOCSFF, &effect))) {
+        ALOGW("Could not upload force feedback effect to device %s due to error %d.",
+                mPath.c_str(), errno);
+        return;
+    }
+    mFfEffectId = effect.id;
+
+    struct input_event ev{};
+    ev.type = EV_FF;
+    ev.code = mFfEffectId;
+    ev.value = 1;
+    size_t written = TEMP_FAILURE_RETRY(write(mFd, &ev, sizeof(ev)));
+    if (written != sizeof(ev)) {
+        ALOGW("Could not start force feedback effect on device %s due to error %d.",
+                mPath.c_str(), errno);
+        return;
+    }
+    mFfEffectPlaying = true;
+}
+
+void EvdevDeviceNode::cancelVibrate() {
+    if (mFfEffectPlaying) {
+        mFfEffectPlaying = false;
+
+        struct input_event ev{};
+        ev.type = EV_FF;
+        ev.code = mFfEffectId;
+        ev.value = 0;
+        size_t written = TEMP_FAILURE_RETRY(write(mFd, &ev, sizeof(ev)));
+        if (written != sizeof(ev)) {
+            ALOGW("Could not stop force feedback effect on device %s due to error %d.",
+                    mPath.c_str(), errno);
+            return;
+        }
+    }
+}
+
+void EvdevDeviceNode::disableDriverKeyRepeat() {
+    unsigned int repeatRate[] = {0, 0};
+    if (TEMP_FAILURE_RETRY(ioctl(mFd, EVIOCSREP, repeatRate))) {
+        ALOGW("Unable to disable kernel key repeat for %s due to error %d.",
+                mPath.c_str(), errno);
+    }
+}
+
+InputHub::InputHub(const std::shared_ptr<InputCallbackInterface>& cb) :
+    mInputCallback(cb) {
+    // Determine the type of suspend blocking we can do on this device. There
+    // are 3 options, in decreasing order of preference:
+    //   1) EPOLLWAKEUP: introduced in Linux kernel 3.5, this flag can be set on
+    //   an epoll event to indicate that a wake lock should be held from the
+    //   time an fd has data until the next epoll_wait (or the epoll fd is
+    //   closed).
+    //   2) EVIOCSSUSPENDBLOCK: introduced into the Android kernel's evdev
+    //   driver, this ioctl blocks suspend while the event queue for the fd is
+    //   not empty. This was never accepted into the mainline kernel, and it was
+    //   replaced by EPOLLWAKEUP.
+    //   3) explicit wake locks: use acquire_wake_lock to manage suspend
+    //   blocking explicitly in the InputHub code.
+    //
+    // (1) can be checked by simply observing the Linux kernel version. (2)
+    // requires an fd from an evdev node, which cannot be done in the InputHub
+    // constructor. So we assume (3) unless (1) is true, and we can verify
+    // whether (2) is true once we have an evdev fd (and we're not in (1)).
+    int major, minor;
+    getLinuxRelease(&major, &minor);
+    if (major > 3 || (major == 3 && minor >= 5)) {
+        ALOGI("Using EPOLLWAKEUP to block suspend while processing input events.");
+        mWakeupMechanism = WakeMechanism::EPOLL_WAKEUP;
+        mNeedToCheckSuspendBlockIoctl = false;
+    }
+    if (manageWakeLocks()) {
+        acquire_wake_lock(PARTIAL_WAKE_LOCK, WAKE_LOCK_ID);
+    }
+
+    // epoll_create argument is ignored, but it must be > 0.
+    mEpollFd = epoll_create(1);
+    LOG_ALWAYS_FATAL_IF(mEpollFd < 0, "Could not create epoll instance. errno=%d", errno);
+
+    mINotifyFd = inotify_init();
+    LOG_ALWAYS_FATAL_IF(mINotifyFd < 0, "Could not create inotify instance. errno=%d", errno);
+
+    struct epoll_event eventItem;
+    memset(&eventItem, 0, sizeof(eventItem));
+    eventItem.events = EPOLLIN;
+    if (mWakeupMechanism == WakeMechanism::EPOLL_WAKEUP) {
+        eventItem.events |= EPOLLWAKEUP;
+    }
+    eventItem.data.u32 = mINotifyFd;
+    int result = epoll_ctl(mEpollFd, EPOLL_CTL_ADD, mINotifyFd, &eventItem);
+    LOG_ALWAYS_FATAL_IF(result != 0, "Could not add INotify to epoll instance. errno=%d", errno);
+
+    int wakeFds[2];
+    result = pipe(wakeFds);
+    LOG_ALWAYS_FATAL_IF(result != 0, "Could not create wake pipe. errno=%d", errno);
+
+    mWakeEventFd = eventfd(0, EFD_NONBLOCK);
+    LOG_ALWAYS_FATAL_IF(mWakeEventFd == -1, "Could not create wake event fd. errno=%d", errno);
+
+    eventItem.data.u32 = mWakeEventFd;
+    result = epoll_ctl(mEpollFd, EPOLL_CTL_ADD, mWakeEventFd, &eventItem);
+    LOG_ALWAYS_FATAL_IF(result != 0, "Could not add wake event fd to epoll instance. errno=%d", errno);
+!!!46010935.cpp!!!	queryProperties() : status_t
+    char buffer[80];
+
+    if (TEMP_FAILURE_RETRY(ioctl(mFd, EVIOCGNAME(sizeof(buffer) - 1), buffer)) < 1) {
+        ALOGV("could not get device name for %s.", mPath.c_str());
+    } else {
+        buffer[sizeof(buffer) - 1] = '\0';
+        mName = buffer;
+    }
+
+    int driverVersion;
+    if (TEMP_FAILURE_RETRY(ioctl(mFd, EVIOCGVERSION, &driverVersion))) {
+        ALOGE("could not get driver version for %s. err=%d", mPath.c_str(), errno);
+        return -errno;
+    }
+
+    struct input_id inputId;
+    if (TEMP_FAILURE_RETRY(ioctl(mFd, EVIOCGID, &inputId))) {
+        ALOGE("could not get device input id for %s. err=%d", mPath.c_str(), errno);
+        return -errno;
+    }
+    mBusType = inputId.bustype;
+    mVendorId = inputId.vendor;
+    mProductId = inputId.product;
+    mVersion = inputId.version;
+
+    if (TEMP_FAILURE_RETRY(ioctl(mFd, EVIOCGPHYS(sizeof(buffer) - 1), buffer)) < 1) {
+        ALOGV("could not get location for %s.", mPath.c_str());
+    } else {
+        buffer[sizeof(buffer) - 1] = '\0';
+        mLocation = buffer;
+    }
+
+    if (TEMP_FAILURE_RETRY(ioctl(mFd, EVIOCGUNIQ(sizeof(buffer) - 1), buffer)) < 1) {
+        ALOGV("could not get unique id for %s.", mPath.c_str());
+    } else {
+        buffer[sizeof(buffer) - 1] = '\0';
+        mUniqueId = buffer;
+    }
+
+    ALOGV("add device %s", mPath.c_str());
+    ALOGV("  bus:        %04x\n"
+          "  vendor:     %04x\n"
+          "  product:    %04x\n"
+          "  version:    %04x\n",
+        mBusType, mVendorId, mProductId, mVersion);
+    ALOGV("  name:       \"%s\"\n"
+          "  location:   \"%s\"\n"
+          "  unique_id:  \"%s\"\n"
+          "  descriptor: (TODO)\n"
+          "  driver:     v%d.%d.%d",
+        mName.c_str(), mLocation.c_str(), mUniqueId.c_str(),
+        driverVersion >> 16, (driverVersion >> 8) & 0xff, (driverVersion >> 16) & 0xff);
+
+    TEMP_FAILURE_RETRY(ioctl(mFd, EVIOCGBIT(EV_KEY, sizeof(mKeyBitmask)), mKeyBitmask));
+    TEMP_FAILURE_RETRY(ioctl(mFd, EVIOCGBIT(EV_ABS, sizeof(mAbsBitmask)), mAbsBitmask));
+    TEMP_FAILURE_RETRY(ioctl(mFd, EVIOCGBIT(EV_REL, sizeof(mRelBitmask)), mRelBitmask));
+    TEMP_FAILURE_RETRY(ioctl(mFd, EVIOCGBIT(EV_SW,  sizeof(mSwBitmask)),  mSwBitmask));
+    TEMP_FAILURE_RETRY(ioctl(mFd, EVIOCGBIT(EV_LED, sizeof(mLedBitmask)), mLedBitmask));
+    TEMP_FAILURE_RETRY(ioctl(mFd, EVIOCGBIT(EV_FF,  sizeof(mFfBitmask)),  mFfBitmask));
+    TEMP_FAILURE_RETRY(ioctl(mFd, EVIOCGPROP(sizeof(mPropBitmask)), mPropBitmask));
+
+    queryAxisInfo();
+
+    return OK;
+!!!46011063.cpp!!!	queryAxisInfo() : void
+    for (int32_t axis = 0; axis < ABS_MAX; ++axis) {
+        if (testBit(axis, mAbsBitmask)) {
+            struct input_absinfo info;
+            if (TEMP_FAILURE_RETRY(ioctl(mFd, EVIOCGABS(axis), &info))) {
+                ALOGW("Error reading absolute controller %d for device %s fd %d, errno=%d",
+                        axis, mPath.c_str(), mFd, errno);
+                continue;
+            }
+
+            mAbsInfo[axis] = std::unique_ptr<AbsoluteAxisInfo>(new AbsoluteAxisInfo{
+                    .minValue = info.minimum,
+                    .maxValue = info.maximum,
+                    .flat = info.flat,
+                    .fuzz = info.fuzz,
+                    .resolution = info.resolution
+                    });
+        }
+    }

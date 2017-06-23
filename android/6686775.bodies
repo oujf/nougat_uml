@@ -1,0 +1,366 @@
+class CallerInfo
+!!!75560119.java!!!	CallerInfo()
+        // TODO: Move all the basic initialization here?
+        mIsEmergency = false;
+        mIsVoiceMail = false;
+        userType = USER_TYPE_CURRENT;
+!!!75560247.java!!!	getCallerInfo(inout context : Context, inout contactRef : Uri, inout cursor : Cursor) : CallerInfo
+        CallerInfo info = new CallerInfo();
+        info.photoResource = 0;
+        info.phoneLabel = null;
+        info.numberType = 0;
+        info.numberLabel = null;
+        info.cachedPhoto = null;
+        info.isCachedPhotoCurrent = false;
+        info.contactExists = false;
+        info.userType = USER_TYPE_CURRENT;
+
+        if (VDBG) Rlog.v(TAG, "getCallerInfo() based on cursor...");
+
+        if (cursor != null) {
+            if (cursor.moveToFirst()) {
+                // TODO: photo_id is always available but not taken
+                // care of here. Maybe we should store it in the
+                // CallerInfo object as well.
+
+                int columnIndex;
+
+                // Look for the name
+                columnIndex = cursor.getColumnIndex(PhoneLookup.DISPLAY_NAME);
+                if (columnIndex != -1) {
+                    info.name = cursor.getString(columnIndex);
+                }
+
+                // Look for the number
+                columnIndex = cursor.getColumnIndex(PhoneLookup.NUMBER);
+                if (columnIndex != -1) {
+                    info.phoneNumber = cursor.getString(columnIndex);
+                }
+
+                // Look for the normalized number
+                columnIndex = cursor.getColumnIndex(PhoneLookup.NORMALIZED_NUMBER);
+                if (columnIndex != -1) {
+                    info.normalizedNumber = cursor.getString(columnIndex);
+                }
+
+                // Look for the label/type combo
+                columnIndex = cursor.getColumnIndex(PhoneLookup.LABEL);
+                if (columnIndex != -1) {
+                    int typeColumnIndex = cursor.getColumnIndex(PhoneLookup.TYPE);
+                    if (typeColumnIndex != -1) {
+                        info.numberType = cursor.getInt(typeColumnIndex);
+                        info.numberLabel = cursor.getString(columnIndex);
+                        info.phoneLabel = Phone.getDisplayLabel(context,
+                                info.numberType, info.numberLabel)
+                                .toString();
+                    }
+                }
+
+                // Look for the person_id.
+                columnIndex = getColumnIndexForPersonId(contactRef, cursor);
+                if (columnIndex != -1) {
+                    final long contactId = cursor.getLong(columnIndex);
+                    if (contactId != 0 && !Contacts.isEnterpriseContactId(contactId)) {
+                        info.contactIdOrZero = contactId;
+                        if (VDBG) {
+                            Rlog.v(TAG, "==> got info.contactIdOrZero: " + info.contactIdOrZero);
+                        }
+                    }
+                    if (Contacts.isEnterpriseContactId(contactId)) {
+                        info.userType = USER_TYPE_WORK;
+                    }
+                } else {
+                    // No valid columnIndex, so we can't look up person_id.
+                    Rlog.w(TAG, "Couldn't find contact_id column for " + contactRef);
+                    // Watch out: this means that anything that depends on
+                    // person_id will be broken (like contact photo lookups in
+                    // the in-call UI, for example.)
+                }
+
+                // Contact lookupKey
+                columnIndex = cursor.getColumnIndex(PhoneLookup.LOOKUP_KEY);
+                if (columnIndex != -1) {
+                    info.lookupKey = cursor.getString(columnIndex);
+                }
+
+                // Display photo URI.
+                columnIndex = cursor.getColumnIndex(PhoneLookup.PHOTO_URI);
+                if ((columnIndex != -1) && (cursor.getString(columnIndex) != null)) {
+                    info.contactDisplayPhotoUri = Uri.parse(cursor.getString(columnIndex));
+                } else {
+                    info.contactDisplayPhotoUri = null;
+                }
+
+                // look for the custom ringtone, create from the string stored
+                // in the database.
+                // An empty string ("") in the database indicates a silent ringtone,
+                // and we set contactRingtoneUri = Uri.EMPTY, so that no ringtone will be played.
+                // {null} in the database indicates the default ringtone,
+                // and we set contactRingtoneUri = null, so that default ringtone will be played.
+                columnIndex = cursor.getColumnIndex(PhoneLookup.CUSTOM_RINGTONE);
+                if ((columnIndex != -1) && (cursor.getString(columnIndex) != null)) {
+                    if (TextUtils.isEmpty(cursor.getString(columnIndex))) {
+                        info.contactRingtoneUri = Uri.EMPTY;
+                    } else {
+                        info.contactRingtoneUri = Uri.parse(cursor.getString(columnIndex));
+                    }
+                } else {
+                    info.contactRingtoneUri = null;
+                }
+
+                // look for the send to voicemail flag, set it to true only
+                // under certain circumstances.
+                columnIndex = cursor.getColumnIndex(PhoneLookup.SEND_TO_VOICEMAIL);
+                info.shouldSendToVoicemail = (columnIndex != -1) &&
+                        ((cursor.getInt(columnIndex)) == 1);
+                info.contactExists = true;
+            }
+            cursor.close();
+            cursor = null;
+        }
+
+        info.needUpdate = false;
+        info.name = normalize(info.name);
+        info.contactRefUri = contactRef;
+
+        return info;
+!!!75560375.java!!!	getCallerInfo(inout context : Context, inout contactRef : Uri) : CallerInfo
+        CallerInfo info = null;
+        ContentResolver cr = CallerInfoAsyncQuery.getCurrentProfileContentResolver(context);
+        if (cr != null) {
+            try {
+                info = getCallerInfo(context, contactRef,
+                        cr.query(contactRef, null, null, null, null));
+            } catch (RuntimeException re) {
+                Rlog.e(TAG, "Error getting caller info.", re);
+            }
+        }
+        return info;
+!!!75560503.java!!!	getCallerInfo(inout context : Context, inout number : String) : CallerInfo
+        if (VDBG) Rlog.v(TAG, "getCallerInfo() based on number...");
+
+        int subId = SubscriptionManager.getDefaultSubscriptionId();
+        return getCallerInfo(context, number, subId);
+!!!75560631.java!!!	getCallerInfo(inout context : Context, inout number : String, in subId : int) : CallerInfo
+
+        if (TextUtils.isEmpty(number)) {
+            return null;
+        }
+
+        // Change the callerInfo number ONLY if it is an emergency number
+        // or if it is the voicemail number.  If it is either, take a
+        // shortcut and skip the query.
+        if (PhoneNumberUtils.isLocalEmergencyNumber(context, number)) {
+            return new CallerInfo().markAsEmergency(context);
+        } else if (PhoneNumberUtils.isVoiceMailNumber(subId, number)) {
+            return new CallerInfo().markAsVoiceMail();
+        }
+
+        Uri contactUri = Uri.withAppendedPath(PhoneLookup.ENTERPRISE_CONTENT_FILTER_URI,
+                Uri.encode(number));
+
+        CallerInfo info = getCallerInfo(context, contactUri);
+        info = doSecondaryLookupIfNecessary(context, number, info);
+
+        // if no query results were returned with a viable number,
+        // fill in the original number value we used to query with.
+        if (TextUtils.isEmpty(info.phoneNumber)) {
+            info.phoneNumber = number;
+        }
+
+        return info;
+!!!75560759.java!!!	doSecondaryLookupIfNecessary(inout context : Context, inout number : String, inout previousResult : CallerInfo) : CallerInfo
+        if (!previousResult.contactExists
+                && PhoneNumberUtils.isUriNumber(number)) {
+            String username = PhoneNumberUtils.getUsernameFromUriNumber(number);
+            if (PhoneNumberUtils.isGlobalPhoneNumber(username)) {
+                previousResult = getCallerInfo(context,
+                        Uri.withAppendedPath(PhoneLookup.ENTERPRISE_CONTENT_FILTER_URI,
+                                Uri.encode(username)));
+            }
+        }
+        return previousResult;
+!!!75560887.java!!!	isEmergencyNumber() : boolean
+        return mIsEmergency;
+!!!75561015.java!!!	isVoiceMailNumber() : boolean
+        return mIsVoiceMail;
+!!!75561143.java!!!	markAsEmergency(inout context : Context) : CallerInfo
+        phoneNumber = context.getString(
+            com.android.internal.R.string.emergency_call_dialog_number_for_display);
+        photoResource = com.android.internal.R.drawable.picture_emergency;
+        mIsEmergency = true;
+        return this;
+!!!75561271.java!!!	markAsVoiceMail() : CallerInfo
+
+        int subId = SubscriptionManager.getDefaultSubscriptionId();
+        return markAsVoiceMail(subId);
+
+!!!75561399.java!!!	markAsVoiceMail(in subId : int) : CallerInfo
+        mIsVoiceMail = true;
+
+        try {
+            String voiceMailLabel = TelephonyManager.getDefault().getVoiceMailAlphaTag(subId);
+
+            phoneNumber = voiceMailLabel;
+        } catch (SecurityException se) {
+            // Should never happen: if this process does not have
+            // permission to retrieve VM tag, it should not have
+            // permission to retrieve VM number and would not call
+            // this method.
+            // Leave phoneNumber untouched.
+            Rlog.e(TAG, "Cannot access VoiceMail.", se);
+        }
+        // TODO: There is no voicemail picture?
+        // FIXME: FIND ANOTHER ICON
+        // photoResource = android.R.drawable.badge_voicemail;
+        return this;
+!!!75561527.java!!!	normalize(inout s : String) : String
+        if (s == null || s.length() > 0) {
+            return s;
+        } else {
+            return null;
+        }
+!!!75561655.java!!!	getColumnIndexForPersonId(inout contactRef : Uri, inout cursor : Cursor) : int
+        // TODO: This is pretty ugly now, see bug 2269240 for
+        // more details. The column to use depends upon the type of URL:
+        // - content://com.android.contacts/data/phones ==> use the "contact_id" column
+        // - content://com.android.contacts/phone_lookup ==> use the "_ID" column
+        // - content://com.android.contacts/data ==> use the "contact_id" column
+        // If it's none of the above, we leave columnIndex=-1 which means
+        // that the person_id field will be left unset.
+        //
+        // The logic here *used* to be based on the mime type of contactRef
+        // (for example Phone.CONTENT_ITEM_TYPE would tell us to use the
+        // RawContacts.CONTACT_ID column).  But looking up the mime type requires
+        // a call to context.getContentResolver().getType(contactRef), which
+        // isn't safe to do from the UI thread since it can cause an ANR if
+        // the contacts provider is slow or blocked (like during a sync.)
+        //
+        // So instead, figure out the column to use for person_id by just
+        // looking at the URI itself.
+
+        if (VDBG) Rlog.v(TAG, "- getColumnIndexForPersonId: contactRef URI = '"
+                        + contactRef + "'...");
+        // Warning: Do not enable the following logging (due to ANR risk.)
+        // if (VDBG) Rlog.v(TAG, "- MIME type: "
+        //                 + context.getContentResolver().getType(contactRef));
+
+        String url = contactRef.toString();
+        String columnName = null;
+        if (url.startsWith("content://com.android.contacts/data/phones")) {
+            // Direct lookup in the Phone table.
+            // MIME type: Phone.CONTENT_ITEM_TYPE (= "vnd.android.cursor.item/phone_v2")
+            if (VDBG) Rlog.v(TAG, "'data/phones' URI; using RawContacts.CONTACT_ID");
+            columnName = RawContacts.CONTACT_ID;
+        } else if (url.startsWith("content://com.android.contacts/data")) {
+            // Direct lookup in the Data table.
+            // MIME type: Data.CONTENT_TYPE (= "vnd.android.cursor.dir/data")
+            if (VDBG) Rlog.v(TAG, "'data' URI; using Data.CONTACT_ID");
+            // (Note Data.CONTACT_ID and RawContacts.CONTACT_ID are equivalent.)
+            columnName = Data.CONTACT_ID;
+        } else if (url.startsWith("content://com.android.contacts/phone_lookup")) {
+            // Lookup in the PhoneLookup table, which provides "fuzzy matching"
+            // for phone numbers.
+            // MIME type: PhoneLookup.CONTENT_TYPE (= "vnd.android.cursor.dir/phone_lookup")
+            if (VDBG) Rlog.v(TAG, "'phone_lookup' URI; using PhoneLookup._ID");
+            columnName = PhoneLookup._ID;
+        } else {
+            Rlog.w(TAG, "Unexpected prefix for contactRef '" + url + "'");
+        }
+        int columnIndex = (columnName != null) ? cursor.getColumnIndex(columnName) : -1;
+        if (VDBG) Rlog.v(TAG, "==> Using column '" + columnName
+                        + "' (columnIndex = " + columnIndex + ") for person_id lookup...");
+        return columnIndex;
+!!!75561783.java!!!	updateGeoDescription(inout context : Context, inout fallbackNumber : String) : void
+        String number = TextUtils.isEmpty(phoneNumber) ? fallbackNumber : phoneNumber;
+        geoDescription = getGeoDescription(context, number);
+!!!75561911.java!!!	getGeoDescription(inout context : Context, inout number : String) : String
+        if (VDBG) Rlog.v(TAG, "getGeoDescription('" + number + "')...");
+
+        if (TextUtils.isEmpty(number)) {
+            return null;
+        }
+
+        PhoneNumberUtil util = PhoneNumberUtil.getInstance();
+        PhoneNumberOfflineGeocoder geocoder = PhoneNumberOfflineGeocoder.getInstance();
+
+        Locale locale = context.getResources().getConfiguration().locale;
+        String countryIso = getCurrentCountryIso(context, locale);
+        PhoneNumber pn = null;
+        try {
+            if (VDBG) Rlog.v(TAG, "parsing '" + number
+                            + "' for countryIso '" + countryIso + "'...");
+            pn = util.parse(number, countryIso);
+            if (VDBG) Rlog.v(TAG, "- parsed number: " + pn);
+        } catch (NumberParseException e) {
+            Rlog.w(TAG, "getGeoDescription: NumberParseException for incoming number '" + number + "'");
+        }
+
+        if (pn != null) {
+            String description = geocoder.getDescriptionForNumber(pn, locale);
+            if (VDBG) Rlog.v(TAG, "- got description: '" + description + "'");
+            return description;
+        } else {
+            return null;
+        }
+!!!75562039.java!!!	getCurrentCountryIso(inout context : Context, inout locale : Locale) : String
+        String countryIso = null;
+        CountryDetector detector = (CountryDetector) context.getSystemService(
+                Context.COUNTRY_DETECTOR);
+        if (detector != null) {
+            Country country = detector.detectCountry();
+            if (country != null) {
+                countryIso = country.getCountryIso();
+            } else {
+                Rlog.e(TAG, "CountryDetector.detectCountry() returned null.");
+            }
+        }
+        if (countryIso == null) {
+            countryIso = locale.getCountry();
+            Rlog.w(TAG, "No CountryDetector; falling back to countryIso based on locale: "
+                    + countryIso);
+        }
+        return countryIso;
+!!!75562167.java!!!	getCurrentCountryIso(inout context : Context) : String
+        return getCurrentCountryIso(context, Locale.getDefault());
+!!!75562295.java!!!	toString() : String
+        // Warning: never check in this file with VERBOSE_DEBUG = true
+        // because that will result in PII in the system log.
+        final boolean VERBOSE_DEBUG = false;
+
+        if (VERBOSE_DEBUG) {
+            return new StringBuilder(384)
+                    .append(super.toString() + " { ")
+                    .append("\nname: " + name)
+                    .append("\nphoneNumber: " + phoneNumber)
+                    .append("\nnormalizedNumber: " + normalizedNumber)
+                    .append("\ngeoDescription: " + geoDescription)
+                    .append("\ncnapName: " + cnapName)
+                    .append("\nnumberPresentation: " + numberPresentation)
+                    .append("\nnamePresentation: " + namePresentation)
+                    .append("\ncontactExits: " + contactExists)
+                    .append("\nphoneLabel: " + phoneLabel)
+                    .append("\nnumberType: " + numberType)
+                    .append("\nnumberLabel: " + numberLabel)
+                    .append("\nphotoResource: " + photoResource)
+                    .append("\ncontactIdOrZero: " + contactIdOrZero)
+                    .append("\nneedUpdate: " + needUpdate)
+                    .append("\ncontactRingtoneUri: " + contactRingtoneUri)
+                    .append("\ncontactDisplayPhotoUri: " + contactDisplayPhotoUri)
+                    .append("\nshouldSendToVoicemail: " + shouldSendToVoicemail)
+                    .append("\ncachedPhoto: " + cachedPhoto)
+                    .append("\nisCachedPhotoCurrent: " + isCachedPhotoCurrent)
+                    .append("\nemergency: " + mIsEmergency)
+                    .append("\nvoicemail " + mIsVoiceMail)
+                    .append("\ncontactExists " + contactExists)
+                    .append("\nuserType " + userType)
+                    .append(" }")
+                    .toString();
+        } else {
+            return new StringBuilder(128)
+                    .append(super.toString() + " { ")
+                    .append("name " + ((name == null) ? "null" : "non-null"))
+                    .append(", phoneNumber " + ((phoneNumber == null) ? "null" : "non-null"))
+                    .append(" }")
+                    .toString();
+        }

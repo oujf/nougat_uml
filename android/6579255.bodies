@@ -1,0 +1,625 @@
+class ZenModeHelper
+!!!74179127.java!!!	ZenModeHelper(inout context : Context, inout looper : Looper, inout conditionProviders : ConditionProviders)
+        mContext = context;
+        mHandler = new H(looper);
+        addCallback(mMetrics);
+        mAppOps = (AppOpsManager) context.getSystemService(Context.APP_OPS_SERVICE);
+        mDefaultConfig = readDefaultConfig(context.getResources());
+        appendDefaultScheduleRules(mDefaultConfig);
+        appendDefaultEventRules(mDefaultConfig);
+        mConfig = mDefaultConfig;
+        mConfigs.put(UserHandle.USER_SYSTEM, mConfig);
+        mSettingsObserver = new SettingsObserver(mHandler);
+        mSettingsObserver.observe();
+        mFiltering = new ZenModeFiltering(mContext);
+        mConditions = new ZenModeConditions(this, conditionProviders);
+        mServiceConfig = conditionProviders.getConfig();
+!!!74179255.java!!!	getLooper() : Looper
+        return mHandler.getLooper();
+!!!74179383.java!!!	toString() : String
+        return TAG;
+!!!74179511.java!!!	matchesCallFilter(inout userHandle : UserHandle, inout extras : Bundle, inout validator : ValidateNotificationPeople, in contactsTimeoutMs : int, in timeoutAffinity : float) : boolean
+        synchronized (mConfig) {
+            return ZenModeFiltering.matchesCallFilter(mContext, mZenMode, mConfig, userHandle,
+                    extras,
+                    validator, contactsTimeoutMs, timeoutAffinity);
+        }
+!!!74179639.java!!!	isCall(inout record : NotificationRecord) : boolean
+        return mFiltering.isCall(record);
+!!!74179767.java!!!	shouldIntercept(inout record : NotificationRecord) : boolean
+        synchronized (mConfig) {
+            return mFiltering.shouldIntercept(mZenMode, mConfig, record);
+        }
+!!!74179895.java!!!	shouldSuppressWhenScreenOff() : boolean
+        synchronized (mConfig) {
+            return !mConfig.allowWhenScreenOff;
+        }
+!!!74180023.java!!!	shouldSuppressWhenScreenOn() : boolean
+        synchronized (mConfig) {
+            return !mConfig.allowWhenScreenOn;
+        }
+!!!74180151.java!!!	addCallback(inout callback : ZenModeHelper::Callback) : void
+        mCallbacks.add(callback);
+!!!74180279.java!!!	removeCallback(inout callback : ZenModeHelper::Callback) : void
+        mCallbacks.remove(callback);
+!!!74180407.java!!!	initZenMode() : void
+        if (DEBUG) Log.d(TAG, "initZenMode");
+        evaluateZenMode("init", true /*setRingerMode*/);
+!!!74180535.java!!!	onSystemReady() : void
+        if (DEBUG) Log.d(TAG, "onSystemReady");
+        mAudioManager = LocalServices.getService(AudioManagerInternal.class);
+        if (mAudioManager != null) {
+            mAudioManager.setRingerModeDelegate(mRingerModeDelegate);
+        }
+        mPm = mContext.getPackageManager();
+        mHandler.postMetricsTimer();
+        cleanUpZenRules();
+        evaluateZenMode("onSystemReady", true);
+!!!74180663.java!!!	onUserSwitched(in user : int) : void
+        loadConfigForUser(user, "onUserSwitched");
+!!!74180791.java!!!	onUserRemoved(in user : int) : void
+        if (user < UserHandle.USER_SYSTEM) return;
+        if (DEBUG) Log.d(TAG, "onUserRemoved u=" + user);
+        mConfigs.remove(user);
+!!!74180919.java!!!	onUserUnlocked(in user : int) : void
+        loadConfigForUser(user, "onUserUnlocked");
+!!!74181047.java!!!	loadConfigForUser(in user : int, inout reason : String) : void
+        if (mUser == user || user < UserHandle.USER_SYSTEM) return;
+        mUser = user;
+        if (DEBUG) Log.d(TAG, reason + " u=" + user);
+        ZenModeConfig config = mConfigs.get(user);
+        if (config == null) {
+            if (DEBUG) Log.d(TAG, reason + " generating default config for user " + user);
+            config = mDefaultConfig.copy();
+            config.user = user;
+        }
+        synchronized (mConfig) {
+            setConfigLocked(config, reason);
+        }
+        cleanUpZenRules();
+!!!74181175.java!!!	getZenModeListenerInterruptionFilter() : int
+        return NotificationManager.zenModeToInterruptionFilter(mZenMode);
+!!!74181303.java!!!	requestFromListener(inout name : ComponentName, in filter : int) : void
+        final int newZen = NotificationManager.zenModeFromInterruptionFilter(filter, -1);
+        if (newZen != -1) {
+            setManualZenMode(newZen, null,
+                    "listener:" + (name != null ? name.flattenToShortString() : null));
+        }
+!!!74181431.java!!!	setSuppressedEffects(in suppressedEffects : long) : void
+        if (mSuppressedEffects == suppressedEffects) return;
+        mSuppressedEffects = suppressedEffects;
+        applyRestrictions();
+!!!74181559.java!!!	getSuppressedEffects() : long
+        return mSuppressedEffects;
+!!!74181687.java!!!	getZenMode() : int
+        return mZenMode;
+!!!74181815.java!!!	getZenRules() : ZenModeConfig::ZenRule
+        List<ZenRule> rules = new ArrayList<>();
+        synchronized (mConfig) {
+            if (mConfig == null) return rules;
+            for (ZenRule rule : mConfig.automaticRules.values()) {
+                if (canManageAutomaticZenRule(rule)) {
+                    rules.add(rule);
+                }
+            }
+        }
+        return rules;
+!!!74181943.java!!!	getAutomaticZenRule(inout id : String) : AutomaticZenRule
+        ZenRule rule;
+        synchronized (mConfig) {
+            if (mConfig == null) return null;
+             rule = mConfig.automaticRules.get(id);
+        }
+        if (rule == null) return null;
+        if (canManageAutomaticZenRule(rule)) {
+             return createAutomaticZenRule(rule);
+        }
+        return null;
+!!!74182071.java!!!	addAutomaticZenRule(inout automaticZenRule : AutomaticZenRule, inout reason : String) : String
+        if (!isSystemRule(automaticZenRule)) {
+            ServiceInfo owner = getServiceInfo(automaticZenRule.getOwner());
+            if (owner == null) {
+                throw new IllegalArgumentException("Owner is not a condition provider service");
+            }
+
+            int ruleInstanceLimit = -1;
+            if (owner.metaData != null) {
+                ruleInstanceLimit = owner.metaData.getInt(
+                        ConditionProviderService.META_DATA_RULE_INSTANCE_LIMIT, -1);
+            }
+            if (ruleInstanceLimit > 0 && ruleInstanceLimit
+                    < (getCurrentInstanceCount(automaticZenRule.getOwner()) + 1)) {
+                throw new IllegalArgumentException("Rule instance limit exceeded");
+            }
+        }
+
+        ZenModeConfig newConfig;
+        synchronized (mConfig) {
+            if (mConfig == null) {
+                throw new AndroidRuntimeException("Could not create rule");
+            }
+            if (DEBUG) {
+                Log.d(TAG, "addAutomaticZenRule rule= " + automaticZenRule + " reason=" + reason);
+            }
+            newConfig = mConfig.copy();
+            ZenRule rule = new ZenRule();
+            populateZenRule(automaticZenRule, rule, true);
+            newConfig.automaticRules.put(rule.id, rule);
+            if (setConfigLocked(newConfig, reason, true)) {
+                return rule.id;
+            } else {
+                throw new AndroidRuntimeException("Could not create rule");
+            }
+        }
+!!!74182199.java!!!	updateAutomaticZenRule(inout ruleId : String, inout automaticZenRule : AutomaticZenRule, inout reason : String) : boolean
+        ZenModeConfig newConfig;
+        synchronized (mConfig) {
+            if (mConfig == null) return false;
+            if (DEBUG) {
+                Log.d(TAG, "updateAutomaticZenRule zenRule=" + automaticZenRule
+                        + " reason=" + reason);
+            }
+            newConfig = mConfig.copy();
+            ZenModeConfig.ZenRule rule;
+            if (ruleId == null) {
+                throw new IllegalArgumentException("Rule doesn't exist");
+            } else {
+                rule = newConfig.automaticRules.get(ruleId);
+                if (rule == null || !canManageAutomaticZenRule(rule)) {
+                    throw new SecurityException(
+                            "Cannot update rules not owned by your condition provider");
+                }
+            }
+            populateZenRule(automaticZenRule, rule, false);
+            newConfig.automaticRules.put(ruleId, rule);
+            return setConfigLocked(newConfig, reason, true);
+        }
+!!!74182327.java!!!	removeAutomaticZenRule(inout id : String, inout reason : String) : boolean
+        ZenModeConfig newConfig;
+        synchronized (mConfig) {
+            if (mConfig == null) return false;
+            newConfig = mConfig.copy();
+            ZenRule rule = newConfig.automaticRules.get(id);
+            if (rule == null) return false;
+            if (canManageAutomaticZenRule(rule)) {
+                newConfig.automaticRules.remove(id);
+                if (DEBUG) Log.d(TAG, "removeZenRule zenRule=" + id + " reason=" + reason);
+            } else {
+                throw new SecurityException(
+                        "Cannot delete rules not owned by your condition provider");
+            }
+            return setConfigLocked(newConfig, reason, true);
+        }
+!!!74182455.java!!!	removeAutomaticZenRules(inout packageName : String, inout reason : String) : boolean
+        ZenModeConfig newConfig;
+        synchronized (mConfig) {
+            if (mConfig == null) return false;
+            newConfig = mConfig.copy();
+            for (int i = newConfig.automaticRules.size() - 1; i >= 0; i--) {
+                ZenRule rule = newConfig.automaticRules.get(newConfig.automaticRules.keyAt(i));
+                if (rule.component.getPackageName().equals(packageName)
+                        && canManageAutomaticZenRule(rule)) {
+                    newConfig.automaticRules.removeAt(i);
+                }
+            }
+            return setConfigLocked(newConfig, reason, true);
+        }
+!!!74182583.java!!!	getCurrentInstanceCount(inout owner : ComponentName) : int
+        int count = 0;
+        synchronized (mConfig) {
+            for (ZenRule rule : mConfig.automaticRules.values()) {
+                if (rule.component != null && rule.component.equals(owner)) {
+                    count++;
+                }
+            }
+        }
+        return count;
+!!!74182711.java!!!	canManageAutomaticZenRule(inout rule : ZenModeConfig::ZenRule) : boolean
+        final int callingUid = Binder.getCallingUid();
+        if (callingUid == 0 || callingUid == Process.SYSTEM_UID) {
+            return true;
+        } else if (mContext.checkCallingPermission(android.Manifest.permission.MANAGE_NOTIFICATIONS)
+                == PackageManager.PERMISSION_GRANTED) {
+            return true;
+        } else {
+            String[] packages = mPm.getPackagesForUid(Binder.getCallingUid());
+            if (packages != null) {
+                final int packageCount = packages.length;
+                for (int i = 0; i < packageCount; i++) {
+                    if (packages[i].equals(rule.component.getPackageName())) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+!!!74182839.java!!!	isSystemRule(inout rule : AutomaticZenRule) : boolean
+        return ZenModeConfig.SYSTEM_AUTHORITY.equals(rule.getOwner().getPackageName());
+!!!74182967.java!!!	getServiceInfo(inout owner : ComponentName) : ServiceInfo
+        Intent queryIntent = new Intent();
+        queryIntent.setComponent(owner);
+        List<ResolveInfo> installedServices = mPm.queryIntentServicesAsUser(
+                queryIntent,
+                PackageManager.GET_SERVICES | PackageManager.GET_META_DATA,
+                UserHandle.getCallingUserId());
+        if (installedServices != null) {
+            for (int i = 0, count = installedServices.size(); i < count; i++) {
+                ResolveInfo resolveInfo = installedServices.get(i);
+                ServiceInfo info = resolveInfo.serviceInfo;
+                if (mServiceConfig.bindPermission.equals(info.permission)) {
+                    return info;
+                }
+            }
+        }
+        return null;
+!!!74183095.java!!!	populateZenRule(inout automaticZenRule : AutomaticZenRule, inout rule : ZenModeConfig::ZenRule, inout isNew : boolean) : void
+        if (isNew) {
+            rule.id = ZenModeConfig.newRuleId();
+            rule.creationTime = System.currentTimeMillis();
+            rule.component = automaticZenRule.getOwner();
+        }
+
+        if (rule.enabled != automaticZenRule.isEnabled()) {
+            rule.snoozing = false;
+        }
+        rule.name = automaticZenRule.getName();
+        rule.condition = null;
+        rule.conditionId = automaticZenRule.getConditionId();
+        rule.enabled = automaticZenRule.isEnabled();
+        rule.zenMode = NotificationManager.zenModeFromInterruptionFilter(
+                automaticZenRule.getInterruptionFilter(), Global.ZEN_MODE_OFF);
+!!!74183223.java!!!	createAutomaticZenRule(inout rule : ZenModeConfig::ZenRule) : AutomaticZenRule
+        return new AutomaticZenRule(rule.name, rule.component, rule.conditionId,
+                NotificationManager.zenModeToInterruptionFilter(rule.zenMode), rule.enabled,
+                rule.creationTime);
+!!!74183351.java!!!	setManualZenMode(in zenMode : int, inout conditionId : Uri, inout reason : String) : void
+        setManualZenMode(zenMode, conditionId, reason, true /*setRingerMode*/);
+!!!74183479.java!!!	setManualZenMode(in zenMode : int, inout conditionId : Uri, inout reason : String, inout setRingerMode : boolean) : void
+        ZenModeConfig newConfig;
+        synchronized (mConfig) {
+            if (mConfig == null) return;
+            if (!Global.isValidZenMode(zenMode)) return;
+            if (DEBUG) Log.d(TAG, "setManualZenMode " + Global.zenModeToString(zenMode)
+                    + " conditionId=" + conditionId + " reason=" + reason
+                    + " setRingerMode=" + setRingerMode);
+            newConfig = mConfig.copy();
+            if (zenMode == Global.ZEN_MODE_OFF) {
+                newConfig.manualRule = null;
+                for (ZenRule automaticRule : newConfig.automaticRules.values()) {
+                    if (automaticRule.isAutomaticActive()) {
+                        automaticRule.snoozing = true;
+                    }
+                }
+            } else {
+                final ZenRule newRule = new ZenRule();
+                newRule.enabled = true;
+                newRule.zenMode = zenMode;
+                newRule.conditionId = conditionId;
+                newConfig.manualRule = newRule;
+            }
+            setConfigLocked(newConfig, reason, setRingerMode);
+        }
+!!!74183607.java!!!	dump(inout pw : PrintWriter, inout prefix : String) : void
+        pw.print(prefix); pw.print("mZenMode=");
+        pw.println(Global.zenModeToString(mZenMode));
+        dump(pw, prefix, "mDefaultConfig", mDefaultConfig);
+        final int N = mConfigs.size();
+        for (int i = 0; i < N; i++) {
+            dump(pw, prefix, "mConfigs[u=" + mConfigs.keyAt(i) + "]", mConfigs.valueAt(i));
+        }
+        pw.print(prefix); pw.print("mUser="); pw.println(mUser);
+        synchronized (mConfig) {
+            dump(pw, prefix, "mConfig", mConfig);
+        }
+
+        pw.print(prefix); pw.print("mSuppressedEffects="); pw.println(mSuppressedEffects);
+        mFiltering.dump(pw, prefix);
+        mConditions.dump(pw, prefix);
+!!!74183735.java!!!	dump(inout pw : PrintWriter, inout prefix : String, inout var : String, inout config : ZenModeConfig) : void
+        pw.print(prefix); pw.print(var); pw.print('=');
+        if (config == null) {
+            pw.println(config);
+            return;
+        }
+        pw.printf("allow(calls=%s,callsFrom=%s,repeatCallers=%s,messages=%s,messagesFrom=%s,"
+                + "events=%s,reminders=%s,whenScreenOff,whenScreenOn=%s)\n",
+                config.allowCalls, ZenModeConfig.sourceToString(config.allowCallsFrom),
+                config.allowRepeatCallers, config.allowMessages,
+                ZenModeConfig.sourceToString(config.allowMessagesFrom),
+                config.allowEvents, config.allowReminders, config.allowWhenScreenOff,
+                config.allowWhenScreenOn);
+        pw.print(prefix); pw.print("  manualRule="); pw.println(config.manualRule);
+        if (config.automaticRules.isEmpty()) return;
+        final int N = config.automaticRules.size();
+        for (int i = 0; i < N; i++) {
+            pw.print(prefix); pw.print(i == 0 ? "  automaticRules=" : "                 ");
+            pw.println(config.automaticRules.valueAt(i));
+        }
+!!!74183863.java!!!	readXml(inout parser : XmlPullParser, inout forRestore : boolean) : void
+        final ZenModeConfig config = ZenModeConfig.readXml(parser, mConfigMigration);
+        if (config != null) {
+            if (forRestore) {
+                //TODO: http://b/22388012
+                if (config.user != UserHandle.USER_SYSTEM) {
+                    return;
+                }
+                config.manualRule = null;  // don't restore the manual rule
+                long time = System.currentTimeMillis();
+                if (config.automaticRules != null) {
+                    for (ZenRule automaticRule : config.automaticRules.values()) {
+                        // don't restore transient state from restored automatic rules
+                        automaticRule.snoozing = false;
+                        automaticRule.condition = null;
+                        automaticRule.creationTime = time;
+                    }
+                }
+            }
+            if (DEBUG) Log.d(TAG, "readXml");
+            synchronized (mConfig) {
+                setConfigLocked(config, "readXml");
+            }
+        }
+!!!74183991.java!!!	writeXml(inout out : XmlSerializer, inout forBackup : boolean) : void
+        final int N = mConfigs.size();
+        for (int i = 0; i < N; i++) {
+            //TODO: http://b/22388012
+            if (forBackup && mConfigs.keyAt(i) != UserHandle.USER_SYSTEM) {
+                continue;
+            }
+            mConfigs.valueAt(i).writeXml(out);
+        }
+!!!74184119.java!!!	getNotificationPolicy() : NotificationManager::Policy
+        return getNotificationPolicy(mConfig);
+!!!74184247.java!!!	getNotificationPolicy(inout config : ZenModeConfig) : NotificationManager::Policy
+        return config == null ? null : config.toNotificationPolicy();
+!!!74184375.java!!!	setNotificationPolicy(inout policy : NotificationManager::Policy) : void
+        if (policy == null || mConfig == null) return;
+        synchronized (mConfig) {
+            final ZenModeConfig newConfig = mConfig.copy();
+            newConfig.applyNotificationPolicy(policy);
+            setConfigLocked(newConfig, "setNotificationPolicy");
+        }
+!!!74184503.java!!!	cleanUpZenRules() : void
+        long currentTime = System.currentTimeMillis();
+        synchronized (mConfig) {
+            final ZenModeConfig newConfig = mConfig.copy();
+            if (newConfig.automaticRules != null) {
+                for (int i = newConfig.automaticRules.size() - 1; i >= 0; i--) {
+                    ZenRule rule = newConfig.automaticRules.get(newConfig.automaticRules.keyAt(i));
+                    if (RULE_INSTANCE_GRACE_PERIOD < (currentTime - rule.creationTime)) {
+                        try {
+                            mPm.getPackageInfo(rule.component.getPackageName(),
+                                    PackageManager.MATCH_UNINSTALLED_PACKAGES);
+                        } catch (PackageManager.NameNotFoundException e) {
+                            newConfig.automaticRules.removeAt(i);
+                        }
+                    }
+                }
+            }
+            setConfigLocked(newConfig, "cleanUpZenRules");
+        }
+!!!74184631.java!!!	getConfig() : ZenModeConfig
+        synchronized (mConfig) {
+            return mConfig.copy();
+        }
+!!!74184759.java!!!	setConfigLocked(inout config : ZenModeConfig, inout reason : String) : boolean
+        return setConfigLocked(config, reason, true /*setRingerMode*/);
+!!!74184887.java!!!	setConfigAsync(inout config : ZenModeConfig, inout reason : String) : void
+        mHandler.postSetConfig(config, reason);
+!!!74185015.java!!!	setConfigLocked(inout config : ZenModeConfig, inout reason : String, inout setRingerMode : boolean) : boolean
+        final long identity = Binder.clearCallingIdentity();
+        try {
+            if (config == null || !config.isValid()) {
+                Log.w(TAG, "Invalid config in setConfigLocked; " + config);
+                return false;
+            }
+            if (config.user != mUser) {
+                // simply store away for background users
+                mConfigs.put(config.user, config);
+                if (DEBUG) Log.d(TAG, "setConfigLocked: store config for user " + config.user);
+                return true;
+            }
+            mConditions.evaluateConfig(config, false /*processSubscriptions*/);  // may modify config
+            mConfigs.put(config.user, config);
+            if (DEBUG) Log.d(TAG, "setConfigLocked reason=" + reason, new Throwable());
+            ZenLog.traceConfig(reason, mConfig, config);
+            final boolean policyChanged = !Objects.equals(getNotificationPolicy(mConfig),
+                    getNotificationPolicy(config));
+            if (!config.equals(mConfig)) {
+                dispatchOnConfigChanged();
+            }
+            if (policyChanged) {
+                dispatchOnPolicyChanged();
+            }
+            mConfig = config;
+            mHandler.postApplyConfig(config, reason, setRingerMode);
+            return true;
+        } finally {
+            Binder.restoreCallingIdentity(identity);
+        }
+!!!74185143.java!!!	applyConfig(inout config : ZenModeConfig, inout reason : String, inout setRingerMode : boolean) : void
+        final String val = Integer.toString(config.hashCode());
+        Global.putString(mContext.getContentResolver(), Global.ZEN_MODE_CONFIG_ETAG, val);
+        if (!evaluateZenMode(reason, setRingerMode)) {
+            applyRestrictions();  // evaluateZenMode will also apply restrictions if changed
+        }
+        mConditions.evaluateConfig(config, true /*processSubscriptions*/);
+!!!74185271.java!!!	getZenModeSetting() : int
+        return Global.getInt(mContext.getContentResolver(), Global.ZEN_MODE, Global.ZEN_MODE_OFF);
+!!!74185399.java!!!	setZenModeSetting(in zen : int) : void
+        Global.putInt(mContext.getContentResolver(), Global.ZEN_MODE, zen);
+!!!74185527.java!!!	getPreviousRingerModeSetting() : int
+        return Global.getInt(mContext.getContentResolver(),
+                Global.ZEN_MODE_RINGER_LEVEL, AudioManager.RINGER_MODE_NORMAL);
+!!!74185655.java!!!	setPreviousRingerModeSetting(inout previousRingerLevel : Integer) : void
+        Global.putString(
+                mContext.getContentResolver(), Global.ZEN_MODE_RINGER_LEVEL,
+                previousRingerLevel == null ? null : Integer.toString(previousRingerLevel));
+!!!74185783.java!!!	evaluateZenMode(inout reason : String, inout setRingerMode : boolean) : boolean
+        if (DEBUG) Log.d(TAG, "evaluateZenMode");
+        final int zenBefore = mZenMode;
+        final int zen = computeZenMode();
+        ZenLog.traceSetZenMode(zen, reason);
+        mZenMode = zen;
+        updateRingerModeAffectedStreams();
+        setZenModeSetting(mZenMode);
+        if (setRingerMode) {
+            applyZenToRingerMode();
+        }
+        applyRestrictions();
+        if (zen != zenBefore) {
+            mHandler.postDispatchOnZenModeChanged();
+        }
+        return true;
+!!!74185911.java!!!	updateRingerModeAffectedStreams() : void
+        if (mAudioManager != null) {
+            mAudioManager.updateRingerModeAffectedStreamsInternal();
+        }
+!!!74186039.java!!!	computeZenMode() : int
+        synchronized (mConfig) {
+            if (mConfig == null) return Global.ZEN_MODE_OFF;
+            if (mConfig.manualRule != null) return mConfig.manualRule.zenMode;
+            int zen = Global.ZEN_MODE_OFF;
+            for (ZenRule automaticRule : mConfig.automaticRules.values()) {
+                if (automaticRule.isAutomaticActive()) {
+                    if (zenSeverity(automaticRule.zenMode) > zenSeverity(zen)) {
+                        zen = automaticRule.zenMode;
+                    }
+                }
+            }
+            return zen;
+        }
+!!!74186167.java!!!	applyRestrictions() : void
+        final boolean zen = mZenMode != Global.ZEN_MODE_OFF;
+
+        // notification restrictions
+        final boolean muteNotifications =
+                (mSuppressedEffects & SUPPRESSED_EFFECT_NOTIFICATIONS) != 0;
+        // call restrictions
+        final boolean muteCalls = zen && !mConfig.allowCalls && !mConfig.allowRepeatCallers
+                || (mSuppressedEffects & SUPPRESSED_EFFECT_CALLS) != 0;
+        // total silence restrictions
+        final boolean muteEverything = mZenMode == Global.ZEN_MODE_NO_INTERRUPTIONS;
+
+        for (int i = USAGE_UNKNOWN; i <= USAGE_VIRTUAL_SOURCE; i++) {
+            if (i == USAGE_NOTIFICATION) {
+                applyRestrictions(muteNotifications || muteEverything, i);
+            } else if (i == USAGE_NOTIFICATION_RINGTONE) {
+                applyRestrictions(muteCalls || muteEverything, i);
+            } else {
+                applyRestrictions(muteEverything, i);
+            }
+        }
+!!!74186295.java!!!	applyRestrictions(inout mute : boolean, in usage : int) : void
+        final String[] exceptionPackages = null; // none (for now)
+        mAppOps.setRestriction(AppOpsManager.OP_VIBRATE, usage,
+                mute ? AppOpsManager.MODE_IGNORED : AppOpsManager.MODE_ALLOWED,
+                exceptionPackages);
+        mAppOps.setRestriction(AppOpsManager.OP_PLAY_AUDIO, usage,
+                mute ? AppOpsManager.MODE_IGNORED : AppOpsManager.MODE_ALLOWED,
+                exceptionPackages);
+!!!74186423.java!!!	applyZenToRingerMode() : void
+        if (mAudioManager == null) return;
+        // force the ringer mode into compliance
+        final int ringerModeInternal = mAudioManager.getRingerModeInternal();
+        int newRingerModeInternal = ringerModeInternal;
+        switch (mZenMode) {
+            case Global.ZEN_MODE_NO_INTERRUPTIONS:
+            case Global.ZEN_MODE_ALARMS:
+                if (ringerModeInternal != AudioManager.RINGER_MODE_SILENT) {
+                    setPreviousRingerModeSetting(ringerModeInternal);
+                    newRingerModeInternal = AudioManager.RINGER_MODE_SILENT;
+                }
+                break;
+            case Global.ZEN_MODE_IMPORTANT_INTERRUPTIONS:
+            case Global.ZEN_MODE_OFF:
+                if (ringerModeInternal == AudioManager.RINGER_MODE_SILENT) {
+                    newRingerModeInternal = getPreviousRingerModeSetting();
+                    setPreviousRingerModeSetting(null);
+                }
+                break;
+        }
+        if (newRingerModeInternal != -1) {
+            mAudioManager.setRingerModeInternal(newRingerModeInternal, TAG);
+        }
+!!!74186551.java!!!	dispatchOnConfigChanged() : void
+        for (Callback callback : mCallbacks) {
+            callback.onConfigChanged();
+        }
+!!!74186679.java!!!	dispatchOnPolicyChanged() : void
+        for (Callback callback : mCallbacks) {
+            callback.onPolicyChanged();
+        }
+!!!74186807.java!!!	dispatchOnZenModeChanged() : void
+        for (Callback callback : mCallbacks) {
+            callback.onZenModeChanged();
+        }
+!!!74186935.java!!!	readDefaultConfig(inout resources : Resources) : ZenModeConfig
+        XmlResourceParser parser = null;
+        try {
+            parser = resources.getXml(R.xml.default_zen_mode_config);
+            while (parser.next() != XmlPullParser.END_DOCUMENT) {
+                final ZenModeConfig config = ZenModeConfig.readXml(parser, mConfigMigration);
+                if (config != null) return config;
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "Error reading default zen mode config from resource", e);
+        } finally {
+            IoUtils.closeQuietly(parser);
+        }
+        return new ZenModeConfig();
+!!!74187063.java!!!	appendDefaultScheduleRules(inout config : ZenModeConfig) : void
+        if (config == null) return;
+
+        final ScheduleInfo weeknights = new ScheduleInfo();
+        weeknights.days = ZenModeConfig.WEEKNIGHT_DAYS;
+        weeknights.startHour = 22;
+        weeknights.endHour = 7;
+        final ZenRule rule1 = new ZenRule();
+        rule1.enabled = false;
+        rule1.name = mContext.getResources()
+                .getString(R.string.zen_mode_default_weeknights_name);
+        rule1.conditionId = ZenModeConfig.toScheduleConditionId(weeknights);
+        rule1.zenMode = Global.ZEN_MODE_ALARMS;
+        rule1.component = ScheduleConditionProvider.COMPONENT;
+        rule1.id = ZenModeConfig.newRuleId();
+        rule1.creationTime = System.currentTimeMillis();
+        config.automaticRules.put(rule1.id, rule1);
+
+        final ScheduleInfo weekends = new ScheduleInfo();
+        weekends.days = ZenModeConfig.WEEKEND_DAYS;
+        weekends.startHour = 23;
+        weekends.startMinute = 30;
+        weekends.endHour = 10;
+        final ZenRule rule2 = new ZenRule();
+        rule2.enabled = false;
+        rule2.name = mContext.getResources()
+                .getString(R.string.zen_mode_default_weekends_name);
+        rule2.conditionId = ZenModeConfig.toScheduleConditionId(weekends);
+        rule2.zenMode = Global.ZEN_MODE_ALARMS;
+        rule2.component = ScheduleConditionProvider.COMPONENT;
+        rule2.id = ZenModeConfig.newRuleId();
+        rule2.creationTime = System.currentTimeMillis();
+        config.automaticRules.put(rule2.id, rule2);
+!!!74187191.java!!!	appendDefaultEventRules(inout config : ZenModeConfig) : void
+        if (config == null) return;
+
+        final EventInfo events = new EventInfo();
+        events.calendar = null; // any calendar
+        events.reply = EventInfo.REPLY_YES_OR_MAYBE;
+        final ZenRule rule = new ZenRule();
+        rule.enabled = false;
+        rule.name = mContext.getResources().getString(R.string.zen_mode_default_events_name);
+        rule.conditionId = ZenModeConfig.toEventConditionId(events);
+        rule.zenMode = Global.ZEN_MODE_ALARMS;
+        rule.component = EventConditionProvider.COMPONENT;
+        rule.id = ZenModeConfig.newRuleId();
+        rule.creationTime = System.currentTimeMillis();
+        config.automaticRules.put(rule.id, rule);
+!!!74187319.java!!!	zenSeverity(in zen : int) : int
+        switch (zen) {
+            case Global.ZEN_MODE_IMPORTANT_INTERRUPTIONS: return 1;
+            case Global.ZEN_MODE_ALARMS: return 2;
+            case Global.ZEN_MODE_NO_INTERRUPTIONS: return 3;
+            default: return 0;
+        }

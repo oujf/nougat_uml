@@ -1,0 +1,206 @@
+class Server
+!!!41846071.cpp!!!	Initialize(in service_id : UUID, inout gatt_pipe : int) : bool
+  internal_.reset(new ServerInternals);
+  if (!internal_) {
+    LOG_ERROR(LOG_TAG, "Error creating internals");
+    return false;
+  }
+  g_internal = internal_.get();
+
+  std::unique_lock<std::mutex> lock(internal_->lock);
+  int status = internal_->Initialize();
+  if (status) {
+    LOG_ERROR(LOG_TAG, "Error initializing internals");
+    return false;
+  }
+
+  bt_uuid_t uuid = service_id.GetBlueDroid();
+
+  bt_status_t btstat = internal_->gatt->server->register_server(&uuid);
+  if (btstat != BT_STATUS_SUCCESS) {
+    LOG_ERROR(LOG_TAG, "Failed to register server");
+    return false;
+  }
+
+  internal_->api_synchronize.wait(lock);
+  // TODO(icoolidge): Better error handling.
+  if (internal_->server_if == 0) {
+    LOG_ERROR(LOG_TAG, "Initialization of server failed");
+    return false;
+  }
+
+  *gatt_pipe = internal_->pipefd[kPipeReadEnd];
+  LOG_INFO(LOG_TAG, "Server Initialize succeeded");
+  return true;
+!!!41846199.cpp!!!	SetAdvertisement(in ids : std::vector<UUID>, in service_data : std::vector<uint8_t>, in manufacturer_data : std::vector<uint8_t>, in transmit_name : bool) : bool
+  std::vector<uint8_t> id_data;
+  auto mutable_manufacturer_data = manufacturer_data;
+  auto mutable_service_data = service_data;
+
+  for (const UUID &id : ids) {
+    const auto le_id = id.GetFullLittleEndian();
+    id_data.insert(id_data.end(), le_id.begin(), le_id.end());
+  }
+
+  std::lock_guard<std::mutex> lock(internal_->lock);
+
+  // Setup our advertisement. This has no callback.
+  bt_status_t btstat = internal_->gatt->client->set_adv_data(
+      internal_->client_if, false, /* beacon, not scan response */
+      transmit_name,               /* name */
+      false,                       /* no txpower */
+      2, 2,                        /* interval */
+      0,                           /* appearance */
+      mutable_manufacturer_data.size(),
+      reinterpret_cast<char *>(mutable_manufacturer_data.data()),
+      mutable_service_data.size(),
+      reinterpret_cast<char *>(mutable_service_data.data()), id_data.size(),
+      reinterpret_cast<char *>(id_data.data()));
+  if (btstat != BT_STATUS_SUCCESS) {
+    LOG_ERROR(LOG_TAG, "Failed to set advertising data");
+    return false;
+  }
+  return true;
+!!!41846327.cpp!!!	SetScanResponse(in ids : std::vector<UUID>, in service_data : std::vector<uint8_t>, in manufacturer_data : std::vector<uint8_t>, in transmit_name : bool) : bool
+  std::vector<uint8_t> id_data;
+  auto mutable_manufacturer_data = manufacturer_data;
+  auto mutable_service_data = service_data;
+
+  for (const UUID &id : ids) {
+    const auto le_id = id.GetFullLittleEndian();
+    id_data.insert(id_data.end(), le_id.begin(), le_id.end());
+  }
+
+  std::lock_guard<std::mutex> lock(internal_->lock);
+
+  // Setup our advertisement. This has no callback.
+  bt_status_t btstat = internal_->gatt->client->set_adv_data(
+      internal_->client_if, true, /* scan response */
+      transmit_name,              /* name */
+      false,                      /* no txpower */
+      2, 2,                       /* interval */
+      0,                          /* appearance */
+      mutable_manufacturer_data.size(),
+      reinterpret_cast<char *>(mutable_manufacturer_data.data()),
+      mutable_service_data.size(),
+      reinterpret_cast<char *>(mutable_service_data.data()), id_data.size(),
+      reinterpret_cast<char *>(id_data.data()));
+  if (btstat != BT_STATUS_SUCCESS) {
+    LOG_ERROR(LOG_TAG, "Failed to set scan response data");
+    return false;
+  }
+  return true;
+!!!41846455.cpp!!!	AddCharacteristic(in id : UUID, in properties : int, in permissions : int) : bool
+  std::unique_lock<std::mutex> lock(internal_->lock);
+  bt_status_t btstat = internal_->AddCharacteristic(
+      id, properties, permissions);
+  if (btstat != BT_STATUS_SUCCESS) {
+    LOG_ERROR(LOG_TAG, "Failed to add characteristic to service: 0x%04x",
+              internal_->service_handle);
+    return false;
+  }
+  internal_->api_synchronize.wait(lock);
+  const int handle = internal_->uuid_to_attribute[id];
+  internal_->characteristics[handle].notify = properties & kPropertyNotify;
+  return true;
+!!!41846583.cpp!!!	AddBlob(in id : UUID, in control_id : UUID, in properties : int, in permissions : int) : bool
+  std::unique_lock<std::mutex> lock(internal_->lock);
+
+  // First, add the primary attribute (characteristic value)
+  bt_status_t btstat = internal_->AddCharacteristic(
+      id, properties, permissions);
+  if (btstat != BT_STATUS_SUCCESS) {
+    LOG_ERROR(LOG_TAG, "Failed to set scan response data");
+    return false;
+  }
+
+  internal_->api_synchronize.wait(lock);
+
+  // Next, add the secondary attribute (blob control).
+  // Control attributes have fixed permissions/properties.
+  btstat = internal_->AddCharacteristic(
+      control_id,
+      kPropertyRead | kPropertyWrite,
+      kPermissionRead | kPermissionWrite);
+  internal_->api_synchronize.wait(lock);
+
+  // Finally, associate the control attribute with the value attribute.
+  // Also, initialize the control attribute to a readable zero.
+  const int control_attribute = internal_->uuid_to_attribute[control_id];
+  const int blob_attribute = internal_->uuid_to_attribute[id];
+  internal_->controlled_blobs[control_attribute] = blob_attribute;
+  internal_->characteristics[blob_attribute].notify =
+      properties & kPropertyNotify;
+
+  Characteristic &ctrl = internal_->characteristics[control_attribute];
+  ctrl.next_blob.clear();
+  ctrl.next_blob.push_back(0);
+  ctrl.next_blob_pending = true;
+  ctrl.blob_section = 0;
+  ctrl.notify = false;
+  return true;
+!!!41846711.cpp!!!	SetCharacteristicValue(in id : UUID, in value : std::vector<uint8_t>) : bool
+  std::lock_guard<std::mutex> lock(internal_->lock);
+  const int attribute_id = internal_->uuid_to_attribute[id];
+  Characteristic &ch = internal_->characteristics[attribute_id];
+  ch.next_blob = value;
+  ch.next_blob_pending = true;
+
+  if (!ch.notify)
+    return true;
+
+  for (auto connection : internal_->connections) {
+    char dummy = 0;
+    internal_->gatt->server->send_indication(internal_->server_if,
+                                             attribute_id,
+                                             connection,
+                                             sizeof(dummy),
+                                             true,
+                                             &dummy);
+  }
+  return true;
+!!!41846839.cpp!!!	GetCharacteristicValue(in id : UUID, inout value : std::vector<uint8_t>) : bool
+  std::lock_guard<std::mutex> lock(internal_->lock);
+  const int attribute_id = internal_->uuid_to_attribute[id];
+  *value = internal_->characteristics[attribute_id].blob;
+  return true;
+!!!41846967.cpp!!!	Start() : bool
+  std::unique_lock<std::mutex> lock(internal_->lock);
+  bt_status_t btstat = internal_->gatt->server->start_service(
+      internal_->server_if, internal_->service_handle, GATT_TRANSPORT_LE);
+  if (btstat != BT_STATUS_SUCCESS) {
+    LOG_ERROR(LOG_TAG, "Failed to start service with handle: 0x%04x",
+              internal_->service_handle);
+    return false;
+  }
+  internal_->api_synchronize.wait(lock);
+  return true;
+!!!41847095.cpp!!!	Stop() : bool
+  std::unique_lock<std::mutex> lock(internal_->lock);
+  bt_status_t btstat = internal_->gatt->server->stop_service(
+      internal_->server_if, internal_->service_handle);
+  if (btstat != BT_STATUS_SUCCESS) {
+    LOG_ERROR(LOG_TAG, "Failed to stop service with handle: 0x%04x",
+              internal_->service_handle);
+    return false;
+  }
+  internal_->api_synchronize.wait(lock);
+  return true;
+!!!41847223.cpp!!!	ScanEnable() : bool
+  bt_status_t btstat = internal_->gatt->client->scan(true);
+  if (btstat) {
+    LOG_ERROR(LOG_TAG, "Enable scan failed: %d", btstat);
+    return false;
+  }
+  return true;
+!!!41847351.cpp!!!	ScanDisable() : bool
+  bt_status_t btstat = internal_->gatt->client->scan(false);
+  if (btstat) {
+    LOG_ERROR(LOG_TAG, "Disable scan failed: %d", btstat);
+    return false;
+  }
+  return true;
+!!!41847479.cpp!!!	GetScanResults(inout results : ScanResults) : bool
+  std::lock_guard<std::mutex> lock(internal_->lock);
+  *results = internal_->scan_results;
+  return true;

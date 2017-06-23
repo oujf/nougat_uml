@@ -1,0 +1,535 @@
+class RsdCpuScriptIntrinsicColorMatrix
+!!!46931255.cpp!!!	populateScript(inout s : Script) : void
+    s->mHal.info.exportedVariableCount = 2;
+!!!46931383.cpp!!!	setGlobalVar(in slot : uint32_t, in data : void, in dataLength : size_t) : void
+    switch(slot) {
+    case 0:
+        memcpy (fp, data, sizeof(fp));
+        break;
+    case 1:
+        memcpy (fpa, data, sizeof(fpa));
+        break;
+    default:
+        rsAssert(0);
+        break;
+    }
+    mRootPtr = &kernel;
+!!!46931511.cpp!!!	~RsdCpuScriptIntrinsicColorMatrix()
+    if (mBuf) munmap(mBuf, mBufSize);
+    mBuf = nullptr;
+    mOptKernel = nullptr;
+!!!46931639.cpp!!!	RsdCpuScriptIntrinsicColorMatrix(inout ctx : RsdCpuReferenceImpl, in s : Script, in e : Element)
+
+    mLastKey.key = 0;
+    mBuf = nullptr;
+    mBufSize = 0;
+    mOptKernel = nullptr;
+    const static float defaultMatrix[] = {
+        1.f, 0.f, 0.f, 0.f,
+        0.f, 1.f, 0.f, 0.f,
+        0.f, 0.f, 1.f, 0.f,
+        0.f, 0.f, 0.f, 1.f
+    };
+    const static float defaultAdd[] = {0.f, 0.f, 0.f, 0.f};
+    setGlobalVar(0, defaultMatrix, sizeof(defaultMatrix));
+    setGlobalVar(1, defaultAdd, sizeof(defaultAdd));
+!!!46931767.cpp!!!	preLaunch(in slot : uint32_t, in ains : Allocation, in inLen : uint32_t, inout aout : Allocation, in usr : void, in usrLen : uint32_t, in sc : RsScriptCall) : void
+
+    const Element *ein = ains[0]->mHal.state.type->getElement();
+    const Element *eout = aout->mHal.state.type->getElement();
+
+    if (ein->getType() == eout->getType()) {
+        if (eout->getType() == RS_TYPE_UNSIGNED_8) {
+            updateCoeffCache(1.f, 255.f);
+        } else {
+            updateCoeffCache(1.f, 1.f);
+        }
+    } else {
+        if (eout->getType() == RS_TYPE_UNSIGNED_8) {
+            updateCoeffCache(255.f, 255.f);
+        } else {
+            updateCoeffCache(1.f / 255.f, 1.f);
+        }
+    }
+
+    Key_t key = computeKey(ein, eout);
+
+#if defined(ARCH_X86_HAVE_SSSE3)
+    if ((mOptKernel == nullptr) || (mLastKey.key != key.key)) {
+        // FIXME: Disable mOptKernel to pass RS color matrix CTS cases
+        // mOptKernel = (void (*)(void *, const void *, const short *, uint32_t)) selectKernel(key);
+        mLastKey = key;
+    }
+
+#else //if !defined(ARCH_X86_HAVE_SSSE3)
+    if ((mOptKernel == nullptr) || (mLastKey.key != key.key)) {
+        if (mBuf) munmap(mBuf, mBufSize);
+        mBuf = nullptr;
+        mOptKernel = nullptr;
+        if (build(key)) {
+            mOptKernel = (void (*)(void *, const void *, const short *, uint32_t)) mBuf;
+        }
+#if defined(ARCH_ARM64_USE_INTRINSICS)
+        else {
+            int dt = key.u.outVecSize + (key.u.outType == RS_TYPE_FLOAT_32 ? 4 : 0);
+            int st = key.u.inVecSize + (key.u.inType == RS_TYPE_FLOAT_32 ? 4 : 0);
+            uint32_t mm = 0;
+            int i;
+            for (i = 0; i < 4; i++)
+            {
+                uint32_t m = (key.u.coeffMask >> i) & 0x1111;
+                m = ((m * 0x249) >> 9) & 15;
+                m |= ((key.u.addMask >> i) & 1) << 4;
+                mm |= m << (i * 5);
+            }
+
+            if (key.u.inType == RS_TYPE_FLOAT_32 || key.u.outType == RS_TYPE_FLOAT_32) {
+                rsdIntrinsicColorMatrixSetup_float_K(&mFnTab, mm, dt, st);
+            } else {
+                rsdIntrinsicColorMatrixSetup_int_K(&mFnTab, mm, dt, st);
+            }
+        }
+#endif
+        mLastKey = key;
+    }
+#endif //if !defined(ARCH_X86_HAVE_SSSE3)
+!!!46931895.cpp!!!	kernel(in info : RsExpandKernelDriverInfo, in xstart : uint32_t, in xend : uint32_t, in outstep : uint32_t) : void
+    RsdCpuScriptIntrinsicColorMatrix *cp = (RsdCpuScriptIntrinsicColorMatrix *)info->usr;
+
+    uint32_t instep = info->inStride[0];
+
+    uchar *out = (uchar *)info->outPtr[0];
+    uchar *in = (uchar *)info->inPtr[0];
+    uint32_t x1 = xstart;
+    uint32_t x2 = xend;
+
+    uint32_t vsin = cp->mLastKey.u.inVecSize;
+    uint32_t vsout = cp->mLastKey.u.outVecSize;
+    bool floatIn = !!cp->mLastKey.u.inType;
+    bool floatOut = !!cp->mLastKey.u.outType;
+
+    //if (!info->current.y) ALOGE("steps %i %i   %i %i", instep, outstep, vsin, vsout);
+
+    if(x2 > x1) {
+        int32_t len = x2 - x1;
+        if (gArchUseSIMD) {
+            if((cp->mOptKernel != nullptr) && (len >= 4)) {
+                // The optimized kernel processes 4 pixels at once
+                // and requires a minimum of 1 chunk of 4
+                cp->mOptKernel(out, in, cp->ip, len >> 2);
+                // Update the len and pointers so the generic code can
+                // finish any leftover pixels
+                len &= ~3;
+                x1 += len;
+                out += outstep * len;
+                in += instep * len;
+            }
+#if defined(ARCH_ARM64_USE_INTRINSICS)
+            else {
+                if (cp->mLastKey.u.inType == RS_TYPE_FLOAT_32 || cp->mLastKey.u.outType == RS_TYPE_FLOAT_32) {
+                    // Currently this generates off by one errors.
+                    //rsdIntrinsicColorMatrix_float_K(out, in, len, &cp->mFnTab, cp->tmpFp, cp->tmpFpa);
+                    //x1 += len;
+                    //out += outstep * len;
+                    //in += instep * len;
+                } else {
+                    rsdIntrinsicColorMatrix_int_K(out, in, len, &cp->mFnTab, cp->ip, cp->ipa);
+                    x1 += len;
+                    out += outstep * len;
+                    in += instep * len;
+                }
+            }
+#endif
+        }
+
+        while(x1 != x2) {
+            One(info, out, in, cp->tmpFp, cp->tmpFpa, vsin, vsout, floatIn, floatOut);
+            out += outstep;
+            in += instep;
+            x1++;
+        }
+    }
+!!!46932023.cpp!!!	updateCoeffCache(in fpMul : float, in addMul : float) : void
+    for(int ct=0; ct < 16; ct++) {
+        ip[ct] = (short)(fp[ct] * 256.f + 0.5f);
+        tmpFp[ct] = fp[ct] * fpMul;
+        //ALOGE("mat %i %f  %f", ct, fp[ct], tmpFp[ct]);
+    }
+
+    float add = 0.f;
+    if (fpMul > 254.f) add = 0.5f;
+    for(int ct=0; ct < 4; ct++) {
+        tmpFpa[ct] = fpa[ct] * addMul + add;
+        //ALOGE("fpa %i %f  %f", ct, fpa[ct], tmpFpa[ct * 4 + 0]);
+    }
+
+    for(int ct=0; ct < 4; ct++) {
+        ipa[ct] = (int)(fpa[ct] * 65536.f + 0.5f);
+    }
+!!!46932151.cpp!!!	computeKey(in ein : Element, in eout : Element) : Key_t
+
+    Key_t key;
+    key.key = 0;
+
+    // Compute a unique code key for this operation
+
+    // Add to the key the input and output types
+    bool hasFloat = false;
+    if (ein->getType() == RS_TYPE_FLOAT_32) {
+        hasFloat = true;
+        key.u.inType = RS_TYPE_FLOAT_32;
+        rsAssert(key.u.inType == RS_TYPE_FLOAT_32);
+    }
+    if (eout->getType() == RS_TYPE_FLOAT_32) {
+        hasFloat = true;
+        key.u.outType = RS_TYPE_FLOAT_32;
+        rsAssert(key.u.outType == RS_TYPE_FLOAT_32);
+    }
+
+    // Mask in the bits indicating which coefficients in the
+    // color matrix are needed.
+    if (hasFloat) {
+        for (uint32_t i=0; i < 16; i++) {
+            if (fabs(fp[i]) != 0.f) {
+                key.u.coeffMask |= 1 << i;
+            }
+        }
+        if (fabs(fpa[0]) != 0.f) key.u.addMask |= 0x1;
+        if (fabs(fpa[1]) != 0.f) key.u.addMask |= 0x2;
+        if (fabs(fpa[2]) != 0.f) key.u.addMask |= 0x4;
+        if (fabs(fpa[3]) != 0.f) key.u.addMask |= 0x8;
+
+    } else {
+        for (uint32_t i=0; i < 16; i++) {
+            if (ip[i] != 0) {
+                key.u.coeffMask |= 1 << i;
+            }
+        }
+        if (ipa[0] != 0) key.u.addMask |= 0x1;
+        if (ipa[1] != 0) key.u.addMask |= 0x2;
+        if (ipa[2] != 0) key.u.addMask |= 0x4;
+        if (ipa[3] != 0) key.u.addMask |= 0x8;
+    }
+
+    // Look for a dot product where the r,g,b colums are the same
+    if ((ip[0] == ip[1]) && (ip[0] == ip[2]) &&
+        (ip[4] == ip[5]) && (ip[4] == ip[6]) &&
+        (ip[8] == ip[9]) && (ip[8] == ip[10]) &&
+        (ip[12] == ip[13]) && (ip[12] == ip[14])) {
+
+        if (!key.u.addMask) key.u.dot = 1;
+    }
+
+    // Is alpha a simple copy
+    if (!(key.u.coeffMask & 0x0888) && (ip[15] == 256) && !(key.u.addMask & 0x8)) {
+        key.u.copyAlpha = !(key.u.inType || key.u.outType);
+    }
+
+    //ALOGE("build key %08x, %08x", (int32_t)(key.key >> 32), (int32_t)key.key);
+
+    switch (ein->getVectorSize()) {
+    case 4:
+        key.u.inVecSize = 3;
+        break;
+    case 3:
+        key.u.inVecSize = 2;
+        key.u.coeffMask &= ~0xF000;
+        break;
+    case 2:
+        key.u.inVecSize = 1;
+        key.u.coeffMask &= ~0xFF00;
+        break;
+    default:
+        key.u.coeffMask &= ~0xFFF0;
+        break;
+    }
+
+    switch (eout->getVectorSize()) {
+    case 4:
+        key.u.outVecSize = 3;
+        break;
+    case 3:
+        key.u.outVecSize = 2;
+        key.u.coeffMask &= ~0x8888;
+        key.u.addMask &= 7;
+        break;
+    case 2:
+        key.u.outVecSize = 1;
+        key.u.coeffMask &= ~0xCCCC;
+        key.u.addMask &= 3;
+        break;
+    default:
+        key.u.coeffMask &= ~0xEEEE;
+        key.u.addMask &= 1;
+        break;
+    }
+
+    if (key.u.inType && !key.u.outType) {
+        key.u.addMask |= 1;
+        if (key.u.outVecSize > 0) key.u.addMask |= 2;
+        if (key.u.outVecSize > 1) key.u.addMask |= 4;
+        if (key.u.outVecSize > 2) key.u.addMask |= 8;
+    }
+
+    //ALOGE("build key %08x, %08x", (int32_t)(key.key >> 32), (int32_t)key.key);
+    return key;
+!!!46932279.cpp!!!	build(in key : Key_t) : bool
+#if defined(ARCH_ARM_USE_INTRINSICS) && !defined(ARCH_ARM64_USE_INTRINSICS)
+    mBufSize = 4096;
+    //StopWatch build_time("rs cm: build time");
+    mBuf = (uint8_t *)mmap(0, mBufSize, PROT_READ | PROT_WRITE,
+                                  MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (mBuf == MAP_FAILED) {
+        mBuf = NULL;
+        return false;
+    }
+
+    uint8_t *buf = mBuf;
+    uint8_t *buf2 = nullptr;
+
+    int ops[5][4];  // 0=unused, 1 = set, 2 = accumulate, 3 = final
+    int opInit[4] = {0, 0, 0, 0};
+
+    memset(ops, 0, sizeof(ops));
+    for (int i=0; i < 4; i++) {
+        if (key.u.coeffMask & (1 << (i*4))) {
+            ops[i][0] = 0x2 | opInit[0];
+            opInit[0] = 1;
+        }
+        if (!key.u.dot) {
+            if (key.u.coeffMask & (1 << (1 + i*4))) {
+                ops[i][1] = 0x2 | opInit[1];
+                opInit[1] = 1;
+            }
+            if (key.u.coeffMask & (1 << (2 + i*4))) {
+                ops[i][2] = 0x2 | opInit[2];
+                opInit[2] = 1;
+            }
+        }
+        if (!key.u.copyAlpha) {
+            if (key.u.coeffMask & (1 << (3 + i*4))) {
+                ops[i][3] = 0x2 | opInit[3];
+                opInit[3] = 1;
+            }
+        }
+    }
+
+    if (key.u.inType || key.u.outType) {
+        key.u.copyAlpha = 0;
+        ADD_CHUNK(prefix_f);
+        buf2 = buf;
+
+        // Load the incoming r,g,b,a as needed
+        if (key.u.inType) {
+            switch(key.u.inVecSize) {
+            case 3:
+                ADD_CHUNK(load_f32_4);
+                break;
+            case 2:
+                ADD_CHUNK(load_f32_3);
+                break;
+            case 1:
+                ADD_CHUNK(load_f32_2);
+                break;
+            case 0:
+                ADD_CHUNK(load_f32_1);
+                break;
+            }
+        } else {
+            switch(key.u.inVecSize) {
+            case 3:
+                ADD_CHUNK(load_u8f_4);
+                break;
+            case 2:
+                ADD_CHUNK(load_u8f_3);
+                break;
+            case 1:
+                ADD_CHUNK(load_u8f_2);
+                break;
+            case 0:
+                ADD_CHUNK(load_u8f_1);
+                break;
+            }
+        }
+
+        for (int i=0; i < 4; i++) {
+            for (int j=0; j < 4; j++) {
+                switch(ops[i][j]) {
+                case 0:
+                    break;
+                case 2:
+                    buf = addVMULL_F32(buf, 12+j, i*2, 8+i*2 + (j >> 1), j & 1);
+                    break;
+                case 3:
+                    buf = addVMLAL_F32(buf, 12+j, i*2, 8+i*2 + (j >> 1), j & 1);
+                    break;
+                }
+            }
+        }
+        for (int j=0; j < 4; j++) {
+            if (opInit[j]) {
+                if (key.u.addMask & (1 << j)) {
+                    buf = addVADD_F32(buf, j, 12+j, 8+j);
+                } else {
+                    buf = addVORR_32(buf, j, 12+j, 12+j);
+                }
+            } else {
+                if (key.u.addMask & (1 << j)) {
+                    buf = addVORR_32(buf, j, 8+j, 8+j);
+                } else {
+                    buf = addVMOV_32(buf, j, 0);
+                }
+            }
+        }
+
+        if (key.u.outType) {
+            switch(key.u.outVecSize) {
+            case 3:
+                ADD_CHUNK(store_f32_4);
+                break;
+            case 2:
+                ADD_CHUNK(store_f32_3);
+                break;
+            case 1:
+                ADD_CHUNK(store_f32_2);
+                break;
+            case 0:
+                ADD_CHUNK(store_f32_1);
+                break;
+            }
+        } else {
+            switch(key.u.outVecSize) {
+            case 3:
+            case 2:
+                ADD_CHUNK(store_f32u_4);
+                break;
+            case 1:
+                ADD_CHUNK(store_f32u_2);
+                break;
+            case 0:
+                ADD_CHUNK(store_f32u_1);
+                break;
+            }
+        }
+
+
+    } else {
+        // Add the function prefix
+        // Store the address for the loop return
+        ADD_CHUNK(prefix_i);
+        buf2 = buf;
+
+        // Load the incoming r,g,b,a as needed
+        switch(key.u.inVecSize) {
+        case 3:
+            ADD_CHUNK(load_u8_4);
+            if (key.u.copyAlpha) {
+                ADD_CHUNK(unpack_u8_3);
+            } else {
+                ADD_CHUNK(unpack_u8_4);
+            }
+            break;
+        case 2:
+            ADD_CHUNK(load_u8_3);
+            ADD_CHUNK(unpack_u8_3);
+            break;
+        case 1:
+            ADD_CHUNK(load_u8_2);
+            ADD_CHUNK(unpack_u8_2);
+            break;
+        case 0:
+            ADD_CHUNK(load_u8_1);
+            ADD_CHUNK(unpack_u8_1);
+            break;
+        }
+
+        // Add multiply and accumulate
+        // use MULL to init the output register,
+        // use MLAL from there
+        for (int i=0; i < 4; i++) {
+            for (int j=0; j < 4; j++) {
+                switch(ops[i][j]) {
+                case 0:
+                    break;
+                case 2:
+                    buf = addVMULL_S16(buf, 8+j, 24+i*2, 4+i, j);
+                    break;
+                case 3:
+                    buf = addVMLAL_S16(buf, 8+j, 24+i*2, 4+i, j);
+                    break;
+                }
+            }
+        }
+        for (int j=0; j < 4; j++) {
+            if (opInit[j]) {
+                if (key.u.addMask & (1 << j)) {
+                    buf = addVQADD_S32(buf, 8+j, 8+j, 4+j);
+                }
+            } else {
+                if (key.u.addMask & (1 << j)) {
+                    buf = addVORR_32(buf, 8+j, 4+j, 4+j);
+                }
+            }
+        }
+
+        // If we have a dot product, perform the special pack.
+        if (key.u.dot) {
+            ADD_CHUNK(pack_u8_1);
+            ADD_CHUNK(dot);
+        } else {
+            switch(key.u.outVecSize) {
+            case 3:
+                if (key.u.copyAlpha) {
+                    ADD_CHUNK(pack_u8_3);
+                } else {
+                    ADD_CHUNK(pack_u8_4);
+                }
+                break;
+            case 2:
+                ADD_CHUNK(pack_u8_3);
+                break;
+            case 1:
+                ADD_CHUNK(pack_u8_2);
+                break;
+            case 0:
+                ADD_CHUNK(pack_u8_1);
+                break;
+            }
+        }
+
+        // Write out result
+        switch(key.u.outVecSize) {
+        case 3:
+        case 2:
+            ADD_CHUNK(store_u8_4);
+            break;
+        case 1:
+            ADD_CHUNK(store_u8_2);
+            break;
+        case 0:
+            ADD_CHUNK(store_u8_1);
+            break;
+        }
+    }
+
+    if (key.u.inType != key.u.outType) {
+        key.u.copyAlpha = 0;
+        key.u.dot = 0;
+    }
+
+    // Loop, branch, and cleanup
+    ADD_CHUNK(postfix1);
+    buf = addBranch(buf, buf2, 0x01);
+    ADD_CHUNK(postfix2);
+
+    int ret = mprotect(mBuf, mBufSize, PROT_READ | PROT_EXEC);
+    if (ret == -1) {
+        ALOGE("mprotect error %i", ret);
+        return false;
+    }
+
+    __builtin___clear_cache((char *) mBuf, (char*) mBuf + mBufSize);
+    return true;
+#else
+    return false;
+#endif

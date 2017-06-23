@@ -1,0 +1,367 @@
+class ApfFilter
+!!!74907191.java!!!	ApfFilter(inout apfCapabilities : ApfCapabilities, inout networkInterface : NetworkInterface, inout ipManagerCallback : IpManager::Callback, inout multicastFilter : boolean)
+        mApfCapabilities = apfCapabilities;
+        mIpManagerCallback = ipManagerCallback;
+        mNetworkInterface = networkInterface;
+        mMulticastFilter = multicastFilter;
+
+        maybeStartFilter();
+!!!74907319.java!!!	log(inout s : String) : void
+        Log.d(TAG, "(" + mNetworkInterface.getName() + "): " + s);
+!!!74907447.java!!!	getUniqueNumberLocked() : long
+        return mUniqueCounter++;
+!!!74907575.java!!!	maybeStartFilter() : void
+        FileDescriptor socket;
+        try {
+            mHardwareAddress = mNetworkInterface.getHardwareAddress();
+            synchronized(this) {
+                // Install basic filters
+                installNewProgramLocked();
+            }
+            socket = Os.socket(AF_PACKET, SOCK_RAW, ETH_P_IPV6);
+            PacketSocketAddress addr = new PacketSocketAddress((short) ETH_P_IPV6,
+                    mNetworkInterface.getIndex());
+            Os.bind(socket, addr);
+            NetworkUtils.attachRaFilter(socket, mApfCapabilities.apfPacketFormat);
+        } catch(SocketException|ErrnoException e) {
+            Log.e(TAG, "Error starting filter", e);
+            return;
+        }
+        mReceiveThread = new ReceiveThread(socket);
+        mReceiveThread.start();
+!!!74907703.java!!!	curTime() : long
+        return System.currentTimeMillis() / 1000L;
+!!!74909879.java!!!	generateArpFilterLocked(inout gen : ApfGenerator) : void
+        // Here's a basic summary of what the ARP filter program does:
+        //
+        // if interface has IPv4 address:
+        //   if it's not an ARP IPv4 request:
+        //     pass
+        //   if it's not a request for our IPv4 address:
+        //     drop
+        // pass
+
+        if (mIPv4Address != null) {
+            // if it's not an ARP IPv4 request, pass
+            gen.addLoadImmediate(Register.R0, ARP_HEADER_OFFSET);
+            gen.addJumpIfBytesNotEqual(Register.R0, ARP_IPV4_REQUEST_HEADER, gen.PASS_LABEL);
+            // if it's not a request for our IPv4 address, drop
+            gen.addLoadImmediate(Register.R0, ARP_TARGET_IP_ADDRESS_OFFSET);
+            gen.addJumpIfBytesNotEqual(Register.R0, mIPv4Address, gen.DROP_LABEL);
+        }
+
+        // Otherwise, pass
+        gen.addJump(gen.PASS_LABEL);
+!!!74910007.java!!!	generateIPv4FilterLocked(inout gen : ApfGenerator) : void
+        // Here's a basic summary of what the IPv4 filter program does:
+        //
+        // if filtering multicast (i.e. multicast lock not held):
+        //   if it's multicast:
+        //     drop
+        //   if it's not broadcast:
+        //     pass
+        //   if it's not DHCP destined to our MAC:
+        //     drop
+        // pass
+
+        if (mMulticastFilter) {
+            // Check for multicast destination address range
+            gen.addLoad8(Register.R0, IPV4_DEST_ADDR_OFFSET);
+            gen.addAnd(0xf0);
+            gen.addJumpIfR0Equals(0xe0, gen.DROP_LABEL);
+
+            // Drop all broadcasts besides DHCP addressed to us
+            // If not a broadcast packet, pass
+            gen.addLoadImmediate(Register.R0, ETH_DEST_ADDR_OFFSET);
+            gen.addJumpIfBytesNotEqual(Register.R0, ETH_BROADCAST_MAC_ADDRESS, gen.PASS_LABEL);
+            // If not UDP, drop
+            gen.addLoad8(Register.R0, IPV4_PROTOCOL_OFFSET);
+            gen.addJumpIfR0NotEquals(IPPROTO_UDP, gen.DROP_LABEL);
+            // If fragment, drop. This matches the BPF filter installed by the DHCP client.
+            gen.addLoad16(Register.R0, IPV4_FRAGMENT_OFFSET_OFFSET);
+            gen.addJumpIfR0AnyBitsSet(IPV4_FRAGMENT_OFFSET_MASK, gen.DROP_LABEL);
+            // If not to DHCP client port, drop
+            gen.addLoadFromMemory(Register.R1, gen.IPV4_HEADER_SIZE_MEMORY_SLOT);
+            gen.addLoad16Indexed(Register.R0, UDP_DESTINATION_PORT_OFFSET);
+            gen.addJumpIfR0NotEquals(DHCP_CLIENT_PORT, gen.DROP_LABEL);
+            // If not DHCP to our MAC address, drop
+            gen.addLoadImmediate(Register.R0, DHCP_CLIENT_MAC_OFFSET);
+            // NOTE: Relies on R1 containing IPv4 header offset.
+            gen.addAddR1();
+            gen.addJumpIfBytesNotEqual(Register.R0, mHardwareAddress, gen.DROP_LABEL);
+        }
+
+        // Otherwise, pass
+        gen.addJump(gen.PASS_LABEL);
+!!!74910135.java!!!	generateIPv6FilterLocked(inout gen : ApfGenerator) : void
+        // Here's a basic summary of what the IPv6 filter program does:
+        //
+        // if it's not ICMPv6:
+        //   if it's multicast and we're dropping multicast:
+        //     drop
+        //   pass
+        // if it's ICMPv6 NA to ff02::1:
+        //   drop
+
+        gen.addLoad8(Register.R0, IPV6_NEXT_HEADER_OFFSET);
+
+        // Drop multicast if the multicast filter is enabled.
+        if (mMulticastFilter) {
+            // Don't touch ICMPv6 multicast here, we deal with it in more detail later.
+            String skipIpv6MulticastFilterLabel = "skipIPv6MulticastFilter";
+            gen.addJumpIfR0Equals(IPPROTO_ICMPV6, skipIpv6MulticastFilterLabel);
+
+            // Drop all other packets sent to ff00::/8.
+            gen.addLoad8(Register.R0, IPV6_DEST_ADDR_OFFSET);
+            gen.addJumpIfR0Equals(0xff, gen.DROP_LABEL);
+            // Not multicast and not ICMPv6. Pass.
+            gen.addJump(gen.PASS_LABEL);
+            gen.defineLabel(skipIpv6MulticastFilterLabel);
+        } else {
+            // If not ICMPv6, pass.
+            gen.addJumpIfR0NotEquals(IPPROTO_ICMPV6, gen.PASS_LABEL);
+        }
+
+        // Add unsolicited multicast neighbor announcements filter
+        String skipUnsolicitedMulticastNALabel = "skipUnsolicitedMulticastNA";
+        // If not neighbor announcements, skip unsolicited multicast NA filter
+        gen.addLoad8(Register.R0, ICMP6_TYPE_OFFSET);
+        gen.addJumpIfR0NotEquals(ICMP6_NEIGHBOR_ANNOUNCEMENT, skipUnsolicitedMulticastNALabel);
+        // If to ff02::1, drop
+        // TODO: Drop only if they don't contain the address of on-link neighbours.
+        gen.addLoadImmediate(Register.R0, IPV6_DEST_ADDR_OFFSET);
+        gen.addJumpIfBytesNotEqual(Register.R0, IPV6_ALL_NODES_ADDRESS,
+                skipUnsolicitedMulticastNALabel);
+        gen.addJump(gen.DROP_LABEL);
+        gen.defineLabel(skipUnsolicitedMulticastNALabel);
+!!!74910263.java!!!	beginProgramLocked() : ApfGenerator
+        ApfGenerator gen = new ApfGenerator();
+        // This is guaranteed to return true because of the check in maybeCreate.
+        gen.setApfVersion(mApfCapabilities.apfVersionSupported);
+
+        // Here's a basic summary of what the initial program does:
+        //
+        // if it's ARP:
+        //   insert ARP filter to drop or pass these appropriately
+        // if it's IPv4:
+        //   insert IPv4 filter to drop or pass these appropriately
+        // if it's not IPv6:
+        //   if it's broadcast:
+        //     drop
+        //   pass
+        // insert IPv6 filter to drop, pass, or fall off the end for ICMPv6 packets
+
+        // Add ARP filters:
+        String skipArpFiltersLabel = "skipArpFilters";
+        gen.addLoad16(Register.R0, ETH_ETHERTYPE_OFFSET);
+        gen.addJumpIfR0NotEquals(ETH_P_ARP, skipArpFiltersLabel);
+        generateArpFilterLocked(gen);
+        gen.defineLabel(skipArpFiltersLabel);
+
+        // Add IPv4 filters:
+        String skipIPv4FiltersLabel = "skipIPv4Filters";
+        // NOTE: Relies on R0 containing ethertype. This is safe because if we got here, we did not
+        // execute the ARP filter, since that filter does not fall through, but either drops or
+        // passes.
+        gen.addJumpIfR0NotEquals(ETH_P_IP, skipIPv4FiltersLabel);
+        generateIPv4FilterLocked(gen);
+        gen.defineLabel(skipIPv4FiltersLabel);
+
+        // Check for IPv6:
+        // NOTE: Relies on R0 containing ethertype. This is safe because if we got here, we did not
+        // execute the ARP or IPv4 filters, since those filters do not fall through, but either
+        // drop or pass.
+        String ipv6FilterLabel = "IPv6Filters";
+        gen.addJumpIfR0Equals(ETH_P_IPV6, ipv6FilterLabel);
+
+        // Drop non-IP non-ARP broadcasts, pass the rest
+        gen.addLoadImmediate(Register.R0, ETH_DEST_ADDR_OFFSET);
+        gen.addJumpIfBytesNotEqual(Register.R0, ETH_BROADCAST_MAC_ADDRESS, gen.PASS_LABEL);
+        gen.addJump(gen.DROP_LABEL);
+
+        // Add IPv6 filters:
+        gen.defineLabel(ipv6FilterLabel);
+        generateIPv6FilterLocked(gen);
+        return gen;
+!!!74910391.java!!!	installNewProgramLocked() : void
+        purgeExpiredRasLocked();
+        final byte[] program;
+        long programMinLifetime = Long.MAX_VALUE;
+        try {
+            // Step 1: Determine how many RA filters we can fit in the program.
+            ApfGenerator gen = beginProgramLocked();
+            ArrayList<Ra> rasToFilter = new ArrayList<Ra>();
+            for (Ra ra : mRas) {
+                ra.generateFilterLocked(gen);
+                // Stop if we get too big.
+                if (gen.programLengthOverEstimate() > mApfCapabilities.maximumApfProgramSize) break;
+                rasToFilter.add(ra);
+            }
+            // Step 2: Actually generate the program
+            gen = beginProgramLocked();
+            for (Ra ra : rasToFilter) {
+                programMinLifetime = Math.min(programMinLifetime, ra.generateFilterLocked(gen));
+            }
+            // Execution will reach the end of the program if no filters match, which will pass the
+            // packet to the AP.
+            program = gen.generate();
+        } catch (IllegalInstructionException e) {
+            Log.e(TAG, "Program failed to generate: ", e);
+            return;
+        }
+        mLastTimeInstalledProgram = curTime();
+        mLastInstalledProgramMinLifetime = programMinLifetime;
+        mLastInstalledProgram = program;
+        mNumProgramUpdates++;
+
+        if (VDBG) {
+            hexDump("Installing filter: ", program, program.length);
+        }
+        mIpManagerCallback.installPacketFilter(program);
+!!!74910519.java!!!	maybeInstallNewProgramLocked() : void
+        if (mRas.size() == 0) return;
+        // If the current program doesn't expire for a while, don't bother updating.
+        long expiry = mLastTimeInstalledProgram + mLastInstalledProgramMinLifetime;
+        if (expiry < curTime() + MAX_PROGRAM_LIFETIME_WORTH_REFRESHING) {
+            installNewProgramLocked();
+        }
+!!!74910647.java!!!	hexDump(inout msg : String, inout packet : byte [[]], in length : int) : void
+        log(msg + HexDump.toHexString(packet, 0, length, false /* lowercase */));
+!!!74910775.java!!!	purgeExpiredRasLocked() : void
+        for (int i = 0; i < mRas.size();) {
+            if (mRas.get(i).isExpired()) {
+                log("Expiring " + mRas.get(i));
+                mRas.remove(i);
+            } else {
+                i++;
+            }
+        }
+!!!74910903.java!!!	processRa(inout packet : byte [[]], in length : int) : void
+        if (VDBG) hexDump("Read packet = ", packet, length);
+
+        // Have we seen this RA before?
+        for (int i = 0; i < mRas.size(); i++) {
+            Ra ra = mRas.get(i);
+            if (ra.matches(packet, length)) {
+                if (VDBG) log("matched RA " + ra);
+                // Update lifetimes.
+                ra.mLastSeen = curTime();
+                ra.mMinLifetime = ra.minLifetime(packet, length);
+                ra.seenCount++;
+
+                // Keep mRas in LRU order so as to prioritize generating filters for recently seen
+                // RAs. LRU prioritizes this because RA filters are generated in order from mRas
+                // until the filter program exceeds the maximum filter program size allowed by the
+                // chipset, so RAs appearing earlier in mRas are more likely to make it into the
+                // filter program.
+                // TODO: consider sorting the RAs in order of increasing expiry time as well.
+                // Swap to front of array.
+                mRas.add(0, mRas.remove(i));
+
+                maybeInstallNewProgramLocked();
+                return;
+            }
+        }
+        purgeExpiredRasLocked();
+        // TODO: figure out how to proceed when we've received more then MAX_RAS RAs.
+        if (mRas.size() >= MAX_RAS) return;
+        final Ra ra;
+        try {
+            ra = new Ra(packet, length);
+        } catch (Exception e) {
+            Log.e(TAG, "Error parsing RA: " + e);
+            return;
+        }
+        // Ignore 0 lifetime RAs.
+        if (ra.isExpired()) return;
+        log("Adding " + ra);
+        mRas.add(ra);
+        installNewProgramLocked();
+!!!74911031.java!!!	maybeCreate(inout apfCapabilities : ApfCapabilities, inout networkInterface : NetworkInterface, inout ipManagerCallback : IpManager::Callback, inout multicastFilter : boolean) : ApfFilter
+        if (apfCapabilities == null || networkInterface == null) return null;
+        if (apfCapabilities.apfVersionSupported == 0) return null;
+        if (apfCapabilities.maximumApfProgramSize < 512) {
+            Log.e(TAG, "Unacceptably small APF limit: " + apfCapabilities.maximumApfProgramSize);
+            return null;
+        }
+        // For now only support generating programs for Ethernet frames. If this restriction is
+        // lifted:
+        //   1. the program generator will need its offsets adjusted.
+        //   2. the packet filter attached to our packet socket will need its offset adjusted.
+        if (apfCapabilities.apfPacketFormat != ARPHRD_ETHER) return null;
+        if (!new ApfGenerator().setApfVersion(apfCapabilities.apfVersionSupported)) {
+            Log.e(TAG, "Unsupported APF version: " + apfCapabilities.apfVersionSupported);
+            return null;
+        }
+        return new ApfFilter(apfCapabilities, networkInterface, ipManagerCallback, multicastFilter);
+!!!74911159.java!!!	shutdown() : void
+        if (mReceiveThread != null) {
+            log("shutting down");
+            mReceiveThread.halt();  // Also closes socket.
+            mReceiveThread = null;
+        }
+        mRas.clear();
+!!!74911287.java!!!	setMulticastFilter(inout enabled : boolean) : void
+        if (mMulticastFilter != enabled) {
+            mMulticastFilter = enabled;
+            installNewProgramLocked();
+        }
+!!!74911415.java!!!	findIPv4Address(inout lp : LinkProperties) : byte
+        byte[] ipv4Address = null;
+        for (InetAddress inetAddr : lp.getAddresses()) {
+            byte[] addr = inetAddr.getAddress();
+            if (addr.length != 4) continue;
+            // More than one IPv4 address, abort
+            if (ipv4Address != null && !Arrays.equals(ipv4Address, addr)) return null;
+            ipv4Address = addr;
+        }
+        return ipv4Address;
+!!!74911543.java!!!	setLinkProperties(inout lp : LinkProperties) : void
+        // NOTE: Do not keep a copy of LinkProperties as it would further duplicate state.
+        byte[] ipv4Address = findIPv4Address(lp);
+        // If ipv4Address is the same as mIPv4Address, then there's no change, just return.
+        if (Arrays.equals(ipv4Address, mIPv4Address)) return;
+        // Otherwise update mIPv4Address and install new program.
+        mIPv4Address = ipv4Address;
+        installNewProgramLocked();
+!!!74911671.java!!!	dump(inout pw : IndentingPrintWriter) : void
+        pw.println("Capabilities: " + mApfCapabilities);
+        pw.println("Receive thread: " + (mReceiveThread != null ? "RUNNING" : "STOPPED"));
+        pw.println("Multicast: " + (mMulticastFilter ? "DROP" : "ALLOW"));
+        try {
+            pw.println("IPv4 address: " + InetAddress.getByAddress(mIPv4Address).getHostAddress());
+        } catch (UnknownHostException|NullPointerException e) {}
+
+        if (mLastTimeInstalledProgram == 0) {
+            pw.println("No program installed.");
+            return;
+        }
+        pw.println("Program updates: " + mNumProgramUpdates);
+        pw.println(String.format(
+                "Last program length %d, installed %ds ago, lifetime %ds",
+                mLastInstalledProgram.length, curTime() - mLastTimeInstalledProgram,
+                mLastInstalledProgramMinLifetime));
+
+        pw.println("RA filters:");
+        pw.increaseIndent();
+        for (Ra ra: mRas) {
+            pw.println(ra);
+            pw.increaseIndent();
+            pw.println(String.format(
+                    "Seen: %d, last %ds ago", ra.seenCount, curTime() - ra.mLastSeen));
+            if (DBG) {
+                pw.println("Last match:");
+                pw.increaseIndent();
+                pw.println(ra.getLastMatchingPacket());
+                pw.decreaseIndent();
+            }
+            pw.decreaseIndent();
+        }
+        pw.decreaseIndent();
+
+        if (DBG) {
+            pw.println("Last program:");
+            pw.increaseIndent();
+            pw.println(HexDump.toHexString(mLastInstalledProgram, false /* lowercase */));
+            pw.decreaseIndent();
+        }

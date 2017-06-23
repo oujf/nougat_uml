@@ -1,0 +1,189 @@
+class UsbDeviceManager
+!!!75204023.java!!!	UsbDeviceManager(inout context : Context, inout alsaManager : UsbAlsaManager)
+        mContext = context;
+        mUsbAlsaManager = alsaManager;
+        mContentResolver = context.getContentResolver();
+        PackageManager pm = mContext.getPackageManager();
+        mHasUsbAccessory = pm.hasSystemFeature(PackageManager.FEATURE_USB_ACCESSORY);
+        initRndisAddress();
+
+        readOemUsbOverrideConfig();
+
+        mHandler = new UsbHandler(FgThread.get().getLooper());
+
+        if (nativeIsStartRequested()) {
+            if (DEBUG) Slog.d(TAG, "accessory attached at boot");
+            startAccessoryMode();
+        }
+
+        boolean secureAdbEnabled = SystemProperties.getBoolean("ro.adb.secure", false);
+        boolean dataEncrypted = "1".equals(SystemProperties.get("vold.decrypt"));
+        if (secureAdbEnabled && !dataEncrypted) {
+            mDebuggingManager = new UsbDebuggingManager(context);
+        }
+        mContext.registerReceiver(mHostReceiver,
+                new IntentFilter(UsbManager.ACTION_USB_PORT_CHANGED));
+!!!75204151.java!!!	getCurrentSettings() : UsbSettingsManager
+        synchronized (mLock) {
+            return mCurrentSettings;
+        }
+!!!75204279.java!!!	systemReady() : void
+        if (DEBUG) Slog.d(TAG, "systemReady");
+
+        mNotificationManager = (NotificationManager)
+                mContext.getSystemService(Context.NOTIFICATION_SERVICE);
+
+        // We do not show the USB notification if the primary volume supports mass storage.
+        // The legacy mass storage UI will be used instead.
+        boolean massStorageSupported = false;
+        final StorageManager storageManager = StorageManager.from(mContext);
+        final StorageVolume primary = storageManager.getPrimaryVolume();
+        massStorageSupported = primary != null && primary.allowMassStorage();
+        mUseUsbNotification = !massStorageSupported && mContext.getResources().getBoolean(
+                com.android.internal.R.bool.config_usbChargingMessage);
+
+        // make sure the ADB_ENABLED setting value matches the current state
+        try {
+            Settings.Global.putInt(mContentResolver,
+                    Settings.Global.ADB_ENABLED, mAdbEnabled ? 1 : 0);
+        } catch (SecurityException e) {
+            // If UserManager.DISALLOW_DEBUGGING_FEATURES is on, that this setting can't be changed.
+            Slog.d(TAG, "ADB_ENABLED is restricted.");
+        }
+        mHandler.sendEmptyMessage(MSG_SYSTEM_READY);
+!!!75204407.java!!!	bootCompleted() : void
+        if (DEBUG) Slog.d(TAG, "boot completed");
+        mHandler.sendEmptyMessage(MSG_BOOT_COMPLETED);
+!!!75204535.java!!!	setCurrentUser(in userId : int, inout settings : UsbSettingsManager) : void
+        synchronized (mLock) {
+            mCurrentSettings = settings;
+            mHandler.obtainMessage(MSG_USER_SWITCHED, userId, 0).sendToTarget();
+        }
+!!!75204663.java!!!	updateUserRestrictions() : void
+        mHandler.sendEmptyMessage(MSG_UPDATE_USER_RESTRICTIONS);
+!!!75204791.java!!!	startAccessoryMode() : void
+        if (!mHasUsbAccessory) return;
+
+        mAccessoryStrings = nativeGetAccessoryStrings();
+        boolean enableAudio = (nativeGetAudioMode() == AUDIO_MODE_SOURCE);
+        // don't start accessory mode if our mandatory strings have not been set
+        boolean enableAccessory = (mAccessoryStrings != null &&
+                        mAccessoryStrings[UsbAccessory.MANUFACTURER_STRING] != null &&
+                        mAccessoryStrings[UsbAccessory.MODEL_STRING] != null);
+        String functions = null;
+
+        if (enableAccessory && enableAudio) {
+            functions = UsbManager.USB_FUNCTION_ACCESSORY + ","
+                    + UsbManager.USB_FUNCTION_AUDIO_SOURCE;
+        } else if (enableAccessory) {
+            functions = UsbManager.USB_FUNCTION_ACCESSORY;
+        } else if (enableAudio) {
+            functions = UsbManager.USB_FUNCTION_AUDIO_SOURCE;
+        }
+
+        if (functions != null) {
+            mAccessoryModeRequestTime = SystemClock.elapsedRealtime();
+            setCurrentFunctions(functions);
+        }
+!!!75204919.java!!!	initRndisAddress() : void
+        // configure RNDIS ethernet address based on our serial number using the same algorithm
+        // we had been previously using in kernel board files
+        final int ETH_ALEN = 6;
+        int address[] = new int[ETH_ALEN];
+        // first byte is 0x02 to signify a locally administered address
+        address[0] = 0x02;
+
+        String serial = SystemProperties.get("ro.serialno", "1234567890ABCDEF");
+        int serialLength = serial.length();
+        // XOR the USB serial across the remaining 5 bytes
+        for (int i = 0; i < serialLength; i++) {
+            address[i % (ETH_ALEN - 1) + 1] ^= (int)serial.charAt(i);
+        }
+        String addrString = String.format(Locale.US, "%02X:%02X:%02X:%02X:%02X:%02X",
+            address[0], address[1], address[2], address[3], address[4], address[5]);
+        try {
+            FileUtils.stringToFile(RNDIS_ETH_ADDR_PATH, addrString);
+        } catch (IOException e) {
+           Slog.e(TAG, "failed to write to " + RNDIS_ETH_ADDR_PATH);
+        }
+!!!75208247.java!!!	getCurrentAccessory() : UsbAccessory
+        return mHandler.getCurrentAccessory();
+!!!75208375.java!!!	openAccessory(inout accessory : UsbAccessory) : ParcelFileDescriptor
+        UsbAccessory currentAccessory = mHandler.getCurrentAccessory();
+        if (currentAccessory == null) {
+            throw new IllegalArgumentException("no accessory attached");
+        }
+        if (!currentAccessory.equals(accessory)) {
+            String error = accessory.toString()
+                    + " does not match current accessory "
+                    + currentAccessory;
+            throw new IllegalArgumentException(error);
+        }
+        getCurrentSettings().checkPermission(accessory);
+        return nativeOpenAccessory();
+!!!75208503.java!!!	isFunctionEnabled(inout function : String) : boolean
+        return UsbManager.containsFunction(SystemProperties.get(USB_CONFIG_PROPERTY), function);
+!!!75208631.java!!!	setCurrentFunctions(inout functions : String) : void
+        if (DEBUG) Slog.d(TAG, "setCurrentFunctions(" + functions + ")");
+        mHandler.sendMessage(MSG_SET_CURRENT_FUNCTIONS, functions);
+!!!75208759.java!!!	setUsbDataUnlocked(inout unlocked : boolean) : void
+        if (DEBUG) Slog.d(TAG, "setUsbDataUnlocked(" + unlocked + ")");
+        mHandler.sendMessage(MSG_SET_USB_DATA_UNLOCKED, unlocked);
+!!!75208887.java!!!	readOemUsbOverrideConfig() : void
+        String[] configList = mContext.getResources().getStringArray(
+            com.android.internal.R.array.config_oemUsbModeOverride);
+
+        if (configList != null) {
+            for (String config: configList) {
+                String[] items = config.split(":");
+                if (items.length == 3) {
+                    if (mOemModeMap == null) {
+                        mOemModeMap = new HashMap<String, List<Pair<String, String>>>();
+                    }
+                    List<Pair<String, String>> overrideList = mOemModeMap.get(items[0]);
+                    if (overrideList == null) {
+                        overrideList = new LinkedList<Pair<String, String>>();
+                        mOemModeMap.put(items[0], overrideList);
+                    }
+                    overrideList.add(new Pair<String, String>(items[1], items[2]));
+                }
+            }
+        }
+!!!75209015.java!!!	applyOemOverrideFunction(inout usbFunctions : String) : String
+        if ((usbFunctions == null) || (mOemModeMap == null)) return usbFunctions;
+
+        String bootMode = SystemProperties.get(BOOT_MODE_PROPERTY, "unknown");
+
+        List<Pair<String, String>> overrides = mOemModeMap.get(bootMode);
+        if (overrides != null) {
+            for (Pair<String, String> pair: overrides) {
+                if (pair.first.equals(usbFunctions)) {
+                    Slog.d(TAG, "OEM USB override: " + pair.first + " ==> " + pair.second);
+                    return pair.second;
+                }
+            }
+        }
+        // return passed in functions as is.
+        return usbFunctions;
+!!!75209143.java!!!	allowUsbDebugging(inout alwaysAllow : boolean, inout publicKey : String) : void
+        if (mDebuggingManager != null) {
+            mDebuggingManager.allowUsbDebugging(alwaysAllow, publicKey);
+        }
+!!!75209271.java!!!	denyUsbDebugging() : void
+        if (mDebuggingManager != null) {
+            mDebuggingManager.denyUsbDebugging();
+        }
+!!!75209399.java!!!	clearUsbDebuggingKeys() : void
+        if (mDebuggingManager != null) {
+            mDebuggingManager.clearUsbDebuggingKeys();
+        } else {
+            throw new RuntimeException("Cannot clear Usb Debugging keys, "
+                        + "UsbDebuggingManager not enabled");
+        }
+!!!75209527.java!!!	dump(inout pw : IndentingPrintWriter) : void
+        if (mHandler != null) {
+            mHandler.dump(pw);
+        }
+        if (mDebuggingManager != null) {
+            mDebuggingManager.dump(pw);
+        }

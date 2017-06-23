@@ -1,0 +1,246 @@
+class ValidateNotificationPeople
+!!!85134903.java!!!	initialize(inout context : Context, inout usageStats : NotificationUsageStats) : void
+        if (DEBUG) Slog.d(TAG, "Initializing  " + getClass().getSimpleName() + ".");
+        mUserToContextMap = new ArrayMap<>();
+        mBaseContext = context;
+        mUsageStats = usageStats;
+        mPeopleCache = new LruCache<String, LookupResult>(PEOPLE_CACHE_SIZE);
+        mEnabled = ENABLE_PEOPLE_VALIDATOR && 1 == Settings.Global.getInt(
+                mBaseContext.getContentResolver(), SETTING_ENABLE_PEOPLE_VALIDATOR, 1);
+        if (mEnabled) {
+            mHandler = new Handler();
+            mObserver = new ContentObserver(mHandler) {
+                @Override
+                public void onChange(boolean selfChange, Uri uri, int userId) {
+                    super.onChange(selfChange, uri, userId);
+                    if (DEBUG || mEvictionCount % 100 == 0) {
+                        if (VERBOSE) Slog.i(TAG, "mEvictionCount: " + mEvictionCount);
+                    }
+                    mPeopleCache.evictAll();
+                    mEvictionCount++;
+                }
+            };
+            mBaseContext.getContentResolver().registerContentObserver(Contacts.CONTENT_URI, true,
+                    mObserver, UserHandle.USER_ALL);
+        }
+!!!85135031.java!!!	process(inout record : NotificationRecord) : RankingReconsideration
+        if (!mEnabled) {
+            if (VERBOSE) Slog.i(TAG, "disabled");
+            return null;
+        }
+        if (record == null || record.getNotification() == null) {
+            if (VERBOSE) Slog.i(TAG, "skipping empty notification");
+            return null;
+        }
+        if (record.getUserId() == UserHandle.USER_ALL) {
+            if (VERBOSE) Slog.i(TAG, "skipping global notification");
+            return null;
+        }
+        Context context = getContextAsUser(record.getUser());
+        if (context == null) {
+            if (VERBOSE) Slog.i(TAG, "skipping notification that lacks a context");
+            return null;
+        }
+        return validatePeople(context, record);
+!!!85135159.java!!!	setConfig(inout config : RankingConfig) : void
+        // ignore: config has no relevant information yet.
+!!!85135287.java!!!	getContactAffinity(inout userHandle : UserHandle, inout extras : Bundle, in timeoutMs : int, in timeoutAffinity : float) : float
+        if (DEBUG) Slog.d(TAG, "checking affinity for " + userHandle);
+        if (extras == null) return NONE;
+        final String key = Long.toString(System.nanoTime());
+        final float[] affinityOut = new float[1];
+        Context context = getContextAsUser(userHandle);
+        if (context == null) {
+            return NONE;
+        }
+        final PeopleRankingReconsideration prr = validatePeople(context, key, extras, affinityOut);
+        float affinity = affinityOut[0];
+
+        if (prr != null) {
+            // Perform the heavy work on a background thread so we can abort when we hit the
+            // timeout.
+            final Semaphore s = new Semaphore(0);
+            AsyncTask.THREAD_POOL_EXECUTOR.execute(new Runnable() {
+                @Override
+                public void run() {
+                    prr.work();
+                    s.release();
+                }
+            });
+
+            try {
+                if (!s.tryAcquire(timeoutMs, TimeUnit.MILLISECONDS)) {
+                    Slog.w(TAG, "Timeout while waiting for affinity: " + key + ". "
+                            + "Returning timeoutAffinity=" + timeoutAffinity);
+                    return timeoutAffinity;
+                }
+            } catch (InterruptedException e) {
+                Slog.w(TAG, "InterruptedException while waiting for affinity: " + key + ". "
+                        + "Returning affinity=" + affinity, e);
+                return affinity;
+            }
+
+            affinity = Math.max(prr.getContactAffinity(), affinity);
+        }
+        return affinity;
+!!!85135415.java!!!	getContextAsUser(inout userHandle : UserHandle) : Context
+        Context context = mUserToContextMap.get(userHandle.getIdentifier());
+        if (context == null) {
+            try {
+                context = mBaseContext.createPackageContextAsUser("android", 0, userHandle);
+                mUserToContextMap.put(userHandle.getIdentifier(), context);
+            } catch (PackageManager.NameNotFoundException e) {
+                Log.e(TAG, "failed to create package context for lookups", e);
+            }
+        }
+        return context;
+!!!85135543.java!!!	validatePeople(inout context : Context, in record : NotificationRecord) : RankingReconsideration
+        final String key = record.getKey();
+        final Bundle extras = record.getNotification().extras;
+        final float[] affinityOut = new float[1];
+        final PeopleRankingReconsideration rr = validatePeople(context, key, extras, affinityOut);
+        final float affinity = affinityOut[0];
+        record.setContactAffinity(affinity);
+        if (rr == null) {
+            mUsageStats.registerPeopleAffinity(record, affinity > NONE, affinity == STARRED_CONTACT,
+                    true /* cached */);
+        } else {
+            rr.setRecord(record);
+        }
+        return rr;
+!!!85135671.java!!!	validatePeople(inout context : Context, inout key : String, inout extras : Bundle, inout affinityOut : float [[]]) : ValidateNotificationPeople::PeopleRankingReconsideration
+        long start = SystemClock.elapsedRealtime();
+        float affinity = NONE;
+        if (extras == null) {
+            return null;
+        }
+
+        final String[] people = getExtraPeople(extras);
+        if (people == null || people.length == 0) {
+            return null;
+        }
+
+        if (VERBOSE) Slog.i(TAG, "Validating: " + key + " for " + context.getUserId());
+        final LinkedList<String> pendingLookups = new LinkedList<String>();
+        for (int personIdx = 0; personIdx < people.length && personIdx < MAX_PEOPLE; personIdx++) {
+            final String handle = people[personIdx];
+            if (TextUtils.isEmpty(handle)) continue;
+
+            synchronized (mPeopleCache) {
+                final String cacheKey = getCacheKey(context.getUserId(), handle);
+                LookupResult lookupResult = mPeopleCache.get(cacheKey);
+                if (lookupResult == null || lookupResult.isExpired()) {
+                    pendingLookups.add(handle);
+                } else {
+                    if (DEBUG) Slog.d(TAG, "using cached lookupResult");
+                }
+                if (lookupResult != null) {
+                    affinity = Math.max(affinity, lookupResult.getAffinity());
+                }
+            }
+        }
+
+        // record the best available data, so far:
+        affinityOut[0] = affinity;
+
+        MetricsLogger.histogram(mBaseContext, "validate_people_cache_latency",
+                (int) (SystemClock.elapsedRealtime() - start));
+
+        if (pendingLookups.isEmpty()) {
+            if (VERBOSE) Slog.i(TAG, "final affinity: " + affinity);
+            return null;
+        }
+
+        if (DEBUG) Slog.d(TAG, "Pending: future work scheduled for: " + key);
+        return new PeopleRankingReconsideration(context, key, pendingLookups);
+!!!85135799.java!!!	getCacheKey(in userId : int, inout handle : String) : String
+        return Integer.toString(userId) + ":" + handle;
+!!!85135927.java!!!	getExtraPeople(inout extras : Bundle) : String
+        Object people = extras.get(Notification.EXTRA_PEOPLE);
+        if (people instanceof String[]) {
+            return (String[]) people;
+        }
+
+        if (people instanceof ArrayList) {
+            ArrayList arrayList = (ArrayList) people;
+
+            if (arrayList.isEmpty()) {
+                return null;
+            }
+
+            if (arrayList.get(0) instanceof String) {
+                ArrayList<String> stringArray = (ArrayList<String>) arrayList;
+                return stringArray.toArray(new String[stringArray.size()]);
+            }
+
+            if (arrayList.get(0) instanceof CharSequence) {
+                ArrayList<CharSequence> charSeqList = (ArrayList<CharSequence>) arrayList;
+                final int N = charSeqList.size();
+                String[] array = new String[N];
+                for (int i = 0; i < N; i++) {
+                    array[i] = charSeqList.get(i).toString();
+                }
+                return array;
+            }
+
+            return null;
+        }
+
+        if (people instanceof String) {
+            String[] array = new String[1];
+            array[0] = (String) people;
+            return array;
+        }
+
+        if (people instanceof char[]) {
+            String[] array = new String[1];
+            array[0] = new String((char[]) people);
+            return array;
+        }
+
+        if (people instanceof CharSequence) {
+            String[] array = new String[1];
+            array[0] = ((CharSequence) people).toString();
+            return array;
+        }
+
+        if (people instanceof CharSequence[]) {
+            CharSequence[] charSeqArray = (CharSequence[]) people;
+            final int N = charSeqArray.length;
+            String[] array = new String[N];
+            for (int i = 0; i < N; i++) {
+                array[i] = charSeqArray[i].toString();
+            }
+            return array;
+        }
+
+        return null;
+!!!85136055.java!!!	resolvePhoneContact(inout context : Context, in number : String) : ValidateNotificationPeople::LookupResult
+        Uri phoneUri = Uri.withAppendedPath(ContactsContract.PhoneLookup.CONTENT_FILTER_URI,
+                Uri.encode(number));
+        return searchContacts(context, phoneUri);
+!!!85136183.java!!!	resolveEmailContact(inout context : Context, in email : String) : ValidateNotificationPeople::LookupResult
+        Uri numberUri = Uri.withAppendedPath(
+                ContactsContract.CommonDataKinds.Email.CONTENT_LOOKUP_URI,
+                Uri.encode(email));
+        return searchContacts(context, numberUri);
+!!!85136311.java!!!	searchContacts(inout context : Context, inout lookupUri : Uri) : ValidateNotificationPeople::LookupResult
+        LookupResult lookupResult = new LookupResult();
+        Cursor c = null;
+        try {
+            c = context.getContentResolver().query(lookupUri, LOOKUP_PROJECTION, null, null, null);
+            if (c == null) {
+                Slog.w(TAG, "Null cursor from contacts query.");
+                return lookupResult;
+            }
+            while (c.moveToNext()) {
+                lookupResult.mergeContact(c);
+            }
+        } catch (Throwable t) {
+            Slog.w(TAG, "Problem getting content resolver or performing contacts query.", t);
+        } finally {
+            if (c != null) {
+                c.close();
+            }
+        }
+        return lookupResult;

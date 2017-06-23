@@ -1,0 +1,273 @@
+class AsmGenerator
+!!!76338231.java!!!	AsmGenerator(inout log : Log, inout osDestJar : String, inout createInfo : ICreateInfo)
+        mLog = log;
+        mOsDestJar = osDestJar;
+        ArrayList<Class<?>> injectedClasses =
+                new ArrayList<>(Arrays.asList(createInfo.getInjectedClasses()));
+        // Search for and add anonymous inner classes also.
+        ListIterator<Class<?>> iter = injectedClasses.listIterator();
+        while (iter.hasNext()) {
+            Class<?> clazz = iter.next();
+            try {
+                int i = 1;
+                while(i < 100) {
+                    iter.add(Class.forName(clazz.getName() + "$" + i));
+                    i++;
+                }
+            } catch (ClassNotFoundException ignored) {
+                // Expected.
+            }
+        }
+        mInjectClasses = injectedClasses.toArray(new Class<?>[0]);
+        mStubMethods = new HashSet<>(Arrays.asList(createInfo.getOverriddenMethods()));
+
+        // Create the map/set of methods to change to delegates
+        mDelegateMethods = new HashMap<>();
+        addToMap(createInfo.getDelegateMethods(), mDelegateMethods);
+
+        for (String className : createInfo.getDelegateClassNatives()) {
+            className = binaryToInternalClassName(className);
+            Set<String> methods = mDelegateMethods.get(className);
+            if (methods == null) {
+                methods = new HashSet<>();
+                mDelegateMethods.put(className, methods);
+            }
+            methods.add(DelegateClassAdapter.ALL_NATIVES);
+        }
+
+        // Create the map of classes to rename.
+        mRenameClasses = new HashMap<>();
+        mClassesNotRenamed = new HashSet<>();
+        String[] renameClasses = createInfo.getRenamedClasses();
+        int n = renameClasses.length;
+        for (int i = 0; i < n; i += 2) {
+            assert i + 1 < n;
+            // The ASM class names uses "/" separators, whereas regular FQCN use "."
+            String oldFqcn = binaryToInternalClassName(renameClasses[i]);
+            String newFqcn = binaryToInternalClassName(renameClasses[i + 1]);
+            mRenameClasses.put(oldFqcn, newFqcn);
+            mClassesNotRenamed.add(oldFqcn);
+        }
+
+        // Create a map of classes to be refactored.
+        mRefactorClasses = new HashMap<>();
+        String[] refactorClasses = createInfo.getJavaPkgClasses();
+        n = refactorClasses.length;
+        for (int i = 0; i < n; i += 2) {
+            assert i + 1 < n;
+            String oldFqcn = binaryToInternalClassName(refactorClasses[i]);
+            String newFqcn = binaryToInternalClassName(refactorClasses[i + 1]);
+            mRefactorClasses.put(oldFqcn, newFqcn);
+        }
+
+        // create the map of renamed class -> return type of method to delete.
+        mDeleteReturns = new HashMap<>();
+        String[] deleteReturns = createInfo.getDeleteReturns();
+        Set<String> returnTypes = null;
+        String renamedClass = null;
+        for (String className : deleteReturns) {
+            // if we reach the end of a section, add it to the main map
+            if (className == null) {
+                if (returnTypes != null) {
+                    mDeleteReturns.put(renamedClass, returnTypes);
+                }
+
+                renamedClass = null;
+                continue;
+            }
+
+            // if the renamed class is null, this is the beginning of a section
+            if (renamedClass == null) {
+                renamedClass = binaryToInternalClassName(className);
+                continue;
+            }
+
+            // just a standard return type, we add it to the list.
+            if (returnTypes == null) {
+                returnTypes = new HashSet<>();
+            }
+            returnTypes.add(binaryToInternalClassName(className));
+        }
+
+        mPromotedFields = new HashMap<>();
+        addToMap(createInfo.getPromotedFields(), mPromotedFields);
+
+        mInjectedMethodsMap = createInfo.getInjectedMethodsMap();
+!!!76338359.java!!!	addToMap(inout entries : String [[]], inout map : Map<String, Set<String>>) : void
+        for (String entry : entries) {
+            int pos = entry.indexOf('#');
+            if (pos <= 0 || pos >= entry.length() - 1) {
+                return;
+            }
+            String className = binaryToInternalClassName(entry.substring(0, pos));
+            String methodOrFieldName = entry.substring(pos + 1);
+            Set<String> set = map.get(className);
+            if (set == null) {
+                set = new HashSet<>();
+                map.put(className, set);
+            }
+            set.add(methodOrFieldName);
+        }
+!!!76338487.java!!!	getClassesNotRenamed() : String
+        return mClassesNotRenamed;
+!!!76338615.java!!!	binaryToInternalClassName(inout className : String) : String
+        if (className == null) {
+            return null;
+        } else {
+            return className.replace('.', '/');
+        }
+!!!76338743.java!!!	setKeep(inout keep : Map<String, ClassReader>) : void
+        mKeep = keep;
+!!!76338871.java!!!	setDeps(inout deps : Map<String, ClassReader>) : void
+        mDeps = deps;
+!!!76338999.java!!!	setCopyFiles(inout copyFiles : Map<String, InputStream>) : void
+        mCopyFiles = copyFiles;
+!!!76339127.java!!!	setRewriteMethodCallClasses(inout rewriteMethodCallClasses : Set<String>) : void
+        mReplaceMethodCallsClasses = rewriteMethodCallClasses;
+!!!76339255.java!!!	generate() : void
+        TreeMap<String, byte[]> all = new TreeMap<>();
+
+        for (Class<?> clazz : mInjectClasses) {
+            String name = classToEntryPath(clazz);
+            InputStream is = ClassLoader.getSystemResourceAsStream(name);
+            ClassReader cr = new ClassReader(is);
+            byte[] b = transform(cr, true);
+            name = classNameToEntryPath(transformName(cr.getClassName()));
+            all.put(name, b);
+        }
+
+        for (Entry<String, ClassReader> entry : mDeps.entrySet()) {
+            ClassReader cr = entry.getValue();
+            byte[] b = transform(cr, true);
+            String name = classNameToEntryPath(transformName(cr.getClassName()));
+            all.put(name, b);
+        }
+
+        for (Entry<String, ClassReader> entry : mKeep.entrySet()) {
+            ClassReader cr = entry.getValue();
+            byte[] b = transform(cr, true);
+            String name = classNameToEntryPath(transformName(cr.getClassName()));
+            all.put(name, b);
+        }
+
+        for (Entry<String, InputStream> entry : mCopyFiles.entrySet()) {
+            try {
+                byte[] b = inputStreamToByteArray(entry.getValue());
+                all.put(entry.getKey(), b);
+            } catch (IOException e) {
+                // Ignore.
+            }
+
+        }
+        mLog.info("# deps classes: %d", mDeps.size());
+        mLog.info("# keep classes: %d", mKeep.size());
+        mLog.info("# renamed     : %d", mRenameCount);
+
+        createJar(new FileOutputStream(mOsDestJar), all);
+        mLog.info("Created JAR file %s", mOsDestJar);
+!!!76339383.java!!!	createJar(inout outStream : FileOutputStream, inout all : Map<String,byte[]>) : void
+        JarOutputStream jar = new JarOutputStream(outStream);
+        for (Entry<String, byte[]> entry : all.entrySet()) {
+            String name = entry.getKey();
+            JarEntry jar_entry = new JarEntry(name);
+            jar.putNextEntry(jar_entry);
+            jar.write(entry.getValue());
+            jar.closeEntry();
+        }
+        jar.flush();
+        jar.close();
+!!!76339511.java!!!	classNameToEntryPath(inout className : String) : String
+        return className.replace('.', '/').concat(".class");
+!!!76339639.java!!!	classToEntryPath(inout clazz : Class) : String
+        return classNameToEntryPath(clazz.getName());
+!!!76339767.java!!!	transform(inout cr : ClassReader, inout stubNativesOnly : boolean) : byte
+
+        boolean hasNativeMethods = hasNativeMethods(cr);
+
+        // Get the class name, as an internal name (e.g. com/android/SomeClass$InnerClass)
+        String className = cr.getClassName();
+
+        String newName = transformName(className);
+        // transformName returns its input argument if there's no need to rename the class
+        if (!newName.equals(className)) {
+            mRenameCount++;
+            // This class is being renamed, so remove it from the list of classes not renamed.
+            mClassesNotRenamed.remove(className);
+        }
+
+        mLog.debug("Transform %s%s%s%s", className,
+                newName.equals(className) ? "" : " (renamed to " + newName + ")",
+                hasNativeMethods ? " -- has natives" : "",
+                stubNativesOnly ? " -- stub natives only" : "");
+
+        // Rewrite the new class from scratch, without reusing the constant pool from the
+        // original class reader.
+        ClassWriter cw = new ClassWriter(ClassWriter.COMPUTE_MAXS);
+
+        ClassVisitor cv = cw;
+
+        // FIXME Generify
+        if ("android/content/res/Resources".equals(className)) {
+            cv = new FieldInjectorAdapter(cv);
+        }
+        if (mReplaceMethodCallsClasses.contains(className)) {
+            cv = new ReplaceMethodCallsAdapter(cv, className);
+        }
+
+        cv = new RefactorClassAdapter(cv, mRefactorClasses);
+        if (!newName.equals(className)) {
+            cv = new RenameClassAdapter(cv, className, newName);
+        }
+
+        String binaryNewName = newName.replace('/', '.');
+        if (mInjectedMethodsMap.keySet().contains(binaryNewName)) {
+            cv = new InjectMethodsAdapter(cv, mInjectedMethodsMap.get(binaryNewName));
+        }
+        cv = new TransformClassAdapter(mLog, mStubMethods, mDeleteReturns.get(className),
+                newName, cv, stubNativesOnly);
+
+        Set<String> delegateMethods = mDelegateMethods.get(className);
+        if (delegateMethods != null && !delegateMethods.isEmpty()) {
+            // If delegateMethods only contains one entry ALL_NATIVES and the class is
+            // known to have no native methods, just skip this step.
+            if (hasNativeMethods ||
+                    !(delegateMethods.size() == 1 &&
+                            delegateMethods.contains(DelegateClassAdapter.ALL_NATIVES))) {
+                cv = new DelegateClassAdapter(mLog, cv, className, delegateMethods);
+            }
+        }
+
+        Set<String> promoteFields = mPromotedFields.get(className);
+        if (promoteFields != null && !promoteFields.isEmpty()) {
+            cv = new PromoteFieldClassAdapter(cv, promoteFields);
+        }
+        cr.accept(cv, 0);
+        return cw.toByteArray();
+!!!76339895.java!!!	transformName(inout className : String) : String
+        String newName = mRenameClasses.get(className);
+        if (newName != null) {
+            return newName;
+        }
+        int pos = className.indexOf('$');
+        if (pos > 0) {
+            // Is this an inner class of a renamed class?
+            String base = className.substring(0, pos);
+            newName = mRenameClasses.get(base);
+            if (newName != null) {
+                return newName + className.substring(pos);
+            }
+        }
+
+        return className;
+!!!76340023.java!!!	hasNativeMethods(inout cr : ClassReader) : boolean
+        ClassHasNativeVisitor cv = new ClassHasNativeVisitor();
+        cr.accept(cv, 0);
+        return cv.hasNativeMethods();
+!!!76340151.java!!!	inputStreamToByteArray(inout is : InputStream) : byte
+        ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+        byte[] data = new byte[8192];  // 8KB
+        int n;
+        while ((n = is.read(data, 0, data.length)) != -1) {
+            buffer.write(data, 0, n);
+        }
+        return buffer.toByteArray();

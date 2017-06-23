@@ -1,0 +1,123 @@
+class BackgroundTaskLoader
+!!!71802935.java!!!	BackgroundTaskLoader(inout loadQueue : TaskResourceLoadQueue, inout iconCache : TaskKeyLruCache, inout thumbnailCache : TaskKeyLruCache, inout defaultThumbnail : Bitmap, inout defaultIcon : BitmapDrawable)
+        mLoadQueue = loadQueue;
+        mIconCache = iconCache;
+        mThumbnailCache = thumbnailCache;
+        mDefaultThumbnail = defaultThumbnail;
+        mDefaultIcon = defaultIcon;
+        mMainThreadHandler = new Handler();
+        mLoadThread = new HandlerThread("Recents-TaskResourceLoader",
+                android.os.Process.THREAD_PRIORITY_BACKGROUND);
+        mLoadThread.start();
+        mLoadThreadHandler = new Handler(mLoadThread.getLooper());
+        mLoadThreadHandler.post(this);
+!!!71803063.java!!!	start(inout context : Context) : void
+        mContext = context;
+        mCancelled = false;
+        // Notify the load thread to start loading
+        synchronized(mLoadThread) {
+            mLoadThread.notifyAll();
+        }
+!!!71803191.java!!!	stop() : void
+        // Mark as cancelled for the thread to pick up
+        mCancelled = true;
+        // If we are waiting for the load queue for more tasks, then we can just reset the
+        // Context now, since nothing is using it
+        if (mWaitingOnLoadQueue) {
+            mContext = null;
+        }
+!!!71803319.java!!!	run() : void
+        while (true) {
+            if (mCancelled) {
+                // We have to unset the context here, since the background thread may be using it
+                // when we call stop()
+                mContext = null;
+                // If we are cancelled, then wait until we are started again
+                synchronized(mLoadThread) {
+                    try {
+                        mLoadThread.wait();
+                    } catch (InterruptedException ie) {
+                        ie.printStackTrace();
+                    }
+                }
+            } else {
+                RecentsConfiguration config = Recents.getConfiguration();
+                SystemServicesProxy ssp = Recents.getSystemServices();
+                // If we've stopped the loader, then fall through to the above logic to wait on
+                // the load thread
+                if (ssp != null) {
+                    // Load the next item from the queue
+                    final Task t = mLoadQueue.nextTask();
+                    if (t != null) {
+                        Drawable cachedIcon = mIconCache.get(t.key);
+                        ThumbnailData cachedThumbnailData = mThumbnailCache.get(t.key);
+
+                        // Load the icon if it is stale or we haven't cached one yet
+                        if (cachedIcon == null) {
+                            cachedIcon = ssp.getBadgedTaskDescriptionIcon(t.taskDescription,
+                                    t.key.userId, mContext.getResources());
+
+                            if (cachedIcon == null) {
+                                ActivityInfo info = ssp.getActivityInfo(
+                                        t.key.getComponent(), t.key.userId);
+                                if (info != null) {
+                                    if (DEBUG) Log.d(TAG, "Loading icon: " + t.key);
+                                    cachedIcon = ssp.getBadgedActivityIcon(info, t.key.userId);
+                                }
+                            }
+
+                            if (cachedIcon == null) {
+                                cachedIcon = mDefaultIcon;
+                            }
+
+                            // At this point, even if we can't load the icon, we will set the
+                            // default icon.
+                            mIconCache.put(t.key, cachedIcon);
+                        }
+                        // Load the thumbnail if it is stale or we haven't cached one yet
+                        if (cachedThumbnailData == null) {
+                            if (config.svelteLevel < RecentsConfiguration.SVELTE_DISABLE_LOADING) {
+                                if (DEBUG) Log.d(TAG, "Loading thumbnail: " + t.key);
+                                cachedThumbnailData = ssp.getTaskThumbnail(t.key.id);
+                            }
+
+                            if (cachedThumbnailData.thumbnail == null) {
+                                cachedThumbnailData.thumbnail = mDefaultThumbnail;
+                            }
+
+                            // When svelte, we trim the memory to just the visible thumbnails when
+                            // leaving, so don't thrash the cache as the user scrolls (just load
+                            // them from scratch each time)
+                            if (config.svelteLevel < RecentsConfiguration.SVELTE_LIMIT_CACHE) {
+                                mThumbnailCache.put(t.key, cachedThumbnailData);
+                            }
+                        }
+                        if (!mCancelled) {
+                            // Notify that the task data has changed
+                            final Drawable newIcon = cachedIcon;
+                            final ThumbnailData newThumbnailData = cachedThumbnailData;
+                            mMainThreadHandler.post(new Runnable() {
+                                @Override
+                                public void run() {
+                                    t.notifyTaskDataLoaded(newThumbnailData.thumbnail, newIcon,
+                                            newThumbnailData.thumbnailInfo);
+                                }
+                            });
+                        }
+                    }
+                }
+
+                // If there are no other items in the list, then just wait until something is added
+                if (!mCancelled && mLoadQueue.isEmpty()) {
+                    synchronized(mLoadQueue) {
+                        try {
+                            mWaitingOnLoadQueue = true;
+                            mLoadQueue.wait();
+                            mWaitingOnLoadQueue = false;
+                        } catch (InterruptedException ie) {
+                            ie.printStackTrace();
+                        }
+                    }
+                }
+            }
+        }

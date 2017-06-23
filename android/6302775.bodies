@@ -1,0 +1,332 @@
+class WifiTracker
+!!!71434423.java!!!	WifiTracker(inout context : Context, inout wifiListener : WifiTracker::WifiListener, inout includeSaved : boolean, inout includeScans : boolean)
+        this(context, wifiListener, null, includeSaved, includeScans);
+!!!71434551.java!!!	WifiTracker(inout context : Context, inout wifiListener : WifiTracker::WifiListener, inout workerLooper : Looper, inout includeSaved : boolean, inout includeScans : boolean)
+        this(context, wifiListener, workerLooper, includeSaved, includeScans, false);
+!!!71434679.java!!!	WifiTracker(inout context : Context, inout wifiListener : WifiTracker::WifiListener, inout includeSaved : boolean, inout includeScans : boolean, inout includePasspoints : boolean)
+        this(context, wifiListener, null, includeSaved, includeScans, includePasspoints);
+!!!71434807.java!!!	WifiTracker(inout context : Context, inout wifiListener : WifiTracker::WifiListener, inout workerLooper : Looper, inout includeSaved : boolean, inout includeScans : boolean, inout includePasspoints : boolean)
+        this(context, wifiListener, workerLooper, includeSaved, includeScans, includePasspoints,
+                context.getSystemService(WifiManager.class),
+                context.getSystemService(ConnectivityManager.class), Looper.myLooper());
+!!!71434935.java!!!	WifiTracker(inout context : Context, inout wifiListener : WifiTracker::WifiListener, inout workerLooper : Looper, inout includeSaved : boolean, inout includeScans : boolean, inout includePasspoints : boolean, inout wifiManager : WifiManager, inout connectivityManager : ConnectivityManager, inout currentLooper : Looper)
+        if (!includeSaved && !includeScans) {
+            throw new IllegalArgumentException("Must include either saved or scans");
+        }
+        mContext = context;
+        if (currentLooper == null) {
+            // When we aren't on a looper thread, default to the main.
+            currentLooper = Looper.getMainLooper();
+        }
+        mMainHandler = new MainHandler(currentLooper);
+        mWorkHandler = new WorkHandler(
+                workerLooper != null ? workerLooper : currentLooper);
+        mWifiManager = wifiManager;
+        mIncludeSaved = includeSaved;
+        mIncludeScans = includeScans;
+        mIncludePasspoints = includePasspoints;
+        mListener = wifiListener;
+        mConnectivityManager = connectivityManager;
+
+        // check if verbose logging has been turned on or off
+        sVerboseLogging = mWifiManager.getVerboseLoggingLevel();
+
+        mFilter = new IntentFilter();
+        mFilter.addAction(WifiManager.WIFI_STATE_CHANGED_ACTION);
+        mFilter.addAction(WifiManager.SCAN_RESULTS_AVAILABLE_ACTION);
+        mFilter.addAction(WifiManager.NETWORK_IDS_CHANGED_ACTION);
+        mFilter.addAction(WifiManager.SUPPLICANT_STATE_CHANGED_ACTION);
+        mFilter.addAction(WifiManager.CONFIGURED_NETWORKS_CHANGED_ACTION);
+        mFilter.addAction(WifiManager.LINK_CONFIGURATION_CHANGED_ACTION);
+        mFilter.addAction(WifiManager.NETWORK_STATE_CHANGED_ACTION);
+
+        mNetworkRequest = new NetworkRequest.Builder()
+                .clearCapabilities()
+                .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+                .build();
+!!!71435063.java!!!	forceUpdate() : void
+        updateAccessPoints();
+!!!71435191.java!!!	forceScan() : void
+        if (mWifiManager.isWifiEnabled() && mScanner != null) {
+            mScanner.forceScan();
+        }
+!!!71435319.java!!!	pauseScanning() : void
+        if (mScanner != null) {
+            mScanner.pause();
+            mScanner = null;
+        }
+!!!71435447.java!!!	resumeScanning() : void
+        if (mScanner == null) {
+            mScanner = new Scanner();
+        }
+
+        mWorkHandler.sendEmptyMessage(WorkHandler.MSG_RESUME);
+        if (mWifiManager.isWifiEnabled()) {
+            mScanner.resume();
+        }
+        mWorkHandler.sendEmptyMessage(WorkHandler.MSG_UPDATE_ACCESS_POINTS);
+!!!71435575.java!!!	startTracking() : void
+        resumeScanning();
+        if (!mRegistered) {
+            mContext.registerReceiver(mReceiver, mFilter);
+            // NetworkCallback objects cannot be reused. http://b/20701525 .
+            mNetworkCallback = new WifiTrackerNetworkCallback();
+            mConnectivityManager.registerNetworkCallback(mNetworkRequest, mNetworkCallback);
+            mRegistered = true;
+        }
+!!!71435703.java!!!	stopTracking() : void
+        if (mRegistered) {
+            mWorkHandler.removeMessages(WorkHandler.MSG_UPDATE_ACCESS_POINTS);
+            mWorkHandler.removeMessages(WorkHandler.MSG_UPDATE_NETWORK_INFO);
+            mContext.unregisterReceiver(mReceiver);
+            mConnectivityManager.unregisterNetworkCallback(mNetworkCallback);
+            mRegistered = false;
+        }
+        pauseScanning();
+!!!71435831.java!!!	getAccessPoints() : AccessPoint
+        synchronized (mAccessPoints) {
+            return new ArrayList<>(mAccessPoints);
+        }
+!!!71435959.java!!!	getManager() : WifiManager
+        return mWifiManager;
+!!!71436087.java!!!	isWifiEnabled() : boolean
+        return mWifiManager.isWifiEnabled();
+!!!71436215.java!!!	doSavedNetworksExist() : boolean
+        return mSavedNetworksExist;
+!!!71436343.java!!!	isConnected() : boolean
+        return mConnected.get();
+!!!71436471.java!!!	dump(inout pw : PrintWriter) : void
+        pw.println("  - wifi tracker ------");
+        for (AccessPoint accessPoint : getAccessPoints()) {
+            pw.println("  " + accessPoint);
+        }
+!!!71436599.java!!!	handleResume() : void
+        mScanResultCache.clear();
+        mSeenBssids.clear();
+        mScanId = 0;
+!!!71436727.java!!!	fetchScanResults() : ScanResult
+        mScanId++;
+        final List<ScanResult> newResults = mWifiManager.getScanResults();
+        for (ScanResult newResult : newResults) {
+            if (newResult.SSID == null || newResult.SSID.isEmpty()) {
+                continue;
+            }
+            mScanResultCache.put(newResult.BSSID, newResult);
+            mSeenBssids.put(newResult.BSSID, mScanId);
+        }
+
+        if (mScanId > NUM_SCANS_TO_CONFIRM_AP_LOSS) {
+            if (DBG) Log.d(TAG, "------ Dumping SSIDs that were expired on this scan ------");
+            Integer threshold = mScanId - NUM_SCANS_TO_CONFIRM_AP_LOSS;
+            for (Iterator<Map.Entry<String, Integer>> it = mSeenBssids.entrySet().iterator();
+                    it.hasNext(); /* nothing */) {
+                Map.Entry<String, Integer> e = it.next();
+                if (e.getValue() < threshold) {
+                    ScanResult result = mScanResultCache.get(e.getKey());
+                    if (DBG) Log.d(TAG, "Removing " + e.getKey() + ":(" + result.SSID + ")");
+                    mScanResultCache.remove(e.getKey());
+                    it.remove();
+                }
+            }
+            if (DBG) Log.d(TAG, "---- Done Dumping SSIDs that were expired on this scan ----");
+        }
+
+        return mScanResultCache.values();
+!!!71436855.java!!!	getWifiConfigurationForNetworkId(in networkId : int) : WifiConfiguration
+        final List<WifiConfiguration> configs = mWifiManager.getConfiguredNetworks();
+        if (configs != null) {
+            for (WifiConfiguration config : configs) {
+                if (mLastInfo != null && networkId == config.networkId &&
+                        !(config.selfAdded && config.numAssociation == 0)) {
+                    return config;
+                }
+            }
+        }
+        return null;
+!!!71436983.java!!!	updateAccessPoints() : void
+        // Swap the current access points into a cached list.
+        List<AccessPoint> cachedAccessPoints = getAccessPoints();
+        ArrayList<AccessPoint> accessPoints = new ArrayList<>();
+
+        // Clear out the configs so we don't think something is saved when it isn't.
+        for (AccessPoint accessPoint : cachedAccessPoints) {
+            accessPoint.clearConfig();
+        }
+
+        /** Lookup table to more quickly update AccessPoints by only considering objects with the
+         * correct SSID.  Maps SSID -> List of AccessPoints with the given SSID.  */
+        Multimap<String, AccessPoint> apMap = new Multimap<String, AccessPoint>();
+        WifiConfiguration connectionConfig = null;
+        if (mLastInfo != null) {
+            connectionConfig = getWifiConfigurationForNetworkId(mLastInfo.getNetworkId());
+        }
+
+        final Collection<ScanResult> results = fetchScanResults();
+
+        final List<WifiConfiguration> configs = mWifiManager.getConfiguredNetworks();
+        if (configs != null) {
+            mSavedNetworksExist = configs.size() != 0;
+            for (WifiConfiguration config : configs) {
+                if (config.selfAdded && config.numAssociation == 0) {
+                    continue;
+                }
+                AccessPoint accessPoint = getCachedOrCreate(config, cachedAccessPoints);
+                if (mLastInfo != null && mLastNetworkInfo != null) {
+                    if (config.isPasspoint() == false) {
+                        accessPoint.update(connectionConfig, mLastInfo, mLastNetworkInfo);
+                    }
+                }
+                if (mIncludeSaved) {
+                    if (!config.isPasspoint() || mIncludePasspoints) {
+                        // If saved network not present in scan result then set its Rssi to MAX_VALUE
+                        boolean apFound = false;
+                        for (ScanResult result : results) {
+                            if (result.SSID.equals(accessPoint.getSsidStr())) {
+                                apFound = true;
+                                break;
+                            }
+                        }
+                        if (!apFound) {
+                            accessPoint.setRssi(Integer.MAX_VALUE);
+                        }
+                        accessPoints.add(accessPoint);
+                    }
+
+                    if (config.isPasspoint() == false) {
+                        apMap.put(accessPoint.getSsidStr(), accessPoint);
+                    }
+                } else {
+                    // If we aren't using saved networks, drop them into the cache so that
+                    // we have access to their saved info.
+                    cachedAccessPoints.add(accessPoint);
+                }
+            }
+        }
+
+        if (results != null) {
+            for (ScanResult result : results) {
+                // Ignore hidden and ad-hoc networks.
+                if (result.SSID == null || result.SSID.length() == 0 ||
+                        result.capabilities.contains("[IBSS]")) {
+                    continue;
+                }
+
+                boolean found = false;
+                for (AccessPoint accessPoint : apMap.getAll(result.SSID)) {
+                    if (accessPoint.update(result)) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found && mIncludeScans) {
+                    AccessPoint accessPoint = getCachedOrCreate(result, cachedAccessPoints);
+                    if (mLastInfo != null && mLastNetworkInfo != null) {
+                        accessPoint.update(connectionConfig, mLastInfo, mLastNetworkInfo);
+                    }
+
+                    if (result.isPasspointNetwork()) {
+                        WifiConfiguration config = mWifiManager.getMatchingWifiConfig(result);
+                        if (config != null) {
+                            accessPoint.update(config);
+                        }
+                    }
+
+                    if (mLastInfo != null && mLastInfo.getBSSID() != null
+                            && mLastInfo.getBSSID().equals(result.BSSID)
+                            && connectionConfig != null && connectionConfig.isPasspoint()) {
+                        /* This network is connected via this passpoint config */
+                        /* SSID match is not going to work for it; so update explicitly */
+                        accessPoint.update(connectionConfig);
+                    }
+
+                    accessPoints.add(accessPoint);
+                    apMap.put(accessPoint.getSsidStr(), accessPoint);
+                }
+            }
+        }
+
+        // Pre-sort accessPoints to speed preference insertion
+        Collections.sort(accessPoints);
+
+        // Log accesspoints that were deleted
+        if (DBG) Log.d(TAG, "------ Dumping SSIDs that were not seen on this scan ------");
+        for (AccessPoint prevAccessPoint : mAccessPoints) {
+            if (prevAccessPoint.getSsid() == null) continue;
+            String prevSsid = prevAccessPoint.getSsidStr();
+            boolean found = false;
+            for (AccessPoint newAccessPoint : accessPoints) {
+                if (newAccessPoint.getSsid() != null && newAccessPoint.getSsid().equals(prevSsid)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found)
+                if (DBG) Log.d(TAG, "Did not find " + prevSsid + " in this scan");
+        }
+        if (DBG)  Log.d(TAG, "---- Done dumping SSIDs that were not seen on this scan ----");
+
+        mAccessPoints = accessPoints;
+        mMainHandler.sendEmptyMessage(MainHandler.MSG_ACCESS_POINT_CHANGED);
+!!!71437111.java!!!	getCachedOrCreate(inout result : ScanResult, inout cache : List<AccessPoint>) : AccessPoint
+        final int N = cache.size();
+        for (int i = 0; i < N; i++) {
+            if (cache.get(i).matches(result)) {
+                AccessPoint ret = cache.remove(i);
+                ret.update(result);
+                return ret;
+            }
+        }
+        return new AccessPoint(mContext, result);
+!!!71437239.java!!!	getCachedOrCreate(inout config : WifiConfiguration, inout cache : List<AccessPoint>) : AccessPoint
+        final int N = cache.size();
+        for (int i = 0; i < N; i++) {
+            if (cache.get(i).matches(config)) {
+                AccessPoint ret = cache.remove(i);
+                ret.loadConfig(config);
+                return ret;
+            }
+        }
+        return new AccessPoint(mContext, config);
+!!!71437367.java!!!	updateNetworkInfo(inout networkInfo : NetworkInfo) : void
+        /* sticky broadcasts can call this when wifi is disabled */
+        if (!mWifiManager.isWifiEnabled()) {
+            mMainHandler.sendEmptyMessage(MainHandler.MSG_PAUSE_SCANNING);
+            return;
+        }
+
+        if (networkInfo != null &&
+                networkInfo.getDetailedState() == DetailedState.OBTAINING_IPADDR) {
+            mMainHandler.sendEmptyMessage(MainHandler.MSG_PAUSE_SCANNING);
+        } else {
+            mMainHandler.sendEmptyMessage(MainHandler.MSG_RESUME_SCANNING);
+        }
+
+        if (networkInfo != null) {
+            mLastNetworkInfo = networkInfo;
+        }
+
+        WifiConfiguration connectionConfig = null;
+        mLastInfo = mWifiManager.getConnectionInfo();
+        if (mLastInfo != null) {
+            connectionConfig = getWifiConfigurationForNetworkId(mLastInfo.getNetworkId());
+        }
+
+        boolean reorder = false;
+        for (int i = mAccessPoints.size() - 1; i >= 0; --i) {
+            if (mAccessPoints.get(i).update(connectionConfig, mLastInfo, mLastNetworkInfo)) {
+                reorder = true;
+            }
+        }
+        if (reorder) {
+            synchronized (mAccessPoints) {
+                Collections.sort(mAccessPoints);
+            }
+            mMainHandler.sendEmptyMessage(MainHandler.MSG_ACCESS_POINT_CHANGED);
+        }
+!!!71437495.java!!!	updateWifiState(in state : int) : void
+        mWorkHandler.obtainMessage(WorkHandler.MSG_UPDATE_WIFI_STATE, state, 0).sendToTarget();
+!!!71437623.java!!!	getCurrentAccessPoints(inout context : Context, inout includeSaved : boolean, inout includeScans : boolean, inout includePasspoints : boolean) : AccessPoint
+        WifiTracker tracker = new WifiTracker(context,
+                null, null, includeSaved, includeScans, includePasspoints);
+        tracker.forceUpdate();
+        return tracker.getAccessPoints();

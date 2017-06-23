@@ -1,0 +1,210 @@
+class MediaSync
+!!!69752759.java!!!	MediaSync()
+        native_setup();
+!!!69753015.java!!!	finalize() : void
+        native_finalize();
+!!!69753271.java!!!	release() : void
+        returnAudioBuffers();
+        if (mAudioThread != null) {
+            if (mAudioLooper != null) {
+                mAudioLooper.quit();
+            }
+        }
+        setCallback(null, null);
+        native_release();
+!!!69753527.java!!!	setCallback(inout cb : MediaSync::Callback, inout handler : Handler) : void
+        synchronized(mCallbackLock) {
+            if (handler != null) {
+                mCallbackHandler = handler;
+            } else {
+                Looper looper;
+                if ((looper = Looper.myLooper()) == null) {
+                    looper = Looper.getMainLooper();
+                }
+                if (looper == null) {
+                    mCallbackHandler = null;
+                } else {
+                    mCallbackHandler = new Handler(looper);
+                }
+            }
+
+            mCallback = cb;
+        }
+!!!69753655.java!!!	setOnErrorListener(inout listener : MediaSync::OnErrorListener, inout handler : Handler) : void
+        synchronized(mOnErrorListenerLock) {
+            if (handler != null) {
+                mOnErrorListenerHandler = handler;
+            } else {
+                Looper looper;
+                if ((looper = Looper.myLooper()) == null) {
+                    looper = Looper.getMainLooper();
+                }
+                if (looper == null) {
+                    mOnErrorListenerHandler = null;
+                } else {
+                    mOnErrorListenerHandler = new Handler(looper);
+                }
+            }
+
+            mOnErrorListener = listener;
+        }
+!!!69753783.java!!!	setSurface(inout surface : Surface) : void
+        native_setSurface(surface);
+!!!69754039.java!!!	setAudioTrack(inout audioTrack : AudioTrack) : void
+        native_setAudioTrack(audioTrack);
+        mAudioTrack = audioTrack;
+        if (audioTrack != null && mAudioThread == null) {
+            createAudioThread();
+        }
+!!!69754423.java!!!	setPlaybackParams(inout params : PlaybackParams) : void
+        synchronized(mAudioLock) {
+            mPlaybackRate = native_setPlaybackParams(params);;
+        }
+        if (mPlaybackRate != 0.0 && mAudioThread != null) {
+            postRenderAudio(0);
+        }
+!!!69754807.java!!!	setSyncParams(inout params : SyncParams) : void
+        synchronized(mAudioLock) {
+            mPlaybackRate = native_setSyncParams(params);;
+        }
+        if (mPlaybackRate != 0.0 && mAudioThread != null) {
+            postRenderAudio(0);
+        }
+!!!69755191.java!!!	flush() : void
+        synchronized(mAudioLock) {
+            mAudioBuffers.clear();
+            mCallbackHandler.removeCallbacksAndMessages(null);
+        }
+        if (mAudioTrack != null) {
+            mAudioTrack.pause();
+            mAudioTrack.flush();
+            // Call stop() to signal to the AudioSink to completely fill the
+            // internal buffer before resuming playback.
+            mAudioTrack.stop();
+        }
+        native_flush();
+!!!69755447.java!!!	getTimestamp() : MediaTimestamp
+        try {
+            // TODO: create the timestamp in native
+            MediaTimestamp timestamp = new MediaTimestamp();
+            if (native_getTimestamp(timestamp)) {
+                return timestamp;
+            } else {
+                return null;
+            }
+        } catch (IllegalStateException e) {
+            return null;
+        }
+!!!69755703.java!!!	queueAudio(inout audioData : ByteBuffer, in bufferId : int, in presentationTimeUs : long) : void
+        if (mAudioTrack == null || mAudioThread == null) {
+            throw new IllegalStateException(
+                    "AudioTrack is NOT set or audio thread is not created");
+        }
+
+        synchronized(mAudioLock) {
+            mAudioBuffers.add(new AudioBuffer(audioData, bufferId, presentationTimeUs));
+        }
+
+        if (mPlaybackRate != 0.0) {
+            postRenderAudio(0);
+        }
+!!!69755831.java!!!	postRenderAudio(in delayMillis : long) : void
+        mAudioHandler.postDelayed(new Runnable() {
+            public void run() {
+                synchronized(mAudioLock) {
+                    if (mPlaybackRate == 0.0) {
+                        return;
+                    }
+
+                    if (mAudioBuffers.isEmpty()) {
+                        return;
+                    }
+
+                    AudioBuffer audioBuffer = mAudioBuffers.get(0);
+                    int size = audioBuffer.mByteBuffer.remaining();
+                    // restart audio track after flush
+                    if (size > 0 && mAudioTrack.getPlayState() != AudioTrack.PLAYSTATE_PLAYING) {
+                        try {
+                            mAudioTrack.play();
+                        } catch (IllegalStateException e) {
+                            Log.w(TAG, "could not start audio track");
+                        }
+                    }
+                    int sizeWritten = mAudioTrack.write(
+                            audioBuffer.mByteBuffer,
+                            size,
+                            AudioTrack.WRITE_NON_BLOCKING);
+                    if (sizeWritten > 0) {
+                        if (audioBuffer.mPresentationTimeUs != -1) {
+                            native_updateQueuedAudioData(
+                                    size, audioBuffer.mPresentationTimeUs);
+                            audioBuffer.mPresentationTimeUs = -1;
+                        }
+
+                        if (sizeWritten == size) {
+                            postReturnByteBuffer(audioBuffer);
+                            mAudioBuffers.remove(0);
+                            if (!mAudioBuffers.isEmpty()) {
+                                postRenderAudio(0);
+                            }
+                            return;
+                        }
+                    }
+                    long pendingTimeMs = TimeUnit.MICROSECONDS.toMillis(
+                            native_getPlayTimeForPendingAudioFrames());
+                    postRenderAudio(pendingTimeMs / 2);
+                }
+            }
+        }, delayMillis);
+!!!69756215.java!!!	postReturnByteBuffer(in audioBuffer : MediaSync::AudioBuffer) : void
+        synchronized(mCallbackLock) {
+            if (mCallbackHandler != null) {
+                final MediaSync sync = this;
+                mCallbackHandler.post(new Runnable() {
+                    public void run() {
+                        Callback callback;
+                        synchronized(mCallbackLock) {
+                            callback = mCallback;
+                            if (mCallbackHandler == null
+                                    || mCallbackHandler.getLooper().getThread()
+                                            != Thread.currentThread()) {
+                                // callback handler has been changed.
+                                return;
+                            }
+                        }
+                        if (callback != null) {
+                            callback.onAudioBufferConsumed(sync, audioBuffer.mByteBuffer,
+                                    audioBuffer.mBufferIndex);
+                        }
+                    }
+                });
+            }
+        }
+!!!69756343.java!!!	returnAudioBuffers() : void
+        synchronized(mAudioLock) {
+            for (AudioBuffer audioBuffer: mAudioBuffers) {
+                postReturnByteBuffer(audioBuffer);
+            }
+            mAudioBuffers.clear();
+        }
+!!!69756471.java!!!	createAudioThread() : void
+        mAudioThread = new Thread() {
+            @Override
+            public void run() {
+                Looper.prepare();
+                synchronized(mAudioLock) {
+                    mAudioLooper = Looper.myLooper();
+                    mAudioHandler = new Handler();
+                    mAudioLock.notify();
+                }
+                Looper.loop();
+            }
+        };
+        mAudioThread.start();
+
+        synchronized(mAudioLock) {
+            try {
+                mAudioLock.wait();
+            } catch(InterruptedException e) {
+            }
+        }

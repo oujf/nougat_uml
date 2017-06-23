@@ -1,0 +1,83 @@
+class NistCurveKeyExchange
+!!!43118647.cpp!!!	NistCurveKeyExchange(inout private_key : EC_KEY, inout error : keymaster_error_t)
+    if (!private_key_.get() || !EC_KEY_check_key(private_key_.get())) {
+        *error = KM_ERROR_INVALID_ARGUMENT;
+        return;
+    }
+    *error = ExtractPublicKey();
+!!!43118775.cpp!!!	GenerateKeyExchange(in curve : keymaster_ec_curve_t) : NistCurveKeyExchange
+    int curve_name;
+    switch (curve) {
+    case KM_EC_CURVE_P_224:
+        curve_name = NID_secp224r1;
+        break;
+    case KM_EC_CURVE_P_256:
+        curve_name = NID_X9_62_prime256v1;
+        break;
+    case KM_EC_CURVE_P_384:
+        curve_name = NID_secp384r1;
+        break;
+    case KM_EC_CURVE_P_521:
+        curve_name = NID_secp521r1;
+        break;
+    default:
+        LOG_E("Not a NIST curve: %d", curve);
+        return nullptr;
+    }
+
+    UniquePtr<EC_KEY, EC_KEY_Delete> key(EC_KEY_new_by_curve_name(curve_name));
+    if (!key.get() || !EC_KEY_generate_key(key.get())) {
+        return nullptr;
+    }
+    keymaster_error_t error;
+    NistCurveKeyExchange* key_exchange = new NistCurveKeyExchange(key.release(), &error);
+    if (error != KM_ERROR_OK) {
+        return nullptr;
+    }
+    return key_exchange;
+!!!43118903.cpp!!!	CalculateSharedKey(in peer_public_value : uint8_t, in peer_public_value_len : size_t, inout out_result : Buffer) : bool
+    const EC_GROUP* group = EC_KEY_get0_group(private_key_.get());
+    UniquePtr<EC_POINT, EC_POINT_Delete> point(EC_POINT_new(group));
+    if (!point.get() ||
+        !EC_POINT_oct2point(/* also test if point is on curve */
+                            group, point.get(), peer_public_value, peer_public_value_len,
+                            nullptr /* ctx */) ||
+        !EC_POINT_is_on_curve(group, point.get(), nullptr /* ctx */)) {
+        LOG_E("Can't convert peer public value to point: %d", TranslateLastOpenSslError());
+        return false;
+    }
+
+    UniquePtr<uint8_t[]> result(new uint8_t[shared_secret_len_]);
+    if (ECDH_compute_key(result.get(), shared_secret_len_, point.get(), private_key_.get(),
+                         nullptr /* kdf */) != static_cast<int>(shared_secret_len_)) {
+        LOG_E("Can't compute ECDH shared key: %d", TranslateLastOpenSslError());
+        return false;
+    }
+
+    out_result->Reinitialize(result.get(), shared_secret_len_);
+    return true;
+!!!43119031.cpp!!!	CalculateSharedKey(in peer_public_value : Buffer, inout out_result : Buffer) : bool
+
+    return CalculateSharedKey(peer_public_value.peek_read(), peer_public_value.available_read(),
+                              out_result);
+!!!43119159.cpp!!!	public_value(inout public_value : Buffer) : bool
+    if (public_key_.get() != nullptr && public_key_len_ != 0) {
+        return public_value->Reinitialize(public_key_.get(), public_key_len_);
+    }
+    return false;
+!!!43119415.cpp!!!	ExtractPublicKey() : keymaster_error_t
+    const EC_GROUP* group = EC_KEY_get0_group(private_key_.get());
+    size_t field_len_bits;
+    keymaster_error_t error = ec_get_group_size(group, &field_len_bits);
+    if (error != KM_ERROR_OK)
+        return error;
+
+    shared_secret_len_ = (field_len_bits + 7) / 8;
+    public_key_len_ = 1 + 2 * shared_secret_len_;
+    public_key_.reset(new uint8_t[public_key_len_]);
+    if (EC_POINT_point2oct(group, EC_KEY_get0_public_key(private_key_.get()),
+                           POINT_CONVERSION_UNCOMPRESSED, public_key_.get(), public_key_len_,
+                           nullptr /* ctx */) != public_key_len_) {
+        return TranslateLastOpenSslError();
+    }
+    return KM_ERROR_OK;

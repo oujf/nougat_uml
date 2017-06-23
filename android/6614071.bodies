@@ -1,0 +1,127 @@
+class TvRemoteProviderWatcher
+!!!74598967.java!!!	TvRemoteProviderWatcher(inout context : Context, inout provider : TvRemoteProviderWatcher::ProviderMethods, inout handler : Handler)
+        mContext = context;
+        mProvider = provider;
+        mHandler = handler;
+        mUserId = UserHandle.myUserId();
+        mPackageManager = context.getPackageManager();
+        mUnbundledServicePackage = context.getString(
+                com.android.internal.R.string.config_tvRemoteServicePackage);
+!!!74599095.java!!!	start() : void
+        if (DEBUG) Slog.d(TAG, "start()");
+        if (!mRunning) {
+            mRunning = true;
+
+            IntentFilter filter = new IntentFilter();
+            filter.addAction(Intent.ACTION_PACKAGE_ADDED);
+            filter.addAction(Intent.ACTION_PACKAGE_REMOVED);
+            filter.addAction(Intent.ACTION_PACKAGE_CHANGED);
+            filter.addAction(Intent.ACTION_PACKAGE_REPLACED);
+            filter.addAction(Intent.ACTION_PACKAGE_RESTARTED);
+            filter.addDataScheme("package");
+            mContext.registerReceiverAsUser(mScanPackagesReceiver,
+                    new UserHandle(mUserId), filter, null, mHandler);
+
+            // Scan packages.
+            // Also has the side-effect of restarting providers if needed.
+            mHandler.post(mScanPackagesRunnable);
+        }
+!!!74599223.java!!!	stop() : void
+        if (mRunning) {
+            mRunning = false;
+
+            mContext.unregisterReceiver(mScanPackagesReceiver);
+            mHandler.removeCallbacks(mScanPackagesRunnable);
+
+            // Stop all providers.
+            for (int i = mProviderProxies.size() - 1; i >= 0; i--) {
+                mProviderProxies.get(i).stop();
+            }
+        }
+!!!74599351.java!!!	scanPackages() : void
+        if (!mRunning) {
+            return;
+        }
+
+        if (DEBUG) Log.d(TAG, "scanPackages()");
+        // Add providers for all new services.
+        // Reorder the list so that providers left at the end will be the ones to remove.
+        int targetIndex = 0;
+        Intent intent = new Intent(TvRemoteProviderProxy.SERVICE_INTERFACE);
+        for (ResolveInfo resolveInfo : mPackageManager.queryIntentServicesAsUser(
+                intent, 0, mUserId)) {
+            ServiceInfo serviceInfo = resolveInfo.serviceInfo;
+            if (serviceInfo != null && verifyServiceTrusted(serviceInfo)) {
+                int sourceIndex = findProvider(serviceInfo.packageName, serviceInfo.name);
+                if (sourceIndex < 0) {
+                    TvRemoteProviderProxy providerProxy =
+                            new TvRemoteProviderProxy(mContext,
+                                    new ComponentName(serviceInfo.packageName, serviceInfo.name),
+                                    mUserId, serviceInfo.applicationInfo.uid);
+                    providerProxy.start();
+                    mProviderProxies.add(targetIndex++, providerProxy);
+                    mProvider.addProvider(providerProxy);
+                } else if (sourceIndex >= targetIndex) {
+                    TvRemoteProviderProxy provider = mProviderProxies.get(sourceIndex);
+                    provider.start(); // restart the provider if needed
+                    provider.rebindIfDisconnected();
+                    Collections.swap(mProviderProxies, sourceIndex, targetIndex++);
+                }
+            }
+        }
+        if (DEBUG) Log.d(TAG, "scanPackages() targetIndex " + targetIndex);
+        // Remove providers for missing services.
+        if (targetIndex < mProviderProxies.size()) {
+            for (int i = mProviderProxies.size() - 1; i >= targetIndex; i--) {
+                TvRemoteProviderProxy providerProxy = mProviderProxies.get(i);
+                mProvider.removeProvider(providerProxy);
+                mProviderProxies.remove(providerProxy);
+                providerProxy.stop();
+            }
+        }
+!!!74599479.java!!!	verifyServiceTrusted(inout serviceInfo : ServiceInfo) : boolean
+        if (serviceInfo.permission == null || !serviceInfo.permission.equals(
+                Manifest.permission.BIND_TV_REMOTE_SERVICE)) {
+            // If the service does not require this permission then any app could
+            // potentially bind to it and cause the atv remote provider service to
+            // misbehave.  So we only want to trust providers that require the
+            // correct permissions.
+            Slog.w(TAG, "Ignoring atv remote provider service because it did not "
+                    + "require the BIND_TV_REMOTE_SERVICE permission in its manifest: "
+                    + serviceInfo.packageName + "/" + serviceInfo.name);
+            return false;
+        }
+
+        // Check if package name is white-listed here.
+        if (!serviceInfo.packageName.equals(mUnbundledServicePackage)) {
+            Slog.w(TAG, "Ignoring atv remote provider service because the package has not "
+                    + "been set and/or whitelisted: "
+                    + serviceInfo.packageName + "/" + serviceInfo.name);
+            return false;
+        }
+
+        if (!hasNecessaryPermissions(serviceInfo.packageName)) {
+            // If the service does not have permission to be
+            // a virtual tv remote controller, do not trust it.
+            Slog.w(TAG, "Ignoring atv remote provider service because its package does not "
+                    + "have TV_VIRTUAL_REMOTE_CONTROLLER permission: " + serviceInfo.packageName);
+            return false;
+        }
+
+        // Looks good.
+        return true;
+!!!74599607.java!!!	hasNecessaryPermissions(inout packageName : String) : boolean
+        if ((mPackageManager.checkPermission(Manifest.permission.TV_VIRTUAL_REMOTE_CONTROLLER,
+                        packageName) == PackageManager.PERMISSION_GRANTED)) {
+            return true;
+        }
+        return false;
+!!!74599735.java!!!	findProvider(inout packageName : String, inout className : String) : int
+        int count = mProviderProxies.size();
+        for (int i = 0; i < count; i++) {
+            TvRemoteProviderProxy provider = mProviderProxies.get(i);
+            if (provider.hasComponentName(packageName, className)) {
+                return i;
+            }
+        }
+        return -1;

@@ -1,0 +1,367 @@
+class RuntimePermissionPersistence
+!!!85346231.java!!!	RuntimePermissionPersistence(inout lock : Object)
+            mLock = lock;
+!!!85346359.java!!!	areDefaultRuntimPermissionsGrantedLPr(in userId : int) : boolean
+            return mDefaultPermissionsGranted.get(userId);
+!!!85346487.java!!!	onDefaultRuntimePermissionsGrantedLPr(in userId : int) : void
+            mFingerprints.put(userId, Build.FINGERPRINT);
+            writePermissionsForUserAsyncLPr(userId);
+!!!85346615.java!!!	writePermissionsForUserSyncLPr(in userId : int) : void
+            mHandler.removeMessages(userId);
+            writePermissionsSync(userId);
+!!!85346743.java!!!	writePermissionsForUserAsyncLPr(in userId : int) : void
+            final long currentTimeMillis = SystemClock.uptimeMillis();
+
+            if (mWriteScheduled.get(userId)) {
+                mHandler.removeMessages(userId);
+
+                // If enough time passed, write without holding off anymore.
+                final long lastNotWrittenMutationTimeMillis = mLastNotWrittenMutationTimesMillis
+                        .get(userId);
+                final long timeSinceLastNotWrittenMutationMillis = currentTimeMillis
+                        - lastNotWrittenMutationTimeMillis;
+                if (timeSinceLastNotWrittenMutationMillis >= MAX_WRITE_PERMISSIONS_DELAY_MILLIS) {
+                    mHandler.obtainMessage(userId).sendToTarget();
+                    return;
+                }
+
+                // Hold off a bit more as settings are frequently changing.
+                final long maxDelayMillis = Math.max(lastNotWrittenMutationTimeMillis
+                        + MAX_WRITE_PERMISSIONS_DELAY_MILLIS - currentTimeMillis, 0);
+                final long writeDelayMillis = Math.min(WRITE_PERMISSIONS_DELAY_MILLIS,
+                        maxDelayMillis);
+
+                Message message = mHandler.obtainMessage(userId);
+                mHandler.sendMessageDelayed(message, writeDelayMillis);
+            } else {
+                mLastNotWrittenMutationTimesMillis.put(userId, currentTimeMillis);
+                Message message = mHandler.obtainMessage(userId);
+                mHandler.sendMessageDelayed(message, WRITE_PERMISSIONS_DELAY_MILLIS);
+                mWriteScheduled.put(userId, true);
+            }
+!!!85346871.java!!!	writePermissionsSync(in userId : int) : void
+            AtomicFile destination = new AtomicFile(getUserRuntimePermissionsFile(userId));
+
+            ArrayMap<String, List<PermissionState>> permissionsForPackage = new ArrayMap<>();
+            ArrayMap<String, List<PermissionState>> permissionsForSharedUser = new ArrayMap<>();
+
+            synchronized (mLock) {
+                mWriteScheduled.delete(userId);
+
+                final int packageCount = mPackages.size();
+                for (int i = 0; i < packageCount; i++) {
+                    String packageName = mPackages.keyAt(i);
+                    PackageSetting packageSetting = mPackages.valueAt(i);
+                    if (packageSetting.sharedUser == null) {
+                        PermissionsState permissionsState = packageSetting.getPermissionsState();
+                        List<PermissionState> permissionsStates = permissionsState
+                                .getRuntimePermissionStates(userId);
+                        if (!permissionsStates.isEmpty()) {
+                            permissionsForPackage.put(packageName, permissionsStates);
+                        }
+                    }
+                }
+
+                final int sharedUserCount = mSharedUsers.size();
+                for (int i = 0; i < sharedUserCount; i++) {
+                    String sharedUserName = mSharedUsers.keyAt(i);
+                    SharedUserSetting sharedUser = mSharedUsers.valueAt(i);
+                    PermissionsState permissionsState = sharedUser.getPermissionsState();
+                    List<PermissionState> permissionsStates = permissionsState
+                            .getRuntimePermissionStates(userId);
+                    if (!permissionsStates.isEmpty()) {
+                        permissionsForSharedUser.put(sharedUserName, permissionsStates);
+                    }
+                }
+            }
+
+            FileOutputStream out = null;
+            try {
+                out = destination.startWrite();
+
+                XmlSerializer serializer = Xml.newSerializer();
+                serializer.setOutput(out, StandardCharsets.UTF_8.name());
+                serializer.setFeature(
+                        "http://xmlpull.org/v1/doc/features.html#indent-output", true);
+                serializer.startDocument(null, true);
+
+                serializer.startTag(null, TAG_RUNTIME_PERMISSIONS);
+
+                String fingerprint = mFingerprints.get(userId);
+                if (fingerprint != null) {
+                    serializer.attribute(null, ATTR_FINGERPRINT, fingerprint);
+                }
+
+                final int packageCount = permissionsForPackage.size();
+                for (int i = 0; i < packageCount; i++) {
+                    String packageName = permissionsForPackage.keyAt(i);
+                    List<PermissionState> permissionStates = permissionsForPackage.valueAt(i);
+                    serializer.startTag(null, TAG_PACKAGE);
+                    serializer.attribute(null, ATTR_NAME, packageName);
+                    writePermissions(serializer, permissionStates);
+                    serializer.endTag(null, TAG_PACKAGE);
+                }
+
+                final int sharedUserCount = permissionsForSharedUser.size();
+                for (int i = 0; i < sharedUserCount; i++) {
+                    String packageName = permissionsForSharedUser.keyAt(i);
+                    List<PermissionState> permissionStates = permissionsForSharedUser.valueAt(i);
+                    serializer.startTag(null, TAG_SHARED_USER);
+                    serializer.attribute(null, ATTR_NAME, packageName);
+                    writePermissions(serializer, permissionStates);
+                    serializer.endTag(null, TAG_SHARED_USER);
+                }
+
+                serializer.endTag(null, TAG_RUNTIME_PERMISSIONS);
+
+                // Now any restored permission grants that are waiting for the apps
+                // in question to be installed.  These are stored as per-package
+                // TAG_RESTORED_RUNTIME_PERMISSIONS blocks, each containing some
+                // number of individual permission grant entities.
+                if (mRestoredUserGrants.get(userId) != null) {
+                    ArrayMap<String, ArraySet<RestoredPermissionGrant>> restoredGrants =
+                            mRestoredUserGrants.get(userId);
+                    if (restoredGrants != null) {
+                        final int pkgCount = restoredGrants.size();
+                        for (int i = 0; i < pkgCount; i++) {
+                            final ArraySet<RestoredPermissionGrant> pkgGrants =
+                                    restoredGrants.valueAt(i);
+                            if (pkgGrants != null && pkgGrants.size() > 0) {
+                                final String pkgName = restoredGrants.keyAt(i);
+                                serializer.startTag(null, TAG_RESTORED_RUNTIME_PERMISSIONS);
+                                serializer.attribute(null, ATTR_PACKAGE_NAME, pkgName);
+
+                                final int N = pkgGrants.size();
+                                for (int z = 0; z < N; z++) {
+                                    RestoredPermissionGrant g = pkgGrants.valueAt(z);
+                                    serializer.startTag(null, TAG_PERMISSION_ENTRY);
+                                    serializer.attribute(null, ATTR_NAME, g.permissionName);
+
+                                    if (g.granted) {
+                                        serializer.attribute(null, ATTR_GRANTED, "true");
+                                    }
+
+                                    if ((g.grantBits&FLAG_PERMISSION_USER_SET) != 0) {
+                                        serializer.attribute(null, ATTR_USER_SET, "true");
+                                    }
+                                    if ((g.grantBits&FLAG_PERMISSION_USER_FIXED) != 0) {
+                                        serializer.attribute(null, ATTR_USER_FIXED, "true");
+                                    }
+                                    if ((g.grantBits&FLAG_PERMISSION_REVOKE_ON_UPGRADE) != 0) {
+                                        serializer.attribute(null, ATTR_REVOKE_ON_UPGRADE, "true");
+                                    }
+                                    serializer.endTag(null, TAG_PERMISSION_ENTRY);
+                                }
+                                serializer.endTag(null, TAG_RESTORED_RUNTIME_PERMISSIONS);
+                            }
+                        }
+                    }
+                }
+
+                serializer.endDocument();
+                destination.finishWrite(out);
+
+                if (Build.FINGERPRINT.equals(fingerprint)) {
+                    mDefaultPermissionsGranted.put(userId, true);
+                }
+            // Any error while writing is fatal.
+            } catch (Throwable t) {
+                Slog.wtf(PackageManagerService.TAG,
+                        "Failed to write settings, restoring backup", t);
+                destination.failWrite(out);
+            } finally {
+                IoUtils.closeQuietly(out);
+            }
+!!!85346999.java!!!	onUserRemoved(in userId : int) : void
+            // Make sure we do not
+            mHandler.removeMessages(userId);
+
+            for (SettingBase sb : mPackages.values()) {
+                revokeRuntimePermissionsAndClearFlags(sb, userId);
+            }
+
+            for (SettingBase sb : mSharedUsers.values()) {
+                revokeRuntimePermissionsAndClearFlags(sb, userId);
+            }
+!!!85347127.java!!!	revokeRuntimePermissionsAndClearFlags(inout sb : SettingBase, in userId : int) : void
+            PermissionsState permissionsState = sb.getPermissionsState();
+            for (PermissionState permissionState
+                    : permissionsState.getRuntimePermissionStates(userId)) {
+                BasePermission bp = mPermissions.get(permissionState.getName());
+                if (bp != null) {
+                    permissionsState.revokeRuntimePermission(bp, userId);
+                    permissionsState.updatePermissionFlags(bp, userId,
+                            PackageManager.MASK_PERMISSION_FLAGS, 0);
+                }
+            }
+!!!85347255.java!!!	deleteUserRuntimePermissionsFile(in userId : int) : void
+            getUserRuntimePermissionsFile(userId).delete();
+!!!85347383.java!!!	readStateForUserSyncLPr(in userId : int) : void
+            File permissionsFile = getUserRuntimePermissionsFile(userId);
+            if (!permissionsFile.exists()) {
+                return;
+            }
+
+            FileInputStream in;
+            try {
+                in = new AtomicFile(permissionsFile).openRead();
+            } catch (FileNotFoundException fnfe) {
+                Slog.i(PackageManagerService.TAG, "No permissions state");
+                return;
+            }
+
+            try {
+                XmlPullParser parser = Xml.newPullParser();
+                parser.setInput(in, null);
+                parseRuntimePermissionsLPr(parser, userId);
+
+            } catch (XmlPullParserException | IOException e) {
+                throw new IllegalStateException("Failed parsing permissions file: "
+                        + permissionsFile , e);
+            } finally {
+                IoUtils.closeQuietly(in);
+            }
+!!!85347511.java!!!	rememberRestoredUserGrantLPr(inout pkgName : String, inout permission : String, inout isGranted : boolean, in restoredFlagSet : int, in userId : int) : void
+            // This change will be remembered at write-settings time
+            ArrayMap<String, ArraySet<RestoredPermissionGrant>> grantsByPackage =
+                    mRestoredUserGrants.get(userId);
+            if (grantsByPackage == null) {
+                grantsByPackage = new ArrayMap<String, ArraySet<RestoredPermissionGrant>>();
+                mRestoredUserGrants.put(userId, grantsByPackage);
+            }
+
+            ArraySet<RestoredPermissionGrant> grants = grantsByPackage.get(pkgName);
+            if (grants == null) {
+                grants = new ArraySet<RestoredPermissionGrant>();
+                grantsByPackage.put(pkgName, grants);
+            }
+
+            RestoredPermissionGrant grant = new RestoredPermissionGrant(permission,
+                    isGranted, restoredFlagSet);
+            grants.add(grant);
+!!!85347639.java!!!	parseRuntimePermissionsLPr(inout parser : XmlPullParser, in userId : int) : void
+            final int outerDepth = parser.getDepth();
+            int type;
+            while ((type = parser.next()) != XmlPullParser.END_DOCUMENT
+                    && (type != XmlPullParser.END_TAG || parser.getDepth() > outerDepth)) {
+                if (type == XmlPullParser.END_TAG || type == XmlPullParser.TEXT) {
+                    continue;
+                }
+
+                switch (parser.getName()) {
+                    case TAG_RUNTIME_PERMISSIONS: {
+                        String fingerprint = parser.getAttributeValue(null, ATTR_FINGERPRINT);
+                        mFingerprints.put(userId, fingerprint);
+                        final boolean defaultsGranted = Build.FINGERPRINT.equals(fingerprint);
+                        mDefaultPermissionsGranted.put(userId, defaultsGranted);
+                    } break;
+
+                    case TAG_PACKAGE: {
+                        String name = parser.getAttributeValue(null, ATTR_NAME);
+                        PackageSetting ps = mPackages.get(name);
+                        if (ps == null) {
+                            Slog.w(PackageManagerService.TAG, "Unknown package:" + name);
+                            XmlUtils.skipCurrentTag(parser);
+                            continue;
+                        }
+                        parsePermissionsLPr(parser, ps.getPermissionsState(), userId);
+                    } break;
+
+                    case TAG_SHARED_USER: {
+                        String name = parser.getAttributeValue(null, ATTR_NAME);
+                        SharedUserSetting sus = mSharedUsers.get(name);
+                        if (sus == null) {
+                            Slog.w(PackageManagerService.TAG, "Unknown shared user:" + name);
+                            XmlUtils.skipCurrentTag(parser);
+                            continue;
+                        }
+                        parsePermissionsLPr(parser, sus.getPermissionsState(), userId);
+                    } break;
+
+                    case TAG_RESTORED_RUNTIME_PERMISSIONS: {
+                        final String pkgName = parser.getAttributeValue(null, ATTR_PACKAGE_NAME);
+                        parseRestoredRuntimePermissionsLPr(parser, pkgName, userId);
+                    } break;
+                }
+            }
+!!!85347767.java!!!	parseRestoredRuntimePermissionsLPr(inout parser : XmlPullParser, in pkgName : String, in userId : int) : void
+            final int outerDepth = parser.getDepth();
+            int type;
+            while ((type = parser.next()) != XmlPullParser.END_DOCUMENT
+                    && (type != XmlPullParser.END_TAG || parser.getDepth() > outerDepth)) {
+                if (type == XmlPullParser.END_TAG || type == XmlPullParser.TEXT) {
+                    continue;
+                }
+
+                switch (parser.getName()) {
+                    case TAG_PERMISSION_ENTRY: {
+                        final String permName = parser.getAttributeValue(null, ATTR_NAME);
+                        final boolean isGranted = "true".equals(
+                                parser.getAttributeValue(null, ATTR_GRANTED));
+
+                        int permBits = 0;
+                        if ("true".equals(parser.getAttributeValue(null, ATTR_USER_SET))) {
+                            permBits |= FLAG_PERMISSION_USER_SET;
+                        }
+                        if ("true".equals(parser.getAttributeValue(null, ATTR_USER_FIXED))) {
+                            permBits |= FLAG_PERMISSION_USER_FIXED;
+                        }
+                        if ("true".equals(parser.getAttributeValue(null, ATTR_REVOKE_ON_UPGRADE))) {
+                            permBits |= FLAG_PERMISSION_REVOKE_ON_UPGRADE;
+                        }
+
+                        if (isGranted || permBits != 0) {
+                            rememberRestoredUserGrantLPr(pkgName, permName, isGranted, permBits, userId);
+                        }
+                    } break;
+                }
+            }
+!!!85347895.java!!!	parsePermissionsLPr(inout parser : XmlPullParser, inout permissionsState : PermissionsState, in userId : int) : void
+            final int outerDepth = parser.getDepth();
+            int type;
+            while ((type = parser.next()) != XmlPullParser.END_DOCUMENT
+                    && (type != XmlPullParser.END_TAG || parser.getDepth() > outerDepth)) {
+                if (type == XmlPullParser.END_TAG || type == XmlPullParser.TEXT) {
+                    continue;
+                }
+
+                switch (parser.getName()) {
+                    case TAG_ITEM: {
+                        String name = parser.getAttributeValue(null, ATTR_NAME);
+                        BasePermission bp = mPermissions.get(name);
+                        if (bp == null) {
+                            Slog.w(PackageManagerService.TAG, "Unknown permission:" + name);
+                            XmlUtils.skipCurrentTag(parser);
+                            continue;
+                        }
+
+                        String grantedStr = parser.getAttributeValue(null, ATTR_GRANTED);
+                        final boolean granted = grantedStr == null
+                                || Boolean.parseBoolean(grantedStr);
+
+                        String flagsStr = parser.getAttributeValue(null, ATTR_FLAGS);
+                        final int flags = (flagsStr != null)
+                                ? Integer.parseInt(flagsStr, 16) : 0;
+
+                        if (granted) {
+                            permissionsState.grantRuntimePermission(bp, userId);
+                            permissionsState.updatePermissionFlags(bp, userId,
+                                        PackageManager.MASK_PERMISSION_FLAGS, flags);
+                        } else {
+                            permissionsState.updatePermissionFlags(bp, userId,
+                                    PackageManager.MASK_PERMISSION_FLAGS, flags);
+                        }
+
+                    } break;
+                }
+            }
+!!!85348023.java!!!	writePermissions(inout serializer : XmlSerializer, inout permissionStates : List<PermissionState>) : void
+            for (PermissionState permissionState : permissionStates) {
+                serializer.startTag(null, TAG_ITEM);
+                serializer.attribute(null, ATTR_NAME,permissionState.getName());
+                serializer.attribute(null, ATTR_GRANTED,
+                        String.valueOf(permissionState.isGranted()));
+                serializer.attribute(null, ATTR_FLAGS,
+                        Integer.toHexString(permissionState.getFlags()));
+                serializer.endTag(null, TAG_ITEM);
+            }

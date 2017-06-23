@@ -1,0 +1,184 @@
+class Bitmap
+!!!82677559.cpp!!!	Bitmap(inout env : JNIEnv, in storageObj : jbyteArray, inout address : void, in info : SkImageInfo, in rowBytes : size_t, inout ctable : SkColorTable)
+    env->GetJavaVM(&mPixelStorage.java.jvm);
+    mPixelStorage.java.jweakRef = env->NewWeakGlobalRef(storageObj);
+    mPixelStorage.java.jstrongRef = nullptr;
+    mPixelRef.reset(new WrappedPixelRef(this, address, info, rowBytes, ctable));
+    // Note: this will trigger a call to onStrongRefDestroyed(), but
+    // we want the pixel ref to have a ref count of 0 at this point
+    mPixelRef->unref();
+!!!82677687.cpp!!!	Bitmap(inout address : void, inout context : void, in freeFunc : FreeFunc, in info : SkImageInfo, in rowBytes : size_t, inout ctable : SkColorTable)
+    mPixelStorage.external.address = address;
+    mPixelStorage.external.context = context;
+    mPixelStorage.external.freeFunc = freeFunc;
+    mPixelRef.reset(new WrappedPixelRef(this, address, info, rowBytes, ctable));
+    // Note: this will trigger a call to onStrongRefDestroyed(), but
+    // we want the pixel ref to have a ref count of 0 at this point
+    mPixelRef->unref();
+!!!82677815.cpp!!!	Bitmap(inout address : void, in fd : int, in info : SkImageInfo, in rowBytes : size_t, inout ctable : SkColorTable)
+    mPixelStorage.ashmem.address = address;
+    mPixelStorage.ashmem.fd = fd;
+    mPixelStorage.ashmem.size = ashmem_get_size_region(fd);
+    mPixelRef.reset(new WrappedPixelRef(this, address, info, rowBytes, ctable));
+    // Note: this will trigger a call to onStrongRefDestroyed(), but
+    // we want the pixel ref to have a ref count of 0 at this point
+    mPixelRef->unref();
+!!!82677943.cpp!!!	info() : SkImageInfo
+    return mPixelRef->info();
+!!!82678455.cpp!!!	rowBytes() : size_t
+    return mPixelRef->rowBytes();
+!!!82678583.cpp!!!	peekAtPixelRef() : SkPixelRef
+    assertValid();
+    return mPixelRef.get();
+!!!82678711.cpp!!!	refPixelRef() : SkPixelRef
+    assertValid();
+    android::AutoMutex _lock(mLock);
+    return refPixelRefLocked();
+!!!82678967.cpp!!!	reconfigure(in info : SkImageInfo, in rowBytes : size_t, inout ctable : SkColorTable) : void
+    mPixelRef->reconfigure(info, rowBytes, ctable);
+!!!82679095.cpp!!!	reconfigure(in info : SkImageInfo) : void
+    reconfigure(info, info.minRowBytes(), nullptr);
+!!!82679223.cpp!!!	setAlphaType(in alphaType : SkAlphaType) : void
+    if (!SkColorTypeValidateAlphaType(info().colorType(), alphaType, &alphaType)) {
+        return;
+    }
+
+    mPixelRef->changeAlphaType(alphaType);
+!!!82679351.cpp!!!	getSkBitmap(inout outBitmap : SkBitmap) : void
+    assertValid();
+    android::AutoMutex _lock(mLock);
+    // Safe because mPixelRef is a WrappedPixelRef type, otherwise rowBytes()
+    // would require locking the pixels first.
+    outBitmap->setInfo(mPixelRef->info(), mPixelRef->rowBytes());
+    outBitmap->setPixelRef(refPixelRefLocked())->unref();
+    outBitmap->setHasHardwareMipMap(hasHardwareMipMap());
+!!!82679479.cpp!!!	detachFromJava() : void
+    bool disposeSelf;
+    {
+        android::AutoMutex _lock(mLock);
+        mAttachedToJava = false;
+        disposeSelf = shouldDisposeSelfLocked();
+    }
+    if (disposeSelf) {
+        delete this;
+    }
+!!!82679607.cpp!!!	freePixels() : void
+    AutoMutex _lock(mLock);
+    if (mPinnedRefCount == 0) {
+        doFreePixels();
+        mPixelStorageType = PixelStorageType::Invalid;
+    }
+!!!82679735.cpp!!!	hasHardwareMipMap() : bool
+    return mPixelRef->hasHardwareMipMap();
+!!!82679863.cpp!!!	setHasHardwareMipMap(in hasMipMap : bool) : void
+    mPixelRef->setHasHardwareMipMap(hasMipMap);
+!!!82679991.cpp!!!	getAshmemFd() : int
+    switch (mPixelStorageType) {
+    case PixelStorageType::Ashmem:
+        return mPixelStorage.ashmem.fd;
+    default:
+        return -1;
+    }
+!!!82680119.cpp!!!	~Bitmap()
+    doFreePixels();
+!!!82680247.cpp!!!	doFreePixels() : void
+    switch (mPixelStorageType) {
+    case PixelStorageType::Invalid:
+        // already free'd, nothing to do
+        break;
+    case PixelStorageType::External:
+        mPixelStorage.external.freeFunc(mPixelStorage.external.address,
+                mPixelStorage.external.context);
+        break;
+    case PixelStorageType::Ashmem:
+        munmap(mPixelStorage.ashmem.address, mPixelStorage.ashmem.size);
+        close(mPixelStorage.ashmem.fd);
+        break;
+    case PixelStorageType::Java:
+        JNIEnv* env = jniEnv();
+        LOG_ALWAYS_FATAL_IF(mPixelStorage.java.jstrongRef,
+                "Deleting a bitmap wrapper while there are outstanding strong "
+                "references! mPinnedRefCount = %d", mPinnedRefCount);
+        env->DeleteWeakGlobalRef(mPixelStorage.java.jweakRef);
+        break;
+    }
+
+    if (android::uirenderer::Caches::hasInstance()) {
+        android::uirenderer::Caches::getInstance().textureCache.releaseTexture(
+                mPixelRef->getStableID());
+    }
+!!!82680375.cpp!!!	onStrongRefDestroyed() : void
+    bool disposeSelf = false;
+    {
+        android::AutoMutex _lock(mLock);
+        if (mPinnedRefCount > 0) {
+            mPinnedRefCount--;
+            if (mPinnedRefCount == 0) {
+                unpinPixelsLocked();
+                disposeSelf = shouldDisposeSelfLocked();
+            }
+        }
+    }
+    if (disposeSelf) {
+        delete this;
+    }
+!!!82680503.cpp!!!	pinPixelsLocked() : void
+    switch (mPixelStorageType) {
+    case PixelStorageType::Invalid:
+        LOG_ALWAYS_FATAL("Cannot pin invalid pixels!");
+        break;
+    case PixelStorageType::External:
+    case PixelStorageType::Ashmem:
+        // Nothing to do
+        break;
+    case PixelStorageType::Java: {
+        JNIEnv* env = jniEnv();
+        if (!mPixelStorage.java.jstrongRef) {
+            mPixelStorage.java.jstrongRef = reinterpret_cast<jbyteArray>(
+                    env->NewGlobalRef(mPixelStorage.java.jweakRef));
+            if (!mPixelStorage.java.jstrongRef) {
+                LOG_ALWAYS_FATAL("Failed to acquire strong reference to pixels");
+            }
+        }
+        break;
+    }
+    }
+!!!82680631.cpp!!!	unpinPixelsLocked() : void
+    switch (mPixelStorageType) {
+    case PixelStorageType::Invalid:
+        LOG_ALWAYS_FATAL("Cannot unpin invalid pixels!");
+        break;
+    case PixelStorageType::External:
+    case PixelStorageType::Ashmem:
+        // Don't need to do anything
+        break;
+    case PixelStorageType::Java: {
+        JNIEnv* env = jniEnv();
+        if (mPixelStorage.java.jstrongRef) {
+            env->DeleteGlobalRef(mPixelStorage.java.jstrongRef);
+            mPixelStorage.java.jstrongRef = nullptr;
+        }
+        break;
+    }
+    }
+!!!82680759.cpp!!!	jniEnv() : JNIEnv
+    JNIEnv* env;
+    auto success = mPixelStorage.java.jvm->GetEnv((void**)&env, JNI_VERSION_1_6);
+    LOG_ALWAYS_FATAL_IF(success != JNI_OK,
+        "Failed to get JNIEnv* from JVM: %p", mPixelStorage.java.jvm);
+    return env;
+!!!82680887.cpp!!!	shouldDisposeSelfLocked() : bool
+    return mPinnedRefCount == 0 && !mAttachedToJava;
+!!!82681015.cpp!!!	assertValid() : void
+    LOG_ALWAYS_FATAL_IF(mPixelStorageType == PixelStorageType::Invalid,
+            "Error, cannot access an invalid/free'd bitmap here!");
+!!!82681143.cpp!!!	refPixelRefLocked() : SkPixelRef
+    mPixelRef->ref();
+    if (mPixelRef->unique()) {
+        // We just restored this from 0, pin the pixels and inc the strong count
+        // Note that there *might be* an incoming onStrongRefDestroyed from whatever
+        // last unref'd
+        pinPixelsLocked();
+        mPinnedRefCount++;
+    }
+    return mPixelRef.get();

@@ -1,0 +1,96 @@
+class DrawFrameTask
+!!!46309815.cpp!!!	setContext(inout thread : RenderThread, inout context : CanvasContext, inout targetNode : RenderNode) : void
+    mRenderThread = thread;
+    mContext = context;
+    mTargetNode = targetNode;
+!!!46309943.cpp!!!	pushLayerUpdate(inout layer : DeferredLayerUpdater) : void
+    LOG_ALWAYS_FATAL_IF(!mContext, "Lifecycle violation, there's no context to pushLayerUpdate with!");
+
+    for (size_t i = 0; i < mLayers.size(); i++) {
+        if (mLayers[i].get() == layer) {
+            return;
+        }
+    }
+    mLayers.push_back(layer);
+!!!46310071.cpp!!!	removeLayerUpdate(inout layer : DeferredLayerUpdater) : void
+    for (size_t i = 0; i < mLayers.size(); i++) {
+        if (mLayers[i].get() == layer) {
+            mLayers.erase(mLayers.begin() + i);
+            return;
+        }
+    }
+!!!46310199.cpp!!!	drawFrame(inout observer : TreeObserver) : int
+    LOG_ALWAYS_FATAL_IF(!mContext, "Cannot drawFrame with no CanvasContext!");
+
+    mSyncResult = SyncResult::OK;
+    mSyncQueued = systemTime(CLOCK_MONOTONIC);
+    mObserver = observer;
+    postAndWait();
+
+    return mSyncResult;
+!!!46310455.cpp!!!	run() : void
+    ATRACE_NAME("DrawFrame");
+
+    bool canUnblockUiThread;
+    bool canDrawThisFrame;
+    {
+        TreeInfo info(TreeInfo::MODE_FULL, *mContext);
+        info.observer = mObserver;
+        canUnblockUiThread = syncFrameState(info);
+        canDrawThisFrame = info.out.canDrawThisFrame;
+    }
+
+    // Grab a copy of everything we need
+    CanvasContext* context = mContext;
+
+    // From this point on anything in "this" is *UNSAFE TO ACCESS*
+    if (canUnblockUiThread) {
+        unblockUiThread();
+    }
+
+    if (CC_LIKELY(canDrawThisFrame)) {
+        context->draw();
+    }
+
+    if (!canUnblockUiThread) {
+        unblockUiThread();
+    }
+!!!46310583.cpp!!!	postAndWait() : void
+    AutoMutex _lock(mLock);
+    mRenderThread->queue(this);
+    mSignal.wait(mLock);
+!!!46310711.cpp!!!	syncFrameState(inout info : TreeInfo) : bool
+    ATRACE_CALL();
+    int64_t vsync = mFrameInfo[static_cast<int>(FrameInfoIndex::Vsync)];
+    mRenderThread->timeLord().vsyncReceived(vsync);
+    bool canDraw = mContext->makeCurrent();
+    Caches::getInstance().textureCache.resetMarkInUse(mContext);
+
+    for (size_t i = 0; i < mLayers.size(); i++) {
+        mLayers[i]->apply();
+    }
+    mLayers.clear();
+    mContext->prepareTree(info, mFrameInfo, mSyncQueued, mTargetNode);
+
+    // This is after the prepareTree so that any pending operations
+    // (RenderNode tree state, prefetched layers, etc...) will be flushed.
+    if (CC_UNLIKELY(!mContext->hasSurface() || !canDraw)) {
+        if (!mContext->hasSurface()) {
+            mSyncResult |= SyncResult::LostSurfaceRewardIfFound;
+        } else {
+            // If we have a surface but can't draw we must be stopped
+            mSyncResult |= SyncResult::ContextIsStopped;
+        }
+        info.out.canDrawThisFrame = false;
+    }
+
+    if (info.out.hasAnimations) {
+        if (info.out.requiresUiRedraw) {
+            mSyncResult |= SyncResult::UIRedrawRequired;
+        }
+    }
+    // If prepareTextures is false, we ran out of texture cache space
+    return info.prepareTextures;
+!!!46310839.cpp!!!	unblockUiThread() : void
+    AutoMutex _lock(mLock);
+    mSignal.signal();

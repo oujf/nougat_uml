@@ -1,0 +1,301 @@
+class ReadJobMapFromDiskRunnable
+!!!73921207.java!!!	ReadJobMapFromDiskRunnable(inout jobSet : JobStore::JobSet)
+            this.jobSet = jobSet;
+!!!73921335.java!!!	run() : void
+            try {
+                List<JobStatus> jobs;
+                FileInputStream fis = mJobsFile.openRead();
+                synchronized (mLock) {
+                    jobs = readJobMapImpl(fis);
+                    if (jobs != null) {
+                        for (int i=0; i<jobs.size(); i++) {
+                            this.jobSet.add(jobs.get(i));
+                        }
+                    }
+                }
+                fis.close();
+            } catch (FileNotFoundException e) {
+                if (JobSchedulerService.DEBUG) {
+                    Slog.d(TAG, "Could not find jobs file, probably there was nothing to load.");
+                }
+            } catch (XmlPullParserException e) {
+                if (JobSchedulerService.DEBUG) {
+                    Slog.d(TAG, "Error parsing xml.", e);
+                }
+            } catch (IOException e) {
+                if (JobSchedulerService.DEBUG) {
+                    Slog.d(TAG, "Error parsing xml.", e);
+                }
+            }
+!!!73921463.java!!!	readJobMapImpl(inout fis : FileInputStream) : JobStatus
+            XmlPullParser parser = Xml.newPullParser();
+            parser.setInput(fis, StandardCharsets.UTF_8.name());
+
+            int eventType = parser.getEventType();
+            while (eventType != XmlPullParser.START_TAG &&
+                    eventType != XmlPullParser.END_DOCUMENT) {
+                eventType = parser.next();
+                Slog.d(TAG, "Start tag: " + parser.getName());
+            }
+            if (eventType == XmlPullParser.END_DOCUMENT) {
+                if (DEBUG) {
+                    Slog.d(TAG, "No persisted jobs.");
+                }
+                return null;
+            }
+
+            String tagName = parser.getName();
+            if ("job-info".equals(tagName)) {
+                final List<JobStatus> jobs = new ArrayList<JobStatus>();
+                // Read in version info.
+                try {
+                    int version = Integer.parseInt(parser.getAttributeValue(null, "version"));
+                    if (version != JOBS_FILE_VERSION) {
+                        Slog.d(TAG, "Invalid version number, aborting jobs file read.");
+                        return null;
+                    }
+                } catch (NumberFormatException e) {
+                    Slog.e(TAG, "Invalid version number, aborting jobs file read.");
+                    return null;
+                }
+                eventType = parser.next();
+                do {
+                    // Read each <job/>
+                    if (eventType == XmlPullParser.START_TAG) {
+                        tagName = parser.getName();
+                        // Start reading job.
+                        if ("job".equals(tagName)) {
+                            JobStatus persistedJob = restoreJobFromXml(parser);
+                            if (persistedJob != null) {
+                                if (DEBUG) {
+                                    Slog.d(TAG, "Read out " + persistedJob);
+                                }
+                                jobs.add(persistedJob);
+                            } else {
+                                Slog.d(TAG, "Error reading job from file.");
+                            }
+                        }
+                    }
+                    eventType = parser.next();
+                } while (eventType != XmlPullParser.END_DOCUMENT);
+                return jobs;
+            }
+            return null;
+!!!73921591.java!!!	restoreJobFromXml(inout parser : XmlPullParser) : JobStatus
+            JobInfo.Builder jobBuilder;
+            int uid, sourceUserId;
+
+            // Read out job identifier attributes and priority.
+            try {
+                jobBuilder = buildBuilderFromXml(parser);
+                jobBuilder.setPersisted(true);
+                uid = Integer.parseInt(parser.getAttributeValue(null, "uid"));
+
+                String val = parser.getAttributeValue(null, "priority");
+                if (val != null) {
+                    jobBuilder.setPriority(Integer.parseInt(val));
+                }
+                val = parser.getAttributeValue(null, "flags");
+                if (val != null) {
+                    jobBuilder.setFlags(Integer.parseInt(val));
+                }
+                val = parser.getAttributeValue(null, "sourceUserId");
+                sourceUserId = val == null ? -1 : Integer.parseInt(val);
+            } catch (NumberFormatException e) {
+                Slog.e(TAG, "Error parsing job's required fields, skipping");
+                return null;
+            }
+
+            String sourcePackageName = parser.getAttributeValue(null, "sourcePackageName");
+
+            final String sourceTag = parser.getAttributeValue(null, "sourceTag");
+
+            int eventType;
+            // Read out constraints tag.
+            do {
+                eventType = parser.next();
+            } while (eventType == XmlPullParser.TEXT);  // Push through to next START_TAG.
+
+            if (!(eventType == XmlPullParser.START_TAG &&
+                    XML_TAG_PARAMS_CONSTRAINTS.equals(parser.getName()))) {
+                // Expecting a <constraints> start tag.
+                return null;
+            }
+            try {
+                buildConstraintsFromXml(jobBuilder, parser);
+            } catch (NumberFormatException e) {
+                Slog.d(TAG, "Error reading constraints, skipping.");
+                return null;
+            }
+            parser.next(); // Consume </constraints>
+
+            // Read out execution parameters tag.
+            do {
+                eventType = parser.next();
+            } while (eventType == XmlPullParser.TEXT);
+            if (eventType != XmlPullParser.START_TAG) {
+                return null;
+            }
+
+            // Tuple of (earliest runtime, latest runtime) in elapsed realtime after disk load.
+            Pair<Long, Long> elapsedRuntimes;
+            try {
+                elapsedRuntimes = buildExecutionTimesFromXml(parser);
+            } catch (NumberFormatException e) {
+                if (DEBUG) {
+                    Slog.d(TAG, "Error parsing execution time parameters, skipping.");
+                }
+                return null;
+            }
+
+            final long elapsedNow = SystemClock.elapsedRealtime();
+            if (XML_TAG_PERIODIC.equals(parser.getName())) {
+                try {
+                    String val = parser.getAttributeValue(null, "period");
+                    final long periodMillis = Long.valueOf(val);
+                    val = parser.getAttributeValue(null, "flex");
+                    final long flexMillis = (val != null) ? Long.valueOf(val) : periodMillis;
+                    jobBuilder.setPeriodic(periodMillis, flexMillis);
+                    // As a sanity check, cap the recreated run time to be no later than flex+period
+                    // from now. This is the latest the periodic could be pushed out. This could
+                    // happen if the periodic ran early (at flex time before period), and then the
+                    // device rebooted.
+                    if (elapsedRuntimes.second > elapsedNow + periodMillis + flexMillis) {
+                        final long clampedLateRuntimeElapsed = elapsedNow + flexMillis
+                                + periodMillis;
+                        final long clampedEarlyRuntimeElapsed = clampedLateRuntimeElapsed
+                                - flexMillis;
+                        Slog.w(TAG,
+                                String.format("Periodic job for uid='%d' persisted run-time is" +
+                                                " too big [%s, %s]. Clamping to [%s,%s]",
+                                        uid,
+                                        DateUtils.formatElapsedTime(elapsedRuntimes.first / 1000),
+                                        DateUtils.formatElapsedTime(elapsedRuntimes.second / 1000),
+                                        DateUtils.formatElapsedTime(
+                                                clampedEarlyRuntimeElapsed / 1000),
+                                        DateUtils.formatElapsedTime(
+                                                clampedLateRuntimeElapsed / 1000))
+                        );
+                        elapsedRuntimes =
+                                Pair.create(clampedEarlyRuntimeElapsed, clampedLateRuntimeElapsed);
+                    }
+                } catch (NumberFormatException e) {
+                    Slog.d(TAG, "Error reading periodic execution criteria, skipping.");
+                    return null;
+                }
+            } else if (XML_TAG_ONEOFF.equals(parser.getName())) {
+                try {
+                    if (elapsedRuntimes.first != JobStatus.NO_EARLIEST_RUNTIME) {
+                        jobBuilder.setMinimumLatency(elapsedRuntimes.first - elapsedNow);
+                    }
+                    if (elapsedRuntimes.second != JobStatus.NO_LATEST_RUNTIME) {
+                        jobBuilder.setOverrideDeadline(
+                                elapsedRuntimes.second - elapsedNow);
+                    }
+                } catch (NumberFormatException e) {
+                    Slog.d(TAG, "Error reading job execution criteria, skipping.");
+                    return null;
+                }
+            } else {
+                if (DEBUG) {
+                    Slog.d(TAG, "Invalid parameter tag, skipping - " + parser.getName());
+                }
+                // Expecting a parameters start tag.
+                return null;
+            }
+            maybeBuildBackoffPolicyFromXml(jobBuilder, parser);
+
+            parser.nextTag(); // Consume parameters end tag.
+
+            // Read out extras Bundle.
+            do {
+                eventType = parser.next();
+            } while (eventType == XmlPullParser.TEXT);
+            if (!(eventType == XmlPullParser.START_TAG
+                    && XML_TAG_EXTRAS.equals(parser.getName()))) {
+                if (DEBUG) {
+                    Slog.d(TAG, "Error reading extras, skipping.");
+                }
+                return null;
+            }
+
+            PersistableBundle extras = PersistableBundle.restoreFromXml(parser);
+            jobBuilder.setExtras(extras);
+            parser.nextTag(); // Consume </extras>
+
+            // Migrate sync jobs forward from earlier, incomplete representation
+            if ("android".equals(sourcePackageName)
+                    && extras != null
+                    && extras.getBoolean("SyncManagerJob", false)) {
+                sourcePackageName = extras.getString("owningPackage", sourcePackageName);
+                if (DEBUG) {
+                    Slog.i(TAG, "Fixing up sync job source package name from 'android' to '"
+                            + sourcePackageName + "'");
+                }
+            }
+
+            // And now we're done
+            JobStatus js = new JobStatus(
+                    jobBuilder.build(), uid, sourcePackageName, sourceUserId, sourceTag,
+                    elapsedRuntimes.first, elapsedRuntimes.second);
+            return js;
+!!!73921719.java!!!	buildBuilderFromXml(inout parser : XmlPullParser) : JobInfo::Builder
+            // Pull out required fields from <job> attributes.
+            int jobId = Integer.parseInt(parser.getAttributeValue(null, "jobid"));
+            String packageName = parser.getAttributeValue(null, "package");
+            String className = parser.getAttributeValue(null, "class");
+            ComponentName cname = new ComponentName(packageName, className);
+
+            return new JobInfo.Builder(jobId, cname);
+!!!73921847.java!!!	buildConstraintsFromXml(inout jobBuilder : JobInfo::Builder, inout parser : XmlPullParser) : void
+            String val = parser.getAttributeValue(null, "connectivity");
+            if (val != null) {
+                jobBuilder.setRequiredNetworkType(JobInfo.NETWORK_TYPE_ANY);
+            }
+            val = parser.getAttributeValue(null, "unmetered");
+            if (val != null) {
+                jobBuilder.setRequiredNetworkType(JobInfo.NETWORK_TYPE_UNMETERED);
+            }
+            val = parser.getAttributeValue(null, "not-roaming");
+            if (val != null) {
+                jobBuilder.setRequiredNetworkType(JobInfo.NETWORK_TYPE_NOT_ROAMING);
+            }
+            val = parser.getAttributeValue(null, "idle");
+            if (val != null) {
+                jobBuilder.setRequiresDeviceIdle(true);
+            }
+            val = parser.getAttributeValue(null, "charging");
+            if (val != null) {
+                jobBuilder.setRequiresCharging(true);
+            }
+!!!73921975.java!!!	maybeBuildBackoffPolicyFromXml(inout jobBuilder : JobInfo::Builder, inout parser : XmlPullParser) : void
+            String val = parser.getAttributeValue(null, "initial-backoff");
+            if (val != null) {
+                long initialBackoff = Long.valueOf(val);
+                val = parser.getAttributeValue(null, "backoff-policy");
+                int backoffPolicy = Integer.parseInt(val);  // Will throw NFE which we catch higher up.
+                jobBuilder.setBackoffCriteria(initialBackoff, backoffPolicy);
+            }
+!!!73922103.java!!!	buildExecutionTimesFromXml(inout parser : XmlPullParser) : Pair
+            // Pull out execution time data.
+            final long nowWallclock = System.currentTimeMillis();
+            final long nowElapsed = SystemClock.elapsedRealtime();
+
+            long earliestRunTimeElapsed = JobStatus.NO_EARLIEST_RUNTIME;
+            long latestRunTimeElapsed = JobStatus.NO_LATEST_RUNTIME;
+            String val = parser.getAttributeValue(null, "deadline");
+            if (val != null) {
+                long latestRuntimeWallclock = Long.valueOf(val);
+                long maxDelayElapsed =
+                        Math.max(latestRuntimeWallclock - nowWallclock, 0);
+                latestRunTimeElapsed = nowElapsed + maxDelayElapsed;
+            }
+            val = parser.getAttributeValue(null, "delay");
+            if (val != null) {
+                long earliestRuntimeWallclock = Long.valueOf(val);
+                long minDelayElapsed =
+                        Math.max(earliestRuntimeWallclock - nowWallclock, 0);
+                earliestRunTimeElapsed = nowElapsed + minDelayElapsed;
+
+            }
+            return Pair.create(earliestRunTimeElapsed, latestRunTimeElapsed);

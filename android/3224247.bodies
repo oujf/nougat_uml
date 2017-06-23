@@ -1,0 +1,136 @@
+class AsymmetricKey
+!!!43096759.cpp!!!	formatted_key_material(in format : keymaster_key_format_t, inout material : UniquePtr<uint8_t[]>, inout size : size_t) : keymaster_error_t
+    if (format != KM_KEY_FORMAT_X509)
+        return KM_ERROR_UNSUPPORTED_KEY_FORMAT;
+
+    if (material == NULL || size == NULL)
+        return KM_ERROR_OUTPUT_PARAMETER_NULL;
+
+    EVP_PKEY_Ptr pkey(EVP_PKEY_new());
+    if (!InternalToEvp(pkey.get()))
+        return TranslateLastOpenSslError();
+
+    int key_data_length = i2d_PUBKEY(pkey.get(), NULL);
+    if (key_data_length <= 0)
+        return TranslateLastOpenSslError();
+
+    material->reset(new (std::nothrow) uint8_t[key_data_length]);
+    if (material->get() == NULL)
+        return KM_ERROR_MEMORY_ALLOCATION_FAILED;
+
+    uint8_t* tmp = material->get();
+    if (i2d_PUBKEY(pkey.get(), &tmp) != key_data_length) {
+        material->reset();
+        return TranslateLastOpenSslError();
+    }
+
+    *size = key_data_length;
+    return KM_ERROR_OK;
+!!!43096887.cpp!!!	GenerateAttestation(in context : KeymasterContext, in attest_params : AuthorizationSet, in tee_enforced : AuthorizationSet, in sw_enforced : AuthorizationSet, inout cert_chain : keymaster_cert_chain_t) : keymaster_error_t
+
+    keymaster_algorithm_t sign_algorithm;
+    if ((!sw_enforced.GetTagValue(TAG_ALGORITHM, &sign_algorithm) &&
+         !tee_enforced.GetTagValue(TAG_ALGORITHM, &sign_algorithm)))
+        return KM_ERROR_UNKNOWN_ERROR;
+
+    if ((sign_algorithm != KM_ALGORITHM_RSA && sign_algorithm != KM_ALGORITHM_EC))
+        return KM_ERROR_INCOMPATIBLE_ALGORITHM;
+
+    EVP_PKEY_Ptr pkey(EVP_PKEY_new());
+    if (!InternalToEvp(pkey.get()))
+        return TranslateLastOpenSslError();
+
+    X509_Ptr certificate(X509_new());
+    if (!certificate.get())
+        return TranslateLastOpenSslError();
+
+    if (!X509_set_version(certificate.get(), 2 /* version 3, but zero-based */))
+        return TranslateLastOpenSslError();
+
+    ASN1_INTEGER_Ptr serialNumber(ASN1_INTEGER_new());
+    if (!serialNumber.get() || !ASN1_INTEGER_set(serialNumber.get(), 1) ||
+        !X509_set_serialNumber(certificate.get(), serialNumber.get() /* Don't release; copied */))
+        return TranslateLastOpenSslError();
+
+    // TODO(swillden): Find useful values (if possible) for issuerName and subjectName.
+    X509_NAME_Ptr issuerName(X509_NAME_new());
+    if (!issuerName.get() ||
+        !X509_NAME_add_entry_by_txt(issuerName.get(), "CN", MBSTRING_ASC,
+                                    reinterpret_cast<const uint8_t*>("Android Keymaster"),
+                                    -1 /* len */, -1 /* loc */, 0 /* set */) ||
+        !X509_set_issuer_name(certificate.get(), issuerName.get() /* Don't release; copied  */))
+        return TranslateLastOpenSslError();
+
+    X509_NAME_Ptr subjectName(X509_NAME_new());
+    if (!subjectName.get() ||
+        !X509_NAME_add_entry_by_txt(subjectName.get(), "CN", MBSTRING_ASC,
+                                    reinterpret_cast<const uint8_t*>("A Keymaster Key"),
+                                    -1 /* len */, -1 /* loc */, 0 /* set */) ||
+        !X509_set_subject_name(certificate.get(), subjectName.get() /* Don't release; copied */))
+        return TranslateLastOpenSslError();
+
+    ASN1_TIME_Ptr notBefore(ASN1_TIME_new());
+    uint64_t activeDateTime = 0;
+    authorizations().GetTagValue(TAG_ACTIVE_DATETIME, &activeDateTime);
+    if (!notBefore.get() || !ASN1_TIME_set(notBefore.get(), activeDateTime / 1000) ||
+        !X509_set_notBefore(certificate.get(), notBefore.get() /* Don't release; copied */))
+        return TranslateLastOpenSslError();
+
+    ASN1_TIME_Ptr notAfter(ASN1_TIME_new());
+    uint64_t usageExpireDateTime = UINT64_MAX;
+    authorizations().GetTagValue(TAG_USAGE_EXPIRE_DATETIME, &usageExpireDateTime);
+    // TODO(swillden): When trusty can use the C++ standard library change the calculation of
+    // notAfterTime to use std::numeric_limits<time_t>::max(), rather than assuming that time_t is
+    // 32 bits.
+    time_t notAfterTime = min(static_cast<uint64_t>(UINT32_MAX), usageExpireDateTime / 1000);
+    if (!notAfter.get() || !ASN1_TIME_set(notAfter.get(), notAfterTime) ||
+        !X509_set_notAfter(certificate.get(), notAfter.get() /* Don't release; copied */))
+        return TranslateLastOpenSslError();
+
+    keymaster_error_t error = add_key_usage_extension(tee_enforced, sw_enforced, certificate.get());
+    if (error != KM_ERROR_OK) {
+        return error;
+    }
+
+    EVP_PKEY_Ptr sign_key(context.AttestationKey(sign_algorithm, &error));
+
+    if (!sign_key.get() ||  //
+        !add_public_key(pkey.get(), certificate.get(), &error) ||
+        !add_attestation_extension(attest_params, tee_enforced, sw_enforced, context,
+                                   certificate.get(), &error))
+        return error;
+
+    if (!copy_attestation_chain(context, sign_algorithm, cert_chain, &error))
+        return error;
+
+    // Copy subject key identifier from cert_chain->entries[1] as authority key_id.
+    if (cert_chain->entry_count < 2) {
+        // cert_chain must have at least two entries, one for the cert we're trying to create and
+        // one for the cert for the key that signs the new cert.
+        return KM_ERROR_UNKNOWN_ERROR;
+    }
+
+    const uint8_t* p = cert_chain->entries[1].data;
+    X509_Ptr signing_cert(d2i_X509(nullptr, &p, cert_chain->entries[1].data_length));
+    if (!signing_cert.get()) {
+        return TranslateLastOpenSslError();
+    }
+
+    UniquePtr<X509V3_CTX> x509v3_ctx(new X509V3_CTX);
+    *x509v3_ctx = {};
+    X509V3_set_ctx(x509v3_ctx.get(), signing_cert.get(), certificate.get(), nullptr /* req */,
+                   nullptr /* crl */, 0 /* flags */);
+
+    X509_EXTENSION_Ptr auth_key_id(X509V3_EXT_nconf_nid(nullptr /* conf */, x509v3_ctx.get(),
+                                                        NID_authority_key_identifier,
+                                                        const_cast<char*>("keyid:always")));
+    if (!auth_key_id.get() ||
+        !X509_add_ext(certificate.get(), auth_key_id.get() /* Don't release; copied */,
+                      -1 /* insert at end */)) {
+        return TranslateLastOpenSslError();
+    }
+
+    if (!X509_sign(certificate.get(), sign_key.get(), EVP_sha256()))
+        return TranslateLastOpenSslError();
+
+    return get_certificate_blob(certificate.get(), &cert_chain->entries[0]);

@@ -1,0 +1,417 @@
+class ConfigureThread
+!!!43945015.cpp!!!	ConfigureThread(inout parent : EmulatedFakeCamera2)
+    mRunning = false;
+!!!43945271.cpp!!!	waitUntilRunning() : status_t
+    Mutex::Autolock lock(mInputMutex);
+    if (!mRunning) {
+        ALOGV("Waiting for configure thread to start");
+        mInputSignal.wait(mInputMutex);
+    }
+    return OK;
+!!!43945399.cpp!!!	newRequestAvailable() : status_t
+    waitUntilRunning();
+
+    Mutex::Autolock lock(mInputMutex);
+
+    mActive = true;
+    mInputSignal.signal();
+
+    return OK;
+!!!43945527.cpp!!!	readyToRun() : status_t
+    Mutex::Autolock lock(mInputMutex);
+
+    ALOGV("Starting up ConfigureThread");
+    mRequest = NULL;
+    mActive  = false;
+    mRunning = true;
+
+    mInputSignal.signal();
+    return NO_ERROR;
+!!!43945655.cpp!!!	isStreamInUse(in id : uint32_t) : bool
+    Mutex::Autolock lock(mInternalsMutex);
+
+    if (mNextBuffers == NULL) return false;
+    for (size_t i=0; i < mNextBuffers->size(); i++) {
+        if ((*mNextBuffers)[i].streamId == (int)id) return true;
+    }
+    return false;
+!!!43945783.cpp!!!	getInProgressCount() : int
+    Mutex::Autolock lock(mInputMutex);
+    return mRequestCount;
+!!!43945911.cpp!!!	threadLoop() : bool
+    status_t res;
+
+    // Check if we're currently processing or just waiting
+    {
+        Mutex::Autolock lock(mInputMutex);
+        if (!mActive) {
+            // Inactive, keep waiting until we've been signaled
+            status_t res;
+            res = mInputSignal.waitRelative(mInputMutex, kWaitPerLoop);
+            if (res != NO_ERROR && res != TIMED_OUT) {
+                ALOGE("%s: Error waiting for input requests: %d",
+                        __FUNCTION__, res);
+                return false;
+            }
+            if (!mActive) return true;
+            ALOGV("New request available");
+        }
+        // Active
+    }
+
+    if (mRequest == NULL) {
+        Mutex::Autolock il(mInternalsMutex);
+
+        ALOGV("Configure: Getting next request");
+        res = mParent->mRequestQueueSrc->dequeue_request(
+            mParent->mRequestQueueSrc,
+            &mRequest);
+        if (res != NO_ERROR) {
+            ALOGE("%s: Error dequeuing next request: %d", __FUNCTION__, res);
+            mParent->signalError();
+            return false;
+        }
+        if (mRequest == NULL) {
+            ALOGV("Configure: Request queue empty, going inactive");
+            // No requests available, go into inactive mode
+            Mutex::Autolock lock(mInputMutex);
+            mActive = false;
+            return true;
+        } else {
+            Mutex::Autolock lock(mInputMutex);
+            mRequestCount++;
+        }
+
+        camera_metadata_entry_t type;
+        res = find_camera_metadata_entry(mRequest,
+                ANDROID_REQUEST_TYPE,
+                &type);
+        if (res != NO_ERROR) {
+            ALOGE("%s: error reading request type", __FUNCTION__);
+            mParent->signalError();
+            return false;
+        }
+        bool success = false;;
+        switch (type.data.u8[0]) {
+            case ANDROID_REQUEST_TYPE_CAPTURE:
+                success = setupCapture();
+                break;
+            case ANDROID_REQUEST_TYPE_REPROCESS:
+                success = setupReprocess();
+                break;
+            default:
+                ALOGE("%s: Unexpected request type %d",
+                        __FUNCTION__, type.data.u8[0]);
+                mParent->signalError();
+                break;
+        }
+        if (!success) return false;
+
+    }
+
+    if (mWaitingForReadout) {
+        bool readoutDone;
+        readoutDone = mParent->mReadoutThread->waitForReady(kWaitPerLoop);
+        if (!readoutDone) return true;
+
+        if (mNextNeedsJpeg) {
+            ALOGV("Configure: Waiting for JPEG compressor");
+        } else {
+            ALOGV("Configure: Waiting for sensor");
+        }
+        mWaitingForReadout = false;
+    }
+
+    if (mNextNeedsJpeg) {
+        bool jpegDone;
+        jpegDone = mParent->mJpegCompressor->waitForDone(kWaitPerLoop);
+        if (!jpegDone) return true;
+
+        ALOGV("Configure: Waiting for sensor");
+        mNextNeedsJpeg = false;
+    }
+
+    if (mNextIsCapture) {
+        return configureNextCapture();
+    } else {
+        return configureNextReprocess();
+    }
+!!!43946039.cpp!!!	setupCapture() : bool
+    status_t res;
+
+    mNextIsCapture = true;
+    // Get necessary parameters for sensor config
+    mParent->mControlThread->processRequest(mRequest);
+
+    camera_metadata_entry_t streams;
+    res = find_camera_metadata_entry(mRequest,
+            ANDROID_REQUEST_OUTPUT_STREAMS,
+            &streams);
+    if (res != NO_ERROR) {
+        ALOGE("%s: error reading output stream tag", __FUNCTION__);
+        mParent->signalError();
+        return false;
+    }
+
+    mNextBuffers = new Buffers;
+    mNextNeedsJpeg = false;
+    ALOGV("Configure: Setting up buffers for capture");
+    for (size_t i = 0; i < streams.count; i++) {
+        int streamId = streams.data.i32[i];
+        const Stream &s = mParent->getStreamInfo(streamId);
+        if (s.format == HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED) {
+            ALOGE("%s: Stream %d does not have a concrete pixel format, but "
+                    "is included in a request!", __FUNCTION__, streamId);
+            mParent->signalError();
+            return false;
+        }
+        StreamBuffer b;
+        b.streamId = streams.data.u8[i];
+        b.width  = s.width;
+        b.height = s.height;
+        b.format = s.format;
+        b.stride = s.stride;
+        mNextBuffers->push_back(b);
+        ALOGV("Configure:    Buffer %zu: Stream %d, %d x %d, format 0x%x, "
+                "stride %d",
+                i, b.streamId, b.width, b.height, b.format, b.stride);
+        if (b.format == HAL_PIXEL_FORMAT_BLOB) {
+            mNextNeedsJpeg = true;
+        }
+    }
+
+    camera_metadata_entry_t e;
+    res = find_camera_metadata_entry(mRequest,
+            ANDROID_REQUEST_FRAME_COUNT,
+            &e);
+    if (res != NO_ERROR) {
+        ALOGE("%s: error reading frame count tag: %s (%d)",
+                __FUNCTION__, strerror(-res), res);
+        mParent->signalError();
+        return false;
+    }
+    mNextFrameNumber = *e.data.i32;
+
+    res = find_camera_metadata_entry(mRequest,
+            ANDROID_SENSOR_EXPOSURE_TIME,
+            &e);
+    if (res != NO_ERROR) {
+        ALOGE("%s: error reading exposure time tag: %s (%d)",
+                __FUNCTION__, strerror(-res), res);
+        mParent->signalError();
+        return false;
+    }
+    mNextExposureTime = *e.data.i64;
+
+    res = find_camera_metadata_entry(mRequest,
+            ANDROID_SENSOR_FRAME_DURATION,
+            &e);
+    if (res != NO_ERROR) {
+        ALOGE("%s: error reading frame duration tag", __FUNCTION__);
+        mParent->signalError();
+        return false;
+    }
+    mNextFrameDuration = *e.data.i64;
+
+    if (mNextFrameDuration <
+            mNextExposureTime + Sensor::kMinVerticalBlank) {
+        mNextFrameDuration = mNextExposureTime + Sensor::kMinVerticalBlank;
+    }
+    res = find_camera_metadata_entry(mRequest,
+            ANDROID_SENSOR_SENSITIVITY,
+            &e);
+    if (res != NO_ERROR) {
+        ALOGE("%s: error reading sensitivity tag", __FUNCTION__);
+        mParent->signalError();
+        return false;
+    }
+    mNextSensitivity = *e.data.i32;
+
+    // Start waiting on readout thread
+    mWaitingForReadout = true;
+    ALOGV("Configure: Waiting for readout thread");
+
+    return true;
+!!!43946167.cpp!!!	setupReprocess() : bool
+    status_t res;
+
+    mNextNeedsJpeg = true;
+    mNextIsCapture = false;
+
+    camera_metadata_entry_t reprocessStreams;
+    res = find_camera_metadata_entry(mRequest,
+            ANDROID_REQUEST_INPUT_STREAMS,
+            &reprocessStreams);
+    if (res != NO_ERROR) {
+        ALOGE("%s: error reading output stream tag", __FUNCTION__);
+        mParent->signalError();
+        return false;
+    }
+
+    mNextBuffers = new Buffers;
+
+    ALOGV("Configure: Setting up input buffers for reprocess");
+    for (size_t i = 0; i < reprocessStreams.count; i++) {
+        int streamId = reprocessStreams.data.i32[i];
+        const ReprocessStream &s = mParent->getReprocessStreamInfo(streamId);
+        if (s.format != HAL_PIXEL_FORMAT_RGB_888) {
+            ALOGE("%s: Only ZSL reprocessing supported!",
+                    __FUNCTION__);
+            mParent->signalError();
+            return false;
+        }
+        StreamBuffer b;
+        b.streamId = -streamId;
+        b.width = s.width;
+        b.height = s.height;
+        b.format = s.format;
+        b.stride = s.stride;
+        mNextBuffers->push_back(b);
+    }
+
+    camera_metadata_entry_t streams;
+    res = find_camera_metadata_entry(mRequest,
+            ANDROID_REQUEST_OUTPUT_STREAMS,
+            &streams);
+    if (res != NO_ERROR) {
+        ALOGE("%s: error reading output stream tag", __FUNCTION__);
+        mParent->signalError();
+        return false;
+    }
+
+    ALOGV("Configure: Setting up output buffers for reprocess");
+    for (size_t i = 0; i < streams.count; i++) {
+        int streamId = streams.data.i32[i];
+        const Stream &s = mParent->getStreamInfo(streamId);
+        if (s.format != HAL_PIXEL_FORMAT_BLOB) {
+            // TODO: Support reprocess to YUV
+            ALOGE("%s: Non-JPEG output stream %d for reprocess not supported",
+                    __FUNCTION__, streamId);
+            mParent->signalError();
+            return false;
+        }
+        StreamBuffer b;
+        b.streamId = streams.data.u8[i];
+        b.width  = s.width;
+        b.height = s.height;
+        b.format = s.format;
+        b.stride = s.stride;
+        mNextBuffers->push_back(b);
+        ALOGV("Configure:    Buffer %zu: Stream %d, %d x %d, format 0x%x, "
+                "stride %d",
+                i, b.streamId, b.width, b.height, b.format, b.stride);
+    }
+
+    camera_metadata_entry_t e;
+    res = find_camera_metadata_entry(mRequest,
+            ANDROID_REQUEST_FRAME_COUNT,
+            &e);
+    if (res != NO_ERROR) {
+        ALOGE("%s: error reading frame count tag: %s (%d)",
+                __FUNCTION__, strerror(-res), res);
+        mParent->signalError();
+        return false;
+    }
+    mNextFrameNumber = *e.data.i32;
+
+    return true;
+!!!43946295.cpp!!!	configureNextCapture() : bool
+    bool vsync = mParent->mSensor->waitForVSync(kWaitPerLoop);
+    if (!vsync) return true;
+
+    Mutex::Autolock il(mInternalsMutex);
+    ALOGV("Configure: Configuring sensor for capture %d", mNextFrameNumber);
+    mParent->mSensor->setExposureTime(mNextExposureTime);
+    mParent->mSensor->setFrameDuration(mNextFrameDuration);
+    mParent->mSensor->setSensitivity(mNextSensitivity);
+
+    getBuffers();
+
+    ALOGV("Configure: Done configure for capture %d", mNextFrameNumber);
+    mParent->mReadoutThread->setNextOperation(true, mRequest, mNextBuffers);
+    mParent->mSensor->setDestinationBuffers(mNextBuffers);
+
+    mRequest = NULL;
+    mNextBuffers = NULL;
+
+    Mutex::Autolock lock(mInputMutex);
+    mRequestCount--;
+
+    return true;
+!!!43946423.cpp!!!	configureNextReprocess() : bool
+    Mutex::Autolock il(mInternalsMutex);
+
+    getBuffers();
+
+    ALOGV("Configure: Done configure for reprocess %d", mNextFrameNumber);
+    mParent->mReadoutThread->setNextOperation(false, mRequest, mNextBuffers);
+
+    mRequest = NULL;
+    mNextBuffers = NULL;
+
+    Mutex::Autolock lock(mInputMutex);
+    mRequestCount--;
+
+    return true;
+!!!43946551.cpp!!!	getBuffers() : bool
+    status_t res;
+    /** Get buffers to fill for this frame */
+    for (size_t i = 0; i < mNextBuffers->size(); i++) {
+        StreamBuffer &b = mNextBuffers->editItemAt(i);
+
+        if (b.streamId > 0) {
+            Stream s = mParent->getStreamInfo(b.streamId);
+            ALOGV("Configure: Dequeing buffer from stream %d", b.streamId);
+            res = s.ops->dequeue_buffer(s.ops, &(b.buffer) );
+            if (res != NO_ERROR || b.buffer == NULL) {
+                ALOGE("%s: Unable to dequeue buffer from stream %d: %s (%d)",
+                        __FUNCTION__, b.streamId, strerror(-res), res);
+                mParent->signalError();
+                return false;
+            }
+
+            /* Lock the buffer from the perspective of the graphics mapper */
+            const Rect rect(s.width, s.height);
+
+            res = GraphicBufferMapper::get().lock(*(b.buffer),
+                    GRALLOC_USAGE_HW_CAMERA_WRITE,
+                    rect, (void**)&(b.img) );
+
+            if (res != NO_ERROR) {
+                ALOGE("%s: grbuffer_mapper.lock failure: %s (%d)",
+                        __FUNCTION__, strerror(-res), res);
+                s.ops->cancel_buffer(s.ops,
+                        b.buffer);
+                mParent->signalError();
+                return false;
+            }
+        } else {
+            ReprocessStream s = mParent->getReprocessStreamInfo(-b.streamId);
+            ALOGV("Configure: Acquiring buffer from reprocess stream %d",
+                    -b.streamId);
+            res = s.ops->acquire_buffer(s.ops, &(b.buffer) );
+            if (res != NO_ERROR || b.buffer == NULL) {
+                ALOGE("%s: Unable to acquire buffer from reprocess stream %d: "
+                        "%s (%d)", __FUNCTION__, -b.streamId,
+                        strerror(-res), res);
+                mParent->signalError();
+                return false;
+            }
+
+            /* Lock the buffer from the perspective of the graphics mapper */
+            const Rect rect(s.width, s.height);
+
+            res = GraphicBufferMapper::get().lock(*(b.buffer),
+                    GRALLOC_USAGE_HW_CAMERA_READ,
+                    rect, (void**)&(b.img) );
+            if (res != NO_ERROR) {
+                ALOGE("%s: grbuffer_mapper.lock failure: %s (%d)",
+                        __FUNCTION__, strerror(-res), res);
+                s.ops->release_buffer(s.ops,
+                        b.buffer);
+                mParent->signalError();
+                return false;
+            }
+        }
+    }
+    return true;

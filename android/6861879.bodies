@@ -1,0 +1,513 @@
+class UiccCardApplication
+!!!76691639.java!!!	UiccCardApplication(inout uiccCard : UiccCard, inout as : IccCardApplicationStatus, inout c : Context, inout ci : CommandsInterface)
+        if (DBG) log("Creating UiccApp: " + as);
+        mUiccCard = uiccCard;
+        mAppState = as.app_state;
+        mAppType = as.app_type;
+        mAuthContext = getAuthContext(mAppType);
+        mPersoSubState = as.perso_substate;
+        mAid = as.aid;
+        mAppLabel = as.app_label;
+        mPin1Replaced = (as.pin1_replaced != 0);
+        mPin1State = as.pin1;
+        mPin2State = as.pin2;
+
+        mContext = c;
+        mCi = ci;
+
+        mIccFh = createIccFileHandler(as.app_type);
+        mIccRecords = createIccRecords(as.app_type, mContext, mCi);
+        if (mAppState == AppState.APPSTATE_READY) {
+            queryFdn();
+            queryPin1State();
+        }
+        mCi.registerForNotAvailable(mHandler, EVENT_RADIO_UNAVAILABLE, null);
+!!!76691767.java!!!	update(inout as : IccCardApplicationStatus, inout c : Context, inout ci : CommandsInterface) : void
+        synchronized (mLock) {
+            if (mDestroyed) {
+                loge("Application updated after destroyed! Fix me!");
+                return;
+            }
+
+            if (DBG) log(mAppType + " update. New " + as);
+            mContext = c;
+            mCi = ci;
+            AppType oldAppType = mAppType;
+            AppState oldAppState = mAppState;
+            PersoSubState oldPersoSubState = mPersoSubState;
+            mAppType = as.app_type;
+            mAuthContext = getAuthContext(mAppType);
+            mAppState = as.app_state;
+            mPersoSubState = as.perso_substate;
+            mAid = as.aid;
+            mAppLabel = as.app_label;
+            mPin1Replaced = (as.pin1_replaced != 0);
+            mPin1State = as.pin1;
+            mPin2State = as.pin2;
+
+            if (mAppType != oldAppType) {
+                if (mIccFh != null) { mIccFh.dispose();}
+                if (mIccRecords != null) { mIccRecords.dispose();}
+                mIccFh = createIccFileHandler(as.app_type);
+                mIccRecords = createIccRecords(as.app_type, c, ci);
+            }
+
+            if (mPersoSubState != oldPersoSubState &&
+                    mPersoSubState == PersoSubState.PERSOSUBSTATE_SIM_NETWORK) {
+                notifyNetworkLockedRegistrantsIfNeeded(null);
+            }
+
+            if (mAppState != oldAppState) {
+                if (DBG) log(oldAppType + " changed state: " + oldAppState + " -> " + mAppState);
+                // If the app state turns to APPSTATE_READY, then query FDN status,
+                //as it might have failed in earlier attempt.
+                if (mAppState == AppState.APPSTATE_READY) {
+                    queryFdn();
+                    queryPin1State();
+                }
+                notifyPinLockedRegistrantsIfNeeded(null);
+                notifyReadyRegistrantsIfNeeded(null);
+            }
+        }
+!!!76691895.java!!!	dispose() : void
+        synchronized (mLock) {
+            if (DBG) log(mAppType + " being Disposed");
+            mDestroyed = true;
+            if (mIccRecords != null) { mIccRecords.dispose();}
+            if (mIccFh != null) { mIccFh.dispose();}
+            mIccRecords = null;
+            mIccFh = null;
+            mCi.unregisterForNotAvailable(mHandler);
+        }
+!!!76692023.java!!!	createIccRecords(inout type : IccCardApplicationStatus::AppType, inout c : Context, inout ci : CommandsInterface) : IccRecords
+        if (type == AppType.APPTYPE_USIM || type == AppType.APPTYPE_SIM) {
+            return new SIMRecords(this, c, ci);
+        } else if (type == AppType.APPTYPE_RUIM || type == AppType.APPTYPE_CSIM){
+            return new RuimRecords(this, c, ci);
+        } else if (type == AppType.APPTYPE_ISIM) {
+            return new IsimUiccRecords(this, c, ci);
+        } else {
+            // Unknown app type (maybe detection is still in progress)
+            return null;
+        }
+!!!76692151.java!!!	createIccFileHandler(inout type : IccCardApplicationStatus::AppType) : IccFileHandler
+        switch (type) {
+            case APPTYPE_SIM:
+                return new SIMFileHandler(this, mAid, mCi);
+            case APPTYPE_RUIM:
+                return new RuimFileHandler(this, mAid, mCi);
+            case APPTYPE_USIM:
+                return new UsimFileHandler(this, mAid, mCi);
+            case APPTYPE_CSIM:
+                return new CsimFileHandler(this, mAid, mCi);
+            case APPTYPE_ISIM:
+                return new IsimFileHandler(this, mAid, mCi);
+            default:
+                return null;
+        }
+!!!76692279.java!!!	queryFdn() : void
+        //This shouldn't change run-time. So needs to be called only once.
+        int serviceClassX;
+
+        serviceClassX = CommandsInterface.SERVICE_CLASS_VOICE +
+                        CommandsInterface.SERVICE_CLASS_DATA +
+                        CommandsInterface.SERVICE_CLASS_FAX;
+        mCi.queryFacilityLockForApp (
+                CommandsInterface.CB_FACILITY_BA_FD, "", serviceClassX,
+                mAid, mHandler.obtainMessage(EVENT_QUERY_FACILITY_FDN_DONE));
+!!!76692407.java!!!	onQueryFdnEnabled(inout ar : AsyncResult) : void
+        synchronized (mLock) {
+            if (ar.exception != null) {
+                if (DBG) log("Error in querying facility lock:" + ar.exception);
+                return;
+            }
+
+            int[] result = (int[])ar.result;
+            if(result.length != 0) {
+                //0 - Available & Disabled, 1-Available & Enabled, 2-Unavailable.
+                if (result[0] == 2) {
+                    mIccFdnEnabled = false;
+                    mIccFdnAvailable = false;
+                } else {
+                    mIccFdnEnabled = (result[0] == 1) ? true : false;
+                    mIccFdnAvailable = true;
+                }
+                log("Query facility FDN : FDN service available: "+ mIccFdnAvailable
+                        +" enabled: "  + mIccFdnEnabled);
+            } else {
+                loge("Bogus facility lock response");
+            }
+        }
+!!!76692535.java!!!	onChangeFdnDone(inout ar : AsyncResult) : void
+        synchronized (mLock) {
+            int attemptsRemaining = -1;
+
+            if (ar.exception == null) {
+                mIccFdnEnabled = mDesiredFdnEnabled;
+                if (DBG) log("EVENT_CHANGE_FACILITY_FDN_DONE: " +
+                        "mIccFdnEnabled=" + mIccFdnEnabled);
+            } else {
+                attemptsRemaining = parsePinPukErrorResult(ar);
+                loge("Error change facility fdn with exception " + ar.exception);
+            }
+            Message response = (Message)ar.userObj;
+            response.arg1 = attemptsRemaining;
+            AsyncResult.forMessage(response).exception = ar.exception;
+            response.sendToTarget();
+        }
+!!!76692663.java!!!	queryPin1State() : void
+        int serviceClassX = CommandsInterface.SERVICE_CLASS_VOICE +
+                CommandsInterface.SERVICE_CLASS_DATA +
+                CommandsInterface.SERVICE_CLASS_FAX;
+        mCi.queryFacilityLockForApp (
+            CommandsInterface.CB_FACILITY_BA_SIM, "", serviceClassX,
+            mAid, mHandler.obtainMessage(EVENT_QUERY_FACILITY_LOCK_DONE));
+!!!76692791.java!!!	onQueryFacilityLock(inout ar : AsyncResult) : void
+        synchronized (mLock) {
+            if(ar.exception != null) {
+                if (DBG) log("Error in querying facility lock:" + ar.exception);
+                return;
+            }
+
+            int[] ints = (int[])ar.result;
+            if(ints.length != 0) {
+                if (DBG) log("Query facility lock : "  + ints[0]);
+
+                mIccLockEnabled = (ints[0] != 0);
+
+                if (mIccLockEnabled) {
+                    mPinLockedRegistrants.notifyRegistrants();
+                }
+
+                // Sanity check: we expect mPin1State to match mIccLockEnabled.
+                // When mPin1State is DISABLED mIccLockEanbled should be false.
+                // When mPin1State is ENABLED mIccLockEnabled should be true.
+                //
+                // Here we validate these assumptions to assist in identifying which ril/radio's
+                // have not correctly implemented GET_SIM_STATUS
+                switch (mPin1State) {
+                    case PINSTATE_DISABLED:
+                        if (mIccLockEnabled) {
+                            loge("QUERY_FACILITY_LOCK:enabled GET_SIM_STATUS.Pin1:disabled."
+                                    + " Fixme");
+                        }
+                        break;
+                    case PINSTATE_ENABLED_NOT_VERIFIED:
+                    case PINSTATE_ENABLED_VERIFIED:
+                    case PINSTATE_ENABLED_BLOCKED:
+                    case PINSTATE_ENABLED_PERM_BLOCKED:
+                        if (!mIccLockEnabled) {
+                            loge("QUERY_FACILITY_LOCK:disabled GET_SIM_STATUS.Pin1:enabled."
+                                    + " Fixme");
+                        }
+                    case PINSTATE_UNKNOWN:
+                    default:
+                        if (DBG) log("Ignoring: pin1state=" + mPin1State);
+                        break;
+                }
+            } else {
+                loge("Bogus facility lock response");
+            }
+        }
+!!!76692919.java!!!	onChangeFacilityLock(inout ar : AsyncResult) : void
+        synchronized (mLock) {
+            int attemptsRemaining = -1;
+
+            if (ar.exception == null) {
+                mIccLockEnabled = mDesiredPinLocked;
+                if (DBG) log( "EVENT_CHANGE_FACILITY_LOCK_DONE: mIccLockEnabled= "
+                        + mIccLockEnabled);
+            } else {
+                attemptsRemaining = parsePinPukErrorResult(ar);
+                loge("Error change facility lock with exception " + ar.exception);
+            }
+            Message response = (Message)ar.userObj;
+            AsyncResult.forMessage(response).exception = ar.exception;
+            response.arg1 = attemptsRemaining;
+            response.sendToTarget();
+        }
+!!!76693047.java!!!	parsePinPukErrorResult(inout ar : AsyncResult) : int
+        int[] result = (int[]) ar.result;
+        if (result == null) {
+            return -1;
+        } else {
+            int length = result.length;
+            int attemptsRemaining = -1;
+            if (length > 0) {
+                attemptsRemaining = result[0];
+            }
+            log("parsePinPukErrorResult: attemptsRemaining=" + attemptsRemaining);
+            return attemptsRemaining;
+        }
+!!!76693175.java!!!	registerForReady(inout h : Handler, in what : int, inout obj : Object) : void
+        synchronized (mLock) {
+            Registrant r = new Registrant (h, what, obj);
+            mReadyRegistrants.add(r);
+            notifyReadyRegistrantsIfNeeded(r);
+        }
+!!!76693303.java!!!	unregisterForReady(inout h : Handler) : void
+        synchronized (mLock) {
+            mReadyRegistrants.remove(h);
+        }
+!!!76693431.java!!!	registerForLocked(inout h : Handler, in what : int, inout obj : Object) : void
+        synchronized (mLock) {
+            Registrant r = new Registrant (h, what, obj);
+            mPinLockedRegistrants.add(r);
+            notifyPinLockedRegistrantsIfNeeded(r);
+        }
+!!!76693559.java!!!	unregisterForLocked(inout h : Handler) : void
+        synchronized (mLock) {
+            mPinLockedRegistrants.remove(h);
+        }
+!!!76693687.java!!!	registerForNetworkLocked(inout h : Handler, in what : int, inout obj : Object) : void
+        synchronized (mLock) {
+            Registrant r = new Registrant (h, what, obj);
+            mNetworkLockedRegistrants.add(r);
+            notifyNetworkLockedRegistrantsIfNeeded(r);
+        }
+!!!76693815.java!!!	unregisterForNetworkLocked(inout h : Handler) : void
+        synchronized (mLock) {
+            mNetworkLockedRegistrants.remove(h);
+        }
+!!!76693943.java!!!	notifyReadyRegistrantsIfNeeded(inout r : Registrant) : void
+        if (mDestroyed) {
+            return;
+        }
+        if (mAppState == AppState.APPSTATE_READY) {
+            if (mPin1State == PinState.PINSTATE_ENABLED_NOT_VERIFIED ||
+                    mPin1State == PinState.PINSTATE_ENABLED_BLOCKED ||
+                    mPin1State == PinState.PINSTATE_ENABLED_PERM_BLOCKED) {
+                loge("Sanity check failed! APPSTATE is ready while PIN1 is not verified!!!");
+                // Don't notify if application is in insane state
+                return;
+            }
+            if (r == null) {
+                if (DBG) log("Notifying registrants: READY");
+                mReadyRegistrants.notifyRegistrants();
+            } else {
+                if (DBG) log("Notifying 1 registrant: READY");
+                r.notifyRegistrant(new AsyncResult(null, null, null));
+            }
+        }
+!!!76694071.java!!!	notifyPinLockedRegistrantsIfNeeded(inout r : Registrant) : void
+        if (mDestroyed) {
+            return;
+        }
+
+        if (mAppState == AppState.APPSTATE_PIN ||
+                mAppState == AppState.APPSTATE_PUK) {
+            if (mPin1State == PinState.PINSTATE_ENABLED_VERIFIED ||
+                    mPin1State == PinState.PINSTATE_DISABLED) {
+                loge("Sanity check failed! APPSTATE is locked while PIN1 is not!!!");
+                //Don't notify if application is in insane state
+                return;
+            }
+            if (r == null) {
+                if (DBG) log("Notifying registrants: LOCKED");
+                mPinLockedRegistrants.notifyRegistrants();
+            } else {
+                if (DBG) log("Notifying 1 registrant: LOCKED");
+                r.notifyRegistrant(new AsyncResult(null, null, null));
+            }
+        }
+!!!76694199.java!!!	notifyNetworkLockedRegistrantsIfNeeded(inout r : Registrant) : void
+        if (mDestroyed) {
+            return;
+        }
+
+        if (mAppState == AppState.APPSTATE_SUBSCRIPTION_PERSO &&
+                mPersoSubState == PersoSubState.PERSOSUBSTATE_SIM_NETWORK) {
+            if (r == null) {
+                if (DBG) log("Notifying registrants: NETWORK_LOCKED");
+                mNetworkLockedRegistrants.notifyRegistrants();
+            } else {
+                if (DBG) log("Notifying 1 registrant: NETWORK_LOCED");
+                r.notifyRegistrant(new AsyncResult(null, null, null));
+            }
+        }
+!!!76694327.java!!!	getState() : IccCardApplicationStatus::AppState
+        synchronized (mLock) {
+            return mAppState;
+        }
+!!!76694455.java!!!	getType() : IccCardApplicationStatus::AppType
+        synchronized (mLock) {
+            return mAppType;
+        }
+!!!76694583.java!!!	getAuthContext() : int
+        synchronized (mLock) {
+            return mAuthContext;
+        }
+!!!76694711.java!!!	getAuthContext(inout appType : IccCardApplicationStatus::AppType) : int
+        int authContext;
+
+        switch (appType) {
+            case APPTYPE_SIM:
+                authContext = AUTH_CONTEXT_EAP_SIM;
+                break;
+
+            case APPTYPE_USIM:
+                authContext = AUTH_CONTEXT_EAP_AKA;
+                break;
+
+            default:
+                authContext = AUTH_CONTEXT_UNDEFINED;
+                break;
+        }
+
+        return authContext;
+!!!76694839.java!!!	getPersoSubState() : IccCardApplicationStatus::PersoSubState
+        synchronized (mLock) {
+            return mPersoSubState;
+        }
+!!!76694967.java!!!	getAid() : String
+        synchronized (mLock) {
+            return mAid;
+        }
+!!!76695095.java!!!	getAppLabel() : String
+        return mAppLabel;
+!!!76695223.java!!!	getPin1State() : IccCardStatus::PinState
+        synchronized (mLock) {
+            if (mPin1Replaced) {
+                return mUiccCard.getUniversalPinState();
+            }
+            return mPin1State;
+        }
+!!!76695351.java!!!	getIccFileHandler() : IccFileHandler
+        synchronized (mLock) {
+            return mIccFh;
+        }
+!!!76695479.java!!!	getIccRecords() : IccRecords
+        synchronized (mLock) {
+            return mIccRecords;
+        }
+!!!76695607.java!!!	supplyPin(inout pin : String, inout onComplete : Message) : void
+        synchronized (mLock) {
+            mCi.supplyIccPinForApp(pin, mAid, mHandler.obtainMessage(EVENT_PIN1_PUK1_DONE,
+                    onComplete));
+        }
+!!!76695735.java!!!	supplyPuk(inout puk : String, inout newPin : String, inout onComplete : Message) : void
+        synchronized (mLock) {
+        mCi.supplyIccPukForApp(puk, newPin, mAid,
+                mHandler.obtainMessage(EVENT_PIN1_PUK1_DONE, onComplete));
+        }
+!!!76695863.java!!!	supplyPin2(inout pin2 : String, inout onComplete : Message) : void
+        synchronized (mLock) {
+            mCi.supplyIccPin2ForApp(pin2, mAid,
+                    mHandler.obtainMessage(EVENT_PIN2_PUK2_DONE, onComplete));
+        }
+!!!76695991.java!!!	supplyPuk2(inout puk2 : String, inout newPin2 : String, inout onComplete : Message) : void
+        synchronized (mLock) {
+            mCi.supplyIccPuk2ForApp(puk2, newPin2, mAid,
+                    mHandler.obtainMessage(EVENT_PIN2_PUK2_DONE, onComplete));
+        }
+!!!76696119.java!!!	supplyNetworkDepersonalization(inout pin : String, inout onComplete : Message) : void
+        synchronized (mLock) {
+            if (DBG) log("supplyNetworkDepersonalization");
+            mCi.supplyNetworkDepersonalization(pin, onComplete);
+        }
+!!!76696247.java!!!	getIccLockEnabled() : boolean
+        return mIccLockEnabled;
+        /* STOPSHIP: Remove line above and all code associated with setting
+           mIccLockEanbled once all RIL correctly sends the pin1 state.
+        // Use getPin1State to take into account pin1Replaced flag
+        PinState pinState = getPin1State();
+        return pinState == PinState.PINSTATE_ENABLED_NOT_VERIFIED ||
+               pinState == PinState.PINSTATE_ENABLED_VERIFIED ||
+               pinState == PinState.PINSTATE_ENABLED_BLOCKED ||
+               pinState == PinState.PINSTATE_ENABLED_PERM_BLOCKED;*/
+!!!76696375.java!!!	getIccFdnEnabled() : boolean
+        synchronized (mLock) {
+            return mIccFdnEnabled;
+        }
+!!!76696503.java!!!	getIccFdnAvailable() : boolean
+        return mIccFdnAvailable;
+!!!76696631.java!!!	setIccLockEnabled(inout enabled : boolean, inout password : String, inout onComplete : Message) : void
+        synchronized (mLock) {
+            int serviceClassX;
+            serviceClassX = CommandsInterface.SERVICE_CLASS_VOICE +
+                    CommandsInterface.SERVICE_CLASS_DATA +
+                    CommandsInterface.SERVICE_CLASS_FAX;
+
+            mDesiredPinLocked = enabled;
+
+            mCi.setFacilityLockForApp(CommandsInterface.CB_FACILITY_BA_SIM,
+                    enabled, password, serviceClassX, mAid,
+                    mHandler.obtainMessage(EVENT_CHANGE_FACILITY_LOCK_DONE, onComplete));
+        }
+!!!76696759.java!!!	setIccFdnEnabled(inout enabled : boolean, inout password : String, inout onComplete : Message) : void
+        synchronized (mLock) {
+            int serviceClassX;
+            serviceClassX = CommandsInterface.SERVICE_CLASS_VOICE +
+                    CommandsInterface.SERVICE_CLASS_DATA +
+                    CommandsInterface.SERVICE_CLASS_FAX +
+                    CommandsInterface.SERVICE_CLASS_SMS;
+
+            mDesiredFdnEnabled = enabled;
+
+            mCi.setFacilityLockForApp(CommandsInterface.CB_FACILITY_BA_FD,
+                    enabled, password, serviceClassX, mAid,
+                    mHandler.obtainMessage(EVENT_CHANGE_FACILITY_FDN_DONE, onComplete));
+        }
+!!!76696887.java!!!	changeIccLockPassword(inout oldPassword : String, inout newPassword : String, inout onComplete : Message) : void
+        synchronized (mLock) {
+            if (DBG) log("changeIccLockPassword");
+            mCi.changeIccPinForApp(oldPassword, newPassword, mAid,
+                    mHandler.obtainMessage(EVENT_CHANGE_PIN1_DONE, onComplete));
+        }
+!!!76697015.java!!!	changeIccFdnPassword(inout oldPassword : String, inout newPassword : String, inout onComplete : Message) : void
+        synchronized (mLock) {
+            if (DBG) log("changeIccFdnPassword");
+            mCi.changeIccPin2ForApp(oldPassword, newPassword, mAid,
+                    mHandler.obtainMessage(EVENT_CHANGE_PIN2_DONE, onComplete));
+        }
+!!!76697143.java!!!	getIccPin2Blocked() : boolean
+        synchronized (mLock) {
+            return mPin2State == PinState.PINSTATE_ENABLED_BLOCKED;
+        }
+!!!76697271.java!!!	getIccPuk2Blocked() : boolean
+        synchronized (mLock) {
+            return mPin2State == PinState.PINSTATE_ENABLED_PERM_BLOCKED;
+        }
+!!!76697399.java!!!	getPhoneId() : int
+        return mUiccCard.getPhoneId();
+!!!76697527.java!!!	getUiccCard() : UiccCard
+        return mUiccCard;
+!!!76697655.java!!!	log(inout msg : String) : void
+        Rlog.d(LOG_TAG, msg);
+!!!76697783.java!!!	loge(inout msg : String) : void
+        Rlog.e(LOG_TAG, msg);
+!!!76697911.java!!!	dump(inout fd : FileDescriptor, inout pw : PrintWriter, inout args : String [[]]) : void
+        pw.println("UiccCardApplication: " + this);
+        pw.println(" mUiccCard=" + mUiccCard);
+        pw.println(" mAppState=" + mAppState);
+        pw.println(" mAppType=" + mAppType);
+        pw.println(" mPersoSubState=" + mPersoSubState);
+        pw.println(" mAid=" + mAid);
+        pw.println(" mAppLabel=" + mAppLabel);
+        pw.println(" mPin1Replaced=" + mPin1Replaced);
+        pw.println(" mPin1State=" + mPin1State);
+        pw.println(" mPin2State=" + mPin2State);
+        pw.println(" mIccFdnEnabled=" + mIccFdnEnabled);
+        pw.println(" mDesiredFdnEnabled=" + mDesiredFdnEnabled);
+        pw.println(" mIccLockEnabled=" + mIccLockEnabled);
+        pw.println(" mDesiredPinLocked=" + mDesiredPinLocked);
+        pw.println(" mCi=" + mCi);
+        pw.println(" mIccRecords=" + mIccRecords);
+        pw.println(" mIccFh=" + mIccFh);
+        pw.println(" mDestroyed=" + mDestroyed);
+        pw.println(" mReadyRegistrants: size=" + mReadyRegistrants.size());
+        for (int i = 0; i < mReadyRegistrants.size(); i++) {
+            pw.println("  mReadyRegistrants[" + i + "]="
+                    + ((Registrant)mReadyRegistrants.get(i)).getHandler());
+        }
+        pw.println(" mPinLockedRegistrants: size=" + mPinLockedRegistrants.size());
+        for (int i = 0; i < mPinLockedRegistrants.size(); i++) {
+            pw.println("  mPinLockedRegistrants[" + i + "]="
+                    + ((Registrant)mPinLockedRegistrants.get(i)).getHandler());
+        }
+        pw.println(" mNetworkLockedRegistrants: size=" + mNetworkLockedRegistrants.size());
+        for (int i = 0; i < mNetworkLockedRegistrants.size(); i++) {
+            pw.println("  mNetworkLockedRegistrants[" + i + "]="
+                    + ((Registrant)mNetworkLockedRegistrants.get(i)).getHandler());
+        }
+        pw.flush();

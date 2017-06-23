@@ -1,0 +1,207 @@
+class DhcpClient
+!!!74925367.java!!!	makeWakeupMessage(inout cmdName : String, in cmd : int) : WakeupMessage
+        cmdName = DhcpClient.class.getSimpleName() + "." + mIfaceName + "." + cmdName;
+        return new WakeupMessage(mContext, getHandler(), cmdName, cmd);
+!!!74925495.java!!!	DhcpClient(inout context : Context, inout controller : StateMachine, inout iface : String)
+        super(TAG);
+
+        mContext = context;
+        mController = controller;
+        mIfaceName = iface;
+
+        addState(mStoppedState);
+        addState(mDhcpState);
+            addState(mDhcpInitState, mDhcpState);
+            addState(mWaitBeforeStartState, mDhcpState);
+            addState(mDhcpSelectingState, mDhcpState);
+            addState(mDhcpRequestingState, mDhcpState);
+            addState(mDhcpHaveLeaseState, mDhcpState);
+                addState(mConfiguringInterfaceState, mDhcpHaveLeaseState);
+                addState(mDhcpBoundState, mDhcpHaveLeaseState);
+                addState(mWaitBeforeRenewalState, mDhcpHaveLeaseState);
+                addState(mDhcpRenewingState, mDhcpHaveLeaseState);
+                addState(mDhcpRebindingState, mDhcpHaveLeaseState);
+            addState(mDhcpInitRebootState, mDhcpState);
+            addState(mDhcpRebootingState, mDhcpState);
+
+        setInitialState(mStoppedState);
+
+        mRandom = new Random();
+
+        // Used to schedule packet retransmissions.
+        mKickAlarm = makeWakeupMessage("KICK", CMD_KICK);
+        // Used to time out PacketRetransmittingStates.
+        mTimeoutAlarm = makeWakeupMessage("TIMEOUT", CMD_TIMEOUT);
+        // Used to schedule DHCP reacquisition.
+        mRenewAlarm = makeWakeupMessage("RENEW", CMD_RENEW_DHCP);
+        mRebindAlarm = makeWakeupMessage("REBIND", CMD_REBIND_DHCP);
+        mExpiryAlarm = makeWakeupMessage("EXPIRY", CMD_EXPIRE_DHCP);
+!!!74925623.java!!!	registerForPreDhcpNotification() : void
+        mRegisteredForPreDhcpNotification = true;
+!!!74925751.java!!!	makeDhcpClient(inout context : Context, inout controller : StateMachine, inout intf : String) : DhcpClient
+        DhcpClient client = new DhcpClient(context, controller, intf);
+        client.start();
+        return client;
+!!!74925879.java!!!	initInterface() : boolean
+        try {
+            mIface = NetworkInterface.getByName(mIfaceName);
+            mHwAddr = mIface.getHardwareAddress();
+            mInterfaceBroadcastAddr = new PacketSocketAddress(mIface.getIndex(),
+                    DhcpPacket.ETHER_BROADCAST);
+            return true;
+        } catch(SocketException | NullPointerException e) {
+            Log.e(TAG, "Can't determine ifindex or MAC address for " + mIfaceName, e);
+            return false;
+        }
+!!!74926007.java!!!	startNewTransaction() : void
+        mTransactionId = mRandom.nextInt();
+        mTransactionStartMillis = SystemClock.elapsedRealtime();
+!!!74926135.java!!!	initSockets() : boolean
+        return initPacketSocket() && initUdpSocket();
+!!!74926263.java!!!	initPacketSocket() : boolean
+        try {
+            mPacketSock = Os.socket(AF_PACKET, SOCK_RAW, ETH_P_IP);
+            PacketSocketAddress addr = new PacketSocketAddress((short) ETH_P_IP, mIface.getIndex());
+            Os.bind(mPacketSock, addr);
+            NetworkUtils.attachDhcpFilter(mPacketSock);
+        } catch(SocketException|ErrnoException e) {
+            Log.e(TAG, "Error creating packet socket", e);
+            return false;
+        }
+        return true;
+!!!74926391.java!!!	initUdpSocket() : boolean
+        try {
+            mUdpSock = Os.socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+            Os.setsockoptInt(mUdpSock, SOL_SOCKET, SO_REUSEADDR, 1);
+            Os.setsockoptIfreq(mUdpSock, SOL_SOCKET, SO_BINDTODEVICE, mIfaceName);
+            Os.setsockoptInt(mUdpSock, SOL_SOCKET, SO_BROADCAST, 1);
+            Os.setsockoptInt(mUdpSock, SOL_SOCKET, SO_RCVBUF, 0);
+            Os.bind(mUdpSock, Inet4Address.ANY, DhcpPacket.DHCP_CLIENT);
+            NetworkUtils.protectFromVpn(mUdpSock);
+        } catch(SocketException|ErrnoException e) {
+            Log.e(TAG, "Error creating UDP socket", e);
+            return false;
+        }
+        return true;
+!!!74926519.java!!!	connectUdpSock(inout to : Inet4Address) : boolean
+        try {
+            Os.connect(mUdpSock, to, DhcpPacket.DHCP_SERVER);
+            return true;
+        } catch (SocketException|ErrnoException e) {
+            Log.e(TAG, "Error connecting UDP socket", e);
+            return false;
+        }
+!!!74926647.java!!!	closeQuietly(inout fd : FileDescriptor) : void
+        try {
+            IoBridge.closeAndSignalBlockedThreads(fd);
+        } catch (IOException ignored) {}
+!!!74926775.java!!!	closeSockets() : void
+        closeQuietly(mUdpSock);
+        closeQuietly(mPacketSock);
+!!!74927159.java!!!	getSecs() : short
+        return (short) ((SystemClock.elapsedRealtime() - mTransactionStartMillis) / 1000);
+!!!74927287.java!!!	transmitPacket(inout buf : ByteBuffer, inout description : String, in encap : int, inout to : Inet4Address) : boolean
+        try {
+            if (encap == DhcpPacket.ENCAP_L2) {
+                if (DBG) Log.d(TAG, "Broadcasting " + description);
+                Os.sendto(mPacketSock, buf.array(), 0, buf.limit(), 0, mInterfaceBroadcastAddr);
+            } else if (encap == DhcpPacket.ENCAP_BOOTP && to.equals(INADDR_BROADCAST)) {
+                if (DBG) Log.d(TAG, "Broadcasting " + description);
+                // We only send L3-encapped broadcasts in DhcpRebindingState,
+                // where we have an IP address and an unconnected UDP socket.
+                //
+                // N.B.: We only need this codepath because DhcpRequestPacket
+                // hardcodes the source IP address to 0.0.0.0. We could reuse
+                // the packet socket if this ever changes.
+                Os.sendto(mUdpSock, buf, 0, to, DhcpPacket.DHCP_SERVER);
+            } else {
+                // It's safe to call getpeername here, because we only send unicast packets if we
+                // have an IP address, and we connect the UDP socket in DhcpBoundState#enter.
+                if (DBG) Log.d(TAG, String.format("Unicasting %s to %s",
+                        description, Os.getpeername(mUdpSock)));
+                Os.write(mUdpSock, buf);
+            }
+        } catch(ErrnoException|IOException e) {
+            Log.e(TAG, "Can't send packet: ", e);
+            return false;
+        }
+        return true;
+!!!74927415.java!!!	sendDiscoverPacket() : boolean
+        ByteBuffer packet = DhcpPacket.buildDiscoverPacket(
+                DhcpPacket.ENCAP_L2, mTransactionId, getSecs(), mHwAddr,
+                DO_UNICAST, REQUESTED_PARAMS);
+        return transmitPacket(packet, "DHCPDISCOVER", DhcpPacket.ENCAP_L2, INADDR_BROADCAST);
+!!!74927543.java!!!	sendRequestPacket(inout clientAddress : Inet4Address, inout requestedAddress : Inet4Address, inout serverAddress : Inet4Address, inout to : Inet4Address) : boolean
+        // TODO: should we use the transaction ID from the server?
+        final int encap = INADDR_ANY.equals(clientAddress)
+                ? DhcpPacket.ENCAP_L2 : DhcpPacket.ENCAP_BOOTP;
+
+        ByteBuffer packet = DhcpPacket.buildRequestPacket(
+                encap, mTransactionId, getSecs(), clientAddress,
+                DO_UNICAST, mHwAddr, requestedAddress,
+                serverAddress, REQUESTED_PARAMS, null);
+        String serverStr = (serverAddress != null) ? serverAddress.getHostAddress() : null;
+        String description = "DHCPREQUEST ciaddr=" + clientAddress.getHostAddress() +
+                             " request=" + requestedAddress.getHostAddress() +
+                             " serverid=" + serverStr;
+        return transmitPacket(packet, description, encap, to);
+!!!74927671.java!!!	scheduleLeaseTimers() : void
+        if (mDhcpLeaseExpiry == 0) {
+            Log.d(TAG, "Infinite lease, no timer scheduling needed");
+            return;
+        }
+
+        final long now = SystemClock.elapsedRealtime();
+
+        // TODO: consider getting the renew and rebind timers from T1 and T2.
+        // See also:
+        //     https://tools.ietf.org/html/rfc2131#section-4.4.5
+        //     https://tools.ietf.org/html/rfc1533#section-9.9
+        //     https://tools.ietf.org/html/rfc1533#section-9.10
+        final long remainingDelay = mDhcpLeaseExpiry - now;
+        final long renewDelay = remainingDelay / 2;
+        final long rebindDelay = remainingDelay * 7 / 8;
+        mRenewAlarm.schedule(now + renewDelay);
+        mRebindAlarm.schedule(now + rebindDelay);
+        mExpiryAlarm.schedule(now + remainingDelay);
+        Log.d(TAG, "Scheduling renewal in " + (renewDelay / 1000) + "s");
+        Log.d(TAG, "Scheduling rebind in " + (rebindDelay / 1000) + "s");
+        Log.d(TAG, "Scheduling expiry in " + (remainingDelay / 1000) + "s");
+!!!74927799.java!!!	notifySuccess() : void
+        mController.sendMessage(
+                CMD_POST_DHCP_ACTION, DHCP_SUCCESS, 0, new DhcpResults(mDhcpLease));
+!!!74927927.java!!!	notifyFailure() : void
+        mController.sendMessage(CMD_POST_DHCP_ACTION, DHCP_FAILURE, 0, null);
+!!!74928055.java!!!	acceptDhcpResults(inout results : DhcpResults, inout msg : String) : void
+        mDhcpLease = results;
+        mOffer = null;
+        Log.d(TAG, msg + " lease: " + mDhcpLease);
+        notifySuccess();
+!!!74928183.java!!!	clearDhcpState() : void
+        mDhcpLease = null;
+        mDhcpLeaseExpiry = 0;
+        mOffer = null;
+!!!74928311.java!!!	doQuit() : void
+        Log.d(TAG, "doQuit");
+        quit();
+!!!74928439.java!!!	onQuitting() : void
+        Log.d(TAG, "onQuitting");
+        mController.sendMessage(CMD_ON_QUIT);
+!!!74930103.java!!!	isValidPacket(inout packet : DhcpPacket) : boolean
+        // TODO: check checksum.
+        int xid = packet.getTransactionId();
+        if (xid != mTransactionId) {
+            Log.d(TAG, "Unexpected transaction ID " + xid + ", expected " + mTransactionId);
+            return false;
+        }
+        if (!Arrays.equals(packet.getClientMac(), mHwAddr)) {
+            Log.d(TAG, "MAC addr mismatch: got " +
+                    HexDump.toHexString(packet.getClientMac()) + ", expected " +
+                    HexDump.toHexString(packet.getClientMac()));
+            return false;
+        }
+        return true;
+!!!74930231.java!!!	setDhcpLeaseExpiry(inout packet : DhcpPacket) : void
+        long leaseTimeMillis = packet.getLeaseTimeMillis();
+        mDhcpLeaseExpiry =
+                (leaseTimeMillis > 0) ? SystemClock.elapsedRealtime() + leaseTimeMillis : 0;

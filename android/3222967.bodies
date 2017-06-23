@@ -1,0 +1,86 @@
+class AesEvpDecryptOperation
+!!!43085367.cpp!!!	Begin(in input_params : AuthorizationSet, inout output_params : AuthorizationSet) : keymaster_error_t
+    if (need_iv()) {
+        keymaster_error_t error = GetIv(input_params);
+        if (error != KM_ERROR_OK)
+            return error;
+    }
+
+    if (tag_length_ > 0) {
+        tag_buf_length_ = 0;
+        tag_buf_.reset(new (std::nothrow) uint8_t[tag_length_]);
+        if (!tag_buf_.get())
+            return KM_ERROR_MEMORY_ALLOCATION_FAILED;
+    }
+
+    return AesEvpOperation::Begin(input_params, output_params);
+!!!43085495.cpp!!!	Update(in additional_params : AuthorizationSet, in input : Buffer, inout output_params : AuthorizationSet, inout output : Buffer, inout input_consumed : size_t) : keymaster_error_t
+    if (!output || !input_consumed)
+        return KM_ERROR_OUTPUT_PARAMETER_NULL;
+
+    // Barring error, we'll consume it all.
+    *input_consumed = input.available_read();
+
+    keymaster_error_t error;
+    if (block_mode_ == KM_MODE_GCM) {
+        if (!HandleAad(additional_params, input, &error))
+            return error;
+        return ProcessAllButTagLengthBytes(input, output);
+    }
+
+    if (!InternalUpdate(input.peek_read(), input.available_read(), output, &error))
+        return error;
+    return KM_ERROR_OK;
+!!!43085623.cpp!!!	Finish(in additional_params : AuthorizationSet, in input : Buffer, in signature : Buffer, inout output_params : AuthorizationSet, inout output : Buffer) : keymaster_error_t
+    keymaster_error_t error;
+    if (!UpdateForFinish(additional_params, input, output_params, output, &error))
+        return error;
+
+    if (tag_buf_length_ < tag_length_)
+        return KM_ERROR_INVALID_INPUT_LENGTH;
+    else if (tag_length_ > 0 &&
+             !EVP_CIPHER_CTX_ctrl(&ctx_, EVP_CTRL_GCM_SET_TAG, tag_length_, tag_buf_.get()))
+        return TranslateLastOpenSslError();
+
+    AuthorizationSet empty_params;
+    Buffer empty_input;
+    return AesEvpOperation::Finish(empty_params, empty_input, signature, output_params, output);
+!!!43086007.cpp!!!	ProcessAllButTagLengthBytes(in input : Buffer, inout output : Buffer) : keymaster_error_t
+    if (input.available_read() <= tag_buf_unused()) {
+        BufferCandidateTagData(input.peek_read(), input.available_read());
+        return KM_ERROR_OK;
+    }
+
+    const size_t data_available = tag_buf_length_ + input.available_read();
+
+    const size_t to_process = data_available - tag_length_;
+    const size_t to_process_from_tag_buf = min(to_process, tag_buf_length_);
+    const size_t to_process_from_input = to_process - to_process_from_tag_buf;
+
+    if (!output->reserve(to_process + AES_BLOCK_SIZE))
+        return KM_ERROR_MEMORY_ALLOCATION_FAILED;
+
+    keymaster_error_t error;
+    if (!ProcessTagBufContentsAsData(to_process_from_tag_buf, output, &error))
+        return error;
+
+    if (!InternalUpdate(input.peek_read(), to_process_from_input, output, &error))
+        return error;
+
+    BufferCandidateTagData(input.peek_read() + to_process_from_input,
+                           input.available_read() - to_process_from_input);
+    assert(tag_buf_unused() == 0);
+
+    return KM_ERROR_OK;
+!!!43086135.cpp!!!	ProcessTagBufContentsAsData(in to_process : size_t, inout output : Buffer, inout error : keymaster_error_t) : bool
+    assert(to_process <= tag_buf_length_);
+    if (!InternalUpdate(tag_buf_.get(), to_process, output, error))
+        return false;
+    if (to_process < tag_buf_length_)
+        memmove(tag_buf_.get(), tag_buf_.get() + to_process, tag_buf_length_ - to_process);
+    tag_buf_length_ -= to_process;
+    return true;
+!!!43086263.cpp!!!	BufferCandidateTagData(in data : uint8_t, in data_length : size_t) : void
+    assert(data_length <= tag_length_ - tag_buf_length_);
+    memcpy(tag_buf_.get() + tag_buf_length_, data, data_length);
+    tag_buf_length_ += data_length;

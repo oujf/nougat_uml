@@ -1,0 +1,402 @@
+class HWC2On1Adapter
+!!!40966839.cpp!!!	~HWC2On1Adapter()
+    hwc_close_1(mHwc1Device);
+!!!40967351.cpp!!!	doGetCapabilities(inout outCount : uint32_t, inout outCapabilities : int32_t) : void
+    if (outCapabilities == nullptr) {
+        *outCount = mCapabilities.size();
+        return;
+    }
+
+    auto capabilityIter = mCapabilities.cbegin();
+    for (size_t written = 0; written < *outCount; ++written) {
+        if (capabilityIter == mCapabilities.cend()) {
+            return;
+        }
+        outCapabilities[written] = static_cast<int32_t>(*capabilityIter);
+        ++capabilityIter;
+    }
+!!!40967863.cpp!!!	createVirtualDisplay(in width : uint32_t, in height : uint32_t, inout outDisplay : hwc2_display_t) : HWC2::Error
+    std::unique_lock<std::recursive_timed_mutex> lock(mStateMutex);
+
+    if (mHwc1VirtualDisplay) {
+        // We have already allocated our only HWC1 virtual display
+        ALOGE("createVirtualDisplay: HWC1 virtual display already allocated");
+        return Error::NoResources;
+    }
+
+    if (MAX_VIRTUAL_DISPLAY_DIMENSION != 0 &&
+            (width > MAX_VIRTUAL_DISPLAY_DIMENSION ||
+            height > MAX_VIRTUAL_DISPLAY_DIMENSION)) {
+        ALOGE("createVirtualDisplay: Can't create a virtual display with"
+                " a dimension > %u (tried %u x %u)",
+                MAX_VIRTUAL_DISPLAY_DIMENSION, width, height);
+        return Error::NoResources;
+    }
+
+    mHwc1VirtualDisplay = std::make_shared<HWC2On1Adapter::Display>(*this,
+            HWC2::DisplayType::Virtual);
+    mHwc1VirtualDisplay->populateConfigs(width, height);
+    const auto displayId = mHwc1VirtualDisplay->getId();
+    mHwc1DisplayMap[HWC_DISPLAY_VIRTUAL] = displayId;
+    mHwc1VirtualDisplay->setHwc1Id(HWC_DISPLAY_VIRTUAL);
+    mDisplays.emplace(displayId, mHwc1VirtualDisplay);
+    *outDisplay = displayId;
+
+    return Error::None;
+!!!40968119.cpp!!!	destroyVirtualDisplay(in displayId : hwc2_display_t) : HWC2::Error
+    std::unique_lock<std::recursive_timed_mutex> lock(mStateMutex);
+
+    if (!mHwc1VirtualDisplay || (mHwc1VirtualDisplay->getId() != displayId)) {
+        return Error::BadDisplay;
+    }
+
+    mHwc1VirtualDisplay.reset();
+    mHwc1DisplayMap.erase(HWC_DISPLAY_VIRTUAL);
+    mDisplays.erase(displayId);
+
+    return Error::None;
+!!!40968375.cpp!!!	dump(inout outSize : uint32_t, inout outBuffer : char) : void
+    if (outBuffer != nullptr) {
+        auto copiedBytes = mDumpString.copy(outBuffer, *outSize);
+        *outSize = static_cast<uint32_t>(copiedBytes);
+        return;
+    }
+
+    std::stringstream output;
+
+    output << "-- HWC2On1Adapter --\n";
+
+    output << "Adapting to a HWC 1." << static_cast<int>(mHwc1MinorVersion) <<
+            " device\n";
+
+    // Attempt to acquire the lock for 1 second, but proceed without the lock
+    // after that, so we can still get some information if we're deadlocked
+    std::unique_lock<std::recursive_timed_mutex> lock(mStateMutex,
+            std::defer_lock);
+    lock.try_lock_for(1s);
+
+    if (mCapabilities.empty()) {
+        output << "Capabilities: None\n";
+    } else {
+        output << "Capabilities:\n";
+        for (auto capability : mCapabilities) {
+            output << "  " << to_string(capability) << '\n';
+        }
+    }
+
+    output << "Displays:\n";
+    for (const auto& element : mDisplays) {
+        const auto& display = element.second;
+        output << display->dump();
+    }
+    output << '\n';
+
+    // Release the lock before calling into HWC1, and since we no longer require
+    // mutual exclusion to access mCapabilities or mDisplays
+    lock.unlock();
+
+    if (mHwc1Device->dump) {
+        output << "HWC1 dump:\n";
+        std::vector<char> hwc1Dump(4096);
+        // Call with size - 1 to preserve a null character at the end
+        mHwc1Device->dump(mHwc1Device, hwc1Dump.data(),
+                static_cast<int>(hwc1Dump.size() - 1));
+        output << hwc1Dump.data();
+    }
+
+    mDumpString = output.str();
+    *outSize = static_cast<uint32_t>(mDumpString.size());
+!!!40968631.cpp!!!	getMaxVirtualDisplayCount() : uint32_t
+    return mHwc1SupportsVirtualDisplays ? 1 : 0;
+!!!40986039.cpp!!!	populateCapabilities() : void
+    ALOGV("populateCapabilities");
+    if (mHwc1MinorVersion >= 3U) {
+        int supportedTypes = 0;
+        auto result = mHwc1Device->query(mHwc1Device,
+                HWC_DISPLAY_TYPES_SUPPORTED, &supportedTypes);
+        if ((result == 0) && ((supportedTypes & HWC_DISPLAY_VIRTUAL) != 0)) {
+            ALOGI("Found support for HWC virtual displays");
+            mHwc1SupportsVirtualDisplays = true;
+        }
+    }
+    if (mHwc1MinorVersion >= 4U) {
+        mCapabilities.insert(Capability::SidebandStream);
+    }
+!!!40986167.cpp!!!	getDisplay(in id : hwc2_display_t) : HWC2On1Adapter::Display
+    std::unique_lock<std::recursive_timed_mutex> lock(mStateMutex);
+
+    auto display = mDisplays.find(id);
+    if (display == mDisplays.end()) {
+        return nullptr;
+    }
+
+    return display->second.get();
+!!!40986295.cpp!!!	getLayer(in displayId : hwc2_display_t, in layerId : hwc2_layer_t) : std::tuple<Layer*, HWC2::Error>
+    auto display = getDisplay(displayId);
+    if (!display) {
+        return std::make_tuple(static_cast<Layer*>(nullptr), Error::BadDisplay);
+    }
+
+    auto layerEntry = mLayers.find(layerId);
+    if (layerEntry == mLayers.end()) {
+        return std::make_tuple(static_cast<Layer*>(nullptr), Error::BadLayer);
+    }
+
+    auto layer = layerEntry->second;
+    if (layer->getDisplay().getId() != displayId) {
+        return std::make_tuple(static_cast<Layer*>(nullptr), Error::BadLayer);
+    }
+    return std::make_tuple(layer.get(), Error::None);
+!!!40986423.cpp!!!	populatePrimary() : void
+    ALOGV("populatePrimary");
+
+    std::unique_lock<std::recursive_timed_mutex> lock(mStateMutex);
+
+    auto display =
+            std::make_shared<Display>(*this, HWC2::DisplayType::Physical);
+    mHwc1DisplayMap[HWC_DISPLAY_PRIMARY] = display->getId();
+    display->setHwc1Id(HWC_DISPLAY_PRIMARY);
+    display->populateConfigs();
+    mDisplays.emplace(display->getId(), std::move(display));
+!!!40986551.cpp!!!	prepareAllDisplays() : bool
+    ATRACE_CALL();
+
+    std::unique_lock<std::recursive_timed_mutex> lock(mStateMutex);
+
+    for (const auto& displayPair : mDisplays) {
+        auto& display = displayPair.second;
+        if (!display->prepare()) {
+            return false;
+        }
+    }
+
+    if (mHwc1DisplayMap.count(0) == 0) {
+        ALOGE("prepareAllDisplays: Unable to find primary HWC1 display");
+        return false;
+    }
+
+    // Always push the primary display
+    std::vector<HWC2On1Adapter::Display::HWC1Contents> requestedContents;
+    auto primaryDisplayId = mHwc1DisplayMap[HWC_DISPLAY_PRIMARY];
+    auto& primaryDisplay = mDisplays[primaryDisplayId];
+    auto primaryDisplayContents = primaryDisplay->cloneRequestedContents();
+    requestedContents.push_back(std::move(primaryDisplayContents));
+
+    // Push the external display, if present
+    if (mHwc1DisplayMap.count(HWC_DISPLAY_EXTERNAL) != 0) {
+        auto externalDisplayId = mHwc1DisplayMap[HWC_DISPLAY_EXTERNAL];
+        auto& externalDisplay = mDisplays[externalDisplayId];
+        auto externalDisplayContents =
+                externalDisplay->cloneRequestedContents();
+        requestedContents.push_back(std::move(externalDisplayContents));
+    } else {
+        // Even if an external display isn't present, we still need to send
+        // at least two displays down to HWC1
+        requestedContents.push_back(nullptr);
+    }
+
+    // Push the hardware virtual display, if supported and present
+    if (mHwc1MinorVersion >= 3) {
+        if (mHwc1DisplayMap.count(HWC_DISPLAY_VIRTUAL) != 0) {
+            auto virtualDisplayId = mHwc1DisplayMap[HWC_DISPLAY_VIRTUAL];
+            auto& virtualDisplay = mDisplays[virtualDisplayId];
+            auto virtualDisplayContents =
+                    virtualDisplay->cloneRequestedContents();
+            requestedContents.push_back(std::move(virtualDisplayContents));
+        } else {
+            requestedContents.push_back(nullptr);
+        }
+    }
+
+    mHwc1Contents.clear();
+    for (auto& displayContents : requestedContents) {
+        mHwc1Contents.push_back(displayContents.get());
+        if (!displayContents) {
+            continue;
+        }
+
+        ALOGV("Display %zd layers:", mHwc1Contents.size() - 1);
+        for (size_t l = 0; l < displayContents->numHwLayers; ++l) {
+            auto& layer = displayContents->hwLayers[l];
+            ALOGV("  %zd: %d", l, layer.compositionType);
+        }
+    }
+
+    ALOGV("Calling HWC1 prepare");
+    {
+        ATRACE_NAME("HWC1 prepare");
+        mHwc1Device->prepare(mHwc1Device, mHwc1Contents.size(),
+                mHwc1Contents.data());
+    }
+
+    for (size_t c = 0; c < mHwc1Contents.size(); ++c) {
+        auto& contents = mHwc1Contents[c];
+        if (!contents) {
+            continue;
+        }
+        ALOGV("Display %zd layers:", c);
+        for (size_t l = 0; l < contents->numHwLayers; ++l) {
+            ALOGV("  %zd: %d", l, contents->hwLayers[l].compositionType);
+        }
+    }
+
+    // Return the received contents to their respective displays
+    for (size_t hwc1Id = 0; hwc1Id < mHwc1Contents.size(); ++hwc1Id) {
+        if (mHwc1Contents[hwc1Id] == nullptr) {
+            continue;
+        }
+
+        auto displayId = mHwc1DisplayMap[hwc1Id];
+        auto& display = mDisplays[displayId];
+        display->setReceivedContents(std::move(requestedContents[hwc1Id]));
+    }
+
+    return true;
+!!!40986679.cpp!!!	setAllDisplays() : HWC2::Error
+    ATRACE_CALL();
+
+    std::unique_lock<std::recursive_timed_mutex> lock(mStateMutex);
+
+    // Make sure we're ready to validate
+    for (size_t hwc1Id = 0; hwc1Id < mHwc1Contents.size(); ++hwc1Id) {
+        if (mHwc1Contents[hwc1Id] == nullptr) {
+            continue;
+        }
+
+        auto displayId = mHwc1DisplayMap[hwc1Id];
+        auto& display = mDisplays[displayId];
+        Error error = display->set(*mHwc1Contents[hwc1Id]);
+        if (error != Error::None) {
+            ALOGE("setAllDisplays: Failed to set display %zd: %s", hwc1Id,
+                    to_string(error).c_str());
+            return error;
+        }
+    }
+
+    ALOGV("Calling HWC1 set");
+    {
+        ATRACE_NAME("HWC1 set");
+        mHwc1Device->set(mHwc1Device, mHwc1Contents.size(),
+                mHwc1Contents.data());
+    }
+
+    // Add retire and release fences
+    for (size_t hwc1Id = 0; hwc1Id < mHwc1Contents.size(); ++hwc1Id) {
+        if (mHwc1Contents[hwc1Id] == nullptr) {
+            continue;
+        }
+
+        auto displayId = mHwc1DisplayMap[hwc1Id];
+        auto& display = mDisplays[displayId];
+        auto retireFenceFd = mHwc1Contents[hwc1Id]->retireFenceFd;
+        ALOGV("setAllDisplays: Adding retire fence %d to display %zd",
+                retireFenceFd, hwc1Id);
+        display->addRetireFence(mHwc1Contents[hwc1Id]->retireFenceFd);
+        display->addReleaseFences(*mHwc1Contents[hwc1Id]);
+    }
+
+    return Error::None;
+!!!40986807.cpp!!!	hwc1Invalidate() : void
+    ALOGV("Received hwc1Invalidate");
+
+    std::unique_lock<std::recursive_timed_mutex> lock(mStateMutex);
+
+    // If the HWC2-side callback hasn't been registered yet, buffer this until
+    // it is registered
+    if (mCallbacks.count(Callback::Refresh) == 0) {
+        mHasPendingInvalidate = true;
+        return;
+    }
+
+    const auto& callbackInfo = mCallbacks[Callback::Refresh];
+    std::vector<hwc2_display_t> displays;
+    for (const auto& displayPair : mDisplays) {
+        displays.emplace_back(displayPair.first);
+    }
+
+    // Call back without the state lock held
+    lock.unlock();
+
+    auto refresh = reinterpret_cast<HWC2_PFN_REFRESH>(callbackInfo.pointer);
+    for (auto display : displays) {
+        refresh(callbackInfo.data, display);
+    }
+!!!40986935.cpp!!!	hwc1Vsync(in hwc1DisplayId : int, in timestamp : int64_t) : void
+    ALOGV("Received hwc1Vsync(%d, %" PRId64 ")", hwc1DisplayId, timestamp);
+
+    std::unique_lock<std::recursive_timed_mutex> lock(mStateMutex);
+
+    // If the HWC2-side callback hasn't been registered yet, buffer this until
+    // it is registered
+    if (mCallbacks.count(Callback::Vsync) == 0) {
+        mPendingVsyncs.emplace_back(hwc1DisplayId, timestamp);
+        return;
+    }
+
+    if (mHwc1DisplayMap.count(hwc1DisplayId) == 0) {
+        ALOGE("hwc1Vsync: Couldn't find display for HWC1 id %d", hwc1DisplayId);
+        return;
+    }
+
+    const auto& callbackInfo = mCallbacks[Callback::Vsync];
+    auto displayId = mHwc1DisplayMap[hwc1DisplayId];
+
+    // Call back without the state lock held
+    lock.unlock();
+
+    auto vsync = reinterpret_cast<HWC2_PFN_VSYNC>(callbackInfo.pointer);
+    vsync(callbackInfo.data, displayId, timestamp);
+!!!40987063.cpp!!!	hwc1Hotplug(in hwc1DisplayId : int, in connected : int) : void
+    ALOGV("Received hwc1Hotplug(%d, %d)", hwc1DisplayId, connected);
+
+    if (hwc1DisplayId != HWC_DISPLAY_EXTERNAL) {
+        ALOGE("hwc1Hotplug: Received hotplug for non-external display");
+        return;
+    }
+
+    std::unique_lock<std::recursive_timed_mutex> lock(mStateMutex);
+
+    // If the HWC2-side callback hasn't been registered yet, buffer this until
+    // it is registered
+    if (mCallbacks.count(Callback::Hotplug) == 0) {
+        mPendingHotplugs.emplace_back(hwc1DisplayId, connected);
+        return;
+    }
+
+    hwc2_display_t displayId = UINT64_MAX;
+    if (mHwc1DisplayMap.count(hwc1DisplayId) == 0) {
+        if (connected == 0) {
+            ALOGW("hwc1Hotplug: Received disconnect for unconnected display");
+            return;
+        }
+
+        // Create a new display on connect
+        auto display = std::make_shared<HWC2On1Adapter::Display>(*this,
+                HWC2::DisplayType::Physical);
+        display->setHwc1Id(HWC_DISPLAY_EXTERNAL);
+        display->populateConfigs();
+        displayId = display->getId();
+        mHwc1DisplayMap[HWC_DISPLAY_EXTERNAL] = displayId;
+        mDisplays.emplace(displayId, std::move(display));
+    } else {
+        if (connected != 0) {
+            ALOGW("hwc1Hotplug: Received connect for previously connected "
+                    "display");
+            return;
+        }
+
+        // Disconnect an existing display
+        displayId = mHwc1DisplayMap[hwc1DisplayId];
+        mHwc1DisplayMap.erase(HWC_DISPLAY_EXTERNAL);
+        mDisplays.erase(displayId);
+    }
+
+    const auto& callbackInfo = mCallbacks[Callback::Hotplug];
+
+    // Call back without the state lock held
+    lock.unlock();
+
+    auto hotplug = reinterpret_cast<HWC2_PFN_HOTPLUG>(callbackInfo.pointer);
+    auto hwc2Connected = (connected == 0) ?
+            HWC2::Connection::Disconnected : HWC2::Connection::Connected;
+    hotplug(callbackInfo.data, displayId, static_cast<int32_t>(hwc2Connected));

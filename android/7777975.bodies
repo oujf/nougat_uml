@@ -1,0 +1,542 @@
+class ManagedServices
+!!!85070519.java!!!	ManagedServices(inout context : Context, inout handler : Handler, inout mutex : Object, inout userProfiles : ManagedServices::UserProfiles)
+        mContext = context;
+        mMutex = mutex;
+        mUserProfiles = userProfiles;
+        mConfig = getConfig();
+        mSettingsObserver = new SettingsObserver(handler);
+
+        mRestoreReceiver = new SettingRestoredReceiver();
+        IntentFilter filter = new IntentFilter(Intent.ACTION_SETTING_RESTORED);
+        context.registerReceiver(mRestoreReceiver, filter);
+        rebuildRestoredPackages();
+!!!85070903.java!!!	getCaption() : String
+        return mConfig.caption;
+!!!85071543.java!!!	newServiceInfo(inout service : IInterface, inout component : ComponentName, in userid : int, inout isSystem : boolean, inout connection : ServiceConnection, in targetSdkVersion : int) : ManagedServices::ManagedServiceInfo
+        return new ManagedServiceInfo(service, component, userid, isSystem, connection,
+                targetSdkVersion);
+!!!85071671.java!!!	onBootPhaseAppsCanStart() : void
+        mSettingsObserver.observe();
+!!!85071799.java!!!	dump(inout pw : PrintWriter, inout filter : NotificationManagerService::DumpFilter) : void
+        pw.println("    All " + getCaption() + "s (" + mEnabledServicesForCurrentProfiles.size()
+                + ") enabled for current profiles:");
+        for (ComponentName cmpt : mEnabledServicesForCurrentProfiles) {
+            if (filter != null && !filter.matches(cmpt)) continue;
+            pw.println("      " + cmpt);
+        }
+
+        pw.println("    Live " + getCaption() + "s (" + mServices.size() + "):");
+        for (ManagedServiceInfo info : mServices) {
+            if (filter != null && !filter.matches(info.component)) continue;
+            pw.println("      " + info.component
+                    + " (user " + info.userid + "): " + info.service
+                    + (info.isSystem?" SYSTEM":"")
+                    + (info.isGuest(this)?" GUEST":""));
+        }
+
+        pw.println("    Snoozed " + getCaption() + "s (" +
+                mSnoozingForCurrentProfiles.size() + "):");
+        for (ComponentName name : mSnoozingForCurrentProfiles) {
+            pw.println("      " + name.flattenToShortString());
+        }
+!!!85071927.java!!!	restoredSettingName(inout setting : String) : String
+        return setting + ":restored";
+!!!85072055.java!!!	settingRestored(inout element : String, inout oldValue : String, inout newValue : String, in userid : int) : void
+        if (DEBUG) Slog.d(TAG, "Restored managed service setting: " + element
+                + " ovalue=" + oldValue + " nvalue=" + newValue);
+        if (mConfig.secureSettingName.equals(element) ||
+                mConfig.secondarySettingName.equals(element)) {
+            if (element != null) {
+                Settings.Secure.putStringForUser(mContext.getContentResolver(),
+                        restoredSettingName(element),
+                        newValue,
+                        userid);
+                updateSettingsAccordingToInstalledServices(element, userid);
+                rebuildRestoredPackages();
+            }
+        }
+!!!85072183.java!!!	isComponentEnabledForPackage(inout pkg : String) : boolean
+        return mEnabledServicesPackageNames.contains(pkg);
+!!!85072311.java!!!	onPackagesChanged(inout queryReplace : boolean, inout pkgList : String [[]]) : void
+        if (DEBUG) Slog.d(TAG, "onPackagesChanged queryReplace=" + queryReplace
+                + " pkgList=" + (pkgList == null ? null : Arrays.asList(pkgList))
+                + " mEnabledServicesPackageNames=" + mEnabledServicesPackageNames);
+        boolean anyServicesInvolved = false;
+
+        if (pkgList != null && (pkgList.length > 0)) {
+            for (String pkgName : pkgList) {
+                if (mEnabledServicesPackageNames.contains(pkgName) ||
+                        mRestoredPackages.contains(pkgName)) {
+                    anyServicesInvolved = true;
+                }
+            }
+        }
+
+        if (anyServicesInvolved) {
+            // if we're not replacing a package, clean up orphaned bits
+            if (!queryReplace) {
+                updateSettingsAccordingToInstalledServices();
+                rebuildRestoredPackages();
+            }
+            // make sure we're still bound to any of our services who may have just upgraded
+            rebindServices(false);
+        }
+!!!85072439.java!!!	onUserSwitched(in user : int) : void
+        if (DEBUG) Slog.d(TAG, "onUserSwitched u=" + user);
+        rebuildRestoredPackages();
+        if (Arrays.equals(mLastSeenProfileIds, mUserProfiles.getCurrentProfileIds())) {
+            if (DEBUG) Slog.d(TAG, "Current profile IDs didn't change, skipping rebindServices().");
+            return;
+        }
+        rebindServices(true);
+!!!85072567.java!!!	onUserUnlocked(in user : int) : void
+        if (DEBUG) Slog.d(TAG, "onUserUnlocked u=" + user);
+        rebuildRestoredPackages();
+        rebindServices(false);
+!!!85072695.java!!!	getServiceFromTokenLocked(inout service : IInterface) : ManagedServices::ManagedServiceInfo
+        if (service == null) {
+            return null;
+        }
+        final IBinder token = service.asBinder();
+        final int N = mServices.size();
+        for (int i = 0; i < N; i++) {
+            final ManagedServiceInfo info = mServices.get(i);
+            if (info.service.asBinder() == token) return info;
+        }
+        return null;
+!!!85072823.java!!!	checkServiceTokenLocked(inout service : IInterface) : ManagedServices::ManagedServiceInfo
+        checkNotNull(service);
+        ManagedServiceInfo info = getServiceFromTokenLocked(service);
+        if (info != null) {
+            return info;
+        }
+        throw new SecurityException("Disallowed call from unknown " + getCaption() + ": "
+                + service);
+!!!85072951.java!!!	unregisterService(inout service : IInterface, in userid : int) : void
+        checkNotNull(service);
+        // no need to check permissions; if your service binder is in the list,
+        // that's proof that you had permission to add it in the first place
+        unregisterServiceImpl(service, userid);
+!!!85073079.java!!!	registerService(inout service : IInterface, inout component : ComponentName, in userid : int) : void
+        checkNotNull(service);
+        ManagedServiceInfo info = registerServiceImpl(service, component, userid);
+        if (info != null) {
+            onServiceAdded(info);
+        }
+!!!85073207.java!!!	registerGuestService(inout guest : ManagedServices::ManagedServiceInfo) : void
+        checkNotNull(guest.service);
+        if (!checkType(guest.service)) {
+            throw new IllegalArgumentException();
+        }
+        if (registerServiceImpl(guest) != null) {
+            onServiceAdded(guest);
+        }
+!!!85073335.java!!!	setComponentState(inout component : ComponentName, inout enabled : boolean) : void
+        boolean previous = !mSnoozingForCurrentProfiles.contains(component);
+        if (previous == enabled) {
+            return;
+        }
+
+        if (enabled) {
+            mSnoozingForCurrentProfiles.remove(component);
+        } else {
+            mSnoozingForCurrentProfiles.add(component);
+        }
+
+        // State changed
+        if (DEBUG) {
+            Slog.d(TAG, ((enabled) ? "Enabling " : "Disabling ") + "component " +
+                    component.flattenToShortString());
+        }
+
+
+        synchronized (mMutex) {
+            final int[] userIds = mUserProfiles.getCurrentProfileIds();
+
+            for (int userId : userIds) {
+                if (enabled) {
+                    registerServiceLocked(component, userId);
+                } else {
+                    unregisterServiceLocked(component, userId);
+                }
+            }
+        }
+!!!85073463.java!!!	rebuildRestoredPackages() : void
+        mRestoredPackages.clear();
+        mSnoozingForCurrentProfiles.clear();
+        String secureSettingName = restoredSettingName(mConfig.secureSettingName);
+        String secondarySettingName = mConfig.secondarySettingName == null
+                ? null : restoredSettingName(mConfig.secondarySettingName);
+        int[] userIds = mUserProfiles.getCurrentProfileIds();
+        final int N = userIds.length;
+        for (int i = 0; i < N; ++i) {
+            ArraySet<ComponentName> names =
+                    loadComponentNamesFromSetting(secureSettingName, userIds[i]);
+            if (secondarySettingName != null) {
+                names.addAll(loadComponentNamesFromSetting(secondarySettingName, userIds[i]));
+            }
+            for (ComponentName name : names) {
+                mRestoredPackages.add(name.getPackageName());
+            }
+        }
+!!!85073591.java!!!	loadComponentNamesFromSetting(inout settingName : String, in userId : int) : ArraySet
+        final ContentResolver cr = mContext.getContentResolver();
+        String settingValue = Settings.Secure.getStringForUser(
+            cr,
+            settingName,
+            userId);
+        if (TextUtils.isEmpty(settingValue))
+            return new ArraySet<>();
+        String[] restored = settingValue.split(ENABLED_SERVICES_SEPARATOR);
+        ArraySet<ComponentName> result = new ArraySet<>(restored.length);
+        for (int i = 0; i < restored.length; i++) {
+            ComponentName value = ComponentName.unflattenFromString(restored[i]);
+            if (null != value) {
+                result.add(value);
+            }
+        }
+        return result;
+!!!85073719.java!!!	storeComponentsToSetting(inout components : Set<ComponentName>, inout settingName : String, in userId : int) : void
+        String[] componentNames = null;
+        if (null != components) {
+            componentNames = new String[components.size()];
+            int index = 0;
+            for (ComponentName c: components) {
+                componentNames[index++] = c.flattenToString();
+            }
+        }
+        final String value = (componentNames == null) ? "" :
+                TextUtils.join(ENABLED_SERVICES_SEPARATOR, componentNames);
+        final ContentResolver cr = mContext.getContentResolver();
+        Settings.Secure.putStringForUser(
+            cr,
+            settingName,
+            value,
+            userId);
+!!!85073847.java!!!	updateSettingsAccordingToInstalledServices() : void
+        int[] userIds = mUserProfiles.getCurrentProfileIds();
+        final int N = userIds.length;
+        for (int i = 0; i < N; ++i) {
+            updateSettingsAccordingToInstalledServices(mConfig.secureSettingName, userIds[i]);
+            if (mConfig.secondarySettingName != null) {
+                updateSettingsAccordingToInstalledServices(
+                        mConfig.secondarySettingName, userIds[i]);
+            }
+        }
+        rebuildRestoredPackages();
+!!!85073975.java!!!	queryPackageForServices(inout packageName : String, in userId : int) : ComponentName
+        Set<ComponentName> installed = new ArraySet<>();
+        final PackageManager pm = mContext.getPackageManager();
+        Intent queryIntent = new Intent(mConfig.serviceInterface);
+        if (!TextUtils.isEmpty(packageName)) {
+            queryIntent.setPackage(packageName);
+        }
+        List<ResolveInfo> installedServices = pm.queryIntentServicesAsUser(
+                queryIntent,
+                PackageManager.GET_SERVICES | PackageManager.GET_META_DATA,
+                userId);
+        if (DEBUG)
+            Slog.v(TAG, mConfig.serviceInterface + " services: " + installedServices);
+        if (installedServices != null) {
+            for (int i = 0, count = installedServices.size(); i < count; i++) {
+                ResolveInfo resolveInfo = installedServices.get(i);
+                ServiceInfo info = resolveInfo.serviceInfo;
+
+                ComponentName component = new ComponentName(info.packageName, info.name);
+                if (!mConfig.bindPermission.equals(info.permission)) {
+                    Slog.w(TAG, "Skipping " + getCaption() + " service "
+                        + info.packageName + "/" + info.name
+                        + ": it does not require the permission "
+                        + mConfig.bindPermission);
+                    continue;
+                }
+                installed.add(component);
+            }
+        }
+        return installed;
+!!!85074103.java!!!	updateSettingsAccordingToInstalledServices(inout setting : String, in userId : int) : void
+        boolean restoredChanged = false;
+        boolean currentChanged = false;
+        Set<ComponentName> restored =
+                loadComponentNamesFromSetting(restoredSettingName(setting), userId);
+        Set<ComponentName> current =
+                loadComponentNamesFromSetting(setting, userId);
+        // Load all services for all packages.
+        Set<ComponentName> installed = queryPackageForServices(null, userId);
+
+        ArraySet<ComponentName> retained = new ArraySet<>();
+
+        for (ComponentName component : installed) {
+            if (null != restored) {
+                boolean wasRestored = restored.remove(component);
+                if (wasRestored) {
+                    // Freshly installed package has service that was mentioned in restored setting.
+                    if (DEBUG)
+                        Slog.v(TAG, "Restoring " + component + " for user " + userId);
+                    restoredChanged = true;
+                    currentChanged = true;
+                    retained.add(component);
+                    continue;
+                }
+            }
+
+            if (null != current) {
+                if (current.contains(component))
+                    retained.add(component);
+            }
+        }
+
+        currentChanged |= ((current == null ? 0 : current.size()) != retained.size());
+
+        if (currentChanged) {
+            if (DEBUG) Slog.v(TAG, "List of  " + getCaption() + " services was updated " + current);
+            storeComponentsToSetting(retained, setting, userId);
+        }
+
+        if (restoredChanged) {
+            if (DEBUG) Slog.v(TAG,
+                    "List of  " + getCaption() + " restored services was updated " + restored);
+            storeComponentsToSetting(restored, restoredSettingName(setting), userId);
+        }
+!!!85074231.java!!!	rebindServices(inout forceRebind : boolean) : void
+        if (DEBUG) Slog.d(TAG, "rebindServices");
+        final int[] userIds = mUserProfiles.getCurrentProfileIds();
+        final int nUserIds = userIds.length;
+
+        final SparseArray<ArraySet<ComponentName>> componentsByUser = new SparseArray<>();
+
+        for (int i = 0; i < nUserIds; ++i) {
+            componentsByUser.put(userIds[i],
+                    loadComponentNamesFromSetting(mConfig.secureSettingName, userIds[i]));
+            if (mConfig.secondarySettingName != null) {
+                componentsByUser.get(userIds[i]).addAll(
+                        loadComponentNamesFromSetting(mConfig.secondarySettingName, userIds[i]));
+            }
+        }
+
+        final ArrayList<ManagedServiceInfo> removableBoundServices = new ArrayList<>();
+        final SparseArray<Set<ComponentName>> toAdd = new SparseArray<>();
+
+        synchronized (mMutex) {
+            // Rebind to non-system services if user switched
+            for (ManagedServiceInfo service : mServices) {
+                if (!service.isSystem && !service.isGuest(this)) {
+                    removableBoundServices.add(service);
+                }
+            }
+
+            mEnabledServicesForCurrentProfiles.clear();
+            mEnabledServicesPackageNames.clear();
+
+            for (int i = 0; i < nUserIds; ++i) {
+                // decode the list of components
+                final ArraySet<ComponentName> userComponents = componentsByUser.get(userIds[i]);
+                if (null == userComponents) {
+                    toAdd.put(userIds[i], new ArraySet<ComponentName>());
+                    continue;
+                }
+
+                final Set<ComponentName> add = new HashSet<>(userComponents);
+                add.removeAll(mSnoozingForCurrentProfiles);
+
+                toAdd.put(userIds[i], add);
+
+                mEnabledServicesForCurrentProfiles.addAll(userComponents);
+
+                for (int j = 0; j < userComponents.size(); j++) {
+                    final ComponentName component = userComponents.valueAt(j);
+                    mEnabledServicesPackageNames.add(component.getPackageName());
+                }
+            }
+        }
+
+        for (ManagedServiceInfo info : removableBoundServices) {
+            final ComponentName component = info.component;
+            final int oldUser = info.userid;
+            final Set<ComponentName> allowedComponents = toAdd.get(info.userid);
+            if (allowedComponents != null) {
+                if (allowedComponents.contains(component) && !forceRebind) {
+                    // Already bound, don't need to bind again.
+                    allowedComponents.remove(component);
+                } else {
+                    // No longer allowed to be bound, or must rebind.
+                    Slog.v(TAG, "disabling " + getCaption() + " for user "
+                            + oldUser + ": " + component);
+                    unregisterService(component, oldUser);
+                }
+            }
+        }
+
+        for (int i = 0; i < nUserIds; ++i) {
+            final Set<ComponentName> add = toAdd.get(userIds[i]);
+            for (ComponentName component : add) {
+                Slog.v(TAG, "enabling " + getCaption() + " for " + userIds[i] + ": " + component);
+                registerService(component, userIds[i]);
+            }
+        }
+
+        mLastSeenProfileIds = userIds;
+!!!85074359.java!!!	registerService(in name : ComponentName, in userid : int) : void
+        synchronized (mMutex) {
+            registerServiceLocked(name, userid);
+        }
+!!!85074487.java!!!	registerSystemService(in name : ComponentName, in userid : int) : void
+        synchronized (mMutex) {
+            registerServiceLocked(name, userid, true /* isSystem */);
+        }
+!!!85074615.java!!!	registerServiceLocked(in name : ComponentName, in userid : int) : void
+        registerServiceLocked(name, userid, false /* isSystem */);
+!!!85074743.java!!!	registerServiceLocked(in name : ComponentName, in userid : int, in isSystem : boolean) : void
+        if (DEBUG) Slog.v(TAG, "registerService: " + name + " u=" + userid);
+
+        final String servicesBindingTag = name.toString() + "/" + userid;
+        if (mServicesBinding.contains(servicesBindingTag)) {
+            // stop registering this thing already! we're working on it
+            return;
+        }
+        mServicesBinding.add(servicesBindingTag);
+
+        final int N = mServices.size();
+        for (int i = N - 1; i >= 0; i--) {
+            final ManagedServiceInfo info = mServices.get(i);
+            if (name.equals(info.component)
+                && info.userid == userid) {
+                // cut old connections
+                if (DEBUG) Slog.v(TAG, "    disconnecting old " + getCaption() + ": "
+                    + info.service);
+                removeServiceLocked(i);
+                if (info.connection != null) {
+                    mContext.unbindService(info.connection);
+                }
+            }
+        }
+
+        Intent intent = new Intent(mConfig.serviceInterface);
+        intent.setComponent(name);
+
+        intent.putExtra(Intent.EXTRA_CLIENT_LABEL, mConfig.clientLabel);
+
+        final PendingIntent pendingIntent = PendingIntent.getActivity(
+            mContext, 0, new Intent(mConfig.settingsAction), 0);
+        intent.putExtra(Intent.EXTRA_CLIENT_INTENT, pendingIntent);
+
+        ApplicationInfo appInfo = null;
+        try {
+            appInfo = mContext.getPackageManager().getApplicationInfo(
+                name.getPackageName(), 0);
+        } catch (NameNotFoundException e) {
+            // Ignore if the package doesn't exist we won't be able to bind to the service.
+        }
+        final int targetSdkVersion =
+            appInfo != null ? appInfo.targetSdkVersion : Build.VERSION_CODES.BASE;
+
+        try {
+            if (DEBUG) Slog.v(TAG, "binding: " + intent);
+            ServiceConnection serviceConnection = new ServiceConnection() {
+                IInterface mService;
+
+                @Override
+                public void onServiceConnected(ComponentName name, IBinder binder) {
+                    boolean added = false;
+                    ManagedServiceInfo info = null;
+                    synchronized (mMutex) {
+                        mServicesBinding.remove(servicesBindingTag);
+                        try {
+                            mService = asInterface(binder);
+                            info = newServiceInfo(mService, name,
+                                userid, isSystem, this, targetSdkVersion);
+                            binder.linkToDeath(info, 0);
+                            added = mServices.add(info);
+                        } catch (RemoteException e) {
+                            // already dead
+                        }
+                    }
+                    if (added) {
+                        onServiceAdded(info);
+                    }
+                }
+
+                @Override
+                public void onServiceDisconnected(ComponentName name) {
+                    Slog.v(TAG, getCaption() + " connection lost: " + name);
+                }
+            };
+            if (!mContext.bindServiceAsUser(intent,
+                serviceConnection,
+                BIND_AUTO_CREATE | BIND_FOREGROUND_SERVICE | BIND_ALLOW_WHITELIST_MANAGEMENT,
+                new UserHandle(userid))) {
+                mServicesBinding.remove(servicesBindingTag);
+                Slog.w(TAG, "Unable to bind " + getCaption() + " service: " + intent);
+                return;
+            }
+        } catch (SecurityException ex) {
+            Slog.e(TAG, "Unable to bind " + getCaption() + " service: " + intent, ex);
+            return;
+        }
+!!!85074871.java!!!	unregisterService(inout name : ComponentName, in userid : int) : void
+        synchronized (mMutex) {
+            unregisterServiceLocked(name, userid);
+        }
+!!!85074999.java!!!	unregisterServiceLocked(inout name : ComponentName, in userid : int) : void
+        final int N = mServices.size();
+        for (int i = N - 1; i >= 0; i--) {
+            final ManagedServiceInfo info = mServices.get(i);
+            if (name.equals(info.component)
+                && info.userid == userid) {
+                removeServiceLocked(i);
+                if (info.connection != null) {
+                    try {
+                        mContext.unbindService(info.connection);
+                    } catch (IllegalArgumentException ex) {
+                        // something happened to the service: we think we have a connection
+                        // but it's bogus.
+                        Slog.e(TAG, getCaption() + " " + name + " could not be unbound: " + ex);
+                    }
+                }
+            }
+        }
+!!!85075127.java!!!	removeServiceImpl(inout service : IInterface, in userid : int) : ManagedServices::ManagedServiceInfo
+        if (DEBUG) Slog.d(TAG, "removeServiceImpl service=" + service + " u=" + userid);
+        ManagedServiceInfo serviceInfo = null;
+        synchronized (mMutex) {
+            final int N = mServices.size();
+            for (int i = N - 1; i >= 0; i--) {
+                final ManagedServiceInfo info = mServices.get(i);
+                if (info.service.asBinder() == service.asBinder()
+                        && info.userid == userid) {
+                    if (DEBUG) Slog.d(TAG, "Removing active service " + info.component);
+                    serviceInfo = removeServiceLocked(i);
+                }
+            }
+        }
+        return serviceInfo;
+!!!85075255.java!!!	removeServiceLocked(in i : int) : ManagedServices::ManagedServiceInfo
+        final ManagedServiceInfo info = mServices.remove(i);
+        onServiceRemovedLocked(info);
+        return info;
+!!!85075383.java!!!	checkNotNull(inout service : IInterface) : void
+        if (service == null) {
+            throw new IllegalArgumentException(getCaption() + " must not be null");
+        }
+!!!85075511.java!!!	registerServiceImpl(in service : IInterface, in component : ComponentName, in userid : int) : ManagedServices::ManagedServiceInfo
+        ManagedServiceInfo info = newServiceInfo(service, component, userid,
+                true /*isSystem*/, null /*connection*/, Build.VERSION_CODES.LOLLIPOP);
+        return registerServiceImpl(info);
+!!!85075639.java!!!	registerServiceImpl(inout info : ManagedServices::ManagedServiceInfo) : ManagedServices::ManagedServiceInfo
+        synchronized (mMutex) {
+            try {
+                info.service.asBinder().linkToDeath(info, 0);
+                mServices.add(info);
+                return info;
+            } catch (RemoteException e) {
+                // already dead
+            }
+        }
+        return null;
+!!!85075767.java!!!	unregisterServiceImpl(inout service : IInterface, in userid : int) : void
+        ManagedServiceInfo info = removeServiceImpl(service, userid);
+        if (info != null && info.connection != null && !info.isGuest(this)) {
+            mContext.unbindService(info.connection);
+        }
+!!!85077431.java!!!	isComponentEnabledForCurrentProfiles(inout component : ComponentName) : boolean
+        return mEnabledServicesForCurrentProfiles.contains(component);

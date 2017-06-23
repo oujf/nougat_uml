@@ -1,0 +1,282 @@
+class DNSResponder
+!!!43277367.cpp!!!	~DNSResponder()
+    stopServer();
+!!!43277495.cpp!!!	addMapping(in name : char, in type : ns_type, in addr : char) : void
+    std::lock_guard<std::mutex> lock(mappings_mutex_);
+    auto it = mappings_.find(QueryKey(name, type));
+    if (it != mappings_.end()) {
+        ALOGI("Overwriting mapping for (%s, %s), previous address %s, new "
+            "address %s", name, dnstype2str(type), it->second.c_str(),
+            addr);
+        it->second = addr;
+        return;
+    }
+    mappings_.emplace(std::piecewise_construct,
+                      std::forward_as_tuple(name, type),
+                      std::forward_as_tuple(addr));
+!!!43277623.cpp!!!	removeMapping(in name : char, in type : ns_type) : void
+    std::lock_guard<std::mutex> lock(mappings_mutex_);
+    auto it = mappings_.find(QueryKey(name, type));
+    if (it != mappings_.end()) {
+        ALOGI("Cannot remove mapping mapping from (%s, %s), not present", name,
+            dnstype2str(type));
+        return;
+    }
+    mappings_.erase(it);
+!!!43277751.cpp!!!	setResponseProbability(in response_probability : double) : void
+    response_probability_ = response_probability;
+!!!43277879.cpp!!!	running() : bool
+    return socket_ != -1;
+!!!43278007.cpp!!!	startServer() : bool
+    if (running()) {
+        ALOGI("server already running");
+        return false;
+    }
+    addrinfo ai_hints{
+        .ai_family = AF_UNSPEC,
+        .ai_socktype = SOCK_DGRAM,
+        .ai_flags = AI_PASSIVE
+    };
+    addrinfo* ai_res;
+    int rv = getaddrinfo(listen_address_.c_str(), listen_service_.c_str(),
+                         &ai_hints, &ai_res);
+    if (rv) {
+        ALOGI("getaddrinfo(%s, %s) failed: %s", listen_address_.c_str(),
+            listen_service_.c_str(), gai_strerror(rv));
+        return false;
+    }
+    int s = -1;
+    for (const addrinfo* ai = ai_res ; ai ; ai = ai->ai_next) {
+        s = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (s < 0) continue;
+        const int one = 1;
+        setsockopt(s, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
+        if (bind(s, ai->ai_addr, ai->ai_addrlen)) {
+            APLOGI("bind failed for socket %d", s);
+            close(s);
+            s = -1;
+            continue;
+        }
+        std::string host_str = addr2str(ai->ai_addr, ai->ai_addrlen);
+        ALOGI("bound to UDP %s:%s", host_str.c_str(), listen_service_.c_str());
+        break;
+    }
+    freeaddrinfo(ai_res);
+    if (s < 0) {
+        ALOGI("bind() failed");
+        return false;
+    }
+
+    int flags = fcntl(s, F_GETFL, 0);
+    if (flags < 0) flags = 0;
+    if (fcntl(s, F_SETFL, flags | O_NONBLOCK) < 0) {
+        APLOGI("fcntl(F_SETFL) failed for socket %d", s);
+        close(s);
+        return false;
+    }
+
+    int ep_fd = epoll_create(1);
+    if (ep_fd < 0) {
+        char error_msg[512] = { 0 };
+        if (strerror_r(errno, error_msg, sizeof(error_msg)))
+            strncpy(error_msg, "UNKNOWN", sizeof(error_msg));
+        APLOGI("epoll_create() failed: %s", error_msg);
+        close(s);
+        return false;
+    }
+    epoll_event ev;
+    ev.events = EPOLLIN;
+    ev.data.fd = s;
+    if (epoll_ctl(ep_fd, EPOLL_CTL_ADD, s, &ev) < 0) {
+        APLOGI("epoll_ctl() failed for socket %d", s);
+        close(ep_fd);
+        close(s);
+        return false;
+    }
+
+    epoll_fd_ = ep_fd;
+    socket_ = s;
+    {
+        std::lock_guard<std::mutex> lock(update_mutex_);
+        handler_thread_ = std::thread(&DNSResponder::requestHandler, this);
+    }
+    ALOGI("server started successfully");
+    return true;
+!!!43278135.cpp!!!	stopServer() : bool
+    std::lock_guard<std::mutex> lock(update_mutex_);
+    if (!running()) {
+        ALOGI("server not running");
+        return false;
+    }
+    if (terminate_) {
+        ALOGI("LOGIC ERROR");
+        return false;
+    }
+    ALOGI("stopping server");
+    terminate_ = true;
+    handler_thread_.join();
+    close(epoll_fd_);
+    close(socket_);
+    terminate_ = false;
+    socket_ = -1;
+    ALOGI("server stopped successfully");
+    return true;
+!!!43278519.cpp!!!	queries() : std::vector<std::pair<std::string, ns_type>>
+    std::lock_guard<std::mutex> lock(queries_mutex_);
+    return queries_;
+!!!43278647.cpp!!!	clearQueries() : void
+    std::lock_guard<std::mutex> lock(queries_mutex_);
+    queries_.clear();
+!!!43279287.cpp!!!	requestHandler() : void
+    epoll_event evs[1];
+    while (!terminate_) {
+        int n = epoll_wait(epoll_fd_, evs, 1, poll_timeout_ms_);
+        if (n == 0) continue;
+        if (n < 0) {
+            ALOGI("epoll_wait() failed");
+            // TODO(imaipi): terminate on error.
+            return;
+        }
+        char buffer[4096];
+        sockaddr_storage sa;
+        socklen_t sa_len = sizeof(sa);
+        ssize_t len;
+        do {
+            len = recvfrom(socket_, buffer, sizeof(buffer), 0,
+                           (sockaddr*) &sa, &sa_len);
+        } while (len < 0 && (errno == EAGAIN || errno == EINTR));
+        if (len <= 0) {
+            ALOGI("recvfrom() failed");
+            continue;
+        }
+        ALOGI("read %zd bytes", len);
+        char response[4096];
+        size_t response_len = sizeof(response);
+        if (handleDNSRequest(buffer, len, response, &response_len) &&
+            response_len > 0) {
+            len = sendto(socket_, response, response_len, 0,
+                         reinterpret_cast<const sockaddr*>(&sa), sa_len);
+            std::string host_str =
+                addr2str(reinterpret_cast<const sockaddr*>(&sa), sa_len);
+            if (len > 0) {
+                ALOGI("sent %zu bytes to %s", len, host_str.c_str());
+            } else {
+                APLOGI("sendto() failed for %s", host_str.c_str());
+            }
+            // Test that the response is actually a correct DNS message.
+            const char* response_end = response + len;
+            DNSHeader header;
+            const char* cur = header.read(response, response_end);
+            if (cur == nullptr) ALOGI("response is flawed");
+
+        } else {
+            ALOGI("not responding");
+        }
+    }
+!!!43279415.cpp!!!	handleDNSRequest(in buffer : char, in len : ssize_t, inout response : char, inout response_len : size_t) : bool
+    ALOGI("request: '%s'", str2hex(buffer, len).c_str());
+    const char* buffer_end = buffer + len;
+    DNSHeader header;
+    const char* cur = header.read(buffer, buffer_end);
+    // TODO(imaipi): for now, unparsable messages are silently dropped, fix.
+    if (cur == nullptr) {
+        ALOGI("failed to parse query");
+        return false;
+    }
+    if (header.qr) {
+        ALOGI("response received instead of a query");
+        return false;
+    }
+    if (header.opcode != ns_opcode::ns_o_query) {
+        ALOGI("unsupported request opcode received");
+        return makeErrorResponse(&header, ns_rcode::ns_r_notimpl, response,
+                                 response_len);
+    }
+    if (header.questions.empty()) {
+        ALOGI("no questions present");
+        return makeErrorResponse(&header, ns_rcode::ns_r_formerr, response,
+                                 response_len);
+    }
+    if (!header.answers.empty()) {
+        ALOGI("already %zu answers present in query", header.answers.size());
+        return makeErrorResponse(&header, ns_rcode::ns_r_formerr, response,
+                                 response_len);
+    }
+    {
+        std::lock_guard<std::mutex> lock(queries_mutex_);
+        for (const DNSQuestion& question : header.questions) {
+            queries_.push_back(make_pair(question.qname.name,
+                                         ns_type(question.qtype)));
+        }
+    }
+
+    // Ignore requests with the preset probability.
+    auto constexpr bound = std::numeric_limits<unsigned>::max();
+    if (arc4random_uniform(bound) > bound*response_probability_) {
+        ALOGI("returning SRVFAIL in accordance with probability distribution");
+        return makeErrorResponse(&header, ns_rcode::ns_r_servfail, response,
+                                 response_len);
+    }
+
+    for (const DNSQuestion& question : header.questions) {
+        if (question.qclass != ns_class::ns_c_in &&
+            question.qclass != ns_class::ns_c_any) {
+            ALOGI("unsupported question class %u", question.qclass);
+            return makeErrorResponse(&header, ns_rcode::ns_r_notimpl, response,
+                                     response_len);
+        }
+        if (!addAnswerRecords(question, &header.answers)) {
+            return makeErrorResponse(&header, ns_rcode::ns_r_servfail, response,
+                                     response_len);
+        }
+    }
+    header.qr = true;
+    char* response_cur = header.write(response, response + *response_len);
+    if (response_cur == nullptr) {
+        return false;
+    }
+    *response_len = response_cur - response;
+    return true;
+!!!43279543.cpp!!!	addAnswerRecords(in question : DNSQuestion, inout answers : std::vector<DNSRecord>) : bool
+    auto it = mappings_.find(QueryKey(question.qname.name, question.qtype));
+    if (it == mappings_.end()) {
+        // TODO(imaipi): handle correctly
+        ALOGI("no mapping found for %s %s, lazily refusing to add an answer",
+            question.qname.name.c_str(), dnstype2str(question.qtype));
+        return true;
+    }
+    ALOGI("mapping found for %s %s: %s", question.qname.name.c_str(),
+        dnstype2str(question.qtype), it->second.c_str());
+    DNSRecord record;
+    record.name = question.qname;
+    record.rtype = question.qtype;
+    record.rclass = ns_class::ns_c_in;
+    record.ttl = 5;  // seconds
+    if (question.qtype == ns_type::ns_t_a) {
+        record.rdata.resize(4);
+        if (inet_pton(AF_INET, it->second.c_str(), record.rdata.data()) != 1) {
+            ALOGI("inet_pton(AF_INET, %s) failed", it->second.c_str());
+            return false;
+        }
+    } else if (question.qtype == ns_type::ns_t_aaaa) {
+        record.rdata.resize(16);
+        if (inet_pton(AF_INET6, it->second.c_str(), record.rdata.data()) != 1) {
+            ALOGI("inet_pton(AF_INET6, %s) failed", it->second.c_str());
+            return false;
+        }
+    } else {
+        ALOGI("unhandled qtype %s", dnstype2str(question.qtype));
+        return false;
+    }
+    answers->push_back(std::move(record));
+    return true;
+!!!43279799.cpp!!!	makeErrorResponse(inout header : DNSHeader, in rcode : ns_rcode, inout response : char, inout response_len : size_t) : bool
+    header->answers.clear();
+    header->authorities.clear();
+    header->additionals.clear();
+    header->rcode = rcode;
+    header->qr = true;
+    char* response_cur = header->write(response, response + *response_len);
+    if (response_cur == nullptr) return false;
+    *response_len = response_cur - response;
+    return true;

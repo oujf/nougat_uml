@@ -1,0 +1,456 @@
+class ControlThread
+!!!43948343.cpp!!!	ControlThread(inout parent : EmulatedFakeCamera2)
+    mRunning = false;
+!!!43948599.cpp!!!	readyToRun() : status_t
+    Mutex::Autolock lock(mInputMutex);
+
+    ALOGV("Starting up ControlThread");
+    mRunning = true;
+    mStartAf = false;
+    mCancelAf = false;
+    mStartPrecapture = false;
+
+    mControlMode = ANDROID_CONTROL_MODE_AUTO;
+
+    mEffectMode = ANDROID_CONTROL_EFFECT_MODE_OFF;
+    mSceneMode = ANDROID_CONTROL_SCENE_MODE_FACE_PRIORITY;
+
+    mAfMode = ANDROID_CONTROL_AF_MODE_AUTO;
+    mAfModeChange = false;
+
+    mAeMode = ANDROID_CONTROL_AE_MODE_ON;
+    mAwbMode = ANDROID_CONTROL_AWB_MODE_AUTO;
+
+    mAfTriggerId = 0;
+    mPrecaptureTriggerId = 0;
+
+    mAfState = ANDROID_CONTROL_AF_STATE_INACTIVE;
+    mAeState = ANDROID_CONTROL_AE_STATE_INACTIVE;
+    mAwbState = ANDROID_CONTROL_AWB_STATE_INACTIVE;
+
+    mExposureTime = kNormalExposureTime;
+
+    mInputSignal.signal();
+    return NO_ERROR;
+!!!43948727.cpp!!!	waitUntilRunning() : status_t
+    Mutex::Autolock lock(mInputMutex);
+    if (!mRunning) {
+        ALOGV("Waiting for control thread to start");
+        mInputSignal.wait(mInputMutex);
+    }
+    return OK;
+!!!43948855.cpp!!!	processRequest(inout request : camera_metadata_t) : status_t
+    Mutex::Autolock lock(mInputMutex);
+    // TODO: Add handling for all android.control.* fields here
+    camera_metadata_entry_t mode;
+    status_t res;
+
+#define READ_IF_OK(res, what, def)                                             \
+    (((res) == OK) ? (what) : (uint8_t)(def))
+
+    res = find_camera_metadata_entry(request,
+            ANDROID_CONTROL_MODE,
+            &mode);
+    mControlMode = READ_IF_OK(res, mode.data.u8[0], ANDROID_CONTROL_MODE_OFF);
+
+    // disable all 3A
+    if (mControlMode == ANDROID_CONTROL_MODE_OFF) {
+        mEffectMode =   ANDROID_CONTROL_EFFECT_MODE_OFF;
+        mSceneMode =    ANDROID_CONTROL_SCENE_MODE_DISABLED;
+        mAfMode =       ANDROID_CONTROL_AF_MODE_OFF;
+        mAeLock =       ANDROID_CONTROL_AE_LOCK_ON;
+        mAeMode =       ANDROID_CONTROL_AE_MODE_OFF;
+        mAfModeChange = true;
+        mStartAf =      false;
+        mCancelAf =     true;
+        mAeState =      ANDROID_CONTROL_AE_STATE_INACTIVE;
+        mAwbMode =      ANDROID_CONTROL_AWB_MODE_OFF;
+        return res;
+    }
+
+    res = find_camera_metadata_entry(request,
+            ANDROID_CONTROL_EFFECT_MODE,
+            &mode);
+    mEffectMode = READ_IF_OK(res, mode.data.u8[0],
+                             ANDROID_CONTROL_EFFECT_MODE_OFF);
+
+    res = find_camera_metadata_entry(request,
+            ANDROID_CONTROL_SCENE_MODE,
+            &mode);
+    mSceneMode = READ_IF_OK(res, mode.data.u8[0],
+                             ANDROID_CONTROL_SCENE_MODE_DISABLED);
+
+    res = find_camera_metadata_entry(request,
+            ANDROID_CONTROL_AF_MODE,
+            &mode);
+    if (mAfMode != mode.data.u8[0]) {
+        ALOGV("AF new mode: %d, old mode %d", mode.data.u8[0], mAfMode);
+        mAfMode = mode.data.u8[0];
+        mAfModeChange = true;
+        mStartAf = false;
+        mCancelAf = false;
+    }
+
+    res = find_camera_metadata_entry(request,
+            ANDROID_CONTROL_AE_MODE,
+            &mode);
+    mAeMode = READ_IF_OK(res, mode.data.u8[0],
+                             ANDROID_CONTROL_AE_MODE_OFF);
+
+    res = find_camera_metadata_entry(request,
+            ANDROID_CONTROL_AE_LOCK,
+            &mode);
+    uint8_t aeLockVal = READ_IF_OK(res, mode.data.u8[0],
+                                   ANDROID_CONTROL_AE_LOCK_ON);
+    bool aeLock = (aeLockVal == ANDROID_CONTROL_AE_LOCK_ON);
+    if (mAeLock && !aeLock) {
+        mAeState = ANDROID_CONTROL_AE_STATE_INACTIVE;
+    }
+    mAeLock = aeLock;
+
+    res = find_camera_metadata_entry(request,
+            ANDROID_CONTROL_AWB_MODE,
+            &mode);
+    mAwbMode = READ_IF_OK(res, mode.data.u8[0],
+                          ANDROID_CONTROL_AWB_MODE_OFF);
+
+    // TODO: Override more control fields
+
+    if (mAeMode != ANDROID_CONTROL_AE_MODE_OFF) {
+        camera_metadata_entry_t exposureTime;
+        res = find_camera_metadata_entry(request,
+                ANDROID_SENSOR_EXPOSURE_TIME,
+                &exposureTime);
+        if (res == OK) {
+            exposureTime.data.i64[0] = mExposureTime;
+        }
+    }
+
+#undef READ_IF_OK
+
+    return OK;
+!!!43948983.cpp!!!	triggerAction(in msgType : uint32_t, in ext1 : int32_t, in ext2 : int32_t) : status_t
+    ALOGV("%s: Triggering %d (%d, %d)", __FUNCTION__, msgType, ext1, ext2);
+    Mutex::Autolock lock(mInputMutex);
+    switch (msgType) {
+        case CAMERA2_TRIGGER_AUTOFOCUS:
+            mAfTriggerId = ext1;
+            mStartAf = true;
+            mCancelAf = false;
+            break;
+        case CAMERA2_TRIGGER_CANCEL_AUTOFOCUS:
+            mAfTriggerId = ext1;
+            mStartAf = false;
+            mCancelAf = true;
+            break;
+        case CAMERA2_TRIGGER_PRECAPTURE_METERING:
+            mPrecaptureTriggerId = ext1;
+            mStartPrecapture = true;
+            break;
+        default:
+            ALOGE("%s: Unknown action triggered: %d (arguments %d %d)",
+                    __FUNCTION__, msgType, ext1, ext2);
+            return BAD_VALUE;
+    }
+    return OK;
+!!!43949367.cpp!!!	threadLoop() : bool
+    bool afModeChange = false;
+    bool afTriggered = false;
+    bool afCancelled = false;
+    uint8_t afState;
+    uint8_t afMode;
+    int32_t afTriggerId;
+    bool precaptureTriggered = false;
+    uint8_t aeState;
+    uint8_t aeMode;
+    bool    aeLock;
+    int32_t precaptureTriggerId;
+    nsecs_t nextSleep = kControlCycleDelay;
+
+    {
+        Mutex::Autolock lock(mInputMutex);
+        if (mStartAf) {
+            ALOGD("Starting AF trigger processing");
+            afTriggered = true;
+            mStartAf = false;
+        } else if (mCancelAf) {
+            ALOGD("Starting cancel AF trigger processing");
+            afCancelled = true;
+            mCancelAf = false;
+        }
+        afState = mAfState;
+        afMode = mAfMode;
+        afModeChange = mAfModeChange;
+        mAfModeChange = false;
+
+        afTriggerId = mAfTriggerId;
+
+        if(mStartPrecapture) {
+            ALOGD("Starting precapture trigger processing");
+            precaptureTriggered = true;
+            mStartPrecapture = false;
+        }
+        aeState = mAeState;
+        aeMode = mAeMode;
+        aeLock = mAeLock;
+        precaptureTriggerId = mPrecaptureTriggerId;
+    }
+
+    if (afCancelled || afModeChange) {
+        ALOGV("Resetting AF state due to cancel/mode change");
+        afState = ANDROID_CONTROL_AF_STATE_INACTIVE;
+        updateAfState(afState, afTriggerId);
+        mAfScanDuration = 0;
+        mLockAfterPassiveScan = false;
+    }
+
+    uint8_t oldAfState = afState;
+
+    if (afTriggered) {
+        afState = processAfTrigger(afMode, afState);
+    }
+
+    afState = maybeStartAfScan(afMode, afState);
+    afState = updateAfScan(afMode, afState, &nextSleep);
+    updateAfState(afState, afTriggerId);
+
+    if (precaptureTriggered) {
+        aeState = processPrecaptureTrigger(aeMode, aeState);
+    }
+
+    aeState = maybeStartAeScan(aeMode, aeLock, aeState);
+    aeState = updateAeScan(aeMode, aeLock, aeState, &nextSleep);
+    updateAeState(aeState, precaptureTriggerId);
+
+    int ret;
+    timespec t;
+    t.tv_sec = 0;
+    t.tv_nsec = nextSleep;
+    do {
+        ret = nanosleep(&t, &t);
+    } while (ret != 0);
+
+    if (mAfScanDuration > 0) {
+        mAfScanDuration -= nextSleep;
+    }
+    if (mAeScanDuration > 0) {
+        mAeScanDuration -= nextSleep;
+    }
+
+    return true;
+!!!43949495.cpp!!!	processAfTrigger(in afMode : uint8_t, in afState : uint8_t) : int
+    switch (afMode) {
+        case ANDROID_CONTROL_AF_MODE_OFF:
+        case ANDROID_CONTROL_AF_MODE_EDOF:
+            // Do nothing
+            break;
+        case ANDROID_CONTROL_AF_MODE_MACRO:
+        case ANDROID_CONTROL_AF_MODE_AUTO:
+            switch (afState) {
+                case ANDROID_CONTROL_AF_STATE_INACTIVE:
+                case ANDROID_CONTROL_AF_STATE_FOCUSED_LOCKED:
+                case ANDROID_CONTROL_AF_STATE_NOT_FOCUSED_LOCKED:
+                    // Start new focusing cycle
+                    mAfScanDuration =  ((double)rand() / RAND_MAX) *
+                        (kMaxAfDuration - kMinAfDuration) + kMinAfDuration;
+                    afState = ANDROID_CONTROL_AF_STATE_ACTIVE_SCAN;
+                    ALOGV("%s: AF scan start, duration %" PRId64 " ms",
+                          __FUNCTION__, mAfScanDuration / 1000000);
+                    break;
+                case ANDROID_CONTROL_AF_STATE_ACTIVE_SCAN:
+                    // Ignore new request, already scanning
+                    break;
+                default:
+                    ALOGE("Unexpected AF state in AUTO/MACRO AF mode: %d",
+                          afState);
+            }
+            break;
+        case ANDROID_CONTROL_AF_MODE_CONTINUOUS_PICTURE:
+            switch (afState) {
+                // Picture mode waits for passive scan to complete
+                case ANDROID_CONTROL_AF_STATE_PASSIVE_SCAN:
+                    mLockAfterPassiveScan = true;
+                    break;
+                case ANDROID_CONTROL_AF_STATE_INACTIVE:
+                    afState = ANDROID_CONTROL_AF_STATE_NOT_FOCUSED_LOCKED;
+                    break;
+                case ANDROID_CONTROL_AF_STATE_PASSIVE_FOCUSED:
+                    afState = ANDROID_CONTROL_AF_STATE_FOCUSED_LOCKED;
+                    break;
+                case ANDROID_CONTROL_AF_STATE_FOCUSED_LOCKED:
+                case ANDROID_CONTROL_AF_STATE_NOT_FOCUSED_LOCKED:
+                    // Must cancel to get out of these states
+                    break;
+                default:
+                    ALOGE("Unexpected AF state in CONTINUOUS_PICTURE AF mode: %d",
+                          afState);
+            }
+            break;
+        case ANDROID_CONTROL_AF_MODE_CONTINUOUS_VIDEO:
+            switch (afState) {
+                // Video mode does not wait for passive scan to complete
+                case ANDROID_CONTROL_AF_STATE_PASSIVE_SCAN:
+                case ANDROID_CONTROL_AF_STATE_INACTIVE:
+                    afState = ANDROID_CONTROL_AF_STATE_NOT_FOCUSED_LOCKED;
+                    break;
+                case ANDROID_CONTROL_AF_STATE_PASSIVE_FOCUSED:
+                    afState = ANDROID_CONTROL_AF_STATE_FOCUSED_LOCKED;
+                    break;
+                case ANDROID_CONTROL_AF_STATE_FOCUSED_LOCKED:
+                case ANDROID_CONTROL_AF_STATE_NOT_FOCUSED_LOCKED:
+                    // Must cancel to get out of these states
+                    break;
+                default:
+                    ALOGE("Unexpected AF state in CONTINUOUS_VIDEO AF mode: %d",
+                          afState);
+            }
+            break;
+        default:
+            break;
+    }
+    return afState;
+!!!43949623.cpp!!!	maybeStartAfScan(in afMode : uint8_t, in afState : uint8_t) : int
+    if ((afMode == ANDROID_CONTROL_AF_MODE_CONTINUOUS_VIDEO ||
+            afMode == ANDROID_CONTROL_AF_MODE_CONTINUOUS_PICTURE) &&
+        (afState == ANDROID_CONTROL_AF_STATE_INACTIVE ||
+            afState == ANDROID_CONTROL_AF_STATE_PASSIVE_FOCUSED)) {
+
+        bool startScan = ((double)rand() / RAND_MAX) < kContinuousAfStartRate;
+        if (startScan) {
+            // Start new passive focusing cycle
+            mAfScanDuration =  ((double)rand() / RAND_MAX) *
+                (kMaxAfDuration - kMinAfDuration) + kMinAfDuration;
+            afState = ANDROID_CONTROL_AF_STATE_PASSIVE_SCAN;
+            ALOGV("%s: AF passive scan start, duration %" PRId64 " ms",
+                __FUNCTION__, mAfScanDuration / 1000000);
+        }
+    }
+    return afState;
+!!!43949751.cpp!!!	updateAfScan(in afMode : uint8_t, in afState : uint8_t, inout maxSleep : nsecs_t) : int
+    if (! (afState == ANDROID_CONTROL_AF_STATE_ACTIVE_SCAN ||
+            afState == ANDROID_CONTROL_AF_STATE_PASSIVE_SCAN ) ) {
+        return afState;
+    }
+
+    if (mAfScanDuration <= 0) {
+        ALOGV("%s: AF scan done", __FUNCTION__);
+        switch (afMode) {
+            case ANDROID_CONTROL_AF_MODE_MACRO:
+            case ANDROID_CONTROL_AF_MODE_AUTO: {
+                bool success = ((double)rand() / RAND_MAX) < kAfSuccessRate;
+                if (success) {
+                    afState = ANDROID_CONTROL_AF_STATE_FOCUSED_LOCKED;
+                } else {
+                    afState = ANDROID_CONTROL_AF_STATE_NOT_FOCUSED_LOCKED;
+                }
+                break;
+            }
+            case ANDROID_CONTROL_AF_MODE_CONTINUOUS_PICTURE:
+                if (mLockAfterPassiveScan) {
+                    afState = ANDROID_CONTROL_AF_STATE_FOCUSED_LOCKED;
+                    mLockAfterPassiveScan = false;
+                } else {
+                    afState = ANDROID_CONTROL_AF_STATE_PASSIVE_FOCUSED;
+                }
+                break;
+            case ANDROID_CONTROL_AF_MODE_CONTINUOUS_VIDEO:
+                afState = ANDROID_CONTROL_AF_STATE_PASSIVE_FOCUSED;
+                break;
+            default:
+                ALOGE("Unexpected AF mode in scan state");
+        }
+    } else {
+        if (mAfScanDuration <= *maxSleep) {
+            *maxSleep = mAfScanDuration;
+        }
+    }
+    return afState;
+!!!43949879.cpp!!!	updateAfState(in newState : uint8_t, in triggerId : int32_t) : void
+    Mutex::Autolock lock(mInputMutex);
+    if (mAfState != newState) {
+        ALOGV("%s: Autofocus state now %d, id %d", __FUNCTION__,
+                newState, triggerId);
+        mAfState = newState;
+        mParent->sendNotification(CAMERA2_MSG_AUTOFOCUS,
+                newState, triggerId, 0);
+    }
+!!!43950007.cpp!!!	processPrecaptureTrigger(in aeMode : uint8_t, in aeState : uint8_t) : int
+    switch (aeMode) {
+        case ANDROID_CONTROL_AE_MODE_OFF:
+            // Don't do anything for these
+            return aeState;
+        case ANDROID_CONTROL_AE_MODE_ON:
+        case ANDROID_CONTROL_AE_MODE_ON_AUTO_FLASH:
+        case ANDROID_CONTROL_AE_MODE_ON_ALWAYS_FLASH:
+        case ANDROID_CONTROL_AE_MODE_ON_AUTO_FLASH_REDEYE:
+            // Trigger a precapture cycle
+            aeState = ANDROID_CONTROL_AE_STATE_PRECAPTURE;
+            mAeScanDuration = ((double)rand() / RAND_MAX) *
+                    (kMaxPrecaptureAeDuration - kMinPrecaptureAeDuration) +
+                    kMinPrecaptureAeDuration;
+            ALOGD("%s: AE precapture scan start, duration %" PRId64 " ms",
+                    __FUNCTION__, mAeScanDuration / 1000000);
+
+    }
+    return aeState;
+!!!43950135.cpp!!!	maybeStartAeScan(in aeMode : uint8_t, in aeLocked : bool, in aeState : uint8_t) : int
+    if (aeLocked) return aeState;
+    switch (aeMode) {
+        case ANDROID_CONTROL_AE_MODE_OFF:
+            break;
+        case ANDROID_CONTROL_AE_MODE_ON:
+        case ANDROID_CONTROL_AE_MODE_ON_AUTO_FLASH:
+        case ANDROID_CONTROL_AE_MODE_ON_ALWAYS_FLASH:
+        case ANDROID_CONTROL_AE_MODE_ON_AUTO_FLASH_REDEYE: {
+            if (aeState != ANDROID_CONTROL_AE_STATE_INACTIVE &&
+                    aeState != ANDROID_CONTROL_AE_STATE_CONVERGED) break;
+
+            bool startScan = ((double)rand() / RAND_MAX) < kAeScanStartRate;
+            if (startScan) {
+                mAeScanDuration = ((double)rand() / RAND_MAX) *
+                (kMaxAeDuration - kMinAeDuration) + kMinAeDuration;
+                aeState = ANDROID_CONTROL_AE_STATE_SEARCHING;
+                ALOGV("%s: AE scan start, duration %" PRId64 " ms",
+                        __FUNCTION__, mAeScanDuration / 1000000);
+            }
+        }
+    }
+
+    return aeState;
+!!!43950263.cpp!!!	updateAeScan(in aeMode : uint8_t, in aeLock : bool, in aeState : uint8_t, inout maxSleep : nsecs_t) : int
+    if (aeLock && aeState != ANDROID_CONTROL_AE_STATE_PRECAPTURE) {
+        mAeScanDuration = 0;
+        aeState = ANDROID_CONTROL_AE_STATE_LOCKED;
+    } else if ((aeState == ANDROID_CONTROL_AE_STATE_SEARCHING) ||
+            (aeState == ANDROID_CONTROL_AE_STATE_PRECAPTURE ) ) {
+        if (mAeScanDuration <= 0) {
+            ALOGV("%s: AE scan done", __FUNCTION__);
+            aeState = aeLock ?
+                    ANDROID_CONTROL_AE_STATE_LOCKED :ANDROID_CONTROL_AE_STATE_CONVERGED;
+
+            Mutex::Autolock lock(mInputMutex);
+            mExposureTime = kNormalExposureTime;
+        } else {
+            if (mAeScanDuration <= *maxSleep) {
+                *maxSleep = mAeScanDuration;
+            }
+
+            int64_t exposureDelta =
+                    ((double)rand() / RAND_MAX) * 2 * kExposureJump -
+                    kExposureJump;
+            Mutex::Autolock lock(mInputMutex);
+            mExposureTime = mExposureTime + exposureDelta;
+            if (mExposureTime < kMinExposureTime) mExposureTime = kMinExposureTime;
+        }
+    }
+
+    return aeState;
+!!!43950391.cpp!!!	updateAeState(in newState : uint8_t, in triggerId : int32_t) : void
+    Mutex::Autolock lock(mInputMutex);
+    if (mAeState != newState) {
+        ALOGV("%s: Autoexposure state now %d, id %d", __FUNCTION__,
+                newState, triggerId);
+        mAeState = newState;
+        mParent->sendNotification(CAMERA2_MSG_AUTOEXPOSURE,
+                newState, triggerId, 0);
+    }

@@ -1,0 +1,475 @@
+class PackageHandler
+!!!85211447.java!!!	connectToService() : boolean
+            if (DEBUG_SD_INSTALL) Log.i(TAG, "Trying to bind to" +
+                    " DefaultContainerService");
+            Intent service = new Intent().setComponent(DEFAULT_CONTAINER_COMPONENT);
+            Process.setThreadPriority(Process.THREAD_PRIORITY_DEFAULT);
+            if (mContext.bindServiceAsUser(service, mDefContainerConn,
+                    Context.BIND_AUTO_CREATE, UserHandle.SYSTEM)) {
+                Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND);
+                mBound = true;
+                return true;
+            }
+            Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND);
+            return false;
+!!!85211575.java!!!	disconnectService() : void
+            mContainerService = null;
+            mBound = false;
+            Process.setThreadPriority(Process.THREAD_PRIORITY_DEFAULT);
+            mContext.unbindService(mDefContainerConn);
+            Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND);
+!!!85211703.java!!!	PackageHandler(inout looper : Looper)
+            super(looper);
+!!!85211831.java!!!	handleMessage(inout msg : Message) : void
+            try {
+                doHandleMessage(msg);
+            } finally {
+                Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND);
+            }
+!!!85211959.java!!!	doHandleMessage(inout msg : Message) : void
+            switch (msg.what) {
+                case INIT_COPY: {
+                    HandlerParams params = (HandlerParams) msg.obj;
+                    int idx = mPendingInstalls.size();
+                    if (DEBUG_INSTALL) Slog.i(TAG, "init_copy idx=" + idx + ": " + params);
+                    // If a bind was already initiated we dont really
+                    // need to do anything. The pending install
+                    // will be processed later on.
+                    if (!mBound) {
+                        Trace.asyncTraceBegin(TRACE_TAG_PACKAGE_MANAGER, "bindingMCS",
+                                System.identityHashCode(mHandler));
+                        // If this is the only one pending we might
+                        // have to bind to the service again.
+                        if (!connectToService()) {
+                            Slog.e(TAG, "Failed to bind to media container service");
+                            params.serviceError();
+                            Trace.asyncTraceEnd(TRACE_TAG_PACKAGE_MANAGER, "bindingMCS",
+                                    System.identityHashCode(mHandler));
+                            if (params.traceMethod != null) {
+                                Trace.asyncTraceEnd(TRACE_TAG_PACKAGE_MANAGER, params.traceMethod,
+                                        params.traceCookie);
+                            }
+                            return;
+                        } else {
+                            // Once we bind to the service, the first
+                            // pending request will be processed.
+                            mPendingInstalls.add(idx, params);
+                        }
+                    } else {
+                        mPendingInstalls.add(idx, params);
+                        // Already bound to the service. Just make
+                        // sure we trigger off processing the first request.
+                        if (idx == 0) {
+                            mHandler.sendEmptyMessage(MCS_BOUND);
+                        }
+                    }
+                    break;
+                }
+                case MCS_BOUND: {
+                    if (DEBUG_INSTALL) Slog.i(TAG, "mcs_bound");
+                    if (msg.obj != null) {
+                        mContainerService = (IMediaContainerService) msg.obj;
+                        Trace.asyncTraceEnd(TRACE_TAG_PACKAGE_MANAGER, "bindingMCS",
+                                System.identityHashCode(mHandler));
+                    }
+                    if (mContainerService == null) {
+                        if (!mBound) {
+                            // Something seriously wrong since we are not bound and we are not
+                            // waiting for connection. Bail out.
+                            Slog.e(TAG, "Cannot bind to media container service");
+                            for (HandlerParams params : mPendingInstalls) {
+                                // Indicate service bind error
+                                params.serviceError();
+                                Trace.asyncTraceEnd(TRACE_TAG_PACKAGE_MANAGER, "queueInstall",
+                                        System.identityHashCode(params));
+                                if (params.traceMethod != null) {
+                                    Trace.asyncTraceEnd(TRACE_TAG_PACKAGE_MANAGER,
+                                            params.traceMethod, params.traceCookie);
+                                }
+                                return;
+                            }
+                            mPendingInstalls.clear();
+                        } else {
+                            Slog.w(TAG, "Waiting to connect to media container service");
+                        }
+                    } else if (mPendingInstalls.size() > 0) {
+                        HandlerParams params = mPendingInstalls.get(0);
+                        if (params != null) {
+                            Trace.asyncTraceEnd(TRACE_TAG_PACKAGE_MANAGER, "queueInstall",
+                                    System.identityHashCode(params));
+                            Trace.traceBegin(TRACE_TAG_PACKAGE_MANAGER, "startCopy");
+                            if (params.startCopy()) {
+                                // We are done...  look for more work or to
+                                // go idle.
+                                if (DEBUG_SD_INSTALL) Log.i(TAG,
+                                        "Checking for more work or unbind...");
+                                // Delete pending install
+                                if (mPendingInstalls.size() > 0) {
+                                    mPendingInstalls.remove(0);
+                                }
+                                if (mPendingInstalls.size() == 0) {
+                                    if (mBound) {
+                                        if (DEBUG_SD_INSTALL) Log.i(TAG,
+                                                "Posting delayed MCS_UNBIND");
+                                        removeMessages(MCS_UNBIND);
+                                        Message ubmsg = obtainMessage(MCS_UNBIND);
+                                        // Unbind after a little delay, to avoid
+                                        // continual thrashing.
+                                        sendMessageDelayed(ubmsg, 10000);
+                                    }
+                                } else {
+                                    // There are more pending requests in queue.
+                                    // Just post MCS_BOUND message to trigger processing
+                                    // of next pending install.
+                                    if (DEBUG_SD_INSTALL) Log.i(TAG,
+                                            "Posting MCS_BOUND for next work");
+                                    mHandler.sendEmptyMessage(MCS_BOUND);
+                                }
+                            }
+                            Trace.traceEnd(TRACE_TAG_PACKAGE_MANAGER);
+                        }
+                    } else {
+                        // Should never happen ideally.
+                        Slog.w(TAG, "Empty queue");
+                    }
+                    break;
+                }
+                case MCS_RECONNECT: {
+                    if (DEBUG_INSTALL) Slog.i(TAG, "mcs_reconnect");
+                    if (mPendingInstalls.size() > 0) {
+                        if (mBound) {
+                            disconnectService();
+                        }
+                        if (!connectToService()) {
+                            Slog.e(TAG, "Failed to bind to media container service");
+                            for (HandlerParams params : mPendingInstalls) {
+                                // Indicate service bind error
+                                params.serviceError();
+                                Trace.asyncTraceEnd(TRACE_TAG_PACKAGE_MANAGER, "queueInstall",
+                                        System.identityHashCode(params));
+                            }
+                            mPendingInstalls.clear();
+                        }
+                    }
+                    break;
+                }
+                case MCS_UNBIND: {
+                    // If there is no actual work left, then time to unbind.
+                    if (DEBUG_INSTALL) Slog.i(TAG, "mcs_unbind");
+
+                    if (mPendingInstalls.size() == 0 && mPendingVerification.size() == 0) {
+                        if (mBound) {
+                            if (DEBUG_INSTALL) Slog.i(TAG, "calling disconnectService()");
+
+                            disconnectService();
+                        }
+                    } else if (mPendingInstalls.size() > 0) {
+                        // There are more pending requests in queue.
+                        // Just post MCS_BOUND message to trigger processing
+                        // of next pending install.
+                        mHandler.sendEmptyMessage(MCS_BOUND);
+                    }
+
+                    break;
+                }
+                case MCS_GIVE_UP: {
+                    if (DEBUG_INSTALL) Slog.i(TAG, "mcs_giveup too many retries");
+                    HandlerParams params = mPendingInstalls.remove(0);
+                    Trace.asyncTraceEnd(TRACE_TAG_PACKAGE_MANAGER, "queueInstall",
+                            System.identityHashCode(params));
+                    break;
+                }
+                case SEND_PENDING_BROADCAST: {
+                    String packages[];
+                    ArrayList<String> components[];
+                    int size = 0;
+                    int uids[];
+                    Process.setThreadPriority(Process.THREAD_PRIORITY_DEFAULT);
+                    synchronized (mPackages) {
+                        if (mPendingBroadcasts == null) {
+                            return;
+                        }
+                        size = mPendingBroadcasts.size();
+                        if (size <= 0) {
+                            // Nothing to be done. Just return
+                            return;
+                        }
+                        packages = new String[size];
+                        components = new ArrayList[size];
+                        uids = new int[size];
+                        int i = 0;  // filling out the above arrays
+
+                        for (int n = 0; n < mPendingBroadcasts.userIdCount(); n++) {
+                            int packageUserId = mPendingBroadcasts.userIdAt(n);
+                            Iterator<Map.Entry<String, ArrayList<String>>> it
+                                    = mPendingBroadcasts.packagesForUserId(packageUserId)
+                                            .entrySet().iterator();
+                            while (it.hasNext() && i < size) {
+                                Map.Entry<String, ArrayList<String>> ent = it.next();
+                                packages[i] = ent.getKey();
+                                components[i] = ent.getValue();
+                                PackageSetting ps = mSettings.mPackages.get(ent.getKey());
+                                uids[i] = (ps != null)
+                                        ? UserHandle.getUid(packageUserId, ps.appId)
+                                        : -1;
+                                i++;
+                            }
+                        }
+                        size = i;
+                        mPendingBroadcasts.clear();
+                    }
+                    // Send broadcasts
+                    for (int i = 0; i < size; i++) {
+                        sendPackageChangedBroadcast(packages[i], true, components[i], uids[i]);
+                    }
+                    Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND);
+                    break;
+                }
+                case START_CLEANING_PACKAGE: {
+                    Process.setThreadPriority(Process.THREAD_PRIORITY_DEFAULT);
+                    final String packageName = (String)msg.obj;
+                    final int userId = msg.arg1;
+                    final boolean andCode = msg.arg2 != 0;
+                    synchronized (mPackages) {
+                        if (userId == UserHandle.USER_ALL) {
+                            int[] users = sUserManager.getUserIds();
+                            for (int user : users) {
+                                mSettings.addPackageToCleanLPw(
+                                        new PackageCleanItem(user, packageName, andCode));
+                            }
+                        } else {
+                            mSettings.addPackageToCleanLPw(
+                                    new PackageCleanItem(userId, packageName, andCode));
+                        }
+                    }
+                    Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND);
+                    startCleaningPackages();
+                } break;
+                case POST_INSTALL: {
+                    if (DEBUG_INSTALL) Log.v(TAG, "Handling post-install for " + msg.arg1);
+
+                    PostInstallData data = mRunningInstalls.get(msg.arg1);
+                    final boolean didRestore = (msg.arg2 != 0);
+                    mRunningInstalls.delete(msg.arg1);
+
+                    if (data != null) {
+                        InstallArgs args = data.args;
+                        PackageInstalledInfo parentRes = data.res;
+
+                        final boolean grantPermissions = (args.installFlags
+                                & PackageManager.INSTALL_GRANT_RUNTIME_PERMISSIONS) != 0;
+                        final boolean killApp = (args.installFlags
+                                & PackageManager.INSTALL_DONT_KILL_APP) == 0;
+                        final String[] grantedPermissions = args.installGrantPermissions;
+
+                        // Handle the parent package
+                        handlePackagePostInstall(parentRes, grantPermissions, killApp,
+                                grantedPermissions, didRestore, args.installerPackageName,
+                                args.observer);
+
+                        // Handle the child packages
+                        final int childCount = (parentRes.addedChildPackages != null)
+                                ? parentRes.addedChildPackages.size() : 0;
+                        for (int i = 0; i < childCount; i++) {
+                            PackageInstalledInfo childRes = parentRes.addedChildPackages.valueAt(i);
+                            handlePackagePostInstall(childRes, grantPermissions, killApp,
+                                    grantedPermissions, false, args.installerPackageName,
+                                    args.observer);
+                        }
+
+                        // Log tracing if needed
+                        if (args.traceMethod != null) {
+                            Trace.asyncTraceEnd(TRACE_TAG_PACKAGE_MANAGER, args.traceMethod,
+                                    args.traceCookie);
+                        }
+                    } else {
+                        Slog.e(TAG, "Bogus post-install token " + msg.arg1);
+                    }
+
+                    Trace.asyncTraceEnd(TRACE_TAG_PACKAGE_MANAGER, "postInstall", msg.arg1);
+                } break;
+                case UPDATED_MEDIA_STATUS: {
+                    if (DEBUG_SD_INSTALL) Log.i(TAG, "Got message UPDATED_MEDIA_STATUS");
+                    boolean reportStatus = msg.arg1 == 1;
+                    boolean doGc = msg.arg2 == 1;
+                    if (DEBUG_SD_INSTALL) Log.i(TAG, "reportStatus=" + reportStatus + ", doGc = " + doGc);
+                    if (doGc) {
+                        // Force a gc to clear up stale containers.
+                        Runtime.getRuntime().gc();
+                    }
+                    if (msg.obj != null) {
+                        @SuppressWarnings("unchecked")
+                        Set<AsecInstallArgs> args = (Set<AsecInstallArgs>) msg.obj;
+                        if (DEBUG_SD_INSTALL) Log.i(TAG, "Unloading all containers");
+                        // Unload containers
+                        unloadAllContainers(args);
+                    }
+                    if (reportStatus) {
+                        try {
+                            if (DEBUG_SD_INSTALL) Log.i(TAG, "Invoking MountService call back");
+                            PackageHelper.getMountService().finishMediaUpdate();
+                        } catch (RemoteException e) {
+                            Log.e(TAG, "MountService not running?");
+                        }
+                    }
+                } break;
+                case WRITE_SETTINGS: {
+                    Process.setThreadPriority(Process.THREAD_PRIORITY_DEFAULT);
+                    synchronized (mPackages) {
+                        removeMessages(WRITE_SETTINGS);
+                        removeMessages(WRITE_PACKAGE_RESTRICTIONS);
+                        mSettings.writeLPr();
+                        mDirtyUsers.clear();
+                    }
+                    Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND);
+                } break;
+                case WRITE_PACKAGE_RESTRICTIONS: {
+                    Process.setThreadPriority(Process.THREAD_PRIORITY_DEFAULT);
+                    synchronized (mPackages) {
+                        removeMessages(WRITE_PACKAGE_RESTRICTIONS);
+                        for (int userId : mDirtyUsers) {
+                            mSettings.writePackageRestrictionsLPr(userId);
+                        }
+                        mDirtyUsers.clear();
+                    }
+                    Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND);
+                } break;
+                case WRITE_PACKAGE_LIST: {
+                    Process.setThreadPriority(Process.THREAD_PRIORITY_DEFAULT);
+                    synchronized (mPackages) {
+                        removeMessages(WRITE_PACKAGE_LIST);
+                        mSettings.writePackageListLPr(msg.arg1);
+                    }
+                    Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND);
+                } break;
+                case CHECK_PENDING_VERIFICATION: {
+                    final int verificationId = msg.arg1;
+                    final PackageVerificationState state = mPendingVerification.get(verificationId);
+
+                    if ((state != null) && !state.timeoutExtended()) {
+                        final InstallArgs args = state.getInstallArgs();
+                        final Uri originUri = Uri.fromFile(args.origin.resolvedFile);
+
+                        Slog.i(TAG, "Verification timed out for " + originUri);
+                        mPendingVerification.remove(verificationId);
+
+                        int ret = PackageManager.INSTALL_FAILED_VERIFICATION_FAILURE;
+
+                        if (getDefaultVerificationResponse() == PackageManager.VERIFICATION_ALLOW) {
+                            Slog.i(TAG, "Continuing with installation of " + originUri);
+                            state.setVerifierResponse(Binder.getCallingUid(),
+                                    PackageManager.VERIFICATION_ALLOW_WITHOUT_SUFFICIENT);
+                            broadcastPackageVerified(verificationId, originUri,
+                                    PackageManager.VERIFICATION_ALLOW,
+                                    state.getInstallArgs().getUser());
+                            try {
+                                ret = args.copyApk(mContainerService, true);
+                            } catch (RemoteException e) {
+                                Slog.e(TAG, "Could not contact the ContainerService");
+                            }
+                        } else {
+                            broadcastPackageVerified(verificationId, originUri,
+                                    PackageManager.VERIFICATION_REJECT,
+                                    state.getInstallArgs().getUser());
+                        }
+
+                        Trace.asyncTraceEnd(
+                                TRACE_TAG_PACKAGE_MANAGER, "verification", verificationId);
+
+                        processPendingInstall(args, ret);
+                        mHandler.sendEmptyMessage(MCS_UNBIND);
+                    }
+                    break;
+                }
+                case PACKAGE_VERIFIED: {
+                    final int verificationId = msg.arg1;
+
+                    final PackageVerificationState state = mPendingVerification.get(verificationId);
+                    if (state == null) {
+                        Slog.w(TAG, "Invalid verification token " + verificationId + " received");
+                        break;
+                    }
+
+                    final PackageVerificationResponse response = (PackageVerificationResponse) msg.obj;
+
+                    state.setVerifierResponse(response.callerUid, response.code);
+
+                    if (state.isVerificationComplete()) {
+                        mPendingVerification.remove(verificationId);
+
+                        final InstallArgs args = state.getInstallArgs();
+                        final Uri originUri = Uri.fromFile(args.origin.resolvedFile);
+
+                        int ret;
+                        if (state.isInstallAllowed()) {
+                            ret = PackageManager.INSTALL_FAILED_INTERNAL_ERROR;
+                            broadcastPackageVerified(verificationId, originUri,
+                                    response.code, state.getInstallArgs().getUser());
+                            try {
+                                ret = args.copyApk(mContainerService, true);
+                            } catch (RemoteException e) {
+                                Slog.e(TAG, "Could not contact the ContainerService");
+                            }
+                        } else {
+                            ret = PackageManager.INSTALL_FAILED_VERIFICATION_FAILURE;
+                        }
+
+                        Trace.asyncTraceEnd(
+                                TRACE_TAG_PACKAGE_MANAGER, "verification", verificationId);
+
+                        processPendingInstall(args, ret);
+                        mHandler.sendEmptyMessage(MCS_UNBIND);
+                    }
+
+                    break;
+                }
+                case START_INTENT_FILTER_VERIFICATIONS: {
+                    IFVerificationParams params = (IFVerificationParams) msg.obj;
+                    verifyIntentFiltersIfNeeded(params.userId, params.verifierUid,
+                            params.replacing, params.pkg);
+                    break;
+                }
+                case INTENT_FILTER_VERIFIED: {
+                    final int verificationId = msg.arg1;
+
+                    final IntentFilterVerificationState state = mIntentFilterVerificationStates.get(
+                            verificationId);
+                    if (state == null) {
+                        Slog.w(TAG, "Invalid IntentFilter verification token "
+                                + verificationId + " received");
+                        break;
+                    }
+
+                    final int userId = state.getUserId();
+
+                    if (DEBUG_DOMAIN_VERIFICATION) Slog.d(TAG,
+                            "Processing IntentFilter verification with token:"
+                            + verificationId + " and userId:" + userId);
+
+                    final IntentFilterVerificationResponse response =
+                            (IntentFilterVerificationResponse) msg.obj;
+
+                    state.setVerifierResponse(response.callerUid, response.code);
+
+                    if (DEBUG_DOMAIN_VERIFICATION) Slog.d(TAG,
+                            "IntentFilter verification with token:" + verificationId
+                            + " and userId:" + userId
+                            + " is settings verifier response with response code:"
+                            + response.code);
+
+                    if (response.code == PackageManager.INTENT_FILTER_VERIFICATION_FAILURE) {
+                        if (DEBUG_DOMAIN_VERIFICATION) Slog.d(TAG, "Domains failing verification: "
+                                + response.getFailedDomainsString());
+                    }
+
+                    if (state.isVerificationComplete()) {
+                        mIntentFilterVerifier.receiveVerificationResponse(verificationId);
+                    } else {
+                        if (DEBUG_DOMAIN_VERIFICATION) Slog.d(TAG,
+                                "IntentFilter verification with token:" + verificationId
+                                + " was not said to be complete");
+                    }
+
+                    break;
+                }
+            }

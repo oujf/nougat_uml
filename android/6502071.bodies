@@ -1,0 +1,282 @@
+class Session
+!!!73293623.java!!!	Session(inout accounts : AccountManagerService::UserAccounts, inout response : IAccountManagerResponse, inout accountType : String, inout expectActivityLaunch : boolean, inout stripAuthTokenFromResult : boolean, inout accountName : String, inout authDetailsRequired : boolean)
+            this(accounts, response, accountType, expectActivityLaunch, stripAuthTokenFromResult,
+                    accountName, authDetailsRequired, false /* updateLastAuthenticatedTime */);
+!!!73293751.java!!!	Session(inout accounts : AccountManagerService::UserAccounts, inout response : IAccountManagerResponse, inout accountType : String, inout expectActivityLaunch : boolean, inout stripAuthTokenFromResult : boolean, inout accountName : String, inout authDetailsRequired : boolean, inout updateLastAuthenticatedTime : boolean)
+            super();
+            //if (response == null) throw new IllegalArgumentException("response is null");
+            if (accountType == null) throw new IllegalArgumentException("accountType is null");
+            mAccounts = accounts;
+            mStripAuthTokenFromResult = stripAuthTokenFromResult;
+            mResponse = response;
+            mAccountType = accountType;
+            mExpectActivityLaunch = expectActivityLaunch;
+            mCreationTime = SystemClock.elapsedRealtime();
+            mAccountName = accountName;
+            mAuthDetailsRequired = authDetailsRequired;
+            mUpdateLastAuthenticatedTime = updateLastAuthenticatedTime;
+
+            synchronized (mSessions) {
+                mSessions.put(toString(), this);
+            }
+            if (response != null) {
+                try {
+                    response.asBinder().linkToDeath(this, 0 /* flags */);
+                } catch (RemoteException e) {
+                    mResponse = null;
+                    binderDied();
+                }
+            }
+!!!73293879.java!!!	getResponseAndClose() : IAccountManagerResponse
+            if (mResponse == null) {
+                // this session has already been closed
+                return null;
+            }
+            IAccountManagerResponse response = mResponse;
+            close(); // this clears mResponse so we need to save the response before this call
+            return response;
+!!!73294007.java!!!	checkKeyIntent(in authUid : int, inout intent : Intent) : void
+            long bid = Binder.clearCallingIdentity();
+            try {
+                PackageManager pm = mContext.getPackageManager();
+                ResolveInfo resolveInfo = pm.resolveActivityAsUser(intent, 0, mAccounts.userId);
+                ActivityInfo targetActivityInfo = resolveInfo.activityInfo;
+                int targetUid = targetActivityInfo.applicationInfo.uid;
+                if (PackageManager.SIGNATURE_MATCH != pm.checkSignatures(authUid, targetUid)) {
+                    String pkgName = targetActivityInfo.packageName;
+                    String activityName = targetActivityInfo.name;
+                    String tmpl = "KEY_INTENT resolved to an Activity (%s) in a package (%s) that "
+                            + "does not share a signature with the supplying authenticator (%s).";
+                    throw new SecurityException(
+                            String.format(tmpl, activityName, pkgName, mAccountType));
+                }
+            } finally {
+                Binder.restoreCallingIdentity(bid);
+            }
+!!!73294135.java!!!	close() : void
+            synchronized (mSessions) {
+                if (mSessions.remove(toString()) == null) {
+                    // the session was already closed, so bail out now
+                    return;
+                }
+            }
+            if (mResponse != null) {
+                // stop listening for response deaths
+                mResponse.asBinder().unlinkToDeath(this, 0 /* flags */);
+
+                // clear this so that we don't accidentally send any further results
+                mResponse = null;
+            }
+            cancelTimeout();
+            unbind();
+!!!73294263.java!!!	binderDied() : void
+            mResponse = null;
+            close();
+!!!73294391.java!!!	toDebugString() : String
+            return toDebugString(SystemClock.elapsedRealtime());
+!!!73294519.java!!!	toDebugString(in now : long) : String
+            return "Session: expectLaunch " + mExpectActivityLaunch
+                    + ", connected " + (mAuthenticator != null)
+                    + ", stats (" + mNumResults + "/" + mNumRequestContinued
+                    + "/" + mNumErrors + ")"
+                    + ", lifetime " + ((now - mCreationTime) / 1000.0);
+!!!73294647.java!!!	bind() : void
+            if (Log.isLoggable(TAG, Log.VERBOSE)) {
+                Log.v(TAG, "initiating bind to authenticator type " + mAccountType);
+            }
+            if (!bindToAuthenticator(mAccountType)) {
+                Log.d(TAG, "bind attempt failed for " + toDebugString());
+                onError(AccountManager.ERROR_CODE_REMOTE_EXCEPTION, "bind failure");
+            }
+!!!73294775.java!!!	unbind() : void
+            if (mAuthenticator != null) {
+                mAuthenticator = null;
+                mContext.unbindService(this);
+            }
+!!!73294903.java!!!	cancelTimeout() : void
+            mMessageHandler.removeMessages(MESSAGE_TIMED_OUT, this);
+!!!73295031.java!!!	onServiceConnected(inout name : ComponentName, inout service : IBinder) : void
+            mAuthenticator = IAccountAuthenticator.Stub.asInterface(service);
+            try {
+                run();
+            } catch (RemoteException e) {
+                onError(AccountManager.ERROR_CODE_REMOTE_EXCEPTION,
+                        "remote exception");
+            }
+!!!73295159.java!!!	onServiceDisconnected(inout name : ComponentName) : void
+            mAuthenticator = null;
+            IAccountManagerResponse response = getResponseAndClose();
+            if (response != null) {
+                try {
+                    response.onError(AccountManager.ERROR_CODE_REMOTE_EXCEPTION,
+                            "disconnected");
+                } catch (RemoteException e) {
+                    if (Log.isLoggable(TAG, Log.VERBOSE)) {
+                        Log.v(TAG, "Session.onServiceDisconnected: "
+                                + "caught RemoteException while responding", e);
+                    }
+                }
+            }
+!!!73295415.java!!!	onTimedOut() : void
+            IAccountManagerResponse response = getResponseAndClose();
+            if (response != null) {
+                try {
+                    response.onError(AccountManager.ERROR_CODE_REMOTE_EXCEPTION,
+                            "timeout");
+                } catch (RemoteException e) {
+                    if (Log.isLoggable(TAG, Log.VERBOSE)) {
+                        Log.v(TAG, "Session.onTimedOut: caught RemoteException while responding",
+                                e);
+                    }
+                }
+            }
+!!!73295543.java!!!	onResult(inout result : Bundle) : void
+            Bundle.setDefusable(result, true);
+            mNumResults++;
+            Intent intent = null;
+            if (result != null) {
+                boolean isSuccessfulConfirmCreds = result.getBoolean(
+                        AccountManager.KEY_BOOLEAN_RESULT, false);
+                boolean isSuccessfulUpdateCredsOrAddAccount =
+                        result.containsKey(AccountManager.KEY_ACCOUNT_NAME)
+                        && result.containsKey(AccountManager.KEY_ACCOUNT_TYPE);
+                // We should only update lastAuthenticated time, if
+                // mUpdateLastAuthenticatedTime is true and the confirmRequest
+                // or updateRequest was successful
+                boolean needUpdate = mUpdateLastAuthenticatedTime
+                        && (isSuccessfulConfirmCreds || isSuccessfulUpdateCredsOrAddAccount);
+                if (needUpdate || mAuthDetailsRequired) {
+                    boolean accountPresent = isAccountPresentForCaller(mAccountName, mAccountType);
+                    if (needUpdate && accountPresent) {
+                        updateLastAuthenticatedTime(new Account(mAccountName, mAccountType));
+                    }
+                    if (mAuthDetailsRequired) {
+                        long lastAuthenticatedTime = -1;
+                        if (accountPresent) {
+                            lastAuthenticatedTime = DatabaseUtils.longForQuery(
+                                    mAccounts.openHelper.getReadableDatabase(),
+                                    "SELECT " + ACCOUNTS_LAST_AUTHENTICATE_TIME_EPOCH_MILLIS
+                                            + " FROM " +
+                                            TABLE_ACCOUNTS + " WHERE " + ACCOUNTS_NAME + "=? AND "
+                                            + ACCOUNTS_TYPE + "=?",
+                                    new String[] {
+                                            mAccountName, mAccountType
+                                    });
+                        }
+                        result.putLong(AccountManager.KEY_LAST_AUTHENTICATED_TIME,
+                                lastAuthenticatedTime);
+                    }
+                }
+            }
+            if (result != null
+                    && (intent = result.getParcelable(AccountManager.KEY_INTENT)) != null) {
+                checkKeyIntent(
+                        Binder.getCallingUid(),
+                        intent);
+            }
+            if (result != null
+                    && !TextUtils.isEmpty(result.getString(AccountManager.KEY_AUTHTOKEN))) {
+                String accountName = result.getString(AccountManager.KEY_ACCOUNT_NAME);
+                String accountType = result.getString(AccountManager.KEY_ACCOUNT_TYPE);
+                if (!TextUtils.isEmpty(accountName) && !TextUtils.isEmpty(accountType)) {
+                    Account account = new Account(accountName, accountType);
+                    cancelNotification(getSigninRequiredNotificationId(mAccounts, account),
+                            new UserHandle(mAccounts.userId));
+                }
+            }
+            IAccountManagerResponse response;
+            if (mExpectActivityLaunch && result != null
+                    && result.containsKey(AccountManager.KEY_INTENT)) {
+                response = mResponse;
+            } else {
+                response = getResponseAndClose();
+            }
+            if (response != null) {
+                try {
+                    if (result == null) {
+                        if (Log.isLoggable(TAG, Log.VERBOSE)) {
+                            Log.v(TAG, getClass().getSimpleName()
+                                    + " calling onError() on response " + response);
+                        }
+                        response.onError(AccountManager.ERROR_CODE_INVALID_RESPONSE,
+                                "null bundle returned");
+                    } else {
+                        if (mStripAuthTokenFromResult) {
+                            result.remove(AccountManager.KEY_AUTHTOKEN);
+                        }
+                        if (Log.isLoggable(TAG, Log.VERBOSE)) {
+                            Log.v(TAG, getClass().getSimpleName()
+                                    + " calling onResult() on response " + response);
+                        }
+                        if ((result.getInt(AccountManager.KEY_ERROR_CODE, -1) > 0) &&
+                                (intent == null)) {
+                            // All AccountManager error codes are greater than 0
+                            response.onError(result.getInt(AccountManager.KEY_ERROR_CODE),
+                                    result.getString(AccountManager.KEY_ERROR_MESSAGE));
+                        } else {
+                            response.onResult(result);
+                        }
+                    }
+                } catch (RemoteException e) {
+                    // if the caller is dead then there is no one to care about remote exceptions
+                    if (Log.isLoggable(TAG, Log.VERBOSE)) {
+                        Log.v(TAG, "failure while notifying response", e);
+                    }
+                }
+            }
+!!!73295671.java!!!	onRequestContinued() : void
+            mNumRequestContinued++;
+!!!73295799.java!!!	onError(in errorCode : int, inout errorMessage : String) : void
+            mNumErrors++;
+            IAccountManagerResponse response = getResponseAndClose();
+            if (response != null) {
+                if (Log.isLoggable(TAG, Log.VERBOSE)) {
+                    Log.v(TAG, getClass().getSimpleName()
+                            + " calling onError() on response " + response);
+                }
+                try {
+                    response.onError(errorCode, errorMessage);
+                } catch (RemoteException e) {
+                    if (Log.isLoggable(TAG, Log.VERBOSE)) {
+                        Log.v(TAG, "Session.onError: caught RemoteException while responding", e);
+                    }
+                }
+            } else {
+                if (Log.isLoggable(TAG, Log.VERBOSE)) {
+                    Log.v(TAG, "Session.onError: already closed");
+                }
+            }
+!!!73295927.java!!!	bindToAuthenticator(inout authenticatorType : String) : boolean
+            final AccountAuthenticatorCache.ServiceInfo<AuthenticatorDescription> authenticatorInfo;
+            authenticatorInfo = mAuthenticatorCache.getServiceInfo(
+                    AuthenticatorDescription.newKey(authenticatorType), mAccounts.userId);
+            if (authenticatorInfo == null) {
+                if (Log.isLoggable(TAG, Log.VERBOSE)) {
+                    Log.v(TAG, "there is no authenticator for " + authenticatorType
+                            + ", bailing out");
+                }
+                return false;
+            }
+
+            if (!isLocalUnlockedUser(mAccounts.userId)
+                    && !authenticatorInfo.componentInfo.directBootAware) {
+                Slog.w(TAG, "Blocking binding to authenticator " + authenticatorInfo.componentName
+                        + " which isn't encryption aware");
+                return false;
+            }
+
+            Intent intent = new Intent();
+            intent.setAction(AccountManager.ACTION_AUTHENTICATOR_INTENT);
+            intent.setComponent(authenticatorInfo.componentName);
+            if (Log.isLoggable(TAG, Log.VERBOSE)) {
+                Log.v(TAG, "performing bindService to " + authenticatorInfo.componentName);
+            }
+            if (!mContext.bindServiceAsUser(intent, this, Context.BIND_AUTO_CREATE,
+                    UserHandle.of(mAccounts.userId))) {
+                if (Log.isLoggable(TAG, Log.VERBOSE)) {
+                    Log.v(TAG, "bindService to " + authenticatorInfo.componentName + " failed");
+                }
+                return false;
+            }
+
+            return true;

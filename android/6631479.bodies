@@ -1,0 +1,113 @@
+class MonitoringCertNotificationTask
+!!!74850999.java!!!	doInBackground(inout  : Integer...params) : Void
+            int userHandle = params[0];
+
+            if (userHandle == UserHandle.USER_ALL) {
+                for (UserInfo userInfo : mUserManager.getUsers(true)) {
+                    manageNotification(userInfo.getUserHandle());
+                }
+            } else {
+                manageNotification(UserHandle.of(userHandle));
+            }
+            return null;
+!!!74851127.java!!!	manageNotification(inout userHandle : UserHandle) : void
+            if (!mUserManager.isUserUnlocked(userHandle)) {
+                return;
+            }
+
+            // Call out to KeyChain to check for CAs which are waiting for approval.
+            final List<String> pendingCertificates;
+            try {
+                pendingCertificates = getInstalledCaCertificates(userHandle);
+            } catch (RemoteException | RuntimeException e) {
+                Log.e(LOG_TAG, "Could not retrieve certificates from KeyChain service", e);
+                return;
+            }
+
+            synchronized (DevicePolicyManagerService.this) {
+                final DevicePolicyData policy = getUserData(userHandle.getIdentifier());
+
+                // Remove deleted certificates. Flush xml if necessary.
+                if (policy.mAcceptedCaCertificates.retainAll(pendingCertificates)) {
+                    saveSettingsLocked(userHandle.getIdentifier());
+                }
+                // Trim to approved certificates.
+                pendingCertificates.removeAll(policy.mAcceptedCaCertificates);
+            }
+
+            if (pendingCertificates.isEmpty()) {
+                mInjector.getNotificationManager().cancelAsUser(
+                        null, MONITORING_CERT_NOTIFICATION_ID, userHandle);
+                return;
+            }
+
+            // Build and show a warning notification
+            int smallIconId;
+            String contentText;
+            int parentUserId = userHandle.getIdentifier();
+            if (getProfileOwner(userHandle.getIdentifier()) != null) {
+                contentText = mContext.getString(R.string.ssl_ca_cert_noti_managed,
+                        getProfileOwnerName(userHandle.getIdentifier()));
+                smallIconId = R.drawable.stat_sys_certificate_info;
+                parentUserId = getProfileParentId(userHandle.getIdentifier());
+            } else if (getDeviceOwnerUserId() == userHandle.getIdentifier()) {
+                contentText = mContext.getString(R.string.ssl_ca_cert_noti_managed,
+                        getDeviceOwnerName());
+                smallIconId = R.drawable.stat_sys_certificate_info;
+            } else {
+                contentText = mContext.getString(R.string.ssl_ca_cert_noti_by_unknown);
+                smallIconId = android.R.drawable.stat_sys_warning;
+            }
+
+            final int numberOfCertificates = pendingCertificates.size();
+            Intent dialogIntent = new Intent(Settings.ACTION_MONITORING_CERT_INFO);
+            dialogIntent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK);
+            dialogIntent.setPackage("com.android.settings");
+            dialogIntent.putExtra(Settings.EXTRA_NUMBER_OF_CERTIFICATES, numberOfCertificates);
+            dialogIntent.putExtra(Intent.EXTRA_USER_ID, userHandle.getIdentifier());
+            PendingIntent notifyIntent = PendingIntent.getActivityAsUser(mContext, 0,
+                    dialogIntent, PendingIntent.FLAG_UPDATE_CURRENT, null,
+                    new UserHandle(parentUserId));
+
+            final Context userContext;
+            try {
+                final String packageName = mContext.getPackageName();
+                userContext = mContext.createPackageContextAsUser(packageName, 0, userHandle);
+            } catch (PackageManager.NameNotFoundException e) {
+                Log.e(LOG_TAG, "Create context as " + userHandle + " failed", e);
+                return;
+            }
+            final Notification noti = new Notification.Builder(userContext)
+                .setSmallIcon(smallIconId)
+                .setContentTitle(mContext.getResources().getQuantityText(
+                        R.plurals.ssl_ca_cert_warning, numberOfCertificates))
+                .setContentText(contentText)
+                .setContentIntent(notifyIntent)
+                .setPriority(Notification.PRIORITY_HIGH)
+                .setShowWhen(false)
+                .setColor(mContext.getColor(
+                        com.android.internal.R.color.system_notification_accent_color))
+                .build();
+
+            mInjector.getNotificationManager().notifyAsUser(
+                    null, MONITORING_CERT_NOTIFICATION_ID, noti, userHandle);
+!!!74851255.java!!!	getInstalledCaCertificates(inout userHandle : UserHandle) : String
+            KeyChainConnection conn = null;
+            try {
+                conn = KeyChain.bindAsUser(mContext, userHandle);
+                List<ParcelableString> aliases = conn.getService().getUserCaAliases().getList();
+                List<String> result = new ArrayList<>(aliases.size());
+                for (int i = 0; i < aliases.size(); i++) {
+                    result.add(aliases.get(i).string);
+                }
+                return result;
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return null;
+            } catch (AssertionError e) {
+                throw new RuntimeException(e);
+            } finally {
+                if (conn != null) {
+                    conn.close();
+                }
+            }

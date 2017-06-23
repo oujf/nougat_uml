@@ -1,0 +1,243 @@
+class ObjectBase
+!!!46807479.cpp!!!	ObjectBase(inout rsc : Context)
+    mUserRefCount = 0;
+    mSysRefCount = 0;
+    mRSC = rsc;
+    mNext = nullptr;
+    mPrev = nullptr;
+    mDH = nullptr;
+    mName = nullptr;
+
+    if (gDebugStacks || gDebugReferences || gDebugLeaks) {
+        mDH = new DebugHelper();
+    }
+
+    rsAssert(rsc);
+    add();
+
+    if (gDebugLifetime || gDebugReferences) {
+        ALOGV("ObjectBase constructed %p", this);
+    }
+!!!46807607.cpp!!!	incSysRef() : void
+    __sync_fetch_and_add(&mSysRefCount, 1);
+    if (gDebugReferences) {
+        ALOGV("ObjectBase %p incS ref %i, %i", this, mUserRefCount, mSysRefCount);
+    }
+!!!46807735.cpp!!!	decSysRef() : bool
+    if (gDebugReferences) {
+        ALOGV("ObjectBase %p decS ref %i, %i", this, mUserRefCount, mSysRefCount);
+    }
+
+    rsAssert(mSysRefCount > 0);
+    if ((__sync_fetch_and_sub(&mSysRefCount, 1) <= 1)) {
+        __sync_synchronize();
+        if (mUserRefCount <= 0) {
+            return checkDelete(this);
+        }
+    }
+    return false;
+!!!46807863.cpp!!!	incUserRef() : void
+    __sync_fetch_and_add(&mUserRefCount, 1);
+    if (gDebugReferences) {
+        ALOGV("ObjectBase %p incU ref %i, %i", this, mUserRefCount, mSysRefCount);
+    }
+!!!46807991.cpp!!!	decUserRef() : bool
+    rsAssert(mUserRefCount > 0);
+    if (gDebugReferences) {
+        ALOGV("ObjectBase %p decU ref %i, %i", this, mUserRefCount, mSysRefCount);
+        if (mUserRefCount <= 0) {
+            mDH->dump();
+        }
+    }
+
+
+    if ((__sync_fetch_and_sub(&mUserRefCount, 1) <= 1)) {
+        __sync_synchronize();
+        if (mSysRefCount <= 0) {
+            return checkDelete(this);
+        }
+    }
+    return false;
+!!!46808119.cpp!!!	zeroUserRef() : bool
+    if (gDebugReferences) {
+        ALOGV("ObjectBase %p zeroU ref %i, %i", this, mUserRefCount, mSysRefCount);
+    }
+
+    __sync_and_and_fetch(&mUserRefCount, 0);
+    if (mSysRefCount <= 0) {
+        return checkDelete(this);
+    }
+    return false;
+!!!46808247.cpp!!!	checkDelete(in ref : ObjectBase) : bool
+    if (!ref) {
+        return false;
+    }
+
+    asyncLock();
+    // This lock protects us against the non-RS threads changing
+    // the ref counts.  At this point we should be the only thread
+    // working on them.
+    if (ref->mUserRefCount || ref->mSysRefCount) {
+        asyncUnlock();
+        return false;
+    }
+
+    ref->remove();
+    // At this point we can unlock because there should be no possible way
+    // for another thread to reference this object.
+    ref->preDestroy();
+    asyncUnlock();
+    delete ref;
+    return true;
+!!!46808631.cpp!!!	setName(in name : char) : void
+    mName = strdup(name);
+!!!46808759.cpp!!!	setName(in name : char, in len : uint32_t) : void
+    char *c = (char*)calloc(len + 1, sizeof(char));
+    rsAssert(c);
+    memcpy(c, name, len);
+    mName = c;
+!!!46809015.cpp!!!	freeChildren() : bool
+    return false;
+!!!46809143.cpp!!!	zeroAllUserRef(inout rsc : Context) : void
+    if (gDebugReferences || gDebugLeaks) {
+        ALOGV("Forcing release of all outstanding user refs.");
+    }
+
+    // This operation can be slow, only to be called during context cleanup.
+    const ObjectBase * o = rsc->mObjHead;
+    while (o) {
+        //ALOGE("o %p", o);
+        if (o->zeroUserRef()) {
+            // deleted the object and possibly others, restart from head.
+            o = rsc->mObjHead;
+            //ALOGE("o head %p", o);
+        } else {
+            o = o->mNext;
+            //ALOGE("o next %p", o);
+        }
+    }
+
+    if (gDebugReferences || gDebugLeaks) {
+        ALOGV("Objects remaining.");
+        dumpAll(rsc);
+    }
+!!!46809271.cpp!!!	freeAllChildren(inout rsc : Context) : void
+    if (gDebugReferences) {
+        ALOGV("Forcing release of all child objects.");
+    }
+
+    // This operation can be slow, only to be called during context cleanup.
+    ObjectBase * o = (ObjectBase *)rsc->mObjHead;
+    while (o) {
+        if (o->freeChildren()) {
+            // deleted ref to self and possibly others, restart from head.
+            o = (ObjectBase *)rsc->mObjHead;
+        } else {
+            o = (ObjectBase *)o->mNext;
+        }
+    }
+
+    if (gDebugReferences) {
+        ALOGV("Objects remaining.");
+        dumpAll(rsc);
+    }
+!!!46809399.cpp!!!	dumpAll(inout rsc : Context) : void
+    asyncLock();
+
+    ALOGV("Dumping all objects");
+    const ObjectBase * o = rsc->mObjHead;
+    while (o) {
+        ALOGV(" Object %p", o);
+        o->dumpLOGV("  ");
+        if (o->mDH != nullptr) {
+            o->mDH->dump();
+        }
+        o = o->mNext;
+    }
+
+    asyncUnlock();
+!!!46809527.cpp!!!	dumpLOGV(in op : char) : void
+    if (mName) {
+        ALOGV("%s RSobj %p, name %s, refs %i,%i  links %p,%p,%p",
+             op, this, mName, mUserRefCount, mSysRefCount, mNext, mPrev, mRSC);
+    } else {
+        ALOGV("%s RSobj %p, no-name, refs %i,%i  links %p,%p,%p",
+             op, this, mUserRefCount, mSysRefCount, mNext, mPrev, mRSC);
+    }
+!!!46809911.cpp!!!	isValid(in rsc : Context, in obj : ObjectBase) : bool
+    asyncLock();
+
+    const ObjectBase * o = rsc->mObjHead;
+    while (o) {
+        if (o == obj) {
+            asyncUnlock();
+            return true;
+        }
+        o = o->mNext;
+    }
+    asyncUnlock();
+    return false;
+!!!46810039.cpp!!!	asyncLock() : void
+    pthread_mutex_lock(&gObjectInitMutex);
+!!!46810167.cpp!!!	asyncUnlock() : void
+    pthread_mutex_unlock(&gObjectInitMutex);
+!!!46810295.cpp!!!	callUpdateCacheObject(in rsc : Context, inout dstObj : void) : void
+    //ALOGE("ObjectBase::callUpdateCacheObject %p  %p", this, dstObj);
+    *((const void **)dstObj) = this;
+!!!46810551.cpp!!!	~ObjectBase()
+    if (gDebugLifetime || gDebugReferences) {
+        ALOGV("ObjectBase destroyed %p   refs %i %i", this, mUserRefCount, mSysRefCount);
+    }
+
+    if (gDebugStacks || gDebugReferences || gDebugLeaks) {
+        if (gDebugStacks || gDebugReferences) {
+            mDH->dump();
+        }
+        delete mDH;
+        mDH = nullptr;
+    }
+
+    free(const_cast<char *>(mName));
+
+    if (mPrev || mNext) {
+        // While the normal practice is to call remove before we call
+        // delete.  Its possible for objects without a re-use list
+        // for avoiding duplication to be created on the stack.  In those
+        // cases we need to remove ourself here.
+        asyncLock();
+        remove();
+        asyncUnlock();
+    }
+
+    rsAssert(!mUserRefCount);
+    rsAssert(!mSysRefCount);
+!!!46810679.cpp!!!	add() : void
+    asyncLock();
+
+    rsAssert(!mNext);
+    rsAssert(!mPrev);
+    mNext = mRSC->mObjHead;
+    if (mRSC->mObjHead) {
+        mRSC->mObjHead->mPrev = this;
+    }
+    mRSC->mObjHead = this;
+
+    asyncUnlock();
+!!!46810807.cpp!!!	remove() : void
+    if (!mRSC) {
+        rsAssert(!mPrev);
+        rsAssert(!mNext);
+        return;
+    }
+
+    if (mRSC->mObjHead == this) {
+        mRSC->mObjHead = mNext;
+    }
+    if (mPrev) {
+        mPrev->mNext = mNext;
+    }
+    if (mNext) {
+        mNext->mPrev = mPrev;
+    }
+    mPrev = nullptr;
+    mNext = nullptr;

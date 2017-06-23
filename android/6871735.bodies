@@ -1,0 +1,180 @@
+class DcActiveState
+!!!76593975.java!!!	enter() : void
+            if (DBG) log("DcActiveState: enter dc=" + DataConnection.this);
+
+            boolean createNetworkAgent = true;
+            // If a disconnect is already pending, avoid notifying all of connected
+            if (hasMessages(EVENT_DISCONNECT) ||
+                    hasMessages(EVENT_DISCONNECT_ALL) ||
+                    hasDeferredMessages(EVENT_DISCONNECT) ||
+                    hasDeferredMessages(EVENT_DISCONNECT_ALL)) {
+                log("DcActiveState: skipping notifyAllOfConnected()");
+                createNetworkAgent = false;
+            } else {
+                // If we were retrying there maybe more than one, otherwise they'll only be one.
+                notifyAllOfConnected(Phone.REASON_CONNECTED);
+            }
+
+            mPhone.getCallTracker().registerForVoiceCallStarted(getHandler(),
+                    DataConnection.EVENT_DATA_CONNECTION_VOICE_CALL_STARTED, null);
+            mPhone.getCallTracker().registerForVoiceCallEnded(getHandler(),
+                    DataConnection.EVENT_DATA_CONNECTION_VOICE_CALL_ENDED, null);
+
+            // If the EVENT_CONNECT set the current max retry restore it here
+            // if it didn't then this is effectively a NOP.
+            mDcController.addActiveDcByCid(DataConnection.this);
+
+            mNetworkInfo.setDetailedState(NetworkInfo.DetailedState.CONNECTED,
+                    mNetworkInfo.getReason(), null);
+            mNetworkInfo.setExtraInfo(mApnSetting.apn);
+            updateTcpBufferSizes(mRilRat);
+
+            final NetworkMisc misc = new NetworkMisc();
+            misc.subscriberId = mPhone.getSubscriberId();
+
+            if (createNetworkAgent) {
+                mNetworkAgent = new DcNetworkAgent(getHandler().getLooper(), mPhone.getContext(),
+                        "DcNetworkAgent", mNetworkInfo, makeNetworkCapabilities(), mLinkProperties,
+                        50, misc);
+            }
+!!!76594103.java!!!	exit() : void
+            if (DBG) log("DcActiveState: exit dc=" + this);
+            String reason = mNetworkInfo.getReason();
+            if(mDcController.isExecutingCarrierChange()) {
+                reason = Phone.REASON_CARRIER_CHANGE;
+            } else if (mDisconnectParams != null && mDisconnectParams.mReason != null) {
+                reason = mDisconnectParams.mReason;
+            } else if (mDcFailCause != null) {
+                reason = mDcFailCause.toString();
+            }
+            mPhone.getCallTracker().unregisterForVoiceCallStarted(getHandler());
+            mPhone.getCallTracker().unregisterForVoiceCallEnded(getHandler());
+
+            mNetworkInfo.setDetailedState(NetworkInfo.DetailedState.DISCONNECTED,
+                    reason, mNetworkInfo.getExtraInfo());
+            if (mNetworkAgent != null) {
+                mNetworkAgent.sendNetworkInfo(mNetworkInfo);
+                mNetworkAgent = null;
+            }
+!!!76594231.java!!!	processMessage(inout msg : Message) : boolean
+            boolean retVal;
+
+            switch (msg.what) {
+                case EVENT_CONNECT: {
+                    ConnectionParams cp = (ConnectionParams) msg.obj;
+                    // either add this new apn context to our set or
+                    // update the existing cp with the latest connection generation number
+                    mApnContexts.put(cp.mApnContext, cp);
+                    if (DBG) {
+                        log("DcActiveState: EVENT_CONNECT cp=" + cp + " dc=" + DataConnection.this);
+                    }
+                    notifyConnectCompleted(cp, DcFailCause.NONE, false);
+                    retVal = HANDLED;
+                    break;
+                }
+                case EVENT_DISCONNECT: {
+                    DisconnectParams dp = (DisconnectParams) msg.obj;
+                    if (DBG) {
+                        log("DcActiveState: EVENT_DISCONNECT dp=" + dp
+                                + " dc=" + DataConnection.this);
+                    }
+                    if (mApnContexts.containsKey(dp.mApnContext)) {
+                        if (DBG) {
+                            log("DcActiveState msg.what=EVENT_DISCONNECT RefCount="
+                                    + mApnContexts.size());
+                        }
+
+                        if (mApnContexts.size() == 1) {
+                            mApnContexts.clear();
+                            mDisconnectParams = dp;
+                            mConnectionParams = null;
+                            dp.mTag = mTag;
+                            tearDownData(dp);
+                            transitionTo(mDisconnectingState);
+                        } else {
+                            mApnContexts.remove(dp.mApnContext);
+                            notifyDisconnectCompleted(dp, false);
+                        }
+                    } else {
+                        log("DcActiveState ERROR no such apnContext=" + dp.mApnContext
+                                + " in this dc=" + DataConnection.this);
+                        notifyDisconnectCompleted(dp, false);
+                    }
+                    retVal = HANDLED;
+                    break;
+                }
+                case EVENT_DISCONNECT_ALL: {
+                    if (DBG) {
+                        log("DcActiveState EVENT_DISCONNECT clearing apn contexts,"
+                                + " dc=" + DataConnection.this);
+                    }
+                    DisconnectParams dp = (DisconnectParams) msg.obj;
+                    mDisconnectParams = dp;
+                    mConnectionParams = null;
+                    dp.mTag = mTag;
+                    tearDownData(dp);
+                    transitionTo(mDisconnectingState);
+                    retVal = HANDLED;
+                    break;
+                }
+                case EVENT_LOST_CONNECTION: {
+                    if (DBG) {
+                        log("DcActiveState EVENT_LOST_CONNECTION dc=" + DataConnection.this);
+                    }
+
+                    mInactiveState.setEnterNotificationParams(DcFailCause.LOST_CONNECTION);
+                    transitionTo(mInactiveState);
+                    retVal = HANDLED;
+                    break;
+                }
+                case EVENT_DATA_CONNECTION_ROAM_ON: {
+                    mNetworkInfo.setRoaming(true);
+                    if (mNetworkAgent != null) {
+                        mNetworkAgent.sendNetworkInfo(mNetworkInfo);
+                    }
+                    retVal = HANDLED;
+                    break;
+                }
+                case EVENT_DATA_CONNECTION_ROAM_OFF: {
+                    mNetworkInfo.setRoaming(false);
+                    if (mNetworkAgent != null) {
+                        mNetworkAgent.sendNetworkInfo(mNetworkInfo);
+                    }
+                    retVal = HANDLED;
+                    break;
+                }
+                case EVENT_BW_REFRESH_RESPONSE: {
+                    AsyncResult ar = (AsyncResult)msg.obj;
+                    if (ar.exception != null) {
+                        log("EVENT_BW_REFRESH_RESPONSE: error ignoring, e=" + ar.exception);
+                    } else {
+                        final ArrayList<Integer> capInfo = (ArrayList<Integer>)ar.result;
+                        final int lceBwDownKbps = capInfo.get(0);
+                        NetworkCapabilities nc = makeNetworkCapabilities();
+                        if (mPhone.getLceStatus() == RILConstants.LCE_ACTIVE) {
+                            nc.setLinkDownstreamBandwidthKbps(lceBwDownKbps);
+                            if (mNetworkAgent != null) {
+                                mNetworkAgent.sendNetworkCapabilities(nc);
+                            }
+                        }
+                    }
+                    retVal = HANDLED;
+                    break;
+                }
+                case EVENT_DATA_CONNECTION_VOICE_CALL_STARTED:
+                case EVENT_DATA_CONNECTION_VOICE_CALL_ENDED: {
+                    if (updateNetworkInfoSuspendState() && mNetworkAgent != null) {
+                        // state changed
+                        mNetworkAgent.sendNetworkInfo(mNetworkInfo);
+                    }
+                    retVal = HANDLED;
+                    break;
+                }
+                default:
+                    if (VDBG) {
+                        log("DcActiveState not handled msg.what=" + getWhatToString(msg.what));
+                    }
+                    retVal = NOT_HANDLED;
+                    break;
+            }
+            return retVal;

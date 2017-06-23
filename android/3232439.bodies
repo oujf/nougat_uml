@@ -1,0 +1,86 @@
+class RsaVerifyOperation
+!!!43131447.cpp!!!	Begin(in input_params : AuthorizationSet, inout output_params : AuthorizationSet) : keymaster_error_t
+    keymaster_error_t error = RsaDigestingOperation::Begin(input_params, output_params);
+    if (error != KM_ERROR_OK)
+        return error;
+
+    if (digest_ == KM_DIGEST_NONE)
+        return KM_ERROR_OK;
+
+    EVP_PKEY_CTX* pkey_ctx;
+    if (EVP_DigestVerifyInit(&digest_ctx_, &pkey_ctx, digest_algorithm_, NULL, rsa_key_) != 1)
+        return TranslateLastOpenSslError();
+    return SetRsaPaddingInEvpContext(pkey_ctx, false /* signing */);
+!!!43131575.cpp!!!	Update(in additional_params : AuthorizationSet, in input : Buffer, inout output_params : AuthorizationSet, inout output : Buffer, inout input_consumed : size_t) : keymaster_error_t
+    if (digest_ == KM_DIGEST_NONE)
+        // Just buffer the data.
+        return RsaOperation::Update(additional_params, input, output_params, output,
+                                    input_consumed);
+
+    if (EVP_DigestVerifyUpdate(&digest_ctx_, input.peek_read(), input.available_read()) != 1)
+        return TranslateLastOpenSslError();
+    *input_consumed = input.available_read();
+    return KM_ERROR_OK;
+!!!43131703.cpp!!!	Finish(in additional_params : AuthorizationSet, in input : Buffer, in signature : Buffer, inout output_params : AuthorizationSet, inout output : Buffer) : keymaster_error_t
+    keymaster_error_t error = UpdateForFinish(additional_params, input);
+    if (error != KM_ERROR_OK)
+        return error;
+
+    if (digest_ == KM_DIGEST_NONE)
+        return VerifyUndigested(signature);
+    else
+        return VerifyDigested(signature);
+!!!43131831.cpp!!!	VerifyUndigested(in signature : Buffer) : keymaster_error_t
+    UniquePtr<RSA, RSA_Delete> rsa(EVP_PKEY_get1_RSA(const_cast<EVP_PKEY*>(rsa_key_)));
+    if (!rsa.get())
+        return KM_ERROR_UNKNOWN_ERROR;
+
+    size_t key_len = RSA_size(rsa.get());
+    int openssl_padding;
+    switch (padding_) {
+    case KM_PAD_NONE:
+        if (data_.available_read() > key_len)
+            return KM_ERROR_INVALID_INPUT_LENGTH;
+        if (key_len != signature.available_read())
+            return KM_ERROR_VERIFICATION_FAILED;
+        openssl_padding = RSA_NO_PADDING;
+        break;
+    case KM_PAD_RSA_PKCS1_1_5_SIGN:
+        if (data_.available_read() + kPkcs1UndigestedSignaturePaddingOverhead > key_len) {
+            LOG_E("Input too long: cannot verify %u-byte message with PKCS1 padding && %u-bit key",
+                  data_.available_read(), key_len * 8);
+            return KM_ERROR_INVALID_INPUT_LENGTH;
+        }
+        openssl_padding = RSA_PKCS1_PADDING;
+        break;
+    default:
+        return KM_ERROR_UNSUPPORTED_PADDING_MODE;
+    }
+
+    UniquePtr<uint8_t[]> decrypted_data(new (std::nothrow) uint8_t[key_len]);
+    if (!decrypted_data.get())
+        return KM_ERROR_MEMORY_ALLOCATION_FAILED;
+    int bytes_decrypted = RSA_public_decrypt(signature.available_read(), signature.peek_read(),
+                                             decrypted_data.get(), rsa.get(), openssl_padding);
+    if (bytes_decrypted < 0)
+        return KM_ERROR_VERIFICATION_FAILED;
+
+    const uint8_t* compare_pos = decrypted_data.get();
+    size_t bytes_to_compare = bytes_decrypted;
+    uint8_t zero_check_result = 0;
+    if (padding_ == KM_PAD_NONE && data_.available_read() < bytes_to_compare) {
+        // If the data is short, for "unpadded" signing we zero-pad to the left.  So during
+        // verification we should have zeros on the left of the decrypted data.  Do a constant-time
+        // check.
+        const uint8_t* zero_end = compare_pos + bytes_to_compare - data_.available_read();
+        while (compare_pos < zero_end)
+            zero_check_result |= *compare_pos++;
+        bytes_to_compare = data_.available_read();
+    }
+    if (memcmp_s(compare_pos, data_.peek_read(), bytes_to_compare) != 0 || zero_check_result != 0)
+        return KM_ERROR_VERIFICATION_FAILED;
+    return KM_ERROR_OK;
+!!!43131959.cpp!!!	VerifyDigested(in signature : Buffer) : keymaster_error_t
+    if (!EVP_DigestVerifyFinal(&digest_ctx_, signature.peek_read(), signature.available_read()))
+        return KM_ERROR_VERIFICATION_FAILED;
+    return KM_ERROR_OK;

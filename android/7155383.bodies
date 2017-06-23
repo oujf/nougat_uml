@@ -1,0 +1,310 @@
+class CameraDeviceCallbacks
+!!!79354167.java!!!	asBinder() : IBinder
+            return this;
+!!!79354295.java!!!	onDeviceError(in errorCode : int, inout resultExtras : CaptureResultExtras) : void
+            if (DEBUG) {
+                Log.d(TAG, String.format(
+                        "Device error received, code %d, frame number %d, request ID %d, subseq ID %d",
+                        errorCode, resultExtras.getFrameNumber(), resultExtras.getRequestId(),
+                        resultExtras.getSubsequenceId()));
+            }
+
+            synchronized(mInterfaceLock) {
+                if (mRemoteDevice == null) {
+                    return; // Camera already closed
+                }
+
+                switch (errorCode) {
+                    case ERROR_CAMERA_DISCONNECTED:
+                        CameraDeviceImpl.this.mDeviceHandler.post(mCallOnDisconnected);
+                        break;
+                    default:
+                        Log.e(TAG, "Unknown error from camera device: " + errorCode);
+                        // no break
+                    case ERROR_CAMERA_DEVICE:
+                    case ERROR_CAMERA_SERVICE:
+                        mInError = true;
+                        final int publicErrorCode = (errorCode == ERROR_CAMERA_DEVICE) ?
+                                StateCallback.ERROR_CAMERA_DEVICE :
+                                StateCallback.ERROR_CAMERA_SERVICE;
+                        Runnable r = new Runnable() {
+                            @Override
+                            public void run() {
+                                if (!CameraDeviceImpl.this.isClosed()) {
+                                    mDeviceCallback.onError(CameraDeviceImpl.this, publicErrorCode);
+                                }
+                            }
+                        };
+                        CameraDeviceImpl.this.mDeviceHandler.post(r);
+                        break;
+                    case ERROR_CAMERA_REQUEST:
+                    case ERROR_CAMERA_RESULT:
+                    case ERROR_CAMERA_BUFFER:
+                        onCaptureErrorLocked(errorCode, resultExtras);
+                        break;
+                }
+            }
+!!!79354423.java!!!	onRepeatingRequestError(in lastFrameNumber : long) : void
+            if (DEBUG) {
+                Log.d(TAG, "Repeating request error received. Last frame number is " +
+                        lastFrameNumber);
+            }
+
+            synchronized(mInterfaceLock) {
+                // Camera is already closed or no repeating request is present.
+                if (mRemoteDevice == null || mRepeatingRequestId == REQUEST_ID_NONE) {
+                    return; // Camera already closed
+                }
+
+                checkEarlyTriggerSequenceComplete(mRepeatingRequestId, lastFrameNumber);
+                mRepeatingRequestId = REQUEST_ID_NONE;
+            }
+!!!79354551.java!!!	onDeviceIdle() : void
+            if (DEBUG) {
+                Log.d(TAG, "Camera now idle");
+            }
+            synchronized(mInterfaceLock) {
+                if (mRemoteDevice == null) return; // Camera already closed
+
+                if (!CameraDeviceImpl.this.mIdle) {
+                    CameraDeviceImpl.this.mDeviceHandler.post(mCallOnIdle);
+                }
+                CameraDeviceImpl.this.mIdle = true;
+            }
+!!!79354679.java!!!	onCaptureStarted(in resultExtras : CaptureResultExtras, in timestamp : long) : void
+            int requestId = resultExtras.getRequestId();
+            final long frameNumber = resultExtras.getFrameNumber();
+
+            if (DEBUG) {
+                Log.d(TAG, "Capture started for id " + requestId + " frame number " + frameNumber);
+            }
+            final CaptureCallbackHolder holder;
+
+            synchronized(mInterfaceLock) {
+                if (mRemoteDevice == null) return; // Camera already closed
+
+                // Get the callback for this frame ID, if there is one
+                holder = CameraDeviceImpl.this.mCaptureCallbackMap.get(requestId);
+
+                if (holder == null) {
+                    return;
+                }
+
+                if (isClosed()) return;
+
+                // Dispatch capture start notice
+                holder.getHandler().post(
+                    new Runnable() {
+                        @Override
+                        public void run() {
+                            if (!CameraDeviceImpl.this.isClosed()) {
+                                holder.getCallback().onCaptureStarted(
+                                    CameraDeviceImpl.this,
+                                    holder.getRequest(resultExtras.getSubsequenceId()),
+                                    timestamp, frameNumber);
+                            }
+                        }
+                    });
+
+            }
+!!!79354807.java!!!	onResultReceived(inout result : CameraMetadataNative, inout resultExtras : CaptureResultExtras) : void
+
+            int requestId = resultExtras.getRequestId();
+            long frameNumber = resultExtras.getFrameNumber();
+
+            if (DEBUG) {
+                Log.v(TAG, "Received result frame " + frameNumber + " for id "
+                        + requestId);
+            }
+
+            synchronized(mInterfaceLock) {
+                if (mRemoteDevice == null) return; // Camera already closed
+
+                // TODO: Handle CameraCharacteristics access from CaptureResult correctly.
+                result.set(CameraCharacteristics.LENS_INFO_SHADING_MAP_SIZE,
+                        getCharacteristics().get(CameraCharacteristics.LENS_INFO_SHADING_MAP_SIZE));
+
+                final CaptureCallbackHolder holder =
+                        CameraDeviceImpl.this.mCaptureCallbackMap.get(requestId);
+                final CaptureRequest request = holder.getRequest(resultExtras.getSubsequenceId());
+
+                boolean isPartialResult =
+                        (resultExtras.getPartialResultCount() < mTotalPartialCount);
+                boolean isReprocess = request.isReprocess();
+
+                // Check if we have a callback for this
+                if (holder == null) {
+                    if (DEBUG) {
+                        Log.d(TAG,
+                                "holder is null, early return at frame "
+                                        + frameNumber);
+                    }
+
+                    mFrameNumberTracker.updateTracker(frameNumber, /*result*/null, isPartialResult,
+                            isReprocess);
+
+                    return;
+                }
+
+                if (isClosed()) {
+                    if (DEBUG) {
+                        Log.d(TAG,
+                                "camera is closed, early return at frame "
+                                        + frameNumber);
+                    }
+
+                    mFrameNumberTracker.updateTracker(frameNumber, /*result*/null, isPartialResult,
+                            isReprocess);
+                    return;
+                }
+
+
+                Runnable resultDispatch = null;
+
+                CaptureResult finalResult;
+
+                // Either send a partial result or the final capture completed result
+                if (isPartialResult) {
+                    final CaptureResult resultAsCapture =
+                            new CaptureResult(result, request, resultExtras);
+
+                    // Partial result
+                    resultDispatch = new Runnable() {
+                        @Override
+                        public void run() {
+                            if (!CameraDeviceImpl.this.isClosed()){
+                                holder.getCallback().onCaptureProgressed(
+                                    CameraDeviceImpl.this,
+                                    request,
+                                    resultAsCapture);
+                            }
+                        }
+                    };
+
+                    finalResult = resultAsCapture;
+                } else {
+                    List<CaptureResult> partialResults =
+                            mFrameNumberTracker.popPartialResults(frameNumber);
+
+                    final TotalCaptureResult resultAsCapture = new TotalCaptureResult(result,
+                            request, resultExtras, partialResults, holder.getSessionId());
+
+                    // Final capture result
+                    resultDispatch = new Runnable() {
+                        @Override
+                        public void run() {
+                            if (!CameraDeviceImpl.this.isClosed()){
+                                holder.getCallback().onCaptureCompleted(
+                                    CameraDeviceImpl.this,
+                                    request,
+                                    resultAsCapture);
+                            }
+                        }
+                    };
+
+                    finalResult = resultAsCapture;
+                }
+
+                holder.getHandler().post(resultDispatch);
+
+                // Collect the partials for a total result; or mark the frame as totally completed
+                mFrameNumberTracker.updateTracker(frameNumber, finalResult, isPartialResult,
+                        isReprocess);
+
+                // Fire onCaptureSequenceCompleted
+                if (!isPartialResult) {
+                    checkAndFireSequenceComplete();
+                }
+            }
+!!!79354935.java!!!	onPrepared(in streamId : int) : void
+            final OutputConfiguration output;
+            final StateCallbackKK sessionCallback;
+
+            if (DEBUG) {
+                Log.v(TAG, "Stream " + streamId + " is prepared");
+            }
+
+            synchronized(mInterfaceLock) {
+                output = mConfiguredOutputs.get(streamId);
+                sessionCallback = mSessionStateCallback;
+            }
+
+            if (sessionCallback == null) return;
+
+            if (output == null) {
+                Log.w(TAG, "onPrepared invoked for unknown output Surface");
+                return;
+            }
+            final Surface surface = output.getSurface();
+
+            sessionCallback.onSurfacePrepared(surface);
+!!!79355063.java!!!	onCaptureErrorLocked(in errorCode : int, inout resultExtras : CaptureResultExtras) : void
+
+            final int requestId = resultExtras.getRequestId();
+            final int subsequenceId = resultExtras.getSubsequenceId();
+            final long frameNumber = resultExtras.getFrameNumber();
+            final CaptureCallbackHolder holder =
+                    CameraDeviceImpl.this.mCaptureCallbackMap.get(requestId);
+
+            final CaptureRequest request = holder.getRequest(subsequenceId);
+
+            Runnable failureDispatch = null;
+            if (errorCode == ERROR_CAMERA_BUFFER) {
+                final Surface outputSurface =
+                        mConfiguredOutputs.get(resultExtras.getErrorStreamId()).getSurface();
+                if (DEBUG) {
+                    Log.v(TAG, String.format("Lost output buffer reported for frame %d, target %s",
+                            frameNumber, outputSurface));
+                }
+                failureDispatch = new Runnable() {
+                    @Override
+                    public void run() {
+                        if (!CameraDeviceImpl.this.isClosed()){
+                            holder.getCallback().onCaptureBufferLost(
+                                CameraDeviceImpl.this,
+                                request,
+                                outputSurface,
+                                frameNumber);
+                        }
+                    }
+                };
+            } else {
+                boolean mayHaveBuffers = (errorCode == ERROR_CAMERA_RESULT);
+
+                // This is only approximate - exact handling needs the camera service and HAL to
+                // disambiguate between request failures to due abort and due to real errors.  For
+                // now, assume that if the session believes we're mid-abort, then the error is due
+                // to abort.
+                int reason = (mCurrentSession != null && mCurrentSession.isAborting()) ?
+                        CaptureFailure.REASON_FLUSHED :
+                        CaptureFailure.REASON_ERROR;
+
+                final CaptureFailure failure = new CaptureFailure(
+                    request,
+                    reason,
+                    /*dropped*/ mayHaveBuffers,
+                    requestId,
+                    frameNumber);
+
+                failureDispatch = new Runnable() {
+                    @Override
+                    public void run() {
+                        if (!CameraDeviceImpl.this.isClosed()){
+                            holder.getCallback().onCaptureFailed(
+                                CameraDeviceImpl.this,
+                                request,
+                                failure);
+                        }
+                    }
+                };
+
+                // Fire onCaptureSequenceCompleted if appropriate
+                if (DEBUG) {
+                    Log.v(TAG, String.format("got error frame %d", frameNumber));
+                }
+                mFrameNumberTracker.updateTracker(frameNumber, /*error*/true, request.isReprocess());
+                checkAndFireSequenceComplete();
+            }
+
+            // Dispatch the failure callback
+            holder.getHandler().post(failureDispatch);

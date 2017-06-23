@@ -1,0 +1,425 @@
+class ReportCommand
+!!!43831223.cpp!!!	Run(in args : std::vector<std::string>) : bool
+  // 1. Parse options.
+  if (!ParseOptions(args)) {
+    return false;
+  }
+
+  // 2. Read record file and build SampleTree.
+  record_file_reader_ = RecordFileReader::CreateInstance(record_filename_);
+  if (record_file_reader_ == nullptr) {
+    return false;
+  }
+  if (!ReadEventAttrFromRecordFile()) {
+    return false;
+  }
+  // Read features first to prepare build ids used when building SampleTree.
+  if (!ReadFeaturesFromRecordFile()) {
+    return false;
+  }
+  ScopedCurrentArch scoped_arch(record_file_arch_);
+  ReadSampleTreeFromRecordFile();
+
+  // 3. Show collected information.
+  if (!PrintReport()) {
+    return false;
+  }
+
+  return true;
+!!!43831351.cpp!!!	ParseOptions(in args : std::vector<std::string>) : bool
+  bool demangle = true;
+  std::string symfs_dir;
+  std::string vmlinux;
+  bool print_sample_count = false;
+  std::vector<std::string> sort_keys = {"comm", "pid", "tid", "dso", "symbol"};
+  std::unordered_set<std::string> comm_filter;
+  std::unordered_set<std::string> dso_filter;
+  std::unordered_set<int> pid_filter;
+  std::unordered_set<int> tid_filter;
+
+  for (size_t i = 0; i < args.size(); ++i) {
+    if (args[i] == "-b") {
+      use_branch_address_ = true;
+    } else if (args[i] == "--children") {
+      accumulate_callchain_ = true;
+    } else if (args[i] == "--comms" || args[i] == "--dsos") {
+      std::unordered_set<std::string>& filter = (args[i] == "--comms" ? comm_filter : dso_filter);
+      if (!NextArgumentOrError(args, &i)) {
+        return false;
+      }
+      std::vector<std::string> strs = android::base::Split(args[i], ",");
+      filter.insert(strs.begin(), strs.end());
+
+    } else if (args[i] == "-g") {
+      print_callgraph_ = true;
+      accumulate_callchain_ = true;
+      if (i + 1 < args.size() && args[i + 1][0] != '-') {
+        ++i;
+        if (args[i] == "callee") {
+          callgraph_show_callee_ = true;
+        } else if (args[i] == "caller") {
+          callgraph_show_callee_ = false;
+        } else {
+          LOG(ERROR) << "Unknown argument with -g option: " << args[i];
+          return false;
+        }
+      }
+    } else if (args[i] == "-i") {
+      if (!NextArgumentOrError(args, &i)) {
+        return false;
+      }
+      record_filename_ = args[i];
+
+    } else if (args[i] == "-n") {
+      print_sample_count = true;
+
+    } else if (args[i] == "--no-demangle") {
+      demangle = false;
+    } else if (args[i] == "-o") {
+      if (!NextArgumentOrError(args, &i)) {
+        return false;
+      }
+      report_filename_ = args[i];
+
+    } else if (args[i] == "--pids" || args[i] == "--tids") {
+      if (!NextArgumentOrError(args, &i)) {
+        return false;
+      }
+      std::vector<std::string> strs = android::base::Split(args[i], ",");
+      std::vector<int> ids;
+      for (const auto& s : strs) {
+        int id;
+        if (!android::base::ParseInt(s.c_str(), &id, 0)) {
+          LOG(ERROR) << "invalid id in " << args[i] << " option: " << s;
+          return false;
+        }
+        ids.push_back(id);
+      }
+      std::unordered_set<int>& filter = (args[i] == "--pids" ? pid_filter : tid_filter);
+      filter.insert(ids.begin(), ids.end());
+
+    } else if (args[i] == "--sort") {
+      if (!NextArgumentOrError(args, &i)) {
+        return false;
+      }
+      sort_keys = android::base::Split(args[i], ",");
+    } else if (args[i] == "--symfs") {
+      if (!NextArgumentOrError(args, &i)) {
+        return false;
+      }
+      symfs_dir = args[i];
+
+    } else if (args[i] == "--vmlinux") {
+      if (!NextArgumentOrError(args, &i)) {
+        return false;
+      }
+      vmlinux = args[i];
+    } else {
+      ReportUnknownOption(args, i);
+      return false;
+    }
+  }
+
+  Dso::SetDemangle(demangle);
+  if (!Dso::SetSymFsDir(symfs_dir)) {
+    return false;
+  }
+  if (!vmlinux.empty()) {
+    Dso::SetVmlinux(vmlinux);
+  }
+
+  if (!accumulate_callchain_) {
+    displayable_items_.push_back(
+        std::unique_ptr<Displayable>(new SelfOverheadItem(*sample_tree_, "Overhead")));
+  } else {
+    displayable_items_.push_back(
+        std::unique_ptr<Displayable>(new AccumulatedOverheadItem(*sample_tree_)));
+    displayable_items_.push_back(std::unique_ptr<Displayable>(new SelfOverheadItem(*sample_tree_)));
+  }
+  if (print_sample_count) {
+    displayable_items_.push_back(std::unique_ptr<Displayable>(new SampleCountItem));
+  }
+  for (auto& key : sort_keys) {
+    if (!use_branch_address_ && branch_sort_keys.find(key) != branch_sort_keys.end()) {
+      LOG(ERROR) << "sort key '" << key << "' can only be used with -b option.";
+      return false;
+    }
+    if (key == "pid") {
+      PidItem* item = new PidItem;
+      displayable_items_.push_back(std::unique_ptr<Displayable>(item));
+      comparable_items_.push_back(item);
+    } else if (key == "tid") {
+      TidItem* item = new TidItem;
+      displayable_items_.push_back(std::unique_ptr<Displayable>(item));
+      comparable_items_.push_back(item);
+    } else if (key == "comm") {
+      CommItem* item = new CommItem;
+      displayable_items_.push_back(std::unique_ptr<Displayable>(item));
+      comparable_items_.push_back(item);
+    } else if (key == "dso") {
+      DsoItem* item = new DsoItem;
+      displayable_items_.push_back(std::unique_ptr<Displayable>(item));
+      comparable_items_.push_back(item);
+    } else if (key == "symbol") {
+      SymbolItem* item = new SymbolItem;
+      displayable_items_.push_back(std::unique_ptr<Displayable>(item));
+      comparable_items_.push_back(item);
+    } else if (key == "dso_from") {
+      DsoFromItem* item = new DsoFromItem;
+      displayable_items_.push_back(std::unique_ptr<Displayable>(item));
+      comparable_items_.push_back(item);
+    } else if (key == "dso_to") {
+      DsoToItem* item = new DsoToItem;
+      displayable_items_.push_back(std::unique_ptr<Displayable>(item));
+      comparable_items_.push_back(item);
+    } else if (key == "symbol_from") {
+      SymbolFromItem* item = new SymbolFromItem;
+      displayable_items_.push_back(std::unique_ptr<Displayable>(item));
+      comparable_items_.push_back(item);
+    } else if (key == "symbol_to") {
+      SymbolToItem* item = new SymbolToItem;
+      displayable_items_.push_back(std::unique_ptr<Displayable>(item));
+      comparable_items_.push_back(item);
+    } else {
+      LOG(ERROR) << "Unknown sort key: " << key;
+      return false;
+    }
+  }
+  sample_tree_->SetFilters(pid_filter, tid_filter, comm_filter, dso_filter);
+  return true;
+!!!43831479.cpp!!!	ReadEventAttrFromRecordFile() : bool
+  const std::vector<PerfFileFormat::FileAttr>& attrs = record_file_reader_->AttrSection();
+  if (attrs.size() != 1) {
+    LOG(ERROR) << "record file contains " << attrs.size() << " attrs";
+    return false;
+  }
+  event_attr_ = attrs[0].attr;
+  if (use_branch_address_ && (event_attr_.sample_type & PERF_SAMPLE_BRANCH_STACK) == 0) {
+    LOG(ERROR) << record_filename_ << " is not recorded with branch stack sampling option.";
+    return false;
+  }
+  return true;
+!!!43831607.cpp!!!	ReadSampleTreeFromRecordFile() : void
+  thread_tree_.AddThread(0, 0, "swapper");
+  record_file_reader_->ReadDataSection([this](std::unique_ptr<Record> record) {
+    ProcessRecord(std::move(record));
+    return true;
+  });
+!!!43831735.cpp!!!	ProcessRecord(in record : std::unique_ptr<Record>) : void
+  BuildThreadTree(*record, &thread_tree_);
+  if (record->header.type == PERF_RECORD_SAMPLE) {
+    ProcessSampleRecord(*static_cast<const SampleRecord*>(record.get()));
+  }
+!!!43831863.cpp!!!	ProcessSampleRecord(in r : SampleRecord) : void
+  if (use_branch_address_ && (r.sample_type & PERF_SAMPLE_BRANCH_STACK)) {
+    for (auto& item : r.branch_stack_data.stack) {
+      if (item.from != 0 && item.to != 0) {
+        sample_tree_->AddBranchSample(r.tid_data.pid, r.tid_data.tid, item.from, item.to,
+                                      item.flags, r.time_data.time, r.period_data.period);
+      }
+    }
+  } else {
+    bool in_kernel = (r.header.misc & PERF_RECORD_MISC_CPUMODE_MASK) == PERF_RECORD_MISC_KERNEL;
+    SampleEntry* sample = sample_tree_->AddSample(r.tid_data.pid, r.tid_data.tid, r.ip_data.ip,
+                                                  r.time_data.time, r.period_data.period, in_kernel);
+    if (sample == nullptr) {
+      return;
+    }
+    if (accumulate_callchain_) {
+      std::vector<uint64_t> ips;
+      if (r.sample_type & PERF_SAMPLE_CALLCHAIN) {
+        ips.insert(ips.end(), r.callchain_data.ips.begin(), r.callchain_data.ips.end());
+      }
+      // Use stack_user_data.data.size() instead of stack_user_data.dyn_size, to make up for
+      // the missing kernel patch in N9. See b/22612370.
+      if ((r.sample_type & PERF_SAMPLE_REGS_USER) && (r.regs_user_data.reg_mask != 0) &&
+          (r.sample_type & PERF_SAMPLE_STACK_USER) && (!r.stack_user_data.data.empty())) {
+        RegSet regs = CreateRegSet(r.regs_user_data.reg_mask, r.regs_user_data.regs);
+        std::vector<char> stack(r.stack_user_data.data.begin(),
+                                r.stack_user_data.data.begin() + r.stack_user_data.data.size());
+        std::vector<uint64_t> unwind_ips =
+            UnwindCallChain(ScopedCurrentArch::GetCurrentArch(), *sample->thread, regs, stack);
+        if (!unwind_ips.empty()) {
+          ips.push_back(PERF_CONTEXT_USER);
+          ips.insert(ips.end(), unwind_ips.begin(), unwind_ips.end());
+        }
+      }
+
+      std::vector<SampleEntry*> callchain;
+      callchain.push_back(sample);
+
+      bool first_ip = true;
+      for (auto& ip : ips) {
+        if (ip >= PERF_CONTEXT_MAX) {
+          switch (ip) {
+            case PERF_CONTEXT_KERNEL:
+              in_kernel = true;
+              break;
+            case PERF_CONTEXT_USER:
+              in_kernel = false;
+              break;
+            default:
+              LOG(ERROR) << "Unexpected perf_context in callchain: " << ip;
+          }
+        } else {
+          if (first_ip) {
+            first_ip = false;
+            // Remove duplication with sampled ip.
+            if (ip == r.ip_data.ip) {
+              continue;
+            }
+          }
+          SampleEntry* sample =
+              sample_tree_->AddCallChainSample(r.tid_data.pid, r.tid_data.tid, ip, r.time_data.time,
+                                               r.period_data.period, in_kernel, callchain);
+          callchain.push_back(sample);
+        }
+      }
+
+      if (print_callgraph_) {
+        std::set<SampleEntry*> added_set;
+        if (!callgraph_show_callee_) {
+          std::reverse(callchain.begin(), callchain.end());
+        }
+        while (callchain.size() >= 2) {
+          SampleEntry* sample = callchain[0];
+          callchain.erase(callchain.begin());
+          // Add only once for recursive calls on callchain.
+          if (added_set.find(sample) != added_set.end()) {
+            continue;
+          }
+          added_set.insert(sample);
+          sample_tree_->InsertCallChainForSample(sample, callchain, r.period_data.period);
+        }
+      }
+    }
+  }
+!!!43831991.cpp!!!	ReadFeaturesFromRecordFile() : bool
+  std::vector<BuildIdRecord> records = record_file_reader_->ReadBuildIdFeature();
+  std::vector<std::pair<std::string, BuildId>> build_ids;
+  for (auto& r : records) {
+    build_ids.push_back(std::make_pair(r.filename, r.build_id));
+  }
+  Dso::SetBuildIds(build_ids);
+
+  std::string arch = record_file_reader_->ReadFeatureString(PerfFileFormat::FEAT_ARCH);
+  if (!arch.empty()) {
+    record_file_arch_ = GetArchType(arch);
+    if (record_file_arch_ == ARCH_UNSUPPORTED) {
+      return false;
+    }
+  }
+
+  std::vector<std::string> cmdline = record_file_reader_->ReadCmdlineFeature();
+  if (!cmdline.empty()) {
+    record_cmdline_ = android::base::Join(cmdline, ' ');
+  }
+  return true;
+!!!43832119.cpp!!!	CompareSampleEntry(in sample1 : SampleEntry, in sample2 : SampleEntry) : int
+  for (auto& item : comparable_items_) {
+    int result = item->Compare(sample1, sample2);
+    if (result != 0) {
+      return result;
+    }
+  }
+  return 0;
+!!!43832247.cpp!!!	PrintReport() : bool
+  std::unique_ptr<FILE, decltype(&fclose)> file_handler(nullptr, fclose);
+  if (report_filename_.empty()) {
+    report_fp_ = stdout;
+  } else {
+    report_fp_ = fopen(report_filename_.c_str(), "w");
+    if (report_fp_ == nullptr) {
+      PLOG(ERROR) << "failed to open file " << report_filename_;
+      return false;
+    }
+    file_handler.reset(report_fp_);
+  }
+  PrintReportContext();
+  CollectReportWidth();
+  PrintReportHeader();
+  sample_tree_->VisitAllSamples(
+      std::bind(&ReportCommand::PrintReportEntry, this, std::placeholders::_1));
+  fflush(report_fp_);
+  if (ferror(report_fp_) != 0) {
+    PLOG(ERROR) << "print report failed";
+    return false;
+  }
+  return true;
+!!!43832375.cpp!!!	PrintReportContext() : void
+  const EventType* event_type = FindEventTypeByConfig(event_attr_.type, event_attr_.config);
+  std::string event_type_name;
+  if (event_type != nullptr) {
+    event_type_name = event_type->name;
+  } else {
+    event_type_name =
+        android::base::StringPrintf("(type %u, config %llu)", event_attr_.type, event_attr_.config);
+  }
+  if (!record_cmdline_.empty()) {
+    fprintf(report_fp_, "Cmdline: %s\n", record_cmdline_.c_str());
+  }
+  fprintf(report_fp_, "Samples: %" PRIu64 " of event '%s'\n", sample_tree_->TotalSamples(),
+          event_type_name.c_str());
+  fprintf(report_fp_, "Event count: %" PRIu64 "\n\n", sample_tree_->TotalPeriod());
+!!!43832503.cpp!!!	CollectReportWidth() : void
+  sample_tree_->VisitAllSamples(
+      std::bind(&ReportCommand::CollectReportEntryWidth, this, std::placeholders::_1));
+!!!43832631.cpp!!!	CollectReportEntryWidth(in sample : SampleEntry) : void
+  for (auto& item : displayable_items_) {
+    item->AdjustWidth(sample);
+  }
+!!!43832759.cpp!!!	PrintReportHeader() : void
+  for (size_t i = 0; i < displayable_items_.size(); ++i) {
+    auto& item = displayable_items_[i];
+    if (i != displayable_items_.size() - 1) {
+      fprintf(report_fp_, "%-*s  ", static_cast<int>(item->Width()), item->Name().c_str());
+    } else {
+      fprintf(report_fp_, "%s\n", item->Name().c_str());
+    }
+  }
+!!!43832887.cpp!!!	PrintReportEntry(in sample : SampleEntry) : void
+  for (size_t i = 0; i < displayable_items_.size(); ++i) {
+    auto& item = displayable_items_[i];
+    if (i != displayable_items_.size() - 1) {
+      fprintf(report_fp_, "%-*s  ", static_cast<int>(item->Width()), item->Show(sample).c_str());
+    } else {
+      fprintf(report_fp_, "%s\n", item->Show(sample).c_str());
+    }
+  }
+  if (print_callgraph_) {
+    PrintCallGraph(sample);
+  }
+!!!43833015.cpp!!!	PrintCallGraph(in sample : SampleEntry) : void
+  std::string prefix = "       ";
+  fprintf(report_fp_, "%s|\n", prefix.c_str());
+  fprintf(report_fp_, "%s-- %s\n", prefix.c_str(), sample.symbol->DemangledName());
+  prefix.append(3, ' ');
+  for (size_t i = 0; i < sample.callchain.children.size(); ++i) {
+    PrintCallGraphEntry(1, prefix, sample.callchain.children[i], sample.callchain.children_period,
+                        (i + 1 == sample.callchain.children.size()));
+  }
+!!!43833143.cpp!!!	PrintCallGraphEntry(in depth : size_t, in prefix : std::string, in node : std::unique_ptr<CallChainNode>, in parent_period : uint64_t, in last : bool) : void
+  if (depth > 20) {
+    LOG(WARNING) << "truncated callgraph at depth " << depth;
+    return;
+  }
+  prefix += "|";
+  fprintf(report_fp_, "%s\n", prefix.c_str());
+  if (last) {
+    prefix.back() = ' ';
+  }
+  std::string percentage_s = "-- ";
+  if (node->period + node->children_period != parent_period) {
+    double percentage = 100.0 * (node->period + node->children_period) / parent_period;
+    percentage_s = android::base::StringPrintf("--%.2lf%%-- ", percentage);
+  }
+  fprintf(report_fp_, "%s%s%s\n", prefix.c_str(), percentage_s.c_str(), node->chain[0]->symbol->DemangledName());
+  prefix.append(percentage_s.size(), ' ');
+  for (size_t i = 1; i < node->chain.size(); ++i) {
+    fprintf(report_fp_, "%s%s\n", prefix.c_str(), node->chain[i]->symbol->DemangledName());
+  }
+
+  for (size_t i = 0; i < node->children.size(); ++i) {
+    PrintCallGraphEntry(depth + 1, prefix, node->children[i], node->children_period,
+                        (i + 1 == node->children.size()));
+  }

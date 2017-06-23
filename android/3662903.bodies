@@ -1,0 +1,791 @@
+class QCamera3PicChannel
+!!!44240951.cpp!!!	QCamera3PicChannel(in cam_handle : uint32_t, in channel_handle : uint32_t, inout cam_ops : mm_camera_ops_t, in cb_routine : channel_cb_routine, inout paddingInfo : cam_padding_info_t, inout userData : void, inout stream : camera3_stream_t, in postprocess_mask : uint32_t, in is4KVideo : bool, in isInputStreamConfigured : bool, inout metadataChannel : QCamera3Channel, in numBuffers : uint32_t = MAX_INFLIGHT_REQUESTS)
+    QCamera3HardwareInterface* hal_obj = (QCamera3HardwareInterface*)mUserData;
+    m_max_pic_dim = hal_obj->calcMaxJpegDim();
+    mYuvWidth = stream->width;
+    mYuvHeight = stream->height;
+    mStreamType = CAM_STREAM_TYPE_SNAPSHOT;
+    // Use same pixelformat for 4K video case
+    mStreamFormat = is4KVideo ? VIDEO_FORMAT : SNAPSHOT_FORMAT;
+    int32_t rc = m_postprocessor.initJpeg(jpegEvtHandle, &m_max_pic_dim, this);
+    if (rc != 0) {
+        ALOGE("Init Postprocessor failed");
+    }
+!!!44241079.cpp!!!	~QCamera3PicChannel()
+   stop();
+
+   int32_t rc = m_postprocessor.stop();
+   if (rc != NO_ERROR) {
+       ALOGE("%s: Postprocessor stop failed", __func__);
+   }
+
+   rc = m_postprocessor.deinit();
+   if (rc != 0) {
+       ALOGE("De-init Postprocessor failed");
+   }
+
+   if (0 < mOfflineMetaMemory.getCnt()) {
+       mOfflineMetaMemory.deallocate();
+   }
+   if (0 < mOfflineMemory.getCnt()) {
+       mOfflineMemory.unregisterBuffers();
+   }
+!!!44241207.cpp!!!	initialize(in isType : cam_is_type_t) : int32_t
+    int32_t rc = NO_ERROR;
+    cam_dimension_t streamDim;
+    cam_stream_type_t streamType;
+    cam_format_t streamFormat;
+    mm_camera_channel_attr_t attr;
+
+    if (NULL == mCamera3Stream) {
+        ALOGE("%s: Camera stream uninitialized", __func__);
+        return NO_INIT;
+    }
+
+    if (1 <= m_numStreams) {
+        // Only one stream per channel supported in v3 Hal
+        return NO_ERROR;
+    }
+
+    memset(&attr, 0, sizeof(mm_camera_channel_attr_t));
+    attr.notify_mode = MM_CAMERA_SUPER_BUF_NOTIFY_BURST;
+    attr.look_back = 1;
+    attr.post_frame_skip = 1;
+    attr.water_mark = 1;
+    attr.max_unmatched_frames = 1;
+
+    rc = init(&attr, NULL);
+    if (rc < 0) {
+        ALOGE("%s: init failed", __func__);
+        return rc;
+    }
+    mIsType = isType;
+
+    streamType = mStreamType;
+    streamFormat = mStreamFormat;
+    streamDim.width = mYuvWidth;
+    streamDim.height = mYuvHeight;
+
+    mNumSnapshotBufs = mCamera3Stream->max_buffers;
+    rc = QCamera3Channel::addStream(streamType, streamFormat, streamDim,
+            ROTATE_0, (uint8_t)mCamera3Stream->max_buffers, mPostProcMask,
+            mIsType);
+
+    Mutex::Autolock lock(mFreeBuffersLock);
+    mFreeBufferList.clear();
+    for (uint32_t i = 0; i < mCamera3Stream->max_buffers; i++) {
+        mFreeBufferList.push_back(i);
+    }
+
+    return rc;
+!!!44241335.cpp!!!	request(inout buffer : buffer_handle_t, in frameNumber : uint32_t, inout pInputBuffer : camera3_stream_buffer_t, inout metadata : metadata_buffer_t) : int32_t
+    ATRACE_CALL();
+    //FIX ME: Return buffer back in case of failures below.
+
+    int32_t rc = NO_ERROR;
+    int index;
+    //extract rotation information
+
+    reprocess_config_t reproc_cfg;
+    memset(&reproc_cfg, 0, sizeof(reprocess_config_t));
+    reproc_cfg.padding = mPaddingInfo;
+    //to ensure a big enough buffer size set the height and width
+    //padding to max(height padding, width padding)
+    if (reproc_cfg.padding->height_padding > reproc_cfg.padding->width_padding) {
+       reproc_cfg.padding->width_padding = reproc_cfg.padding->height_padding;
+    } else {
+       reproc_cfg.padding->height_padding = reproc_cfg.padding->width_padding;
+    }
+    if (NULL != pInputBuffer) {
+        reproc_cfg.input_stream_dim.width = pInputBuffer->stream->width;
+        reproc_cfg.input_stream_dim.height = pInputBuffer->stream->height;
+    } else {
+        reproc_cfg.input_stream_dim.width = mYuvWidth;
+        reproc_cfg.input_stream_dim.height = mYuvHeight;
+        reproc_cfg.src_channel = this;
+    }
+    reproc_cfg.output_stream_dim.width = mCamera3Stream->width;
+    reproc_cfg.output_stream_dim.height = mCamera3Stream->height;
+    reproc_cfg.stream_type = mStreamType;
+    reproc_cfg.stream_format = mStreamFormat;
+    rc = mm_stream_calc_offset_snapshot(mStreamFormat, &reproc_cfg.input_stream_dim,
+            reproc_cfg.padding, &reproc_cfg.input_stream_plane_info);
+    if (rc != 0) {
+        ALOGE("%s: Snapshot stream plane info calculation failed!", __func__);
+        return rc;
+    }
+    if (IS_PARAM_AVAILABLE(CAM_INTF_META_JPEG_ORIENTATION, metadata)) {
+          int32_t *rotation = (int32_t *)POINTER_OF_PARAM(
+            CAM_INTF_META_JPEG_ORIENTATION, metadata);
+          if (*rotation == 0) {
+             reproc_cfg.rotation = ROTATE_0;
+          } else if (*rotation == 90) {
+             reproc_cfg.rotation = ROTATE_90;
+          } else if (*rotation == 180) {
+             reproc_cfg.rotation = ROTATE_180;
+          } else if (*rotation == 270) {
+             reproc_cfg.rotation = ROTATE_270;
+          }
+    }
+
+    // Picture stream has already been started before any request comes in
+    if (!m_bIsActive) {
+        ALOGE("%s: Channel not started!!", __func__);
+        return NO_INIT;
+    }
+
+    index = mMemory.getMatchBufIndex((void*)buffer);
+    if(index < 0) {
+        rc = registerBuffer(buffer, mIsType);
+        if (NO_ERROR != rc) {
+            ALOGE("%s: On-the-fly buffer registration failed %d",
+                    __func__, rc);
+            return rc;
+        }
+
+        index = mMemory.getMatchBufIndex((void*)buffer);
+        if (index < 0) {
+            ALOGE("%s: Could not find object among registered buffers",__func__);
+            return DEAD_OBJECT;
+        }
+    }
+    CDBG("%s: buffer index %d, frameNumber: %u", __func__, index, frameNumber);
+
+    rc = mMemory.markFrameNumber(index, frameNumber);
+
+    //Start the postprocessor for jpeg encoding. Pass mMemory as destination buffer
+    mCurrentBufIndex = index;
+
+    // Start postprocessor
+    // This component needs to be re-configured
+    // once we switch from input(framework) buffer
+    // reprocess to standard capture!
+    bool restartNeeded = ((!mInputBufferConfig) != (NULL != pInputBuffer));
+    if((!mPostProcStarted) || restartNeeded) {
+        m_postprocessor.start(reproc_cfg, metadata);
+        mPostProcStarted = true;
+        mInputBufferConfig = (NULL == pInputBuffer);
+    }
+
+    // Queue jpeg settings
+    rc = queueJpegSetting(index, metadata);
+
+    if (pInputBuffer == NULL) {
+        Mutex::Autolock lock(mFreeBuffersLock);
+        if (!mFreeBufferList.empty()) {
+            List<uint32_t>::iterator it = mFreeBufferList.begin();
+            uint32_t freeBuffer = *it;
+            mStreams[0]->bufDone(freeBuffer);
+            mFreeBufferList.erase(it);
+        } else {
+            ALOGE("%s: No snapshot buffers available!", __func__);
+            rc = NOT_ENOUGH_DATA;
+        }
+    } else {
+        if (0 < mOfflineMetaMemory.getCnt()) {
+            mOfflineMetaMemory.deallocate();
+        }
+        if (0 < mOfflineMemory.getCnt()) {
+            mOfflineMemory.unregisterBuffers();
+        }
+
+        int input_index = mOfflineMemory.getMatchBufIndex((void*)pInputBuffer->buffer);
+        if(input_index < 0) {
+            rc = mOfflineMemory.registerBuffer(pInputBuffer->buffer, mStreamType);
+            if (NO_ERROR != rc) {
+                ALOGE("%s: On-the-fly input buffer registration failed %d",
+                        __func__, rc);
+                return rc;
+            }
+
+            input_index = mOfflineMemory.getMatchBufIndex((void*)pInputBuffer->buffer);
+            if (input_index < 0) {
+                ALOGE("%s: Could not find object among registered buffers",__func__);
+                return DEAD_OBJECT;
+            }
+        }
+        qcamera_fwk_input_pp_data_t *src_frame = NULL;
+        src_frame = (qcamera_fwk_input_pp_data_t *)malloc(
+                sizeof(qcamera_fwk_input_pp_data_t));
+        if (src_frame == NULL) {
+            ALOGE("%s: No memory for src frame", __func__);
+            return NO_MEMORY;
+        }
+        memset(src_frame, 0, sizeof(qcamera_fwk_input_pp_data_t));
+        src_frame->src_frame = *pInputBuffer;
+        rc = mOfflineMemory.getBufDef(reproc_cfg.input_stream_plane_info.plane_info,
+                src_frame->input_buffer, input_index);
+        if (rc != 0) {
+            free(src_frame);
+            return rc;
+        }
+        if (mYUVDump) {
+           dumpYUV(&src_frame->input_buffer, reproc_cfg.input_stream_dim,
+                   reproc_cfg.input_stream_plane_info.plane_info, 1);
+        }
+        cam_dimension_t dim = {sizeof(metadata_buffer_t), 1};
+        cam_stream_buf_plane_info_t meta_planes;
+        rc = mm_stream_calc_offset_metadata(&dim, mPaddingInfo, &meta_planes);
+        if (rc != 0) {
+            ALOGE("%s: Metadata stream plane info calculation failed!", __func__);
+            free(src_frame);
+            return rc;
+        }
+
+        rc = mOfflineMetaMemory.allocate(1, sizeof(metadata_buffer_t), false);
+        if (NO_ERROR != rc) {
+            ALOGE("%s: Couldn't allocate offline metadata buffer!", __func__);
+            free(src_frame);
+            return rc;
+        }
+        mm_camera_buf_def_t meta_buf;
+        cam_frame_len_offset_t offset = meta_planes.plane_info;
+        rc = mOfflineMetaMemory.getBufDef(offset, meta_buf, 0);
+        if (NO_ERROR != rc) {
+            free(src_frame);
+            return rc;
+        }
+        memcpy(meta_buf.buffer, metadata, sizeof(metadata_buffer_t));
+        src_frame->metadata_buffer = meta_buf;
+        src_frame->reproc_config = reproc_cfg;
+
+        CDBG_HIGH("%s: Post-process started", __func__);
+        CDBG_HIGH("%s: Issue call to reprocess", __func__);
+
+        m_postprocessor.processData(src_frame);
+    }
+    return rc;
+!!!44241463.cpp!!!	streamCbRoutine(inout super_frame : mm_camera_super_buf_t, inout stream : QCamera3Stream) : void
+    ATRACE_CALL();
+    //TODO
+    //Used only for getting YUV. Jpeg callback will be sent back from channel
+    //directly to HWI. Refer to func jpegEvtHandle
+
+    //Got the yuv callback. Calling yuv callback handler in PostProc
+    uint8_t frameIndex;
+    mm_camera_super_buf_t* frame = NULL;
+    if(!super_frame) {
+         ALOGE("%s: Invalid Super buffer",__func__);
+         return;
+    }
+
+    if(super_frame->num_bufs != 1) {
+         ALOGE("%s: Multiple streams are not supported",__func__);
+         return;
+    }
+    if(super_frame->bufs[0] == NULL ) {
+         ALOGE("%s: Error, Super buffer frame does not contain valid buffer",
+                  __func__);
+         return;
+    }
+
+    frameIndex = (uint8_t)super_frame->bufs[0]->buf_idx;
+    CDBG("%s: recvd buf_idx: %u for further processing",
+        __func__, (uint32_t)frameIndex);
+    if(frameIndex >= mNumSnapshotBufs) {
+         ALOGE("%s: Error, Invalid index for buffer",__func__);
+         if(stream) {
+             Mutex::Autolock lock(mFreeBuffersLock);
+             mFreeBufferList.push_back(frameIndex);
+             stream->bufDone(frameIndex);
+         }
+         return;
+    }
+
+    frame = (mm_camera_super_buf_t *)malloc(sizeof(mm_camera_super_buf_t));
+    if (frame == NULL) {
+       ALOGE("%s: Error allocating memory to save received_frame structure.",
+                                                                    __func__);
+       if(stream) {
+           Mutex::Autolock lock(mFreeBuffersLock);
+           mFreeBufferList.push_back(frameIndex);
+           stream->bufDone(frameIndex);
+       }
+       return;
+    }
+    *frame = *super_frame;
+
+    if(mYUVDump) {
+        cam_dimension_t dim;
+        memset(&dim, 0, sizeof(dim));
+        stream->getFrameDimension(dim);
+        cam_frame_len_offset_t offset;
+        memset(&offset, 0, sizeof(cam_frame_len_offset_t));
+        stream->getFrameOffset(offset);
+        dumpYUV(frame->bufs[0], dim, offset, 1);
+    }
+
+    m_postprocessor.processData(frame);
+    free(super_frame);
+    return;
+!!!44241591.cpp!!!	getStreamBufs(in len : uint32_t) : QCamera3StreamMem
+    int rc = 0;
+
+    mYuvMemory = new QCamera3HeapMemory();
+    if (!mYuvMemory) {
+        ALOGE("%s: unable to create metadata memory", __func__);
+        return NULL;
+    }
+
+    //Queue YUV buffers in the beginning mQueueAll = true
+    rc = mYuvMemory->allocate(mCamera3Stream->max_buffers, len, false);
+    if (rc < 0) {
+        ALOGE("%s: unable to allocate metadata memory", __func__);
+        delete mYuvMemory;
+        mYuvMemory = NULL;
+        return NULL;
+    }
+    return mYuvMemory;
+!!!44241719.cpp!!!	putStreamBufs() : void
+    mMemory.unregisterBuffers();
+
+    mYuvMemory->deallocate();
+    delete mYuvMemory;
+    mYuvMemory = NULL;
+!!!44241847.cpp!!!	getReprocessType() : reprocess_type_t
+    /* a picture channel could either use the postprocessor for reprocess+jpeg
+       or only for reprocess */
+    reprocess_type_t expectedReprocess;
+    if (mPostProcMask == CAM_QCOM_FEATURE_NONE || mInputBufferHint) {
+        expectedReprocess = REPROCESS_TYPE_JPEG;
+    } else {
+        expectedReprocess = REPROCESS_TYPE_NONE;
+    }
+    CDBG_HIGH("%s: expectedReprocess from Pic Channel is %d", __func__, expectedReprocess);
+    return expectedReprocess;
+!!!44241975.cpp!!!	getExifData(inout metadata : metadata_buffer_t, inout jpeg_settings : jpeg_settings_t) : QCamera3Exif
+    QCamera3Exif *exif = new QCamera3Exif();
+    if (exif == NULL) {
+        ALOGE("%s: No memory for QCamera3Exif", __func__);
+        return NULL;
+    }
+
+    int32_t rc = NO_ERROR;
+    uint32_t count = 0;
+
+    // add exif entries
+    {
+        char dateTime[20];
+        char subsecTime[7];
+        uint32_t subsecCount;
+        memset(dateTime, 0, sizeof(dateTime));
+        memset(subsecTime, 0, sizeof(subsecTime));
+        count = 20;
+        subsecCount = 7;
+        rc = getExifDateTime(dateTime, subsecTime, count, subsecCount);
+        if(rc == NO_ERROR) {
+            exif->addEntry(EXIFTAGID_DATE_TIME,
+                    EXIF_ASCII,
+                    count,
+                    (void *)dateTime);
+            exif->addEntry(EXIFTAGID_EXIF_DATE_TIME_ORIGINAL,
+                    EXIF_ASCII,
+                    count,
+                    (void *)dateTime);
+            exif->addEntry(EXIFTAGID_EXIF_DATE_TIME_DIGITIZED,
+                    EXIF_ASCII,
+                    count,
+                    (void *)dateTime);
+            exif->addEntry(EXIFTAGID_SUBSEC_TIME,
+                    EXIF_ASCII,
+                    subsecCount,
+                    (void *)subsecTime);
+            exif->addEntry(EXIFTAGID_SUBSEC_TIME_ORIGINAL,
+                    EXIF_ASCII,
+                    subsecCount,
+                    (void *)subsecTime);
+            exif->addEntry(EXIFTAGID_SUBSEC_TIME_DIGITIZED,
+                    EXIF_ASCII,
+                    subsecCount,
+                    (void *)subsecTime);
+        } else {
+            ALOGE("%s: getExifDateTime failed", __func__);
+        }
+    }
+
+    if (IS_PARAM_AVAILABLE(CAM_INTF_META_LENS_FOCAL_LENGTH, metadata)) {
+        float focal_length = *(float *)POINTER_OF_PARAM(
+                CAM_INTF_META_LENS_FOCAL_LENGTH, metadata);
+        rat_t focalLength;
+        rc = getExifFocalLength(&focalLength, focal_length);
+        if (rc == NO_ERROR) {
+            exif->addEntry(EXIFTAGID_FOCAL_LENGTH,
+                    EXIF_RATIONAL,
+                    1,
+                    (void *)&(focalLength));
+        } else {
+            ALOGE("%s: getExifFocalLength failed", __func__);
+        }
+    }
+
+    if (IS_PARAM_AVAILABLE(CAM_INTF_META_SENSOR_SENSITIVITY, metadata)) {
+        int16_t isoSpeed = *(int32_t *)POINTER_OF_PARAM(
+                CAM_INTF_META_SENSOR_SENSITIVITY, metadata);
+        exif->addEntry(EXIFTAGID_ISO_SPEED_RATING,
+                   EXIF_SHORT,
+                   1,
+                   (void *)&(isoSpeed));
+    }
+
+    if (IS_PARAM_AVAILABLE(CAM_INTF_META_SENSOR_EXPOSURE_TIME, metadata)) {
+        int64_t sensor_exposure_time = *(int64_t *)POINTER_OF_PARAM(
+                CAM_INTF_META_SENSOR_EXPOSURE_TIME, metadata);
+        rat_t sensorExpTime;
+        rc = getExifExpTimeInfo(&sensorExpTime, sensor_exposure_time);
+        if (rc == NO_ERROR){
+            exif->addEntry(EXIFTAGID_EXPOSURE_TIME,
+                    EXIF_RATIONAL,
+                    1,
+                    (void *)&(sensorExpTime));
+        } else {
+            ALOGE("%s: getExifExpTimeInfo failed", __func__);
+        }
+    }
+
+    if (strlen(jpeg_settings->gps_processing_method) > 0) {
+        char gpsProcessingMethod[
+                    EXIF_ASCII_PREFIX_SIZE + GPS_PROCESSING_METHOD_SIZE];
+        count = 0;
+        rc = getExifGpsProcessingMethod(gpsProcessingMethod,
+                count, jpeg_settings->gps_processing_method);
+        if(rc == NO_ERROR) {
+            exif->addEntry(EXIFTAGID_GPS_PROCESSINGMETHOD,
+                    EXIF_ASCII,
+                    count,
+                    (void *)gpsProcessingMethod);
+        } else {
+            ALOGE("%s: getExifGpsProcessingMethod failed", __func__);
+        }
+    }
+
+    if (jpeg_settings->gps_coordinates_valid) {
+
+        //latitude
+        rat_t latitude[3];
+        char latRef[2];
+        rc = getExifLatitude(latitude, latRef,
+                jpeg_settings->gps_coordinates[0]);
+        if(rc == NO_ERROR) {
+            exif->addEntry(EXIFTAGID_GPS_LATITUDE,
+                           EXIF_RATIONAL,
+                           3,
+                           (void *)latitude);
+            exif->addEntry(EXIFTAGID_GPS_LATITUDE_REF,
+                           EXIF_ASCII,
+                           2,
+                           (void *)latRef);
+        } else {
+            ALOGE("%s: getExifLatitude failed", __func__);
+        }
+
+        //longitude
+        rat_t longitude[3];
+        char lonRef[2];
+        rc = getExifLongitude(longitude, lonRef,
+                jpeg_settings->gps_coordinates[1]);
+        if(rc == NO_ERROR) {
+            exif->addEntry(EXIFTAGID_GPS_LONGITUDE,
+                           EXIF_RATIONAL,
+                           3,
+                           (void *)longitude);
+
+            exif->addEntry(EXIFTAGID_GPS_LONGITUDE_REF,
+                           EXIF_ASCII,
+                           2,
+                           (void *)lonRef);
+        } else {
+            ALOGE("%s: getExifLongitude failed", __func__);
+        }
+
+        //altitude
+        rat_t altitude;
+        char altRef;
+        rc = getExifAltitude(&altitude, &altRef,
+                jpeg_settings->gps_coordinates[2]);
+        if(rc == NO_ERROR) {
+            exif->addEntry(EXIFTAGID_GPS_ALTITUDE,
+                           EXIF_RATIONAL,
+                           1,
+                           (void *)&(altitude));
+
+            exif->addEntry(EXIFTAGID_GPS_ALTITUDE_REF,
+                           EXIF_BYTE,
+                           1,
+                           (void *)&altRef);
+        } else {
+            ALOGE("%s: getExifAltitude failed", __func__);
+        }
+    }
+
+    if (jpeg_settings->gps_timestamp_valid) {
+
+        char gpsDateStamp[20];
+        rat_t gpsTimeStamp[3];
+        rc = getExifGpsDateTimeStamp(gpsDateStamp, 20, gpsTimeStamp,
+                jpeg_settings->gps_timestamp);
+        if(rc == NO_ERROR) {
+            exif->addEntry(EXIFTAGID_GPS_DATESTAMP,
+                           EXIF_ASCII,
+                           strlen(gpsDateStamp) + 1,
+                           (void *)gpsDateStamp);
+
+            exif->addEntry(EXIFTAGID_GPS_TIMESTAMP,
+                           EXIF_RATIONAL,
+                           3,
+                           (void *)gpsTimeStamp);
+        } else {
+            ALOGE("%s: getExifGpsDataTimeStamp failed", __func__);
+        }
+    }
+
+    if (IS_PARAM_AVAILABLE(CAM_INTF_PARM_EXPOSURE_COMPENSATION, metadata) &&
+            IS_PARAM_AVAILABLE(CAM_INTF_PARM_EV_STEP, metadata)) {
+        int32_t exposure_comp = *(int32_t *)POINTER_OF_PARAM(
+                CAM_INTF_PARM_EXPOSURE_COMPENSATION, metadata);
+        cam_rational_type_t comp_step = *(cam_rational_type_t *)POINTER_OF_PARAM(
+                CAM_INTF_PARM_EV_STEP, metadata);
+        srat_t exposure_val;
+        rc = getExifExposureValue(&exposure_val, exposure_comp, comp_step);
+        if(rc == NO_ERROR) {
+            exif->addEntry(EXIFTAGID_EXPOSURE_BIAS_VALUE,
+                       EXIF_SRATIONAL,
+                       1,
+                       (void *)(&exposure_val));
+        } else {
+            ALOGE("%s: getExifExposureValue failed ", __func__);
+        }
+    }
+
+    char value[PROPERTY_VALUE_MAX];
+    if (property_get("ro.product.manufacturer", value, "QCOM-AA") > 0) {
+        exif->addEntry(EXIFTAGID_MAKE,
+                       EXIF_ASCII,
+                       strlen(value) + 1,
+                       (void *)value);
+    } else {
+        ALOGE("%s: getExifMaker failed", __func__);
+    }
+
+    if (property_get("ro.product.model", value, "QCAM-AA") > 0) {
+        exif->addEntry(EXIFTAGID_MODEL,
+                       EXIF_ASCII,
+                       strlen(value) + 1,
+                       (void *)value);
+    } else {
+        ALOGE("%s: getExifModel failed", __func__);
+    }
+
+    return exif;
+!!!44242103.cpp!!!	overrideYuvSize(in width : uint32_t, in height : uint32_t) : void
+   mYuvWidth = width;
+   mYuvHeight = height;
+!!!44242231.cpp!!!	jpegEvtHandle(in status : jpeg_job_status_t, in  : uint32_t, in jobId : uint32_t, inout p_output : mm_jpeg_output_t, inout userdata : void) : void
+    ATRACE_CALL();
+    buffer_handle_t *resultBuffer, *jpegBufferHandle;
+    int32_t resultFrameNumber;
+    int resultStatus = CAMERA3_BUFFER_STATUS_OK;
+    camera3_stream_buffer_t result;
+    camera3_jpeg_blob_t jpegHeader;
+    char* jpeg_eof = 0;
+    int maxJpegSize;
+    int32_t bufIdx;
+
+    QCamera3PicChannel *obj = (QCamera3PicChannel *)userdata;
+    if (obj) {
+        //Construct payload for process_capture_result. Call mChannelCb
+
+        qcamera_hal3_jpeg_data_t *job = obj->m_postprocessor.findJpegJobByJobId(jobId);
+
+        if ((job == NULL) || (status == JPEG_JOB_STATUS_ERROR)) {
+            ALOGE("%s: Error in jobId: (%d) with status: %d", __func__, jobId, status);
+            resultStatus = CAMERA3_BUFFER_STATUS_ERROR;
+        }
+
+        bufIdx = job->jpeg_settings->out_buf_index;
+        CDBG("%s: jpeg out_buf_index: %d", __func__, bufIdx);
+
+        //Construct jpeg transient header of type camera3_jpeg_blob_t
+        //Append at the end of jpeg image of buf_filled_len size
+
+        jpegHeader.jpeg_blob_id = CAMERA3_JPEG_BLOB_ID;
+        jpegHeader.jpeg_size = p_output->buf_filled_len;
+
+
+        char* jpeg_buf = (char *)p_output->buf_vaddr;
+
+        // Gralloc buffer may have additional padding for 4K page size
+        // Follow size guidelines based on spec since framework relies
+        // on that to reach end of buffer and with it the header
+
+        //Handle same as resultBuffer, but for readablity
+        jpegBufferHandle =
+            (buffer_handle_t *)obj->mMemory.getBufferHandle(bufIdx);
+
+        maxJpegSize = ((private_handle_t*)(*jpegBufferHandle))->width;
+        if (maxJpegSize > obj->mMemory.getSize(bufIdx)) {
+            maxJpegSize = obj->mMemory.getSize(bufIdx);
+        }
+
+        jpeg_eof = &jpeg_buf[maxJpegSize-sizeof(jpegHeader)];
+        memcpy(jpeg_eof, &jpegHeader, sizeof(jpegHeader));
+        obj->mMemory.cleanInvalidateCache(bufIdx);
+
+        ////Use below data to issue framework callback
+        resultBuffer = (buffer_handle_t *)obj->mMemory.getBufferHandle(bufIdx);
+        resultFrameNumber = obj->mMemory.getFrameNumber(bufIdx);
+        int32_t rc = obj->mMemory.unregisterBuffer(bufIdx);
+        if (NO_ERROR != rc) {
+            ALOGE("%s: Error %d unregistering stream buffer %d",
+                    __func__, rc, bufIdx);
+        }
+
+        result.stream = obj->mCamera3Stream;
+        result.buffer = resultBuffer;
+        result.status = resultStatus;
+        result.acquire_fence = -1;
+        result.release_fence = -1;
+
+        // Release any snapshot buffers before calling
+        // the user callback. The callback can potentially
+        // unblock pending requests to snapshot stream.
+        if (NULL != job) {
+            int32_t snapshotIdx = -1;
+            mm_camera_super_buf_t* src_frame = NULL;
+
+            if (job->src_reproc_frame)
+                src_frame = job->src_reproc_frame;
+            else
+                src_frame = job->src_frame;
+
+            if (src_frame) {
+                if (obj->mStreams[0]->getMyHandle() ==
+                        src_frame->bufs[0]->stream_id) {
+                    snapshotIdx = src_frame->bufs[0]->buf_idx;
+                } else {
+                    ALOGE("%s: Snapshot stream id %d and source frame %d don't match!",
+                            __func__, obj->mStreams[0]->getMyHandle(),
+                            src_frame->bufs[0]->stream_id);
+                }
+            }
+            if (0 <= snapshotIdx) {
+                Mutex::Autolock lock(obj->mFreeBuffersLock);
+                obj->mFreeBufferList.push_back(snapshotIdx);
+            } else {
+                ALOGE("%s: Snapshot buffer not found!", __func__);
+            }
+        }
+
+        CDBG("%s: Issue Callback", __func__);
+        obj->mChannelCB(NULL, &result, resultFrameNumber, obj->mUserData);
+
+        // release internal data for jpeg job
+        if (job != NULL) {
+            if ((NULL != job->fwk_frame) || (NULL != job->fwk_src_buffer)) {
+                obj->mOfflineMetaMemory.deallocate();
+                obj->mOfflineMemory.unregisterBuffers();
+            }
+            obj->m_postprocessor.releaseOfflineBuffers();
+            obj->m_postprocessor.releaseJpegJobData(job);
+            free(job);
+        }
+
+        return;
+        // }
+    } else {
+        ALOGE("%s: Null userdata in jpeg callback", __func__);
+    }
+!!!44242359.cpp!!!	dataNotifyCB(inout recvd_frame : mm_camera_super_buf_t, inout userdata : void) : void
+    ATRACE_CALL();
+    CDBG("%s: E\n", __func__);
+    QCamera3PicChannel *channel = (QCamera3PicChannel *)userdata;
+
+    if (channel == NULL) {
+        ALOGE("%s: invalid channel pointer", __func__);
+        return;
+    }
+
+    if(channel->m_numStreams != 1) {
+        ALOGE("%s: Error: Bug: This callback assumes one stream per channel",__func__);
+        return;
+    }
+
+
+    if(channel->mStreams[0] == NULL) {
+        ALOGE("%s: Error: Invalid Stream object",__func__);
+        return;
+    }
+
+    channel->QCamera3PicChannel::streamCbRoutine(recvd_frame, channel->mStreams[0]);
+
+    CDBG("%s: X\n", __func__);
+    return;
+!!!44242487.cpp!!!	queueJpegSetting(in index : uint32_t, inout metadata : metadata_buffer_t) : int32_t
+    QCamera3HardwareInterface* hal_obj = (QCamera3HardwareInterface*)mUserData;
+    jpeg_settings_t *settings =
+            (jpeg_settings_t *)malloc(sizeof(jpeg_settings_t));
+
+    if (!settings) {
+        ALOGE("%s: out of memory allocating jpeg_settings", __func__);
+        return -ENOMEM;
+    }
+
+    memset(settings, 0, sizeof(jpeg_settings_t));
+
+    settings->out_buf_index = index;
+
+    settings->jpeg_orientation = 0;
+    IF_META_AVAILABLE(int32_t, orientation, CAM_INTF_META_JPEG_ORIENTATION, metadata) {
+        settings->jpeg_orientation = *orientation;
+    }
+
+    settings->jpeg_quality = 85;
+    IF_META_AVAILABLE(uint32_t, quality1, CAM_INTF_META_JPEG_QUALITY, metadata) {
+        settings->jpeg_quality = (uint8_t) *quality1;
+    }
+
+    IF_META_AVAILABLE(uint32_t, quality2, CAM_INTF_META_JPEG_THUMB_QUALITY, metadata) {
+        settings->jpeg_thumb_quality = (uint8_t) *quality2;
+    }
+
+    IF_META_AVAILABLE(cam_dimension_t, dimension, CAM_INTF_META_JPEG_THUMB_SIZE, metadata) {
+        settings->thumbnail_size = *dimension;
+    }
+
+    settings->gps_timestamp_valid = 0;
+    IF_META_AVAILABLE(int64_t, timestamp, CAM_INTF_META_JPEG_GPS_TIMESTAMP, metadata) {
+        settings->gps_timestamp = *timestamp;
+        settings->gps_timestamp_valid = 1;
+    }
+
+    settings->gps_coordinates_valid = 0;
+    IF_META_AVAILABLE(double, coordinates, CAM_INTF_META_JPEG_GPS_COORDINATES, metadata) {
+        memcpy(settings->gps_coordinates, coordinates, 3*sizeof(double));
+        settings->gps_coordinates_valid = 1;
+    }
+
+    IF_META_AVAILABLE(uint8_t, proc_methods, CAM_INTF_META_JPEG_GPS_PROC_METHODS, metadata) {
+        memset(settings->gps_processing_method, 0,
+                sizeof(settings->gps_processing_method));
+        strlcpy(settings->gps_processing_method, (const char *)proc_methods,
+                sizeof(settings->gps_processing_method));
+    }
+
+    // Image description
+    const char *eepromVersion = hal_obj->getEepromVersionInfo();
+    const uint32_t *ldafCalib = hal_obj->getLdafCalib();
+    if ((eepromVersion && strlen(eepromVersion)) ||
+            ldafCalib) {
+        int len = 0;
+        settings->image_desc_valid = true;
+        if (eepromVersion && strlen(eepromVersion)) {
+            len = snprintf(settings->image_desc, sizeof(settings->image_desc),
+                    "M:%s ", eepromVersion);
+        }
+        if (ldafCalib) {
+            snprintf(settings->image_desc + len,
+                    sizeof(settings->image_desc) - len, "L:%u-%u",
+                    ldafCalib[0], ldafCalib[1]);
+        }
+    }
+
+    return m_postprocessor.processJpegSettingData(settings);

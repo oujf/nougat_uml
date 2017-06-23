@@ -1,0 +1,315 @@
+class JNICameraContext
+!!!82694327.cpp!!!	JNICameraContext(inout env : JNIEnv, in weak_this : jobject, in clazz : jclass, in camera : sp<Camera>)
+    mCameraJObjectWeak = env->NewGlobalRef(weak_this);
+    mCameraJClass = (jclass)env->NewGlobalRef(clazz);
+    mCamera = camera;
+
+    jclass faceClazz = env->FindClass("android/hardware/Camera$Face");
+    mFaceClass = (jclass) env->NewGlobalRef(faceClazz);
+
+    jclass rectClazz = env->FindClass("android/graphics/Rect");
+    mRectClass = (jclass) env->NewGlobalRef(rectClazz);
+
+    jclass pointClazz = env->FindClass("android/graphics/Point");
+    mPointClass = (jclass) env->NewGlobalRef(pointClazz);
+
+    mManualBufferMode = false;
+    mManualCameraCallbackSet = false;
+!!!82694583.cpp!!!	notify(in msgType : int32_t, in ext1 : int32_t, in ext2 : int32_t) : void
+    ALOGV("notify");
+
+    // VM pointer will be NULL if object is released
+    Mutex::Autolock _l(mLock);
+    if (mCameraJObjectWeak == NULL) {
+        ALOGW("callback on dead camera object");
+        return;
+    }
+    JNIEnv *env = AndroidRuntime::getJNIEnv();
+
+    /*
+     * If the notification or msgType is CAMERA_MSG_RAW_IMAGE_NOTIFY, change it
+     * to CAMERA_MSG_RAW_IMAGE since CAMERA_MSG_RAW_IMAGE_NOTIFY is not exposed
+     * to the Java app.
+     */
+    if (msgType == CAMERA_MSG_RAW_IMAGE_NOTIFY) {
+        msgType = CAMERA_MSG_RAW_IMAGE;
+    }
+
+    env->CallStaticVoidMethod(mCameraJClass, fields.post_event,
+            mCameraJObjectWeak, msgType, ext1, ext2, NULL);
+!!!82694711.cpp!!!	postData(in msgType : int32_t, in dataPtr : sp<IMemory>, inout metadata : camera_frame_metadata_t) : void
+    // VM pointer will be NULL if object is released
+    Mutex::Autolock _l(mLock);
+    JNIEnv *env = AndroidRuntime::getJNIEnv();
+    if (mCameraJObjectWeak == NULL) {
+        ALOGW("callback on dead camera object");
+        return;
+    }
+
+    int32_t dataMsgType = msgType & ~CAMERA_MSG_PREVIEW_METADATA;
+
+    // return data based on callback type
+    switch (dataMsgType) {
+        case CAMERA_MSG_VIDEO_FRAME:
+            // should never happen
+            break;
+
+        // For backward-compatibility purpose, if there is no callback
+        // buffer for raw image, the callback returns null.
+        case CAMERA_MSG_RAW_IMAGE:
+            ALOGV("rawCallback");
+            if (mRawImageCallbackBuffers.isEmpty()) {
+                env->CallStaticVoidMethod(mCameraJClass, fields.post_event,
+                        mCameraJObjectWeak, dataMsgType, 0, 0, NULL);
+            } else {
+                copyAndPost(env, dataPtr, dataMsgType);
+            }
+            break;
+
+        // There is no data.
+        case 0:
+            break;
+
+        default:
+            ALOGV("dataCallback(%d, %p)", dataMsgType, dataPtr.get());
+            copyAndPost(env, dataPtr, dataMsgType);
+            break;
+    }
+
+    // post frame metadata to Java
+    if (metadata && (msgType & CAMERA_MSG_PREVIEW_METADATA)) {
+        postMetadata(env, CAMERA_MSG_PREVIEW_METADATA, metadata);
+    }
+!!!82694839.cpp!!!	postDataTimestamp(in timestamp : nsecs_t, in msgType : int32_t, in dataPtr : sp<IMemory>) : void
+    // TODO: plumb up to Java. For now, just drop the timestamp
+    postData(msgType, dataPtr, NULL);
+!!!82694967.cpp!!!	postRecordingFrameHandleTimestamp(in timestamp : nsecs_t, inout handle : native_handle_t) : void
+    // This is not needed at app layer. This should not be called because JNICameraContext cannot
+    // start video recording.
+!!!82695095.cpp!!!	postMetadata(inout env : JNIEnv, in msgType : int32_t, inout metadata : camera_frame_metadata_t) : void
+    jobjectArray obj = NULL;
+    obj = (jobjectArray) env->NewObjectArray(metadata->number_of_faces,
+                                             mFaceClass, NULL);
+    if (obj == NULL) {
+        ALOGE("Couldn't allocate face metadata array");
+        return;
+    }
+
+    for (int i = 0; i < metadata->number_of_faces; i++) {
+        jobject face = env->NewObject(mFaceClass, fields.face_constructor);
+        env->SetObjectArrayElement(obj, i, face);
+
+        jobject rect = env->NewObject(mRectClass, fields.rect_constructor);
+        env->SetIntField(rect, fields.rect_left, metadata->faces[i].rect[0]);
+        env->SetIntField(rect, fields.rect_top, metadata->faces[i].rect[1]);
+        env->SetIntField(rect, fields.rect_right, metadata->faces[i].rect[2]);
+        env->SetIntField(rect, fields.rect_bottom, metadata->faces[i].rect[3]);
+
+        env->SetObjectField(face, fields.face_rect, rect);
+        env->SetIntField(face, fields.face_score, metadata->faces[i].score);
+
+        bool optionalFields = metadata->faces[i].id != 0
+            && metadata->faces[i].left_eye[0] != -2000 && metadata->faces[i].left_eye[1] != -2000
+            && metadata->faces[i].right_eye[0] != -2000 && metadata->faces[i].right_eye[1] != -2000
+            && metadata->faces[i].mouth[0] != -2000 && metadata->faces[i].mouth[1] != -2000;
+        if (optionalFields) {
+            int32_t id = metadata->faces[i].id;
+            env->SetIntField(face, fields.face_id, id);
+
+            jobject leftEye = env->NewObject(mPointClass, fields.point_constructor);
+            env->SetIntField(leftEye, fields.point_x, metadata->faces[i].left_eye[0]);
+            env->SetIntField(leftEye, fields.point_y, metadata->faces[i].left_eye[1]);
+            env->SetObjectField(face, fields.face_left_eye, leftEye);
+            env->DeleteLocalRef(leftEye);
+
+            jobject rightEye = env->NewObject(mPointClass, fields.point_constructor);
+            env->SetIntField(rightEye, fields.point_x, metadata->faces[i].right_eye[0]);
+            env->SetIntField(rightEye, fields.point_y, metadata->faces[i].right_eye[1]);
+            env->SetObjectField(face, fields.face_right_eye, rightEye);
+            env->DeleteLocalRef(rightEye);
+
+            jobject mouth = env->NewObject(mPointClass, fields.point_constructor);
+            env->SetIntField(mouth, fields.point_x, metadata->faces[i].mouth[0]);
+            env->SetIntField(mouth, fields.point_y, metadata->faces[i].mouth[1]);
+            env->SetObjectField(face, fields.face_mouth, mouth);
+            env->DeleteLocalRef(mouth);
+        }
+
+        env->DeleteLocalRef(face);
+        env->DeleteLocalRef(rect);
+    }
+    env->CallStaticVoidMethod(mCameraJClass, fields.post_event,
+            mCameraJObjectWeak, msgType, 0, 0, obj);
+    env->DeleteLocalRef(obj);
+!!!82695223.cpp!!!	addCallbackBuffer(inout env : JNIEnv, in cbb : jbyteArray, in msgType : int) : void
+    ALOGV("addCallbackBuffer: 0x%x", msgType);
+    if (cbb != NULL) {
+        Mutex::Autolock _l(mLock);
+        switch (msgType) {
+            case CAMERA_MSG_PREVIEW_FRAME: {
+                jbyteArray callbackBuffer = (jbyteArray)env->NewGlobalRef(cbb);
+                mCallbackBuffers.push(callbackBuffer);
+
+                ALOGV("Adding callback buffer to queue, %zu total",
+                        mCallbackBuffers.size());
+
+                // We want to make sure the camera knows we're ready for the
+                // next frame. This may have come unset had we not had a
+                // callbackbuffer ready for it last time.
+                if (mManualBufferMode && !mManualCameraCallbackSet) {
+                    mCamera->setPreviewCallbackFlags(CAMERA_FRAME_CALLBACK_FLAG_CAMERA);
+                    mManualCameraCallbackSet = true;
+                }
+                break;
+            }
+            case CAMERA_MSG_RAW_IMAGE: {
+                jbyteArray callbackBuffer = (jbyteArray)env->NewGlobalRef(cbb);
+                mRawImageCallbackBuffers.push(callbackBuffer);
+                break;
+            }
+            default: {
+                jniThrowException(env,
+                        "java/lang/IllegalArgumentException",
+                        "Unsupported message type");
+                return;
+            }
+        }
+    } else {
+       ALOGE("Null byte array!");
+    }
+!!!82695351.cpp!!!	setCallbackMode(inout env : JNIEnv, in installed : bool, in manualMode : bool) : void
+    Mutex::Autolock _l(mLock);
+    mManualBufferMode = manualMode;
+    mManualCameraCallbackSet = false;
+
+    // In order to limit the over usage of binder threads, all non-manual buffer
+    // callbacks use CAMERA_FRAME_CALLBACK_FLAG_BARCODE_SCANNER mode now.
+    //
+    // Continuous callbacks will have the callback re-registered from handleMessage.
+    // Manual buffer mode will operate as fast as possible, relying on the finite supply
+    // of buffers for throttling.
+
+    if (!installed) {
+        mCamera->setPreviewCallbackFlags(CAMERA_FRAME_CALLBACK_FLAG_NOOP);
+        clearCallbackBuffers_l(env, &mCallbackBuffers);
+    } else if (mManualBufferMode) {
+        if (!mCallbackBuffers.isEmpty()) {
+            mCamera->setPreviewCallbackFlags(CAMERA_FRAME_CALLBACK_FLAG_CAMERA);
+            mManualCameraCallbackSet = true;
+        }
+    } else {
+        mCamera->setPreviewCallbackFlags(CAMERA_FRAME_CALLBACK_FLAG_BARCODE_SCANNER);
+        clearCallbackBuffers_l(env, &mCallbackBuffers);
+    }
+!!!82695607.cpp!!!	isRawImageCallbackBufferAvailable() : bool
+    return !mRawImageCallbackBuffers.isEmpty();
+!!!82695735.cpp!!!	release() : void
+    ALOGV("release");
+    Mutex::Autolock _l(mLock);
+    JNIEnv *env = AndroidRuntime::getJNIEnv();
+
+    if (mCameraJObjectWeak != NULL) {
+        env->DeleteGlobalRef(mCameraJObjectWeak);
+        mCameraJObjectWeak = NULL;
+    }
+    if (mCameraJClass != NULL) {
+        env->DeleteGlobalRef(mCameraJClass);
+        mCameraJClass = NULL;
+    }
+    if (mFaceClass != NULL) {
+        env->DeleteGlobalRef(mFaceClass);
+        mFaceClass = NULL;
+    }
+    if (mRectClass != NULL) {
+        env->DeleteGlobalRef(mRectClass);
+        mRectClass = NULL;
+    }
+    if (mPointClass != NULL) {
+        env->DeleteGlobalRef(mPointClass);
+        mPointClass = NULL;
+    }
+    clearCallbackBuffers_l(env);
+    mCamera.clear();
+!!!82695863.cpp!!!	copyAndPost(inout env : JNIEnv, in dataPtr : sp<IMemory>, in msgType : int) : void
+    jbyteArray obj = NULL;
+
+    // allocate Java byte array and copy data
+    if (dataPtr != NULL) {
+        ssize_t offset;
+        size_t size;
+        sp<IMemoryHeap> heap = dataPtr->getMemory(&offset, &size);
+        ALOGV("copyAndPost: off=%zd, size=%zu", offset, size);
+        uint8_t *heapBase = (uint8_t*)heap->base();
+
+        if (heapBase != NULL) {
+            const jbyte* data = reinterpret_cast<const jbyte*>(heapBase + offset);
+
+            if (msgType == CAMERA_MSG_RAW_IMAGE) {
+                obj = getCallbackBuffer(env, &mRawImageCallbackBuffers, size);
+            } else if (msgType == CAMERA_MSG_PREVIEW_FRAME && mManualBufferMode) {
+                obj = getCallbackBuffer(env, &mCallbackBuffers, size);
+
+                if (mCallbackBuffers.isEmpty()) {
+                    ALOGV("Out of buffers, clearing callback!");
+                    mCamera->setPreviewCallbackFlags(CAMERA_FRAME_CALLBACK_FLAG_NOOP);
+                    mManualCameraCallbackSet = false;
+
+                    if (obj == NULL) {
+                        return;
+                    }
+                }
+            } else {
+                ALOGV("Allocating callback buffer");
+                obj = env->NewByteArray(size);
+            }
+
+            if (obj == NULL) {
+                ALOGE("Couldn't allocate byte array for JPEG data");
+                env->ExceptionClear();
+            } else {
+                env->SetByteArrayRegion(obj, 0, size, data);
+            }
+        } else {
+            ALOGE("image heap is NULL");
+        }
+    }
+
+    // post image data to Java
+    env->CallStaticVoidMethod(mCameraJClass, fields.post_event,
+            mCameraJObjectWeak, msgType, 0, 0, obj);
+    if (obj) {
+        env->DeleteLocalRef(obj);
+    }
+!!!82695991.cpp!!!	clearCallbackBuffers_l(inout env : JNIEnv, inout buffers : Vector<jbyteArray>) : void
+    ALOGV("Clearing callback buffers, %zu remained", buffers->size());
+    while (!buffers->isEmpty()) {
+        env->DeleteGlobalRef(buffers->top());
+        buffers->pop();
+    }
+!!!82696119.cpp!!!	clearCallbackBuffers_l(inout env : JNIEnv) : void
+    clearCallbackBuffers_l(env, &mCallbackBuffers);
+    clearCallbackBuffers_l(env, &mRawImageCallbackBuffers);
+!!!82696247.cpp!!!	getCallbackBuffer(inout env : JNIEnv, inout buffers : Vector<jbyteArray>, in bufferSize : size_t) : jbyteArray
+    jbyteArray obj = NULL;
+
+    // Vector access should be protected by lock in postData()
+    if (!buffers->isEmpty()) {
+        ALOGV("Using callback buffer from queue of length %zu", buffers->size());
+        jbyteArray globalBuffer = buffers->itemAt(0);
+        buffers->removeAt(0);
+
+        obj = (jbyteArray)env->NewLocalRef(globalBuffer);
+        env->DeleteGlobalRef(globalBuffer);
+
+        if (obj != NULL) {
+            jsize bufferLength = env->GetArrayLength(obj);
+            if ((int)bufferLength < (int)bufferSize) {
+                ALOGE("Callback buffer was too small! Expected %zu bytes, but got %d bytes!",
+                    bufferSize, bufferLength);
+                env->DeleteLocalRef(obj);
+                return NULL;
+            }
+        }
+    }
+
+    return obj;

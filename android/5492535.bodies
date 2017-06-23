@@ -1,0 +1,344 @@
+class FontState
+!!!46791607.cpp!!!	FontState()
+    mInitialized = false;
+    mMaxNumberOfQuads = 1024;
+    mCurrentQuadIndex = 0;
+    mRSC = nullptr;
+#ifndef ANDROID_RS_SERIALIZE
+    mLibrary = nullptr;
+#endif //ANDROID_RS_SERIALIZE
+
+    float gamma = DEFAULT_TEXT_GAMMA;
+    int32_t blackThreshold = DEFAULT_TEXT_BLACK_GAMMA_THRESHOLD;
+    int32_t whiteThreshold = DEFAULT_TEXT_WHITE_GAMMA_THRESHOLD;
+
+#ifdef __ANDROID__
+    // Get the renderer properties
+    char property[PROPERTY_VALUE_MAX];
+
+    // Get the gamma
+    if (property_get(PROPERTY_TEXT_GAMMA, property, nullptr) > 0) {
+        gamma = atof(property);
+    }
+
+    // Get the black gamma threshold
+    if (property_get(PROPERTY_TEXT_BLACK_GAMMA_THRESHOLD, property, nullptr) > 0) {
+        blackThreshold = atoi(property);
+    }
+
+    // Get the white gamma threshold
+    if (property_get(PROPERTY_TEXT_WHITE_GAMMA_THRESHOLD, property, nullptr) > 0) {
+        whiteThreshold = atoi(property);
+    }
+#endif
+
+    mBlackThreshold = (float)(blackThreshold) / 255.0f;
+    mWhiteThreshold = (float)(whiteThreshold) / 255.0f;
+
+    // Compute the gamma tables
+    mBlackGamma = gamma;
+    mWhiteGamma = 1.0f / gamma;
+
+    setFontColor(0.1f, 0.1f, 0.1f, 1.0f);
+!!!46791735.cpp!!!	~FontState()
+    for (uint32_t i = 0; i < mCacheLines.size(); i ++) {
+        delete mCacheLines[i];
+    }
+
+    rsAssert(!mActiveFonts.size());
+!!!46791863.cpp!!!	init(inout rsc : Context) : void
+    mRSC = rsc;
+!!!46791991.cpp!!!	deinit(inout rsc : Context) : void
+    mInitialized = false;
+
+    mFontShaderFConstant.clear();
+
+    mMesh.clear();
+
+    mFontShaderF.clear();
+    mFontSampler.clear();
+    mFontProgramStore.clear();
+
+    mTextTexture.clear();
+    for (uint32_t i = 0; i < mCacheLines.size(); i ++) {
+        delete mCacheLines[i];
+    }
+    mCacheLines.clear();
+
+    mDefault.clear();
+#ifndef ANDROID_RS_SERIALIZE
+    if (mLibrary) {
+        FT_Done_FreeType( mLibrary );
+        mLibrary = nullptr;
+    }
+#endif //ANDROID_RS_SERIALIZE
+!!!46792247.cpp!!!	measureText(in text : char, in len : uint32_t, inout bounds : Font::Rect) : void
+    renderText(text, len, 0, 0, 0, -1, Font::MEASURE, bounds);
+    bounds->bottom = - bounds->bottom;
+    bounds->top = - bounds->top;
+!!!46792375.cpp!!!	setFontColor(in r : float, in g : float, in b : float, in a : float) : void
+    mConstants.mFontColor[0] = r;
+    mConstants.mFontColor[1] = g;
+    mConstants.mFontColor[2] = b;
+    mConstants.mFontColor[3] = a;
+
+    mConstants.mGamma = 1.0f;
+    const float luminance = (r * 2.0f + g * 5.0f + b) / 8.0f;
+    if (luminance <= mBlackThreshold) {
+        mConstants.mGamma = mBlackGamma;
+    } else if (luminance >= mWhiteThreshold) {
+        mConstants.mGamma = mWhiteGamma;
+    }
+
+    mConstantsDirty = true;
+!!!46792503.cpp!!!	getFontColor(inout r : float, inout g : float, inout b : float, inout a : float) : void
+    *r = mConstants.mFontColor[0];
+    *g = mConstants.mFontColor[1];
+    *b = mConstants.mFontColor[2];
+    *a = mConstants.mFontColor[3];
+!!!46792887.cpp!!!	getRemainingCacheCapacity() : uint32_t
+    uint32_t remainingCapacity = 0;
+    uint32_t totalPixels = 0;
+    for (uint32_t i = 0; i < mCacheLines.size(); i ++) {
+         remainingCapacity += (mCacheLines[i]->mMaxWidth - mCacheLines[i]->mCurrentCol);
+         totalPixels += mCacheLines[i]->mMaxWidth;
+    }
+    remainingCapacity = (remainingCapacity * 100) / totalPixels;
+    return remainingCapacity;
+!!!46793015.cpp!!!	precacheLatin(inout font : Font) : void
+    // Remaining capacity is measured in %
+    uint32_t remainingCapacity = getRemainingCacheCapacity();
+    uint32_t precacheIdx = 0;
+    const size_t l = strlen(mLatinPrecache);
+    while ((remainingCapacity > 25) && (precacheIdx < l)) {
+        font->getCachedUTFChar((int32_t)mLatinPrecache[precacheIdx]);
+        remainingCapacity = getRemainingCacheCapacity();
+        precacheIdx ++;
+    }
+!!!46793143.cpp!!!	getLib() : FT_LibraryRec_
+    if (!mLibrary) {
+        FT_Error error = FT_Init_FreeType(&mLibrary);
+        if (error) {
+            ALOGE("Unable to initialize freetype");
+            return nullptr;
+        }
+    }
+
+    return mLibrary;
+!!!46793271.cpp!!!	initRenderState() : void
+    const char *shaderString = "varying vec2 varTex0;\n"
+                               "void main() {\n"
+                               "  lowp vec4 col = UNI_Color;\n"
+                               "  col.a = texture2D(UNI_Tex0, varTex0.xy).a;\n"
+                               "  col.a = pow(col.a, UNI_Gamma);\n"
+                               "  gl_FragColor = col;\n"
+                               "}\n";
+
+    const char *textureNames[] = { "Tex0" };
+    const size_t textureNamesLengths[] = { 4 };
+    size_t numTextures = sizeof(textureNamesLengths)/sizeof(*textureNamesLengths);
+
+    ObjectBaseRef<const Element> colorElem = Element::createRef(mRSC, RS_TYPE_FLOAT_32,
+                                                                RS_KIND_USER, false, 4);
+    ObjectBaseRef<const Element> gammaElem = Element::createRef(mRSC, RS_TYPE_FLOAT_32,
+                                                                RS_KIND_USER, false, 1);
+
+    const char *ebn1[] = { "Color", "Gamma" };
+    const Element *ebe1[] = {colorElem.get(), gammaElem.get()};
+    ObjectBaseRef<const Element> constInput = Element::create(mRSC, 2, ebe1, ebn1);
+    ObjectBaseRef<Type> inputType = Type::getTypeRef(mRSC, constInput.get(), 1);
+
+    uintptr_t tmp[4];
+    tmp[0] = RS_PROGRAM_PARAM_CONSTANT;
+    tmp[1] = (uintptr_t)inputType.get();
+    tmp[2] = RS_PROGRAM_PARAM_TEXTURE_TYPE;
+    tmp[3] = RS_TEXTURE_2D;
+
+    mFontShaderFConstant.set(Allocation::createAllocation(mRSC, inputType.get(),
+                                                          RS_ALLOCATION_USAGE_SCRIPT |
+                                                          RS_ALLOCATION_USAGE_GRAPHICS_CONSTANTS));
+    ProgramFragment *pf = new ProgramFragment(mRSC, shaderString, strlen(shaderString),
+                                              textureNames, numTextures, textureNamesLengths,
+                                              tmp, 4);
+    mFontShaderF.set(pf);
+    mFontShaderF->bindAllocation(mRSC, mFontShaderFConstant.get(), 0);
+
+    mFontSampler.set(Sampler::getSampler(mRSC, RS_SAMPLER_NEAREST, RS_SAMPLER_NEAREST,
+                                         RS_SAMPLER_CLAMP, RS_SAMPLER_CLAMP,
+                                         RS_SAMPLER_CLAMP).get());
+    mFontShaderF->bindSampler(mRSC, 0, mFontSampler.get());
+
+    mFontProgramStore.set(ProgramStore::getProgramStore(mRSC, true, true, true, true,
+                                                        false, false,
+                                                        RS_BLEND_SRC_SRC_ALPHA,
+                                                        RS_BLEND_DST_ONE_MINUS_SRC_ALPHA,
+                                                        RS_DEPTH_FUNC_ALWAYS).get());
+    mFontProgramStore->init();
+!!!46793399.cpp!!!	initTextTexture() : void
+    ObjectBaseRef<const Element> alphaElem = Element::createRef(mRSC, RS_TYPE_UNSIGNED_8,
+                                                                RS_KIND_PIXEL_A, true, 1);
+
+    // We will allocate a texture to initially hold 32 character bitmaps
+    mCacheHeight = 256;
+    mCacheWidth = 1024;
+    ObjectBaseRef<Type> texType = Type::getTypeRef(mRSC, alphaElem.get(), mCacheWidth, mCacheHeight);
+
+    mCacheBuffer = new uint8_t[mCacheWidth * mCacheHeight];
+
+
+    Allocation *cacheAlloc = Allocation::createAllocation(mRSC, texType.get(),
+                                RS_ALLOCATION_USAGE_GRAPHICS_TEXTURE);
+    mTextTexture.set(cacheAlloc);
+
+    // Split up our cache texture into lines of certain widths
+    int32_t nextLine = 0;
+    mCacheLines.push(new CacheTextureLine(16, texType->getDimX(), nextLine, 0));
+    nextLine += mCacheLines.top()->mMaxHeight;
+    mCacheLines.push(new CacheTextureLine(24, texType->getDimX(), nextLine, 0));
+    nextLine += mCacheLines.top()->mMaxHeight;
+    mCacheLines.push(new CacheTextureLine(24, texType->getDimX(), nextLine, 0));
+    nextLine += mCacheLines.top()->mMaxHeight;
+    mCacheLines.push(new CacheTextureLine(32, texType->getDimX(), nextLine, 0));
+    nextLine += mCacheLines.top()->mMaxHeight;
+    mCacheLines.push(new CacheTextureLine(32, texType->getDimX(), nextLine, 0));
+    nextLine += mCacheLines.top()->mMaxHeight;
+    mCacheLines.push(new CacheTextureLine(40, texType->getDimX(), nextLine, 0));
+    nextLine += mCacheLines.top()->mMaxHeight;
+    mCacheLines.push(new CacheTextureLine(texType->getDimY() - nextLine, texType->getDimX(), nextLine, 0));
+!!!46793783.cpp!!!	flushAllAndInvalidate() : void
+    if (mCurrentQuadIndex != 0) {
+        issueDrawCommand();
+        mCurrentQuadIndex = 0;
+    }
+    for (uint32_t i = 0; i < mActiveFonts.size(); i ++) {
+        mActiveFonts[i]->invalidateTextureCache();
+    }
+    for (uint32_t i = 0; i < mCacheLines.size(); i ++) {
+        mCacheLines[i]->mCurrentCol = 0;
+    }
+!!!46793911.cpp!!!	initVertexArrayBuffers() : void
+    // Now lets write index data
+    ObjectBaseRef<const Element> indexElem = Element::createRef(mRSC, RS_TYPE_UNSIGNED_16, RS_KIND_USER, false, 1);
+    ObjectBaseRef<Type> indexType = Type::getTypeRef(mRSC, indexElem.get(), mMaxNumberOfQuads * 6);
+
+    Allocation *indexAlloc = Allocation::createAllocation(mRSC, indexType.get(),
+                                                          RS_ALLOCATION_USAGE_SCRIPT |
+                                                          RS_ALLOCATION_USAGE_GRAPHICS_VERTEX);
+    uint16_t *indexPtr = (uint16_t*)mRSC->mHal.funcs.allocation.lock1D(mRSC, indexAlloc);
+
+    // Four verts, two triangles , six indices per quad
+    for (uint32_t i = 0; i < mMaxNumberOfQuads; i ++) {
+        int32_t i6 = i * 6;
+        int32_t i4 = i * 4;
+
+        indexPtr[i6 + 0] = i4 + 0;
+        indexPtr[i6 + 1] = i4 + 1;
+        indexPtr[i6 + 2] = i4 + 2;
+
+        indexPtr[i6 + 3] = i4 + 0;
+        indexPtr[i6 + 4] = i4 + 2;
+        indexPtr[i6 + 5] = i4 + 3;
+    }
+
+    indexAlloc->sendDirty(mRSC);
+
+    ObjectBaseRef<const Element> posElem = Element::createRef(mRSC, RS_TYPE_FLOAT_32, RS_KIND_USER, false, 3);
+    ObjectBaseRef<const Element> texElem = Element::createRef(mRSC, RS_TYPE_FLOAT_32, RS_KIND_USER, false, 2);
+
+    const char *ebn1[] = { "position", "texture0" };
+    const Element *ebe1[] = {posElem.get(), texElem.get()};
+    ObjectBaseRef<const Element> vertexDataElem = Element::create(mRSC, 2, ebe1, ebn1);
+
+    ObjectBaseRef<Type> vertexDataType = Type::getTypeRef(mRSC, vertexDataElem.get(), mMaxNumberOfQuads * 4);
+
+    Allocation *vertexAlloc = Allocation::createAllocation(mRSC, vertexDataType.get(),
+                                                           RS_ALLOCATION_USAGE_SCRIPT);
+    mTextMeshPtr = (float*)mRSC->mHal.funcs.allocation.lock1D(mRSC, vertexAlloc);
+
+    mMesh.set(new Mesh(mRSC, 1, 1));
+    mMesh->setVertexBuffer(vertexAlloc, 0);
+    mMesh->setPrimitive(indexAlloc, RS_PRIMITIVE_TRIANGLE, 0);
+    mMesh->init();
+    mRSC->mHal.funcs.allocation.unlock1D(mRSC, indexAlloc);
+    mRSC->mHal.funcs.allocation.unlock1D(mRSC, vertexAlloc);
+!!!46794039.cpp!!!	checkInit() : void
+    if (mInitialized) {
+        return;
+    }
+
+    initTextTexture();
+    initRenderState();
+
+    initVertexArrayBuffers();
+
+    // We store a string with letters in a rough frequency of occurrence
+    mLatinPrecache = " eisarntolcdugpmhbyfvkwzxjq"
+                     "EISARNTOLCDUGPMHBYFVKWZXJQ"
+                     ",.?!()-+@;:`'0123456789";
+    mInitialized = true;
+!!!46794167.cpp!!!	issueDrawCommand() : void
+    Context::PushState ps(mRSC);
+
+    mRSC->setProgramVertex(mRSC->getDefaultProgramVertex());
+    mRSC->setProgramRaster(mRSC->getDefaultProgramRaster());
+    mRSC->setProgramFragment(mFontShaderF.get());
+    mRSC->setProgramStore(mFontProgramStore.get());
+
+    if (mConstantsDirty) {
+        mFontShaderFConstant->data(mRSC, 0, 0, 1, &mConstants, sizeof(mConstants));
+        mConstantsDirty = false;
+    }
+
+    if (!mRSC->setupCheck()) {
+        return;
+    }
+
+    mMesh->renderPrimitiveRange(mRSC, 0, 0, mCurrentQuadIndex * 6);
+!!!46794295.cpp!!!	appendMeshQuad(in x1 : float, in y1 : float, in z1 : float, in u1 : float, in v1 : float, in x2 : float, in y2 : float, in z2 : float, in u2 : float, in v2 : float, in x3 : float, in y3 : float, in z3 : float, in u3 : float, in v3 : float, in x4 : float, in y4 : float, in z4 : float, in u4 : float, in v4 : float) : void
+    const uint32_t vertsPerQuad = 4;
+    const uint32_t floatsPerVert = 6;
+    float *currentPos = mTextMeshPtr + mCurrentQuadIndex * vertsPerQuad * floatsPerVert;
+
+    if (x1 > mSurfaceWidth || y1 < 0.0f || x2 < 0 || y4 > mSurfaceHeight) {
+        return;
+    }
+
+    /*LOGE("V0 x: %f y: %f z: %f", x1, y1, z1);
+    ALOGE("V1 x: %f y: %f z: %f", x2, y2, z2);
+    ALOGE("V2 x: %f y: %f z: %f", x3, y3, z3);
+    ALOGE("V3 x: %f y: %f z: %f", x4, y4, z4);*/
+
+    (*currentPos++) = x1;
+    (*currentPos++) = y1;
+    (*currentPos++) = z1;
+    (*currentPos++) = 0;
+    (*currentPos++) = u1;
+    (*currentPos++) = v1;
+
+    (*currentPos++) = x2;
+    (*currentPos++) = y2;
+    (*currentPos++) = z2;
+    (*currentPos++) = 0;
+    (*currentPos++) = u2;
+    (*currentPos++) = v2;
+
+    (*currentPos++) = x3;
+    (*currentPos++) = y3;
+    (*currentPos++) = z3;
+    (*currentPos++) = 0;
+    (*currentPos++) = u3;
+    (*currentPos++) = v3;
+
+    (*currentPos++) = x4;
+    (*currentPos++) = y4;
+    (*currentPos++) = z4;
+    (*currentPos++) = 0;
+    (*currentPos++) = u4;
+    (*currentPos++) = v4;
+
+    mCurrentQuadIndex ++;
+
+    if (mCurrentQuadIndex == mMaxNumberOfQuads) {
+        issueDrawCommand();
+        mCurrentQuadIndex = 0;
+    }

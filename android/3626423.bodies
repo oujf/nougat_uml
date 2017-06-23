@@ -1,0 +1,128 @@
+class cros_ec_sensors_poll_context_t
+!!!44112695.cpp!!!	cros_ec_sensors_poll_context_t(in module : hw_module_t, in ring_device_name : char, in ring_trigger_name : char)
+    memset(&device, 0, sizeof(sensors_poll_device_1_t));
+
+    device.common.tag      = HARDWARE_DEVICE_TAG;
+    device.common.version  = SENSORS_DEVICE_API_VERSION_1_3;
+    device.common.module   = const_cast<hw_module_t *>(module);
+    device.common.close    = wrapper_close;
+    device.activate        = wrapper_activate;
+    device.setDelay        = wrapper_setDelay;
+    device.poll            = wrapper_poll;
+
+    // Batch processing
+    device.batch           = wrapper_batch;
+    device.flush           = wrapper_flush;
+
+    /*
+     * One more time, assume only one sensor hub in the system.
+     * Find the iio:deviceX with name "cros_ec_ring"
+     * Open /dev/iio:deviceX, enable buffer.
+     */
+    mSensor = new CrosECSensor(
+        Ssensor_info_, Stotal_max_sensor_handle_,
+        Sgesture_info_, Stotal_max_gesture_handle_,
+        ring_device_name, ring_trigger_name);
+
+    mPollFds[crosEcRingFd].fd = mSensor->getFd();
+    mPollFds[crosEcRingFd].events = POLLIN;
+    mPollFds[crosEcRingFd].revents = 0;
+
+    int wakeFds[2];
+    int result = pipe(wakeFds);
+    ALOGE_IF(result < 0, "error creating wake pipe (%s)", strerror(errno));
+    fcntl(wakeFds[0], F_SETFL, O_NONBLOCK);
+    fcntl(wakeFds[1], F_SETFL, O_NONBLOCK);
+    mWritePipeFd = wakeFds[1];
+
+    mPollFds[crosEcWakeFd].fd = wakeFds[0];
+    mPollFds[crosEcWakeFd].events = POLLIN;
+    mPollFds[crosEcWakeFd].revents = 0;
+!!!44112823.cpp!!!	~cros_ec_sensors_poll_context_t()
+    delete mSensor;
+    close(mPollFds[crosEcWakeFd].fd);
+    close(mWritePipeFd);
+!!!44112951.cpp!!!	activate(in handle : int, in enabled : int) : int
+    int err = mSensor->activate(handle, enabled);
+
+    if (enabled && !err) {
+        const char wakeMessage(WAKE_MESSAGE);
+        int result = write(mWritePipeFd, &wakeMessage, 1);
+        ALOGE_IF(result<0, "error sending wake message (%s)", strerror(errno));
+    }
+    return err;
+!!!44113079.cpp!!!	setDelay(in handle : int, in ns : int64_t) : int
+    /* No supported */
+    return 0;
+!!!44113207.cpp!!!	pollEvents(inout data : sensors_event_t, in count : int) : int
+    int nbEvents = 0;
+    int n = 0;
+    do {
+        // see if we have some leftover from the last poll()
+        if (mPollFds[crosEcRingFd].revents & POLLIN) {
+            int nb = mSensor->readEvents(data, count);
+            if (nb < count) {
+                // no more data for this sensor
+                mPollFds[crosEcRingFd].revents = 0;
+            }
+            count -= nb;
+            nbEvents += nb;
+            data += nb;
+        }
+
+        if (count) {
+            // we still have some room, so try to see if we can get
+            // some events immediately or just wait if we don't have
+            // anything to return
+            do {
+                TEMP_FAILURE_RETRY(n = poll(mPollFds, numFds,
+                                            nbEvents ? 0 : -1));
+            } while (n < 0 && errno == EINTR);
+            if (n < 0) {
+                ALOGE("poll() failed (%s)", strerror(errno));
+                return -errno;
+            }
+            if (mPollFds[crosEcWakeFd].revents & POLLIN) {
+                char msg(WAKE_MESSAGE);
+                int result = read(mPollFds[crosEcWakeFd].fd, &msg, 1);
+                ALOGE_IF(result < 0,
+                         "error reading from wake pipe (%s)", strerror(errno));
+                ALOGE_IF(msg != WAKE_MESSAGE,
+                         "unknown message on wake queue (0x%02x)", int(msg));
+                mPollFds[crosEcWakeFd].revents = 0;
+            }
+        }
+        // if we have events and space, go read them
+    } while (n && count);
+    return nbEvents;
+!!!44113335.cpp!!!	batch(in handle : int, in flags : int, in sampling_period_ns : int64_t, in max_report_latency_ns : int64_t) : int
+    return mSensor->batch(handle, sampling_period_ns,
+                          max_report_latency_ns);
+!!!44113463.cpp!!!	flush(in handle : int) : int
+    return mSensor->flush(handle);
+!!!44113591.cpp!!!	wrapper_close(inout dev : hw_device_t) : int
+    cros_ec_sensors_poll_context_t *ctx = reinterpret_cast<cros_ec_sensors_poll_context_t *>(dev);
+    if (ctx) {
+        delete ctx;
+    }
+    if (Stotal_max_sensor_handle_ != 0) {
+        free(Ssensor_info_);
+        Stotal_max_sensor_handle_ = 0;
+        free(Sgesture_info_);
+    }
+    return 0;
+!!!44113719.cpp!!!	wrapper_activate(inout dev : sensors_poll_device_t, in handle : int, in enabled : int) : int
+    cros_ec_sensors_poll_context_t *ctx = reinterpret_cast<cros_ec_sensors_poll_context_t *>(dev);
+    return ctx->activate(handle, enabled);
+!!!44113847.cpp!!!	wrapper_setDelay(inout dev : sensors_poll_device_t, in handle : int, in ns : int64_t) : int
+    cros_ec_sensors_poll_context_t *ctx = reinterpret_cast<cros_ec_sensors_poll_context_t *>(dev);
+    return ctx->setDelay(handle, ns);
+!!!44113975.cpp!!!	wrapper_poll(inout dev : sensors_poll_device_t, inout data : sensors_event_t, in count : int) : int
+    cros_ec_sensors_poll_context_t *ctx = reinterpret_cast<cros_ec_sensors_poll_context_t *>(dev);
+    return ctx->pollEvents(data, count);
+!!!44114103.cpp!!!	wrapper_batch(inout dev : sensors_poll_device_1, in handle : int, in flags : int, in period_ns : int64_t, in timeout : int64_t) : int
+    cros_ec_sensors_poll_context_t *ctx = reinterpret_cast<cros_ec_sensors_poll_context_t *>(dev);
+    return ctx->batch(handle, flags, period_ns, timeout);
+!!!44114231.cpp!!!	wrapper_flush(inout dev : sensors_poll_device_1, in handle : int) : int
+    cros_ec_sensors_poll_context_t *ctx = reinterpret_cast<cros_ec_sensors_poll_context_t *>(dev);
+    return ctx->flush(handle);

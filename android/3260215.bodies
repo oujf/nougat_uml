@@ -1,0 +1,74 @@
+class AudioDaemon
+!!!43213367.cpp!!!	OnInit() : int
+  int exit_code = Daemon::OnInit();
+  if (exit_code != EX_OK) return exit_code;
+  // Initialize a binder wrapper.
+  android::BinderWrapper::Create();
+  // Initialize a binder watcher.
+  binder_watcher_.Init();
+  ConnectToAPS();
+  return EX_OK;
+!!!43213495.cpp!!!	Callback(inout file : base::File) : void
+  input_event event;
+  int bytes_read =
+      file->ReadAtCurrentPos(reinterpret_cast<char*>(&event), sizeof(event));
+  if (bytes_read != sizeof(event)) {
+    LOG(WARNING) << "Couldn't read an input event.";
+    return;
+  }
+  audio_device_handler_->ProcessEvent(event);
+!!!43213623.cpp!!!	OnAPSDisconnected() : void
+  LOG(INFO) << "Audio policy service died. Will try to reconnect.";
+  audio_device_handler_->APSDisconnect();
+  aps_ = nullptr;
+  ConnectToAPS();
+!!!43213751.cpp!!!	ConnectToAPS() : void
+  android::BinderWrapper* binder_wrapper = android::BinderWrapper::Get();
+  auto binder = binder_wrapper->GetService(kAPSServiceName);
+  // If we didn't get the audio policy service, try again in 500 ms.
+  if (!binder.get()) {
+    LOG(INFO) << "Could not connect to audio policy service. Trying again...";
+    brillo::MessageLoop::current()->PostDelayedTask(
+        base::Bind(&AudioDaemon::ConnectToAPS, weak_ptr_factory_.GetWeakPtr()),
+        base::TimeDelta::FromMilliseconds(500));
+    return;
+  }
+  LOG(INFO) << "Connected to audio policy service.";
+  binder_wrapper->RegisterForDeathNotifications(
+      binder,
+      base::Bind(&AudioDaemon::OnAPSDisconnected,
+                 weak_ptr_factory_.GetWeakPtr()));
+  VLOG(1) << "Registered death notification.";
+  aps_ = android::interface_cast<android::IAudioPolicyService>(binder);
+  if (!handler_initialized_)
+    InitializeHandler();
+  else
+    audio_device_handler_->APSConnect(aps_);
+!!!43213879.cpp!!!	InitializeHandler() : void
+  // Start and initialize the audio device handler.
+  audio_device_handler_ =
+      std::unique_ptr<AudioDeviceHandler>(new AudioDeviceHandler());
+  audio_device_handler_->Init(aps_);
+
+  // Poll on all files in kInputDeviceDir.
+  base::FileEnumerator fenum(base::FilePath(kInputDeviceDir),
+                             false /*recursive*/, base::FileEnumerator::FILES);
+  for (base::FilePath name = fenum.Next(); !name.empty(); name = fenum.Next()) {
+    base::File file(name, base::File::FLAG_OPEN | base::File::FLAG_READ);
+    if (file.IsValid()) {
+      MessageLoop* message_loop = MessageLoop::current();
+      int fd = file.GetPlatformFile();
+      // Move file to files_ and ensure that when binding we get a pointer from
+      // the object in files_.
+      files_.emplace(std::move(file));
+      base::Closure callback =
+          base::Bind(&AudioDaemon::Callback, weak_ptr_factory_.GetWeakPtr(),
+                     &files_.top());
+      message_loop->WatchFileDescriptor(fd, MessageLoop::kWatchRead,
+                                        true /*persistent*/, callback);
+    } else {
+      LOG(WARNING) << "Could not open " << name.value() << " for reading. ("
+                   << base::File::ErrorToString(file.error_details()) << ")";
+    }
+  }
+  handler_initialized_ = true;

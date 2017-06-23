@@ -1,0 +1,292 @@
+class QCameraChannel
+!!!44152247.cpp!!!	QCameraChannel(in cam_handle : uint32_t, inout cam_ops : mm_camera_ops_t)
+    m_camHandle = cam_handle;
+    m_camOps = cam_ops;
+    m_bIsActive = false;
+    m_bAllowDynBufAlloc = false;
+
+    m_handle = 0;
+    m_numStreams = 0;
+    memset(mStreams, 0, sizeof(mStreams));
+!!!44152375.cpp!!!	QCameraChannel()
+    m_camHandle = 0;
+    m_camOps = NULL;
+    m_bIsActive = false;
+
+    m_handle = 0;
+    m_numStreams = 0;
+    memset(mStreams, 0, sizeof(mStreams));
+!!!44152503.cpp!!!	~QCameraChannel()
+    if (m_bIsActive) {
+        stop();
+    }
+
+    for (int i = 0; i < m_numStreams; i++) {
+        if (mStreams[i] != NULL) {
+            delete mStreams[i];
+            mStreams[i] = 0;
+        }
+    }
+    m_numStreams = 0;
+    m_camOps->delete_channel(m_camHandle, m_handle);
+    m_handle = 0;
+!!!44152631.cpp!!!	init(inout attr : mm_camera_channel_attr_t, in dataCB : mm_camera_buf_notify_t, inout userData : void) : int32_t
+    m_handle = m_camOps->add_channel(m_camHandle,
+                                      attr,
+                                      dataCB,
+                                      userData);
+    if (m_handle == 0) {
+        ALOGE("%s: Add channel failed", __func__);
+        return UNKNOWN_ERROR;
+    }
+    return NO_ERROR;
+!!!44152759.cpp!!!	addStream(inout allocator : QCameraAllocator, inout streamInfoBuf : QCameraHeapMemory, inout miscBuf : QCameraHeapMemory, in minStreamBufNum : uint8_t, inout paddingInfo : cam_padding_info_t, in stream_cb : stream_cb_routine, inout userdata : void, in bDynAllocBuf : bool, in bDeffAlloc : bool = false, in online_rotation : cam_rotation_t = ROTATE_0) : int32_t
+    int32_t rc = NO_ERROR;
+    if (mStreams.size() >= MAX_STREAM_NUM_IN_BUNDLE) {
+        ALOGE("%s: stream number (%zu) exceeds max limit (%d)",
+              __func__, mStreams.size(), MAX_STREAM_NUM_IN_BUNDLE);
+        if (streamInfoBuf != NULL) {
+            streamInfoBuf->deallocate();
+            delete streamInfoBuf;
+            streamInfoBuf = NULL;
+        }
+        return BAD_VALUE;
+    }
+    QCameraStream *pStream = new QCameraStream(allocator,
+            m_camHandle, m_handle, m_camOps, paddingInfo, bDeffAlloc,
+            online_rotation);
+    if (pStream == NULL) {
+        ALOGE("%s: No mem for Stream", __func__);
+        if (streamInfoBuf != NULL) {
+            streamInfoBuf->deallocate();
+            delete streamInfoBuf;
+            streamInfoBuf = NULL;
+        }
+        return NO_MEMORY;
+    }
+
+    rc = pStream->init(streamInfoBuf, miscBuf, minStreamBufNum,
+                       stream_cb, userdata, bDynAllocBuf);
+    if (rc == 0) {
+        mStreams.add(pStream);
+    } else {
+        delete pStream;
+    }
+    return rc;
+!!!44152887.cpp!!!	linkStream(inout ch : QCameraChannel, inout stream : QCameraStream) : int32_t
+    int32_t rc = NO_ERROR;
+
+    if ((0 == m_handle) || (NULL == ch) || (NULL == stream)) {
+        return NO_INIT;
+    }
+
+    int32_t handle = m_camOps->link_stream(m_camHandle,
+            ch->getMyHandle(),
+            stream->getMyHandle(),
+            m_handle);
+    if (0 == handle) {
+        ALOGE("%s : Linking of stream failed", __func__);
+        rc = INVALID_OPERATION;
+    } else {
+        mStreams.add(stream);
+    }
+
+    return rc;
+!!!44153015.cpp!!!	start() : int32_t
+    int32_t rc = NO_ERROR;
+
+    if (m_numStreams > 1) {
+        // there is more than one stream in the channel
+        // we need to notify mctl that all streams in this channel need to be bundled
+        cam_bundle_config_t bundleInfo;
+        memset(&bundleInfo, 0, sizeof(bundleInfo));
+        rc = m_camOps->get_bundle_info(m_camHandle, m_handle, &bundleInfo);
+        if (rc != NO_ERROR) {
+            ALOGE("%s: get_bundle_info failed", __func__);
+            return rc;
+        }
+        if (bundleInfo.num_of_streams > 1) {
+            for (int i = 0; i < bundleInfo.num_of_streams; i++) {
+                QCameraStream *pStream = getStreamByServerID(bundleInfo.stream_ids[i]);
+                if (pStream != NULL) {
+                    if (pStream->isTypeOf(CAM_STREAM_TYPE_METADATA)) {
+                        // Skip metadata for reprocess now because PP module cannot handle meta data
+                        // May need furthur discussion if Imaginglib need meta data
+                        continue;
+                    }
+
+                    cam_stream_parm_buffer_t param;
+                    memset(&param, 0, sizeof(cam_stream_parm_buffer_t));
+                    param.type = CAM_STREAM_PARAM_TYPE_SET_BUNDLE_INFO;
+                    param.bundleInfo = bundleInfo;
+                    rc = pStream->setParameter(param);
+                    if (rc != NO_ERROR) {
+                        ALOGE("%s: stream setParameter for set bundle failed", __func__);
+                        return rc;
+                    }
+                }
+            }
+        }
+    }
+
+    for (int i = 0; i < m_numStreams; i++) {
+        if (mStreams[i] != NULL) {
+            mStreams[i]->start();
+        }
+    }
+    rc = m_camOps->start_channel(m_camHandle, m_handle);
+
+    if (rc != NO_ERROR) {
+        for (int i = 0; i < m_numStreams; i++) {
+            if (mStreams[i] != NULL) {
+                mStreams[i]->stop();
+            }
+        }
+    } else {
+        m_bIsActive = true;
+        for (int i = 0; i < m_numStreams; i++) {
+            if (mStreams[i] != NULL) {
+                mStreams[i]->cond_signal();
+            }
+        }
+    }
+
+    return rc;
+!!!44153143.cpp!!!	stop() : int32_t
+    int32_t rc = NO_ERROR;
+    for (int i = 0; i < m_numStreams; i++) {
+        if (mStreams[i] != NULL) {
+            mStreams[i]->stop();
+        }
+    }
+
+    rc = m_camOps->stop_channel(m_camHandle, m_handle);
+
+    m_bIsActive = false;
+    return rc;
+!!!44153271.cpp!!!	bufDone(inout recvd_frame : mm_camera_super_buf_t) : int32_t
+    int32_t rc = NO_ERROR;
+    for (int i = 0; i < recvd_frame->num_bufs; i++) {
+         if (recvd_frame->bufs[i] != NULL) {
+             for (int j = 0; j < m_numStreams; j++) {
+                 if (mStreams[j] != NULL &&
+                     mStreams[j]->getMyHandle() == recvd_frame->bufs[i]->stream_id) {
+                     rc = mStreams[j]->bufDone(recvd_frame->bufs[i]->buf_idx);
+                     break; // break loop j
+                 }
+             }
+         }
+    }
+
+    return rc;
+!!!44153399.cpp!!!	processZoomDone(inout previewWindow : preview_stream_ops_t, inout crop_info : cam_crop_data_t) : int32_t
+    int32_t rc = NO_ERROR;
+    for (int i = 0; i < m_numStreams; i++) {
+        if (mStreams[i] != NULL) {
+            rc = mStreams[i]->processZoomDone(previewWindow, crop_info);
+        }
+    }
+    return rc;
+!!!44153527.cpp!!!	config() : int32_t
+    int32_t rc = NO_ERROR;
+
+    for (int i = 0; i < m_numStreams; ++i) {
+        if ( mStreams[i]->isDeffered() ) {
+            rc = mStreams[i]->configStream();
+            if (rc != NO_ERROR) {
+                break;
+            }
+        }
+    }
+
+    return rc;
+!!!44153655.cpp!!!	getStreamByHandle(in streamHandle : uint32_t) : QCameraStream
+    for (int i = 0; i < m_numStreams; i++) {
+        if (mStreams[i] != NULL && mStreams[i]->getMyHandle() == streamHandle) {
+            return mStreams[i];
+        }
+    }
+    return NULL;
+!!!44154039.cpp!!!	getStreamByIndex(in index : uint32_t) : QCameraStream
+    if (index >= MAX_STREAM_NUM_IN_BUNDLE) {
+        return NULL;
+    }
+
+    if (index < mStreams.size()) {
+        return mStreams[index];
+    }
+    return NULL;
+!!!44154167.cpp!!!	getStreamByServerID(in serverID : uint32_t) : QCameraStream
+    for (int i = 0; i < m_numStreams; i++) {
+        if (mStreams[i] != NULL && mStreams[i]->getMyServerID() == serverID) {
+            return mStreams[i];
+        }
+    }
+    return NULL;
+!!!44154295.cpp!!!	UpdateStreamBasedParameters(inout param : QCameraParameters) : int32_t
+    int32_t rc = NO_ERROR;
+    if (param.isPreviewFlipChanged()) {
+        // try to find preview stream
+        for (int i = 0; i < MAX_STREAM_NUM_IN_BUNDLE; i++) {
+            if (mStreams[i] != NULL &&
+                (mStreams[i]->isTypeOf(CAM_STREAM_TYPE_PREVIEW) ||
+                (mStreams[i]->isOrignalTypeOf(CAM_STREAM_TYPE_PREVIEW))) ) {
+                cam_stream_parm_buffer_t param_buf;
+                memset(&param_buf, 0, sizeof(cam_stream_parm_buffer_t));
+                param_buf.type = CAM_STREAM_PARAM_TYPE_SET_FLIP;
+                param_buf.flipInfo.flip_mask = param.getFlipMode(CAM_STREAM_TYPE_PREVIEW);
+                rc = mStreams[i]->setParameter(param_buf);
+                if (rc != NO_ERROR) {
+                    ALOGE("%s: set preview stream flip failed", __func__);
+                }
+            }
+        }
+    }
+    if (param.isVideoFlipChanged()) {
+        // try to find video stream
+        for (int i = 0; i < MAX_STREAM_NUM_IN_BUNDLE; i++) {
+            if (mStreams[i] != NULL &&
+                (mStreams[i]->isTypeOf(CAM_STREAM_TYPE_VIDEO) ||
+                (mStreams[i]->isOrignalTypeOf(CAM_STREAM_TYPE_VIDEO))) ) {
+                cam_stream_parm_buffer_t param_buf;
+                memset(&param_buf, 0, sizeof(cam_stream_parm_buffer_t));
+                param_buf.type = CAM_STREAM_PARAM_TYPE_SET_FLIP;
+                param_buf.flipInfo.flip_mask = param.getFlipMode(CAM_STREAM_TYPE_VIDEO);
+                rc = mStreams[i]->setParameter(param_buf);
+                if (rc != NO_ERROR) {
+                    ALOGE("%s: set video stream flip failed", __func__);
+                }
+            }
+        }
+    }
+    if (param.isSnapshotFlipChanged()) {
+        // try to find snapshot/postview stream
+        for (int i = 0; i < MAX_STREAM_NUM_IN_BUNDLE; i++) {
+            if (mStreams[i] != NULL &&
+                (mStreams[i]->isTypeOf(CAM_STREAM_TYPE_SNAPSHOT) ||
+                 mStreams[i]->isOrignalTypeOf(CAM_STREAM_TYPE_SNAPSHOT) ||
+                 mStreams[i]->isTypeOf(CAM_STREAM_TYPE_POSTVIEW) ||
+                 mStreams[i]->isOrignalTypeOf(CAM_STREAM_TYPE_POSTVIEW) ) ) {
+                cam_stream_parm_buffer_t param_buf;
+                memset(&param_buf, 0, sizeof(cam_stream_parm_buffer_t));
+                param_buf.type = CAM_STREAM_PARAM_TYPE_SET_FLIP;
+                param_buf.flipInfo.flip_mask = param.getFlipMode(CAM_STREAM_TYPE_SNAPSHOT);
+                rc = mStreams[i]->setParameter(param_buf);
+                if (rc != NO_ERROR) {
+                    ALOGE("%s: set snapshot stream flip failed", __func__);
+                }
+            }
+        }
+    }
+    return rc;
+!!!44154423.cpp!!!	deleteChannel() : void
+    if (m_bIsActive) {
+        stop();
+    }
+
+    for (int i = 0; i < m_numStreams; i++) {
+        if (mStreams[i] != NULL) {
+            mStreams[i]->deleteStream();
+        }
+    }
+    m_camOps->delete_channel(m_camHandle, m_handle);

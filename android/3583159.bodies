@@ -1,0 +1,255 @@
+class HubConnection
+!!!44079671.cpp!!!	getInstance() : HubConnection
+    Mutex::Autolock autoLock(sInstanceLock);
+    if (sInstance == NULL) {
+        sInstance = new HubConnection;
+    }
+    return sInstance;
+!!!44079799.cpp!!!	initCheck() : status_t
+    return mFd < 0 ? UNKNOWN_ERROR : OK;
+!!!44079927.cpp!!!	getAliveCheck() : status_t
+    return OK;
+!!!44080055.cpp!!!	threadLoop() : bool
+    ALOGI("threadLoop: starting");
+
+    if (mFd < 0) {
+        ALOGE("threadLoop: exiting prematurely: nanohub is unavailable");
+        return false;
+    }
+    waitOnNanohubLock();
+
+    sendCalibrationOffsets();
+
+    while (!Thread::exitPending()) {
+        ssize_t ret;
+
+        do {
+            ret = poll(mPollFds, mNumPollFds, -1);
+        } while (ret < 0 && errno == EINTR);
+
+        if (mInotifyPollIndex >= 0 && mPollFds[mInotifyPollIndex].revents & POLLIN) {
+            discardInotifyEvent();
+            waitOnNanohubLock();
+        }
+
+#ifdef USB_MAG_BIAS_REPORTING_ENABLED
+        if (mMagBiasPollIndex >= 0 && mPollFds[mMagBiasPollIndex].revents & POLLERR) {
+            // Read from mag bias file
+            char buf[16];
+            lseek(mPollFds[mMagBiasPollIndex].fd, 0, SEEK_SET);
+            ::read(mPollFds[mMagBiasPollIndex].fd, buf, 16);
+            float bias = atof(buf);
+            mUsbMagBias = bias;
+            queueUsbMagBias();
+        }
+#endif // USB_MAG_BIAS_REPORTING_ENABLED
+
+        if (mPollFds[0].revents & POLLIN) {
+            uint8_t recv[256];
+            ssize_t len = ::read(mFd, recv, sizeof(recv));
+
+            for (ssize_t offset = 0; offset < len;) {
+                ret = processBuf(recv + offset, len - offset);
+
+                if (ret > 0)
+                    offset += ret;
+                else
+                    break;
+            }
+        }
+    }
+
+    return false;
+!!!44080183.cpp!!!	queueActivate(in handle : int, in enable : bool) : void
+    struct ConfigCmd cmd;
+    int ret;
+
+    Mutex::Autolock autoLock(mLock);
+
+    if (mSensorState[handle].sensorType) {
+        mSensorState[handle].enable = enable;
+
+        initConfigCmd(&cmd, handle);
+
+        ret = TEMP_FAILURE_RETRY(write(mFd, &cmd, sizeof(cmd)));
+        if (ret == sizeof(cmd))
+            ALOGI("queueActivate: sensor=%d, handle=%d, enable=%d",
+                    cmd.sensorType, handle, enable);
+        else
+            ALOGE("queueActivate: failed to send command: sensor=%d, handle=%d, enable=%d",
+                    cmd.sensorType, handle, enable);
+    } else {
+        ALOGI("queueActivate: unhandled handle=%d, enable=%d", handle, enable);
+    }
+!!!44080311.cpp!!!	queueSetDelay(in handle : int, in sampling_period_ns : nsecs_t) : void
+    struct ConfigCmd cmd;
+    int ret;
+
+    Mutex::Autolock autoLock(mLock);
+
+    if (mSensorState[handle].sensorType) {
+        if (sampling_period_ns > 0 &&
+                mSensorState[handle].rate != SENSOR_RATE_ONCHANGE &&
+                mSensorState[handle].rate != SENSOR_RATE_ONESHOT) {
+            mSensorState[handle].rate = period_ns_to_frequency_q10(sampling_period_ns);
+        }
+
+        initConfigCmd(&cmd, handle);
+
+        ret = TEMP_FAILURE_RETRY(write(mFd, &cmd, sizeof(cmd)));
+        if (ret == sizeof(cmd))
+            ALOGI("queueSetDelay: sensor=%d, handle=%d, period=%" PRId64,
+                    cmd.sensorType, handle, sampling_period_ns);
+        else
+            ALOGE("queueSetDelay: failed to send command: sensor=%d, handle=%d, period=%" PRId64,
+                    cmd.sensorType, handle, sampling_period_ns);
+    } else {
+        ALOGI("queueSetDelay: unhandled handle=%d, period=%" PRId64, handle, sampling_period_ns);
+    }
+!!!44080567.cpp!!!	queueFlush(in handle : int) : void
+    struct ConfigCmd cmd;
+    int ret;
+
+    Mutex::Autolock autoLock(mLock);
+
+    if (mSensorState[handle].sensorType) {
+        mSensorState[handle].flushCnt++;
+
+        initConfigCmd(&cmd, handle);
+        cmd.cmd = CONFIG_CMD_FLUSH;
+
+        ret = TEMP_FAILURE_RETRY(write(mFd, &cmd, sizeof(cmd)));
+        if (ret == sizeof(cmd))
+            ALOGI("queueFlush: sensor=%d, handle=%d",
+                    cmd.sensorType, handle);
+        else
+            ALOGE("queueFlush: failed to send command: sensor=%d, handle=%d",
+                    cmd.sensorType, handle);
+    } else {
+        ALOGI("queueFlush: unhandled handle=%d", handle);
+    }
+!!!44080695.cpp!!!	queueData(in handle : int, inout data : void, in length : size_t) : void
+    Mutex::Autolock autoLock(mLock);
+    queueDataInternal(handle, data, length);
+!!!44080823.cpp!!!	read(inout ev : sensors_event_t, in size : size_t) : ssize_t
+    return mRing.read(ev, size);
+!!!44081079.cpp!!!	saveSensorSettings() : void
+    File saved_settings_file(CONTEXTHUB_SAVED_SETTINGS_PATH, "w");
+
+    status_t err;
+    if ((err = saved_settings_file.initCheck()) != OK) {
+        ALOGE("saved settings file open failed %d (%s)",
+              err,
+              strerror(-err));
+        return;
+    }
+
+    // Build a settings object.
+    sp<JSONArray> magArray = new JSONArray;
+#ifdef USB_MAG_BIAS_REPORTING_ENABLED
+    magArray->addFloat(mMagBias[0] + mUsbMagBias);
+#else
+    magArray->addFloat(mMagBias[0]);
+#endif  // USB_MAG_BIAS_REPORTING_ENABLED
+    magArray->addFloat(mMagBias[1]);
+    magArray->addFloat(mMagBias[2]);
+
+    sp<JSONObject> settingsObject = new JSONObject;
+    settingsObject->setArray("mag", magArray);
+
+    // Write the JSON string to disk.
+    AString serializedSettings = settingsObject->toString();
+    size_t size = serializedSettings.size();
+    if ((err = saved_settings_file.write(serializedSettings.c_str(), size)) != (ssize_t)size) {
+        ALOGE("saved settings file write failed %d (%s)",
+              err,
+              strerror(-err));
+    }
+!!!44081207.cpp!!!	HubConnection()
+    mMagBias[0] = mMagBias[1] = mMagBias[2] = 0.0f;
+    mMagAccuracy = SENSOR_STATUS_UNRELIABLE;
+    mMagAccuracyRestore = SENSOR_STATUS_UNRELIABLE;
+    mGyroBias[0] = mGyroBias[1] = mGyroBias[2] = 0.0f;
+
+    memset(&mSensorState, 0x00, sizeof(mSensorState));
+    mFd = open(NANOHUB_FILE_PATH, O_RDWR);
+    mPollFds[0].fd = mFd;
+    mPollFds[0].events = POLLIN;
+    mPollFds[0].revents = 0;
+    mNumPollFds = 1;
+
+    initNanohubLock();
+
+#ifdef USB_MAG_BIAS_REPORTING_ENABLED
+    mUsbMagBias = 0;
+    mMagBiasPollIndex = -1;
+    int magBiasFd = open(MAG_BIAS_FILE_PATH, O_RDONLY);
+    if (magBiasFd < 0) {
+        ALOGW("Mag bias file open failed: %s", strerror(errno));
+    } else {
+        mPollFds[mNumPollFds].fd = magBiasFd;
+        mPollFds[mNumPollFds].events = 0;
+        mPollFds[mNumPollFds].revents = 0;
+        mMagBiasPollIndex = mNumPollFds;
+        mNumPollFds++;
+    }
+#endif  // USB_MAG_BIAS_REPORTING_ENABLED
+
+    mSensorState[COMMS_SENSOR_ACCEL].sensorType = SENS_TYPE_ACCEL;
+    mSensorState[COMMS_SENSOR_GYRO].sensorType = SENS_TYPE_GYRO;
+    mSensorState[COMMS_SENSOR_GYRO].alt = COMMS_SENSOR_GYRO_UNCALIBRATED;
+    mSensorState[COMMS_SENSOR_GYRO_UNCALIBRATED].sensorType = SENS_TYPE_GYRO;
+    mSensorState[COMMS_SENSOR_GYRO_UNCALIBRATED].alt = COMMS_SENSOR_GYRO;
+    mSensorState[COMMS_SENSOR_MAG].sensorType = SENS_TYPE_MAG;
+    mSensorState[COMMS_SENSOR_MAG].alt = COMMS_SENSOR_MAG_UNCALIBRATED;
+    mSensorState[COMMS_SENSOR_MAG_UNCALIBRATED].sensorType = SENS_TYPE_MAG;
+    mSensorState[COMMS_SENSOR_MAG_UNCALIBRATED].alt = COMMS_SENSOR_MAG;
+    mSensorState[COMMS_SENSOR_LIGHT].sensorType = SENS_TYPE_ALS;
+    mSensorState[COMMS_SENSOR_PROXIMITY].sensorType = SENS_TYPE_PROX;
+    mSensorState[COMMS_SENSOR_PRESSURE].sensorType = SENS_TYPE_BARO;
+    mSensorState[COMMS_SENSOR_TEMPERATURE].sensorType = SENS_TYPE_TEMP;
+    mSensorState[COMMS_SENSOR_ORIENTATION].sensorType = SENS_TYPE_ORIENTATION;
+    mSensorState[COMMS_SENSOR_WINDOW_ORIENTATION].sensorType = SENS_TYPE_WIN_ORIENTATION;
+    mSensorState[COMMS_SENSOR_WINDOW_ORIENTATION].rate = SENSOR_RATE_ONCHANGE;
+    mSensorState[COMMS_SENSOR_STEP_DETECTOR].sensorType = SENS_TYPE_STEP_DETECT;
+    mSensorState[COMMS_SENSOR_STEP_DETECTOR].rate = SENSOR_RATE_ONCHANGE;
+    mSensorState[COMMS_SENSOR_STEP_COUNTER].sensorType = SENS_TYPE_STEP_COUNT;
+    mSensorState[COMMS_SENSOR_SIGNIFICANT_MOTION].sensorType = SENS_TYPE_SIG_MOTION;
+    mSensorState[COMMS_SENSOR_SIGNIFICANT_MOTION].rate = SENSOR_RATE_ONESHOT;
+    mSensorState[COMMS_SENSOR_GRAVITY].sensorType = SENS_TYPE_GRAVITY;
+    mSensorState[COMMS_SENSOR_LINEAR_ACCEL].sensorType = SENS_TYPE_LINEAR_ACCEL;
+    mSensorState[COMMS_SENSOR_ROTATION_VECTOR].sensorType = SENS_TYPE_ROTATION_VECTOR;
+    mSensorState[COMMS_SENSOR_GEO_MAG].sensorType = SENS_TYPE_GEO_MAG_ROT_VEC;
+    mSensorState[COMMS_SENSOR_GAME_ROTATION_VECTOR].sensorType = SENS_TYPE_GAME_ROT_VECTOR;
+    mSensorState[COMMS_SENSOR_HALL].sensorType = SENS_TYPE_HALL;
+    mSensorState[COMMS_SENSOR_HALL].rate = SENSOR_RATE_ONCHANGE;
+    mSensorState[COMMS_SENSOR_SYNC].sensorType = SENS_TYPE_VSYNC;
+    mSensorState[COMMS_SENSOR_SYNC].rate = SENSOR_RATE_ONCHANGE;
+    mSensorState[COMMS_SENSOR_ACTIVITY].sensorType = SENS_TYPE_ACTIVITY;
+    mSensorState[COMMS_SENSOR_ACTIVITY].rate = SENSOR_RATE_ONCHANGE;
+    mSensorState[COMMS_SENSOR_TILT].sensorType = SENS_TYPE_TILT;
+    mSensorState[COMMS_SENSOR_TILT].rate = SENSOR_RATE_ONCHANGE;
+    mSensorState[COMMS_SENSOR_GESTURE].sensorType = SENS_TYPE_GESTURE;
+    mSensorState[COMMS_SENSOR_GESTURE].rate = SENSOR_RATE_ONESHOT;
+    mSensorState[COMMS_SENSOR_DOUBLE_TWIST].sensorType = SENS_TYPE_DOUBLE_TWIST;
+    mSensorState[COMMS_SENSOR_DOUBLE_TWIST].rate = SENSOR_RATE_ONCHANGE;
+    mSensorState[COMMS_SENSOR_DOUBLE_TAP].sensorType = SENS_TYPE_DOUBLE_TAP;
+    mSensorState[COMMS_SENSOR_DOUBLE_TAP].rate = SENSOR_RATE_ONCHANGE;
+
+#ifdef LID_STATE_REPORTING_ENABLED
+    initializeUinputNode();
+
+    // set initial lid state
+    if (property_set(LID_STATE_PROPERTY, LID_STATE_UNKNOWN) < 0) {
+        ALOGE("could not set lid_state property");
+    }
+
+    // enable hall sensor for folio
+    if (mFd >= 0) {
+        queueActivate(COMMS_SENSOR_HALL, true /* enable */);
+    }
+#endif  // LID_STATE_REPORTING_ENABLED
+!!!44081335.cpp!!!	~HubConnection()
+    close(mFd);
+!!!44081463.cpp!!!	onFirstRef() : void
+    run("HubConnection", PRIORITY_URGENT_DISPLAY);

@@ -1,0 +1,165 @@
+class TelecomLoaderService
+!!!85518775.java!!!	TelecomLoaderService(inout context : Context)
+        super(context);
+        mContext = context;
+        registerDefaultAppProviders();
+!!!85519031.java!!!	onBootPhase(in phase : int) : void
+        if (phase == PHASE_ACTIVITY_MANAGER_READY) {
+            registerDefaultAppNotifier();
+            registerCarrierConfigChangedReceiver();
+            connectToTelecom();
+        }
+!!!85519159.java!!!	connectToTelecom() : void
+        synchronized (mLock) {
+            if (mServiceConnection != null) {
+                // TODO: Is unbinding worth doing or wait for system to rebind?
+                mContext.unbindService(mServiceConnection);
+                mServiceConnection = null;
+            }
+
+            TelecomServiceConnection serviceConnection = new TelecomServiceConnection();
+            Intent intent = new Intent(SERVICE_ACTION);
+            intent.setComponent(SERVICE_COMPONENT);
+            int flags = Context.BIND_IMPORTANT | Context.BIND_FOREGROUND_SERVICE
+                    | Context.BIND_AUTO_CREATE;
+
+            // Bind to Telecom and register the service
+            if (mContext.bindServiceAsUser(intent, serviceConnection, flags, UserHandle.SYSTEM)) {
+                mServiceConnection = serviceConnection;
+            }
+        }
+!!!85519287.java!!!	registerDefaultAppProviders() : void
+        final PackageManagerInternal packageManagerInternal = LocalServices.getService(
+                PackageManagerInternal.class);
+
+        // Set a callback for the package manager to query the default sms app.
+        packageManagerInternal.setSmsAppPackagesProvider(
+                new PackageManagerInternal.PackagesProvider() {
+            @Override
+            public String[] getPackages(int userId) {
+                synchronized (mLock) {
+                    if (mServiceConnection == null) {
+                        if (mDefaultSmsAppRequests == null) {
+                            mDefaultSmsAppRequests = new IntArray();
+                        }
+                        mDefaultSmsAppRequests.add(userId);
+                        return null;
+                    }
+                }
+                ComponentName smsComponent = SmsApplication.getDefaultSmsApplication(
+                        mContext, true);
+                if (smsComponent != null) {
+                    return new String[]{smsComponent.getPackageName()};
+                }
+                return null;
+            }
+        });
+
+        // Set a callback for the package manager to query the default dialer app.
+        packageManagerInternal.setDialerAppPackagesProvider(
+                new PackageManagerInternal.PackagesProvider() {
+            @Override
+            public String[] getPackages(int userId) {
+                synchronized (mLock) {
+                    if (mServiceConnection == null) {
+                        if (mDefaultDialerAppRequests == null) {
+                            mDefaultDialerAppRequests = new IntArray();
+                        }
+                        mDefaultDialerAppRequests.add(userId);
+                        return null;
+                    }
+                }
+                String packageName = DefaultDialerManager.getDefaultDialerApplication(mContext);
+                if (packageName != null) {
+                    return new String[]{packageName};
+                }
+                return null;
+            }
+        });
+
+        // Set a callback for the package manager to query the default sim call manager.
+        packageManagerInternal.setSimCallManagerPackagesProvider(
+                new PackageManagerInternal.PackagesProvider() {
+            @Override
+            public String[] getPackages(int userId) {
+                synchronized (mLock) {
+                    if (mServiceConnection == null) {
+                        if (mDefaultSimCallManagerRequests == null) {
+                            mDefaultSimCallManagerRequests = new IntArray();
+                        }
+                        mDefaultSimCallManagerRequests.add(userId);
+                        return null;
+                    }
+                }
+                TelecomManager telecomManager =
+                    (TelecomManager) mContext.getSystemService(Context.TELECOM_SERVICE);
+                PhoneAccountHandle phoneAccount = telecomManager.getSimCallManager(userId);
+                if (phoneAccount != null) {
+                    return new String[]{phoneAccount.getComponentName().getPackageName()};
+                }
+                return null;
+            }
+        });
+!!!85519415.java!!!	registerDefaultAppNotifier() : void
+        final PackageManagerInternal packageManagerInternal = LocalServices.getService(
+                PackageManagerInternal.class);
+
+        // Notify the package manager on default app changes
+        final Uri defaultSmsAppUri = Settings.Secure.getUriFor(
+                Settings.Secure.SMS_DEFAULT_APPLICATION);
+        final Uri defaultDialerAppUri = Settings.Secure.getUriFor(
+                Settings.Secure.DIALER_DEFAULT_APPLICATION);
+
+        ContentObserver contentObserver = new ContentObserver(
+                new Handler(Looper.getMainLooper())) {
+            @Override
+            public void onChange(boolean selfChange, Uri uri, int userId) {
+                if (defaultSmsAppUri.equals(uri)) {
+                    ComponentName smsComponent = SmsApplication.getDefaultSmsApplication(
+                            mContext, true);
+                    if (smsComponent != null) {
+                        packageManagerInternal.grantDefaultPermissionsToDefaultSmsApp(
+                                smsComponent.getPackageName(), userId);
+                    }
+                } else if (defaultDialerAppUri.equals(uri)) {
+                    String packageName = DefaultDialerManager.getDefaultDialerApplication(
+                            mContext);
+                    if (packageName != null) {
+                        packageManagerInternal.grantDefaultPermissionsToDefaultDialerApp(
+                                packageName, userId);
+                    }
+                    updateSimCallManagerPermissions(packageManagerInternal, userId);
+                }
+            }
+        };
+
+        mContext.getContentResolver().registerContentObserver(defaultSmsAppUri,
+                false, contentObserver, UserHandle.USER_ALL);
+        mContext.getContentResolver().registerContentObserver(defaultDialerAppUri,
+                false, contentObserver, UserHandle.USER_ALL);
+!!!85519543.java!!!	registerCarrierConfigChangedReceiver() : void
+        final PackageManagerInternal packageManagerInternal = LocalServices.getService(
+                PackageManagerInternal.class);
+        BroadcastReceiver receiver = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                if (intent.getAction().equals(CarrierConfigManager.ACTION_CARRIER_CONFIG_CHANGED)) {
+                    for (int userId : UserManagerService.getInstance().getUserIds()) {
+                        updateSimCallManagerPermissions(packageManagerInternal, userId);
+                    }
+                }
+            }
+        };
+
+        mContext.registerReceiverAsUser(receiver, UserHandle.ALL,
+            new IntentFilter(CarrierConfigManager.ACTION_CARRIER_CONFIG_CHANGED), null, null);
+!!!85519671.java!!!	updateSimCallManagerPermissions(inout packageManagerInternal : PackageManagerInternal, in userId : int) : void
+        TelecomManager telecomManager =
+            (TelecomManager) mContext.getSystemService(Context.TELECOM_SERVICE);
+        PhoneAccountHandle phoneAccount = telecomManager.getSimCallManager(userId);
+        if (phoneAccount != null) {
+            Slog.i(TAG, "updating sim call manager permissions for userId:" + userId);
+            String packageName = phoneAccount.getComponentName().getPackageName();
+            packageManagerInternal.grantDefaultPermissionsToDefaultSimCallManager(
+                packageName, userId);
+        }

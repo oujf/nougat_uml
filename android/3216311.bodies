@@ -1,0 +1,127 @@
+class ThreadTree
+!!!43054519.cpp!!!	AddThread(in pid : int, in tid : int, in comm : std::string) : void
+  auto it = thread_tree_.find(tid);
+  if (it == thread_tree_.end()) {
+    ThreadEntry* thread = new ThreadEntry{
+        pid, tid,
+        "unknown",                             // comm
+        std::set<MapEntry*, MapComparator>(),  // maps
+    };
+    auto pair = thread_tree_.insert(std::make_pair(tid, std::unique_ptr<ThreadEntry>(thread)));
+    CHECK(pair.second);
+    it = pair.first;
+  }
+  thread_comm_storage_.push_back(std::unique_ptr<std::string>(new std::string(comm)));
+  it->second->comm = thread_comm_storage_.back()->c_str();
+!!!43054647.cpp!!!	ForkThread(in pid : int, in tid : int, in ppid : int, in ptid : int) : void
+  ThreadEntry* parent = FindThreadOrNew(ppid, ptid);
+  ThreadEntry* child = FindThreadOrNew(pid, tid);
+  child->comm = parent->comm;
+  child->maps = parent->maps;
+!!!43054775.cpp!!!	FindThreadOrNew(in pid : int, in tid : int) : ThreadEntry
+  auto it = thread_tree_.find(tid);
+  if (it == thread_tree_.end()) {
+    AddThread(pid, tid, "unknown");
+    it = thread_tree_.find(tid);
+  } else {
+    if (pid != it->second.get()->pid) {
+      // TODO: b/22185053.
+      LOG(DEBUG) << "unexpected (pid, tid) pair: expected (" << it->second.get()->pid << ", " << tid
+                 << "), actual (" << pid << ", " << tid << ")";
+    }
+  }
+  return it->second.get();
+!!!43054903.cpp!!!	AddKernelMap(in start_addr : uint64_t, in len : uint64_t, in pgoff : uint64_t, in time : uint64_t, in filename : std::string) : void
+  // kernel map len can be 0 when record command is not run in supervisor mode.
+  if (len == 0) {
+    return;
+  }
+  Dso* dso = FindKernelDsoOrNew(filename);
+  MapEntry* map = AllocateMap(MapEntry(start_addr, len, pgoff, time, dso));
+  FixOverlappedMap(&kernel_map_tree_, map);
+  auto pair = kernel_map_tree_.insert(map);
+  CHECK(pair.second);
+!!!43055031.cpp!!!	AddThreadMap(in pid : int, in tid : int, in start_addr : uint64_t, in len : uint64_t, in pgoff : uint64_t, in time : uint64_t, in filename : std::string) : void
+  ThreadEntry* thread = FindThreadOrNew(pid, tid);
+  Dso* dso = FindUserDsoOrNew(filename);
+  MapEntry* map = AllocateMap(MapEntry(start_addr, len, pgoff, time, dso));
+  FixOverlappedMap(&thread->maps, map);
+  auto pair = thread->maps.insert(map);
+  CHECK(pair.second);
+!!!43055159.cpp!!!	FindMap(in thread : ThreadEntry, in ip : uint64_t, in in_kernel : bool) : MapEntry
+  MapEntry* result = nullptr;
+  if (!in_kernel) {
+    result = FindMapByAddr(thread->maps, ip);
+  } else {
+    result = FindMapByAddr(kernel_map_tree_, ip);
+  }
+  return result != nullptr ? result : &unknown_map_;
+!!!43055287.cpp!!!	FindSymbol(in map : MapEntry, in ip : uint64_t) : Symbol
+  uint64_t vaddr_in_file;
+  if (map->dso == kernel_dso_.get()) {
+    vaddr_in_file = ip;
+  } else {
+    vaddr_in_file = ip - map->start_addr + map->dso->MinVirtualAddress();
+  }
+  const Symbol* symbol = map->dso->FindSymbol(vaddr_in_file);
+  if (symbol == nullptr) {
+    symbol = &unknown_symbol_;
+  }
+  return symbol;
+!!!43055543.cpp!!!	Clear() : void
+  thread_tree_.clear();
+  thread_comm_storage_.clear();
+  kernel_map_tree_.clear();
+  map_storage_.clear();
+  kernel_dso_.reset();
+  module_dso_tree_.clear();
+  user_dso_tree_.clear();
+!!!43055671.cpp!!!	FindKernelDsoOrNew(in filename : std::string) : Dso
+  if (filename == DEFAULT_KERNEL_MMAP_NAME) {
+    if (kernel_dso_ == nullptr) {
+      kernel_dso_ = Dso::CreateDso(DSO_KERNEL);
+    }
+    return kernel_dso_.get();
+  }
+  auto it = module_dso_tree_.find(filename);
+  if (it == module_dso_tree_.end()) {
+    module_dso_tree_[filename] = Dso::CreateDso(DSO_KERNEL_MODULE, filename);
+    it = module_dso_tree_.find(filename);
+  }
+  return it->second.get();
+!!!43055799.cpp!!!	FindUserDsoOrNew(in filename : std::string) : Dso
+  auto it = user_dso_tree_.find(filename);
+  if (it == user_dso_tree_.end()) {
+    user_dso_tree_[filename] = Dso::CreateDso(DSO_ELF_FILE, filename);
+    it = user_dso_tree_.find(filename);
+  }
+  return it->second.get();
+!!!43055927.cpp!!!	AllocateMap(in value : MapEntry) : MapEntry
+  MapEntry* map = new MapEntry(value);
+  map_storage_.push_back(std::unique_ptr<MapEntry>(map));
+  return map;
+!!!43056055.cpp!!!	FixOverlappedMap(inout map_set : std::set<MapEntry*, MapComparator>, in map : MapEntry) : void
+  for (auto it = map_set->begin(); it != map_set->end();) {
+    if ((*it)->start_addr >= map->get_end_addr()) {
+      // No more overlapped maps.
+      break;
+    }
+    if ((*it)->get_end_addr() <= map->start_addr) {
+      ++it;
+    } else {
+      MapEntry* old = *it;
+      if (old->start_addr < map->start_addr) {
+        MapEntry* before = AllocateMap(MapEntry(old->start_addr, map->start_addr - old->start_addr,
+                                                old->pgoff, old->time, old->dso));
+        map_set->insert(before);
+      }
+      if (old->get_end_addr() > map->get_end_addr()) {
+        MapEntry* after = AllocateMap(
+            MapEntry(map->get_end_addr(), old->get_end_addr() - map->get_end_addr(),
+                     map->get_end_addr() - old->start_addr + old->pgoff, old->time, old->dso));
+        map_set->insert(after);
+      }
+
+      it = map_set->erase(it);
+    }
+  }

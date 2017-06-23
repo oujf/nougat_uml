@@ -1,0 +1,274 @@
+class QCamera3GrallocMemory
+!!!44263991.cpp!!!	QCamera3GrallocMemory(in startIdx : uint32_t)
+    for (int i = 0; i < MM_CAMERA_MAX_NUM_FRAMES; i ++) {
+        mBufferHandle[i] = NULL;
+        mPrivateHandle[i] = NULL;
+    }
+!!!44264247.cpp!!!	registerBuffer(inout buffer : buffer_handle_t, in type : cam_stream_type_t) : int
+    status_t ret = NO_ERROR;
+    struct ion_fd_data ion_info_fd;
+    void *vaddr = NULL;
+    
+    int32_t idx = -1;
+
+    int32_t colorSpace =
+            (type == CAM_STREAM_TYPE_VIDEO) ? ITU_R_709 : ITU_R_601_FR;
+    CDBG(" %s : E ", __FUNCTION__);
+
+    memset(&ion_info_fd, 0, sizeof(ion_info_fd));
+
+    if (0 <= getMatchBufIndex((void *) buffer)) {
+        ALOGV("%s: Buffer already registered", __func__);
+        return ALREADY_EXISTS;
+    }
+
+    Mutex::Autolock lock(mLock);
+    if (mBufferCount >= (MM_CAMERA_MAX_NUM_FRAMES - 1)) {
+        ALOGE("%s: Number of buffers %d greater than what's supported %d",
+                __func__, mBufferCount, MM_CAMERA_MAX_NUM_FRAMES);
+        return BAD_INDEX;
+    }
+
+    idx = getFreeIndexLocked();
+    if (0 > idx) {
+        ALOGE("%s: No available memory slots", __func__);
+        return BAD_INDEX;
+    }
+
+    mBufferHandle[idx] = buffer;
+    mPrivateHandle[idx] = (struct private_handle_t *)(*mBufferHandle[idx]);
+
+    setMetaData(mPrivateHandle[idx], UPDATE_COLOR_SPACE, &colorSpace);
+
+    mMemInfo[idx].main_ion_fd = open("/dev/ion", O_RDONLY);
+    if (mMemInfo[idx].main_ion_fd < 0) {
+        ALOGE("%s: failed: could not open ion device", __func__);
+        ret = NO_MEMORY;
+        goto end;
+    } else {
+        ion_info_fd.fd = mPrivateHandle[idx]->fd;
+        if (ioctl(mMemInfo[idx].main_ion_fd,
+                  ION_IOC_IMPORT, &ion_info_fd) < 0) {
+            ALOGE("%s: ION import failed\n", __func__);
+            close(mMemInfo[idx].main_ion_fd);
+            ret = NO_MEMORY;
+            goto end;
+        }
+    }
+    ALOGV("%s: idx = %d, fd = %d, size = %d, offset = %d",
+            __func__, idx, mPrivateHandle[idx]->fd,
+            mPrivateHandle[idx]->size,
+            mPrivateHandle[idx]->offset);
+    mMemInfo[idx].fd = mPrivateHandle[idx]->fd;
+    mMemInfo[idx].size = mPrivateHandle[idx]->size;
+    mMemInfo[idx].handle = ion_info_fd.handle;
+
+    vaddr = mmap(NULL,
+            mMemInfo[idx].size,
+            PROT_READ | PROT_WRITE,
+            MAP_SHARED,
+            mMemInfo[idx].fd, 0);
+    if (vaddr == MAP_FAILED) {
+        mMemInfo[idx].handle = 0;
+        ret = NO_MEMORY;
+    } else {
+        mPtr[idx] = vaddr;
+        mBufferCount++;
+    }
+
+end:
+    CDBG(" %s : X ",__func__);
+    return ret;
+!!!44264375.cpp!!!	unregisterBuffer(in idx : size_t) : int32_t
+    int32_t rc = NO_ERROR;
+    Mutex::Autolock lock(mLock);
+
+    CDBG("%s: E ", __FUNCTION__);
+
+    if (MM_CAMERA_MAX_NUM_FRAMES <= idx) {
+        ALOGE("%s: Buffer index %d greater than what is supported %d",
+                __func__, idx, MM_CAMERA_MAX_NUM_FRAMES);
+        return BAD_VALUE;
+    }
+
+    if (0 == mMemInfo[idx].handle) {
+        ALOGE("%s: Trying to unregister buffer at %d which still not registered",
+                __func__, idx);
+        return BAD_VALUE;
+    }
+
+    rc = unregisterBufferLocked(idx);
+
+    CDBG(" %s : X ",__FUNCTION__);
+
+    return rc;
+!!!44264503.cpp!!!	unregisterBuffers() : void
+    int err = NO_ERROR;
+    Mutex::Autolock lock(mLock);
+
+    CDBG("%s: E ", __FUNCTION__);
+
+    for (size_t cnt = 0; cnt < MM_CAMERA_MAX_NUM_FRAMES; cnt++) {
+        if (0 == mMemInfo[cnt].handle) {
+            continue;
+        }
+        err = unregisterBufferLocked(cnt);
+        if (NO_ERROR != err) {
+            ALOGE("%s: Error unregistering buffer %d error %d",
+                    __func__, cnt, err);
+        }
+    }
+    mBufferCount = 0;
+    CDBG(" %s : X ",__FUNCTION__);
+!!!44264631.cpp!!!	cacheOps(in index : uint32_t, in cmd : uint) : int
+    if (index >= MM_CAMERA_MAX_NUM_FRAMES) {
+        ALOGE("%s: Index out of bounds", __func__);
+        return -1;
+    }
+    if (index < mStartIdx) {
+        ALOGE("%s: buffer index %d less than starting index %d",
+                __func__, index, mStartIdx);
+        return BAD_INDEX;
+    }
+
+    return cacheOpsInternal(index, cmd, mPtr[index]);
+!!!44264759.cpp!!!	getMatchBufIndex(inout object : void) : int
+    Mutex::Autolock lock(mLock);
+
+    int index = -1;
+    buffer_handle_t *key = (buffer_handle_t*) object;
+    if (!key) {
+        return BAD_VALUE;
+    }
+    for (int i = 0; i < MM_CAMERA_MAX_NUM_FRAMES; i++) {
+        if (mBufferHandle[i] == key) {
+            index = i;
+            break;
+        }
+    }
+
+    return index;
+!!!44264887.cpp!!!	getPtr(in index : uint32_t) : void
+    Mutex::Autolock lock(mLock);
+    return getPtrLocked(index);
+!!!44265015.cpp!!!	markFrameNumber(in index : uint32_t, in frameNumber : uint32_t) : int32_t
+    Mutex::Autolock lock(mLock);
+
+    if (index >= MM_CAMERA_MAX_NUM_FRAMES) {
+        ALOGE("%s: Index out of bounds", __func__);
+        return BAD_INDEX;
+    }
+    if (index < mStartIdx) {
+        ALOGE("%s: buffer index %d less than starting index %d",
+                __func__, index, mStartIdx);
+        return BAD_INDEX;
+    }
+
+    if (0 == mMemInfo[index].handle) {
+        ALOGE("%s: Buffer at %d not registered", __func__, index);
+        return BAD_INDEX;
+    }
+
+    mCurrentFrameNumbers[index] = (int32_t)frameNumber;
+
+    return NO_ERROR;
+!!!44265143.cpp!!!	getFrameNumber(in index : uint32_t) : int32_t
+    Mutex::Autolock lock(mLock);
+
+    if (index >= MM_CAMERA_MAX_NUM_FRAMES) {
+        ALOGE("%s: Index out of bounds", __func__);
+        return -1;
+    }
+    if (index < mStartIdx) {
+        ALOGE("%s: buffer index %d less than starting index %d",
+                __func__, index, mStartIdx);
+        return BAD_INDEX;
+    }
+
+    if (0 == mMemInfo[index].handle) {
+        ALOGE("%s: Buffer at %d not registered", __func__, index);
+        return -1;
+    }
+
+    return mCurrentFrameNumbers[index];
+!!!44265271.cpp!!!	getBufferIndex(in frameNumber : uint32_t) : int32_t
+    for (uint32_t index = mStartIdx;
+            index < MM_CAMERA_MAX_NUM_FRAMES; index++) {
+        if (mMemInfo[index].handle &&
+                mCurrentFrameNumbers[index] == (int32_t)frameNumber)
+            return (int32_t)index;
+    }
+    return -1;
+!!!44265399.cpp!!!	getBufferHandle(in index : uint32_t) : void
+    Mutex::Autolock lock(mLock);
+
+    if (MM_CAMERA_MAX_NUM_FRAMES <= index) {
+        ALOGE("%s: index %d out of bound [0, %d)",
+                __func__, index, MM_CAMERA_MAX_NUM_FRAMES);
+        return NULL;
+    }
+    if (index < mStartIdx) {
+        ALOGE("%s: buffer index %d less than starting index %d",
+                __func__, index, mStartIdx);
+        return NULL;
+    }
+
+    if (0 == mMemInfo[index].handle) {
+        ALOGE("%s: Buffer at %d not registered", __func__, index);
+        return NULL;
+    }
+
+    return mBufferHandle[index];
+!!!44265527.cpp!!!	getPtrLocked(in index : uint32_t) : void
+    if (MM_CAMERA_MAX_NUM_FRAMES <= index) {
+        ALOGE("%s: index %d out of bound [0, %d)",
+                __func__, index, MM_CAMERA_MAX_NUM_FRAMES);
+        return NULL;
+    }
+    if (index < mStartIdx) {
+        ALOGE("%s: buffer index %d less than starting index %d",
+                __func__, index, mStartIdx);
+        return NULL;
+    }
+
+
+    if (0 == mMemInfo[index].handle) {
+        ALOGE("%s: Buffer at %d not registered", __func__, index);
+        return NULL;
+    }
+
+    return mPtr[index];
+!!!44265655.cpp!!!	unregisterBufferLocked(in idx : size_t) : int32_t
+    munmap(mPtr[idx], mMemInfo[idx].size);
+    mPtr[idx] = NULL;
+
+    struct ion_handle_data ion_handle;
+    memset(&ion_handle, 0, sizeof(ion_handle));
+    ion_handle.handle = mMemInfo[idx].handle;
+    if (ioctl(mMemInfo[idx].main_ion_fd, ION_IOC_FREE, &ion_handle) < 0) {
+        ALOGE("ion free failed");
+    }
+    close(mMemInfo[idx].main_ion_fd);
+    memset(&mMemInfo[idx], 0, sizeof(struct QCamera3MemInfo));
+    mBufferHandle[idx] = NULL;
+    mPrivateHandle[idx] = NULL;
+    mBufferCount--;
+
+    return NO_ERROR;
+!!!44265783.cpp!!!	getFreeIndexLocked() : int32_t
+    int index = -1;
+
+    if (mBufferCount >= (MM_CAMERA_MAX_NUM_FRAMES - 1)) {
+        ALOGE("%s: Number of buffers %d greater than what's supported %d",
+            __func__, mBufferCount, MM_CAMERA_MAX_NUM_FRAMES);
+        return index;
+    }
+
+    for (size_t i = 0; i < MM_CAMERA_MAX_NUM_FRAMES; i++) {
+        if (0 == mMemInfo[i].handle) {
+            index = i;
+            break;
+        }
+    }
+
+    return index;

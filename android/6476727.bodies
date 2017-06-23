@@ -1,0 +1,144 @@
+class KeepaliveTracker
+!!!73623351.java!!!	KeepaliveTracker(inout handler : Handler)
+        mConnectivityServiceHandler = handler;
+!!!73625015.java!!!	notifyMessenger(inout messenger : Messenger, in slot : int, in err : int) : void
+        Message message = Message.obtain();
+        message.what = EVENT_PACKET_KEEPALIVE;
+        message.arg1 = slot;
+        message.arg2 = err;
+        message.obj = null;
+        try {
+            messenger.send(message);
+        } catch (RemoteException e) {
+            // Process died?
+        }
+!!!73625143.java!!!	findFirstFreeSlot(inout nai : NetworkAgentInfo) : int
+        HashMap networkKeepalives = mKeepalives.get(nai);
+        if (networkKeepalives == null) {
+            networkKeepalives = new HashMap<Integer, KeepaliveInfo>();
+            mKeepalives.put(nai, networkKeepalives);
+        }
+
+        // Find the lowest-numbered free slot. Slot numbers start from 1, because that's what two
+        // separate chipset implementations independently came up with.
+        int slot;
+        for (slot = 1; slot <= networkKeepalives.size(); slot++) {
+            if (networkKeepalives.get(slot) == null) {
+                return slot;
+            }
+        }
+        return slot;
+!!!73625271.java!!!	handleStartKeepalive(inout message : Message) : void
+        KeepaliveInfo ki = (KeepaliveInfo) message.obj;
+        NetworkAgentInfo nai = ki.getNai();
+        int slot = findFirstFreeSlot(nai);
+        mKeepalives.get(nai).put(slot, ki);
+        ki.start(slot);
+!!!73625399.java!!!	handleStopAllKeepalives(inout nai : NetworkAgentInfo, in reason : int) : void
+        HashMap <Integer, KeepaliveInfo> networkKeepalives = mKeepalives.get(nai);
+        if (networkKeepalives != null) {
+            for (KeepaliveInfo ki : networkKeepalives.values()) {
+                ki.stop(reason);
+            }
+            networkKeepalives.clear();
+            mKeepalives.remove(nai);
+        }
+!!!73625527.java!!!	handleStopKeepalive(inout nai : NetworkAgentInfo, in slot : int, in reason : int) : void
+        String networkName = (nai == null) ? "(null)" : nai.name();
+        HashMap <Integer, KeepaliveInfo> networkKeepalives = mKeepalives.get(nai);
+        if (networkKeepalives == null) {
+            Log.e(TAG, "Attempt to stop keepalive on nonexistent network " + networkName);
+            return;
+        }
+        KeepaliveInfo ki = networkKeepalives.get(slot);
+        if (ki == null) {
+            Log.e(TAG, "Attempt to stop nonexistent keepalive " + slot + " on " + networkName);
+            return;
+        }
+        ki.stop(reason);
+        networkKeepalives.remove(slot);
+        if (networkKeepalives.isEmpty()) {
+            mKeepalives.remove(nai);
+        }
+!!!73625655.java!!!	handleCheckKeepalivesStillValid(inout nai : NetworkAgentInfo) : void
+        HashMap <Integer, KeepaliveInfo> networkKeepalives = mKeepalives.get(nai);
+        if (networkKeepalives != null) {
+            ArrayList<Pair<Integer, Integer>> invalidKeepalives = new ArrayList<>();
+            for (int slot : networkKeepalives.keySet()) {
+                int error = networkKeepalives.get(slot).isValid();
+                if (error != SUCCESS) {
+                    invalidKeepalives.add(Pair.create(slot, error));
+                }
+            }
+            for (Pair<Integer, Integer> slotAndError: invalidKeepalives) {
+                handleStopKeepalive(nai, slotAndError.first, slotAndError.second);
+            }
+        }
+!!!73625783.java!!!	handleEventPacketKeepalive(inout nai : NetworkAgentInfo, inout message : Message) : void
+        int slot = message.arg1;
+        int reason = message.arg2;
+
+        KeepaliveInfo ki = null;
+        try {
+            ki = mKeepalives.get(nai).get(slot);
+        } catch(NullPointerException e) {}
+        if (ki == null) {
+            Log.e(TAG, "Event for unknown keepalive " + slot + " on " + nai.name());
+            return;
+        }
+
+        if (reason == SUCCESS && !ki.isStarted) {
+            // Keepalive successfully started.
+            if (DBG) Log.d(TAG, "Started keepalive " + slot + " on " + nai.name());
+            ki.isStarted = true;
+            ki.notifyMessenger(slot, reason);
+        } else {
+            // Keepalive successfully stopped, or error.
+            ki.isStarted = false;
+            if (reason == SUCCESS) {
+                if (DBG) Log.d(TAG, "Successfully stopped keepalive " + slot + " on " + nai.name());
+            } else {
+                if (DBG) Log.d(TAG, "Keepalive " + slot + " on " + nai.name() + " error " + reason);
+            }
+            handleStopKeepalive(nai, slot, reason);
+        }
+!!!73625911.java!!!	startNattKeepalive(inout nai : NetworkAgentInfo, in intervalSeconds : int, inout messenger : Messenger, inout binder : IBinder, inout srcAddrString : String, in srcPort : int, inout dstAddrString : String, in dstPort : int) : void
+        if (nai == null) {
+            notifyMessenger(messenger, NO_KEEPALIVE, ERROR_INVALID_NETWORK);
+            return;
+        }
+
+        InetAddress srcAddress, dstAddress;
+        try {
+            srcAddress = NetworkUtils.numericToInetAddress(srcAddrString);
+            dstAddress = NetworkUtils.numericToInetAddress(dstAddrString);
+        } catch (IllegalArgumentException e) {
+            notifyMessenger(messenger, NO_KEEPALIVE, ERROR_INVALID_IP_ADDRESS);
+            return;
+        }
+
+        KeepalivePacketData packet;
+        try {
+            packet = KeepalivePacketData.nattKeepalivePacket(
+                    srcAddress, srcPort, dstAddress, NATT_PORT);
+        } catch (KeepalivePacketData.InvalidPacketException e) {
+            notifyMessenger(messenger, NO_KEEPALIVE, e.error);
+            return;
+        }
+        KeepaliveInfo ki = new KeepaliveInfo(messenger, binder, nai, packet, intervalSeconds);
+        Log.d(TAG, "Created keepalive: " + ki.toString());
+        mConnectivityServiceHandler.obtainMessage(
+                NetworkAgent.CMD_START_PACKET_KEEPALIVE, ki).sendToTarget();
+!!!73626039.java!!!	dump(inout pw : IndentingPrintWriter) : void
+        pw.println("Packet keepalives:");
+        pw.increaseIndent();
+        for (NetworkAgentInfo nai : mKeepalives.keySet()) {
+            pw.println(nai.name());
+            pw.increaseIndent();
+            for (int slot : mKeepalives.get(nai).keySet()) {
+                KeepaliveInfo ki = mKeepalives.get(nai).get(slot);
+                pw.println(slot + ": " + ki.toString());
+            }
+            pw.decreaseIndent();
+        }
+        pw.decreaseIndent();

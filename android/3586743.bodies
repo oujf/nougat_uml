@@ -1,0 +1,233 @@
+class AndroidContextHub
+!!!44093111.cpp!!!	~AndroidContextHub()
+    if (unlink(kLockFile) < 0) {
+        LOGE("Couldn't remove lock file: %s", strerror(errno));
+    }
+    if (sensor_fd_ >= 0) {
+        DisableActiveSensors();
+        (void) close(sensor_fd_);
+    }
+    if (comms_fd_ >= 0) {
+        (void) close(comms_fd_);
+    }
+!!!44093239.cpp!!!	TerminateHandler() : void
+    (void) unlink(kLockFile);
+!!!44093367.cpp!!!	Initialize() : bool
+    // Acquire a lock on nanohub, so the HAL read threads won't take our events.
+    // We need to delay after creating the file to have good confidence that
+    // the HALs noticed the lock file creation.
+    if (access(kLockDirectory, F_OK) < 0) {
+        if (mkdir(kLockDirectory, kLockDirPermissions) < 0 && errno != EEXIST) {
+            LOGE("Couldn't create lock directory: %s", strerror(errno));
+        }
+    }
+    int lock_fd = open(kLockFile, O_CREAT | O_EXCL, S_IRUSR | S_IWUSR);
+    if (lock_fd < 0) {
+        LOGE("Couldn't create lock file: %s", strerror(errno));
+        if (errno != EEXIST) {
+            return false;
+        }
+    } else {
+        close(lock_fd);
+        std::this_thread::sleep_for(kLockDelay);
+        LOGD("Lock sleep complete");
+    }
+
+    // Sensor device file is used for sensor requests, e.g. configure, etc., and
+    // returns sensor events
+    sensor_fd_ = open(kSensorDeviceFile, O_RDWR);
+    if (sensor_fd_ < 0) {
+        LOGE("Couldn't open device file: %s", strerror(errno));
+        return false;
+    }
+
+    // The comms device file is used for more generic communication with
+    // nanoapps. Calibration results are returned through this channel.
+    comms_fd_ = open(kCommsDeviceFile, O_RDONLY);
+    if (comms_fd_ < 0) {
+        // TODO(bduddie): Currently informational only, as the kernel change
+        // that adds this device file is not available/propagated yet.
+        // Eventually this should be an error.
+        LOGI("Couldn't open comms device file: %s", strerror(errno));
+    }
+
+    return true;
+!!!44093495.cpp!!!	LoadCalibration() : bool
+    std::vector<uint8_t> cal_data;
+    bool success = true;
+
+    for (size_t i = 0; success && i < kCalibrationKeys.size(); i++) {
+        std::string key;
+        SensorType sensor_type;
+
+        std::tie(key, sensor_type) = kCalibrationKeys[i];
+        if (GetCalibrationBytes(key.c_str(), sensor_type, cal_data)) {
+            success = SendCalibrationData(sensor_type, cal_data);
+        }
+
+        cal_data.clear();
+    }
+
+    return success;
+!!!44093623.cpp!!!	SetLoggingEnabled(in logging_enabled : bool) : void
+    if (logging_enabled) {
+        LOGE("Logging is not supported on this platform");
+    }
+!!!44093751.cpp!!!	WriteEvent(in message : std::vector<uint8_t>) : ContextHub::TransportResult
+    ContextHub::TransportResult result;
+
+    LOGD("Writing %zu bytes", message.size());
+    LOGD_BUF(message.data(), message.size());
+    int ret = write(sensor_fd_, message.data(), message.size());
+    if (ret == -1) {
+        LOGE("Couldn't write %zu bytes to device file: %s", message.size(),
+             strerror(errno));
+        result = TransportResult::GeneralFailure;
+    } else if (ret != (int) message.size()) {
+        LOGW("Write returned %d, expected %zu", ret, message.size());
+        result = TransportResult::GeneralFailure;
+    } else {
+        LOGD("Successfully sent event");
+        result = TransportResult::Success;
+    }
+
+    return result;
+!!!44093879.cpp!!!	ReadEvent(inout message : std::vector<uint8_t>, in timeout_ms : int) : ContextHub::TransportResult
+    ContextHub::TransportResult result = TransportResult::GeneralFailure;
+
+    struct pollfd pollfds[kDeviceFileCount];
+    int fd_count = ResetPollFds(pollfds, kDeviceFileCount);
+
+    int timeout = timeout_ms > 0 ? timeout_ms : kPollNoTimeout;
+    int ret = poll(pollfds, fd_count, timeout);
+    if (ret < 0) {
+        LOGE("Polling failed: %s", strerror(errno));
+        if (errno == EINTR) {
+            result = TransportResult::Canceled;
+        }
+    } else if (ret == 0) {
+        LOGD("Poll timed out");
+        result = TransportResult::Timeout;
+    } else {
+        int read_fd = -1;
+        for (int i = 0; i < kDeviceFileCount; i++) {
+            if (pollfds[i].revents & POLLIN) {
+                read_fd = pollfds[i].fd;
+                break;
+            }
+        }
+
+        if (read_fd == sensor_fd_) {
+            LOGD("Data ready on sensors device file");
+        } else if (read_fd == comms_fd_) {
+            LOGD("Data ready on comms device file");
+        }
+
+        if (read_fd >= 0) {
+            result = ReadEventFromFd(read_fd, message);
+        } else {
+            LOGE("Poll returned but none of expected files are ready");
+        }
+    }
+
+    return result;
+!!!44094007.cpp!!!	FlashSensorHub(in bytes : std::vector<uint8_t>) : bool
+    (void)bytes;
+    LOGE("Flashing is not supported on this platform");
+    return false;
+!!!44094135.cpp!!!	SetCalibration(in sensor_type : SensorType, in data : int32_t) : bool
+    LOGI("Setting calibration for sensor %d (%s) to %d",
+         static_cast<int>(sensor_type),
+         ContextHub::SensorTypeToAbbrevName(sensor_type).c_str(), data);
+    auto cal_file = CalibrationFile::Instance();
+    const char *key = AndroidContextHub::SensorTypeToCalibrationKey(sensor_type);
+    if (cal_file && key) {
+        return cal_file->SetSingleAxis(key, data);
+    }
+    return false;
+!!!44094263.cpp!!!	SetCalibration(in sensor_type : SensorType, in data : float) : bool
+    LOGI("Setting calibration for sensor %d (%s) to %f",
+         static_cast<int>(sensor_type),
+         ContextHub::SensorTypeToAbbrevName(sensor_type).c_str(), data);
+    auto cal_file = CalibrationFile::Instance();
+    const char *key = AndroidContextHub::SensorTypeToCalibrationKey(sensor_type);
+    if (cal_file && key) {
+        return cal_file->SetSingleAxis(key, data);
+    }
+    return false;
+!!!44094391.cpp!!!	SetCalibration(in sensor_type : SensorType, in x : int32_t, in y : int32_t, in z : int32_t) : bool
+    LOGI("Setting calibration for %d to %d %d %d", static_cast<int>(sensor_type),
+         x, y, z);
+    auto cal_file = CalibrationFile::Instance();
+    const char *key = AndroidContextHub::SensorTypeToCalibrationKey(sensor_type);
+    if (cal_file && key) {
+        return cal_file->SetTripleAxis(key, x, y, z);
+    }
+    return false;
+!!!44094519.cpp!!!	SetCalibration(in sensor_type : SensorType, in x : int32_t, in y : int32_t, in z : int32_t, in w : int32_t) : bool
+    LOGI("Setting calibration for %d to %d %d %d %d", static_cast<int>(sensor_type),
+         x, y, z, w);
+    auto cal_file = CalibrationFile::Instance();
+    const char *key = AndroidContextHub::SensorTypeToCalibrationKey(sensor_type);
+    if (cal_file && key) {
+        return cal_file->SetFourAxis(key, x, y, z, w);
+    }
+    return false;
+!!!44094647.cpp!!!	SaveCalibration() : bool
+    LOGI("Saving calibration data");
+    auto cal_file = CalibrationFile::Instance();
+    if (cal_file) {
+        return cal_file->Save();
+    }
+    return false;
+!!!44094775.cpp!!!	ReadEventFromFd(in fd : int, inout message : std::vector<uint8_t>) : ContextHub::TransportResult
+    ContextHub::TransportResult result = TransportResult::GeneralFailure;
+
+    // Set the size to the maximum, so when we resize later, it's always a
+    // shrink (otherwise it will end up clearing the bytes)
+    message.resize(message.capacity());
+
+    LOGD("Calling into read()");
+    int ret = read(fd, message.data(), message.capacity());
+    if (ret < 0) {
+        LOGE("Couldn't read from device file: %s", strerror(errno));
+        if (errno == EINTR) {
+            result = TransportResult::Canceled;
+        }
+    } else if (ret == 0) {
+        // We might need to handle this specially, if the driver implements this
+        // to mean something specific
+        LOGE("Read unexpectedly returned 0 bytes");
+    } else {
+        message.resize(ret);
+        LOGD_VEC(message);
+        result = TransportResult::Success;
+    }
+
+    return result;
+!!!44094903.cpp!!!	ResetPollFds(inout pfds : pollfd, in count : size_t) : int
+    memset(pfds, 0, sizeof(struct pollfd) * count);
+    pfds[0].fd = sensor_fd_;
+    pfds[0].events = POLLIN;
+
+    int nfds = 1;
+    if (count > 1 && comms_fd_ >= 0) {
+        pfds[1].fd = comms_fd_;
+        pfds[1].events = POLLIN;
+        nfds++;
+    }
+    return nfds;
+!!!44095031.cpp!!!	SensorTypeToCalibrationKey(in sensor_type : SensorType) : char
+    for (size_t i = 0; i < kCalibrationKeys.size(); i++) {
+        const char *key;
+        SensorType sensor_type_for_key;
+
+        std::tie(key, sensor_type_for_key) = kCalibrationKeys[i];
+        if (sensor_type == sensor_type_for_key) {
+            return key;
+        }
+    }
+
+    LOGE("No calibration key mapping for sensor type %d",
+         static_cast<int>(sensor_type));
+    return nullptr;

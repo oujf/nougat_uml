@@ -1,0 +1,267 @@
+class Font
+!!!46789687.cpp!!!	~Font()
+#ifndef ANDROID_RS_SERIALIZE
+    if (mFace) {
+        FT_Done_Face(mFace);
+    }
+#endif
+
+    for (uint32_t i = 0; i < mCachedGlyphs.size(); i ++) {
+        CachedGlyphInfo *glyph = mCachedGlyphs.valueAt(i);
+        delete glyph;
+    }
+!!!46790071.cpp!!!	create(inout rsc : Context, in name : char, in fontSize : float, in dpi : uint32_t, in data : void = nullptr, in dataLen : uint32_t = 0) : Font
+    rsc->mStateFont.checkInit();
+    Vector<Font*> &activeFonts = rsc->mStateFont.mActiveFonts;
+
+    for (uint32_t i = 0; i < activeFonts.size(); i ++) {
+        Font *ithFont = activeFonts[i];
+        if (ithFont->mFontName == name && ithFont->mFontSize == fontSize && ithFont->mDpi == dpi) {
+            return ithFont;
+        }
+    }
+
+    Font *newFont = new Font(rsc);
+    bool isInitialized = newFont->init(name, fontSize, dpi, data, dataLen);
+    if (isInitialized) {
+        activeFonts.push(newFont);
+        rsc->mStateFont.precacheLatin(newFont);
+        return newFont;
+    }
+
+    ObjectBase::checkDelete(newFont);
+    return nullptr;
+!!!46790199.cpp!!!	renderUTF(in text : char, in len : uint32_t, in x : int32_t, in y : int32_t, in start : uint32_t, in numGlyphs : int32_t, in mode : Font::RenderMode = FRAMEBUFFER, inout bounds : Font::Rect = nullptr, inout bitmap : uint8_t = nullptr, in bitmapW : uint32_t = 0, in bitmapH : uint32_t = 0) : void
+    if (!mInitialized || numGlyphs == 0 || text == nullptr || len == 0) {
+        return;
+    }
+
+    if (mode == Font::MEASURE) {
+        if (bounds == nullptr) {
+            ALOGE("No return rectangle provided to measure text");
+            return;
+        }
+        // Reset min and max of the bounding box to something large
+        bounds->set(1e6, -1e6, 1e6, -1e6);
+    }
+
+    int32_t penX = x, penY = y;
+    int32_t glyphsLeft = 1;
+    if (numGlyphs > 0) {
+        glyphsLeft = numGlyphs;
+    }
+
+    size_t index = start;
+    size_t nextIndex = 0;
+
+    while (glyphsLeft > 0) {
+
+        int32_t utfChar = utf32_from_utf8_at(text, len, index, &nextIndex);
+
+        // Reached the end of the string or encountered
+        if (utfChar < 0) {
+            break;
+        }
+
+        // Move to the next character in the array
+        index = nextIndex;
+
+        CachedGlyphInfo *cachedGlyph = getCachedUTFChar(utfChar);
+
+        // If it's still not valid, we couldn't cache it, so we shouldn't draw garbage
+        if (cachedGlyph->mIsValid) {
+            switch (mode) {
+            case FRAMEBUFFER:
+                drawCachedGlyph(cachedGlyph, penX, penY);
+                break;
+            case BITMAP:
+                drawCachedGlyph(cachedGlyph, penX, penY, bitmap, bitmapW, bitmapH);
+                break;
+            case MEASURE:
+                measureCachedGlyph(cachedGlyph, penX, penY, bounds);
+                break;
+            }
+        }
+
+        penX += (cachedGlyph->mAdvanceX >> 6);
+
+        // If we were given a specific number of glyphs, decrement
+        if (numGlyphs > 0) {
+            glyphsLeft --;
+        }
+    }
+!!!46790327.cpp!!!	invalidateTextureCache() : void
+    for (uint32_t i = 0; i < mCachedGlyphs.size(); i ++) {
+        mCachedGlyphs.valueAt(i)->mIsValid = false;
+    }
+!!!46790455.cpp!!!	Font(inout rsc : Context)
+    mInitialized = false;
+    mHasKerning = false;
+    mFace = nullptr;
+!!!46790583.cpp!!!	init(in name : char, in fontSize : float, in dpi : uint32_t, in data : void = nullptr, in dataLen : uint32_t = 0) : bool
+#ifndef ANDROID_RS_SERIALIZE
+    if (mInitialized) {
+        ALOGE("Reinitialization of fonts not supported");
+        return false;
+    }
+
+    FT_Error error = 0;
+    if (data != nullptr && dataLen > 0) {
+        error = FT_New_Memory_Face(mRSC->mStateFont.getLib(), (const FT_Byte*)data, dataLen, 0, &mFace);
+    } else {
+        error = FT_New_Face(mRSC->mStateFont.getLib(), name, 0, &mFace);
+    }
+
+    if (error) {
+        ALOGE("Unable to initialize font %s", name);
+        return false;
+    }
+
+    mFontName = rsuCopyString(name);
+    mFontSize = fontSize;
+    mDpi = dpi;
+
+    error = FT_Set_Char_Size(mFace, (FT_F26Dot6)(fontSize * 64.0f), 0, dpi, 0);
+    if (error) {
+        ALOGE("Unable to set font size on %s", name);
+        return false;
+    }
+
+    mHasKerning = FT_HAS_KERNING(mFace);
+
+    mInitialized = true;
+#endif //ANDROID_RS_SERIALIZE
+    return true;
+!!!46790711.cpp!!!	preDestroy() : void
+    for (uint32_t ct = 0; ct < mRSC->mStateFont.mActiveFonts.size(); ct++) {
+        if (mRSC->mStateFont.mActiveFonts[ct] == this) {
+            mRSC->mStateFont.mActiveFonts.removeAt(ct);
+            break;
+        }
+    }
+!!!46790839.cpp!!!	getCachedUTFChar(in utfChar : int32_t) : Font::CachedGlyphInfo
+
+    CachedGlyphInfo *cachedGlyph = mCachedGlyphs.valueFor((uint32_t)utfChar);
+    if (cachedGlyph == nullptr) {
+        cachedGlyph = cacheGlyph((uint32_t)utfChar);
+    }
+    // Is the glyph still in texture cache?
+    if (!cachedGlyph->mIsValid) {
+        updateGlyphCache(cachedGlyph);
+    }
+
+    return cachedGlyph;
+!!!46790967.cpp!!!	cacheGlyph(in glyph : uint32_t) : Font::CachedGlyphInfo
+    CachedGlyphInfo *newGlyph = new CachedGlyphInfo();
+    mCachedGlyphs.add(glyph, newGlyph);
+#ifndef ANDROID_RS_SERIALIZE
+    newGlyph->mGlyphIndex = FT_Get_Char_Index(mFace, glyph);
+    newGlyph->mIsValid = false;
+#endif //ANDROID_RS_SERIALIZE
+    updateGlyphCache(newGlyph);
+
+    return newGlyph;
+!!!46791095.cpp!!!	updateGlyphCache(inout glyph : Font::CachedGlyphInfo) : void
+#ifndef ANDROID_RS_SERIALIZE
+    FT_Error error = FT_Load_Glyph( mFace, glyph->mGlyphIndex, FT_LOAD_RENDER );
+    if (error) {
+        ALOGE("Couldn't load glyph.");
+        return;
+    }
+
+    glyph->mAdvanceX = mFace->glyph->advance.x;
+    glyph->mAdvanceY = mFace->glyph->advance.y;
+    glyph->mBitmapLeft = mFace->glyph->bitmap_left;
+    glyph->mBitmapTop = mFace->glyph->bitmap_top;
+
+    FT_Bitmap *bitmap = &mFace->glyph->bitmap;
+
+    // Now copy the bitmap into the cache texture
+    uint32_t startX = 0;
+    uint32_t startY = 0;
+
+    // Let the font state figure out where to put the bitmap
+    FontState *state = &mRSC->mStateFont;
+    glyph->mIsValid = state->cacheBitmap(bitmap, &startX, &startY);
+
+    if (!glyph->mIsValid) {
+        return;
+    }
+
+    uint32_t endX = startX + bitmap->width;
+    uint32_t endY = startY + bitmap->rows;
+
+    glyph->mBitmapMinX = startX;
+    glyph->mBitmapMinY = startY;
+    glyph->mBitmapWidth = bitmap->width;
+    glyph->mBitmapHeight = bitmap->rows;
+
+    uint32_t cacheWidth = state->getCacheTextureType()->getDimX();
+    uint32_t cacheHeight = state->getCacheTextureType()->getDimY();
+
+    glyph->mBitmapMinU = (float)startX / (float)cacheWidth;
+    glyph->mBitmapMinV = (float)startY / (float)cacheHeight;
+    glyph->mBitmapMaxU = (float)endX / (float)cacheWidth;
+    glyph->mBitmapMaxV = (float)endY / (float)cacheHeight;
+#endif //ANDROID_RS_SERIALIZE
+!!!46791223.cpp!!!	measureCachedGlyph(inout glyph : Font::CachedGlyphInfo, in x : int32_t, in y : int32_t, inout bounds : Font::Rect) : void
+    int32_t nPenX = x + glyph->mBitmapLeft;
+    int32_t nPenY = y - glyph->mBitmapTop + glyph->mBitmapHeight;
+
+    int32_t width = (int32_t) glyph->mBitmapWidth;
+    int32_t height = (int32_t) glyph->mBitmapHeight;
+
+    // 0, 0 is top left, so bottom is a positive number
+    if (bounds->bottom < nPenY) {
+        bounds->bottom = nPenY;
+    }
+    if (bounds->left > nPenX) {
+        bounds->left = nPenX;
+    }
+    if (bounds->right < nPenX + width) {
+        bounds->right = nPenX + width;
+    }
+    if (bounds->top > nPenY - height) {
+        bounds->top = nPenY - height;
+    }
+!!!46791351.cpp!!!	drawCachedGlyph(inout glyph : Font::CachedGlyphInfo, in x : int32_t, in y : int32_t) : void
+    FontState *state = &mRSC->mStateFont;
+
+    int32_t nPenX = x + glyph->mBitmapLeft;
+    int32_t nPenY = y - glyph->mBitmapTop + glyph->mBitmapHeight;
+
+    float u1 = glyph->mBitmapMinU;
+    float u2 = glyph->mBitmapMaxU;
+    float v1 = glyph->mBitmapMinV;
+    float v2 = glyph->mBitmapMaxV;
+
+    int32_t width = (int32_t) glyph->mBitmapWidth;
+    int32_t height = (int32_t) glyph->mBitmapHeight;
+
+    state->appendMeshQuad(nPenX, nPenY, 0, u1, v2,
+                          nPenX + width, nPenY, 0, u2, v2,
+                          nPenX + width, nPenY - height, 0, u2, v1,
+                          nPenX, nPenY - height, 0, u1, v1);
+!!!46791479.cpp!!!	drawCachedGlyph(inout glyph : Font::CachedGlyphInfo, in x : int32_t, in y : int32_t, inout bitmap : uint8_t, in bitmapW : uint32_t, in bitmapH : uint32_t) : void
+    int32_t nPenX = x + glyph->mBitmapLeft;
+    int32_t nPenY = y + glyph->mBitmapTop;
+
+    uint32_t endX = glyph->mBitmapMinX + glyph->mBitmapWidth;
+    uint32_t endY = glyph->mBitmapMinY + glyph->mBitmapHeight;
+
+    FontState *state = &mRSC->mStateFont;
+    uint32_t cacheWidth = state->getCacheTextureType()->getDimX();
+    const uint8_t* cacheBuffer = state->mCacheBuffer;
+
+    uint32_t cacheX = 0, cacheY = 0;
+    int32_t bX = 0, bY = 0;
+    for (cacheX = glyph->mBitmapMinX, bX = nPenX; cacheX < endX; cacheX++, bX++) {
+        for (cacheY = glyph->mBitmapMinY, bY = nPenY; cacheY < endY; cacheY++, bY++) {
+            if (bX < 0 || bY < 0 || bX >= (int32_t) bitmapW || bY >= (int32_t) bitmapH) {
+                ALOGE("Skipping invalid index");
+                continue;
+            }
+            uint8_t tempCol = cacheBuffer[cacheY * cacheWidth + cacheX];
+            bitmap[bY * bitmapW + bX] = tempCol;
+        }
+    }

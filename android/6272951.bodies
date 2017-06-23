@@ -1,0 +1,463 @@
+class PrintSpoolerService
+!!!71223735.java!!!	peekInstance() : PrintSpoolerService
+        synchronized (sLock) {
+            return sInstance;
+        }
+!!!71223863.java!!!	onCreate() : void
+        super.onCreate();
+        mHandlerCaller = new HandlerCaller(this, getMainLooper(),
+                new HandlerCallerCallback(), false);
+
+        mPersistanceManager = new PersistenceManager();
+        mNotificationController = new NotificationController(PrintSpoolerService.this);
+        mCustomIconCache = new CustomPrinterIconCache(getCacheDir());
+
+        synchronized (mLock) {
+            mPersistanceManager.readStateLocked();
+            handleReadPrintJobsLocked();
+        }
+
+        synchronized (sLock) {
+            sInstance = this;
+        }
+!!!71223991.java!!!	onDestroy() : void
+        super.onDestroy();
+!!!71224119.java!!!	onBind(inout intent : Intent) : IBinder
+        return new PrintSpooler();
+!!!71224247.java!!!	dump(inout fd : FileDescriptor, inout pw : PrintWriter, inout args : String [[]]) : void
+        String prefix = (args.length > 0) ? args[0] : "";
+        String tab = "  ";
+
+        synchronized (mLock) {
+            pw.append(prefix).append("print jobs:").println();
+            final int printJobCount = mPrintJobs.size();
+            for (int i = 0; i < printJobCount; i++) {
+                PrintJobInfo printJob = mPrintJobs.get(i);
+                pw.append(prefix).append(tab).append(printJob.toString());
+                pw.println();
+            }
+
+            pw.append(prefix).append("print job files:").println();
+            File[] files = getFilesDir().listFiles();
+            if (files != null) {
+                final int fileCount = files.length;
+                for (int i = 0; i < fileCount; i++) {
+                    File file = files[i];
+                    if (file.isFile() && file.getName().startsWith(PRINT_JOB_FILE_PREFIX)) {
+                        pw.append(prefix).append(tab).append(file.getName()).println();
+                    }
+                }
+            }
+        }
+
+        pw.append(prefix).append("approved print services:").println();
+        Set<String> approvedPrintServices = (new ApprovedPrintServices(this)).getApprovedServices();
+        if (approvedPrintServices != null) {
+            for (String approvedService : approvedPrintServices) {
+                pw.append(prefix).append(tab).append(approvedService).println();
+            }
+        }
+!!!71224375.java!!!	sendOnPrintJobQueued(inout printJob : PrintJobInfo) : void
+        Message message = mHandlerCaller.obtainMessageO(
+                HandlerCallerCallback.MSG_ON_PRINT_JOB_QUEUED, printJob);
+        mHandlerCaller.executeOrSendMessage(message);
+!!!71224503.java!!!	sendOnAllPrintJobsForServiceHandled(inout service : ComponentName) : void
+        Message message = mHandlerCaller.obtainMessageO(
+                HandlerCallerCallback.MSG_ON_ALL_PRINT_JOBS_FOR_SERIVICE_HANDLED, service);
+        mHandlerCaller.executeOrSendMessage(message);
+!!!71224631.java!!!	sendOnAllPrintJobsHandled() : void
+        Message message = mHandlerCaller.obtainMessage(
+                HandlerCallerCallback.MSG_ON_ALL_PRINT_JOBS_HANDLED);
+        mHandlerCaller.executeOrSendMessage(message);
+!!!71224887.java!!!	getPrintJobInfos(inout componentName : ComponentName, in state : int, in appId : int) : PrintJobInfo
+        List<PrintJobInfo> foundPrintJobs = null;
+        synchronized (mLock) {
+            final int printJobCount = mPrintJobs.size();
+            for (int i = 0; i < printJobCount; i++) {
+                PrintJobInfo printJob = mPrintJobs.get(i);
+                PrinterId printerId = printJob.getPrinterId();
+                final boolean sameComponent = (componentName == null
+                        || (printerId != null
+                        && componentName.equals(printerId.getServiceName())));
+                final boolean sameAppId = appId == PrintManager.APP_ID_ANY
+                        || printJob.getAppId() == appId;
+                final boolean sameState = (state == printJob.getState())
+                        || (state == PrintJobInfo.STATE_ANY)
+                        || (state == PrintJobInfo.STATE_ANY_VISIBLE_TO_CLIENTS
+                            && isStateVisibleToUser(printJob.getState()))
+                        || (state == PrintJobInfo.STATE_ANY_ACTIVE
+                            && isActiveState(printJob.getState()))
+                        || (state == PrintJobInfo.STATE_ANY_SCHEDULED
+                            && isScheduledState(printJob.getState()));
+                if (sameComponent && sameAppId && sameState) {
+                    if (foundPrintJobs == null) {
+                        foundPrintJobs = new ArrayList<>();
+                    }
+                    foundPrintJobs.add(printJob);
+                }
+            }
+        }
+        return foundPrintJobs;
+!!!71225015.java!!!	isStateVisibleToUser(in state : int) : boolean
+        return (isActiveState(state) && (state == PrintJobInfo.STATE_FAILED
+                || state == PrintJobInfo.STATE_COMPLETED || state == PrintJobInfo.STATE_CANCELED
+                || state == PrintJobInfo.STATE_BLOCKED));
+!!!71225143.java!!!	getPrintJobInfo(inout printJobId : PrintJobId, in appId : int) : PrintJobInfo
+        synchronized (mLock) {
+            final int printJobCount = mPrintJobs.size();
+            for (int i = 0; i < printJobCount; i++) {
+                PrintJobInfo printJob = mPrintJobs.get(i);
+                if (printJob.getId().equals(printJobId)
+                        && (appId == PrintManager.APP_ID_ANY
+                        || appId == printJob.getAppId())) {
+                    return printJob;
+                }
+            }
+            return null;
+        }
+!!!71225271.java!!!	createPrintJob(inout printJob : PrintJobInfo) : void
+        synchronized (mLock) {
+            addPrintJobLocked(printJob);
+            setPrintJobState(printJob.getId(), PrintJobInfo.STATE_CREATED, null);
+
+            Message message = mHandlerCaller.obtainMessageO(
+                    HandlerCallerCallback.MSG_ON_PRINT_JOB_STATE_CHANGED,
+                    printJob);
+            mHandlerCaller.executeOrSendMessage(message);
+        }
+!!!71225399.java!!!	handleReadPrintJobsLocked() : void
+        // Make a map with the files for a print job since we may have
+        // to delete some. One example of getting orphan files if the
+        // spooler crashes while constructing a print job. We do not
+        // persist partially populated print jobs under construction to
+        // avoid special handling for various attributes missing.
+        ArrayMap<PrintJobId, File> fileForJobMap = null;
+        File[] files = getFilesDir().listFiles();
+        if (files != null) {
+            final int fileCount = files.length;
+            for (int i = 0; i < fileCount; i++) {
+                File file = files[i];
+                if (file.isFile() && file.getName().startsWith(PRINT_JOB_FILE_PREFIX)) {
+                    if (fileForJobMap == null) {
+                        fileForJobMap = new ArrayMap<PrintJobId, File>();
+                    }
+                    String printJobIdString = file.getName().substring(
+                            PRINT_JOB_FILE_PREFIX.length(),
+                            file.getName().indexOf('.'));
+                    PrintJobId printJobId = PrintJobId.unflattenFromString(
+                            printJobIdString);
+                    fileForJobMap.put(printJobId, file);
+                }
+            }
+        }
+
+        final int printJobCount = mPrintJobs.size();
+        for (int i = 0; i < printJobCount; i++) {
+            PrintJobInfo printJob = mPrintJobs.get(i);
+
+            // We want to have only the orphan files at the end.
+            if (fileForJobMap != null) {
+                fileForJobMap.remove(printJob.getId());
+            }
+
+            switch (printJob.getState()) {
+                case PrintJobInfo.STATE_QUEUED:
+                case PrintJobInfo.STATE_STARTED:
+                case PrintJobInfo.STATE_BLOCKED: {
+                    // We have a print job that was queued or started or blocked in
+                    // the past but the device battery died or a crash occurred. In
+                    // this case we assume the print job failed and let the user
+                    // decide whether to restart the job or just cancel it.
+                    setPrintJobState(printJob.getId(), PrintJobInfo.STATE_FAILED,
+                            getString(R.string.no_connection_to_printer));
+                } break;
+            }
+        }
+
+        if (!mPrintJobs.isEmpty()) {
+            // Update the notification.
+            mNotificationController.onUpdateNotifications(mPrintJobs);
+        }
+
+        // Delete the orphan files.
+        if (fileForJobMap != null) {
+            final int orphanFileCount = fileForJobMap.size();
+            for (int i = 0; i < orphanFileCount; i++) {
+                File file = fileForJobMap.valueAt(i);
+                file.delete();
+            }
+        }
+!!!71225527.java!!!	checkAllPrintJobsHandled() : void
+        synchronized (mLock) {
+            if (!hasActivePrintJobsLocked()) {
+                notifyOnAllPrintJobsHandled();
+            }
+        }
+!!!71225655.java!!!	writePrintJobData(in fd : ParcelFileDescriptor, in printJobId : PrintJobId) : void
+        final PrintJobInfo printJob;
+        synchronized (mLock) {
+            printJob = getPrintJobInfo(printJobId, PrintManager.APP_ID_ANY);
+        }
+        new AsyncTask<Void, Void, Void>() {
+            @Override
+            protected Void doInBackground(Void... params) {
+                FileInputStream in = null;
+                FileOutputStream out = null;
+                try {
+                    if (printJob != null) {
+                        File file = generateFileForPrintJob(PrintSpoolerService.this, printJobId);
+                        in = new FileInputStream(file);
+                        out = new FileOutputStream(fd.getFileDescriptor());
+                    }
+                    final byte[] buffer = new byte[8192];
+                    while (true) {
+                        final int readByteCount = in.read(buffer);
+                        if (readByteCount < 0) {
+                            return null;
+                        }
+                        out.write(buffer, 0, readByteCount);
+                    }
+                } catch (FileNotFoundException fnfe) {
+                    Log.e(LOG_TAG, "Error writing print job data!", fnfe);
+                } catch (IOException ioe) {
+                    Log.e(LOG_TAG, "Error writing print job data!", ioe);
+                } finally {
+                    IoUtils.closeQuietly(in);
+                    IoUtils.closeQuietly(out);
+                    IoUtils.closeQuietly(fd);
+                }
+                Log.i(LOG_TAG, "[END WRITE]");
+                return null;
+            }
+        }.executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR, (Void[]) null);
+!!!71225783.java!!!	generateFileForPrintJob(inout context : Context, inout printJobId : PrintJobId) : File
+        return new File(context.getFilesDir(), PRINT_JOB_FILE_PREFIX
+                + printJobId.flattenToString() + "." + PRINT_FILE_EXTENSION);
+!!!71225911.java!!!	addPrintJobLocked(inout printJob : PrintJobInfo) : void
+        mPrintJobs.add(printJob);
+        if (DEBUG_PRINT_JOB_LIFECYCLE) {
+            Slog.i(LOG_TAG, "[ADD] " + printJob);
+        }
+!!!71226039.java!!!	removeObsoletePrintJobs() : void
+        synchronized (mLock) {
+            boolean persistState = false;
+            final int printJobCount = mPrintJobs.size();
+            for (int i = printJobCount - 1; i >= 0; i--) {
+                PrintJobInfo printJob = mPrintJobs.get(i);
+                if (isObsoleteState(printJob.getState())) {
+                    mPrintJobs.remove(i);
+                    if (DEBUG_PRINT_JOB_LIFECYCLE) {
+                        Slog.i(LOG_TAG, "[REMOVE] " + printJob.getId().flattenToString());
+                    }
+                    removePrintJobFileLocked(printJob.getId());
+                    persistState = true;
+                }
+            }
+            if (persistState) {
+                mPersistanceManager.writeStateLocked();
+            }
+        }
+!!!71226167.java!!!	removePrintJobFileLocked(inout printJobId : PrintJobId) : void
+        File file = generateFileForPrintJob(PrintSpoolerService.this, printJobId);
+        if (file.exists()) {
+            file.delete();
+            if (DEBUG_PRINT_JOB_LIFECYCLE) {
+                Slog.i(LOG_TAG, "[REMOVE FILE FOR] " + printJobId);
+            }
+        }
+!!!71226295.java!!!	notifyPrintJobUpdated(inout printJob : PrintJobInfo) : void
+        Message message = mHandlerCaller.obtainMessageO(
+                HandlerCallerCallback.MSG_ON_PRINT_JOB_STATE_CHANGED,
+                printJob);
+        mHandlerCaller.executeOrSendMessage(message);
+
+        mNotificationController.onUpdateNotifications(mPrintJobs);
+!!!71226423.java!!!	setPrintJobState(inout printJobId : PrintJobId, in state : int, inout error : String) : boolean
+        boolean success = false;
+
+        synchronized (mLock) {
+            PrintJobInfo printJob = getPrintJobInfo(printJobId, PrintManager.APP_ID_ANY);
+            if (printJob != null) {
+                final int oldState = printJob.getState();
+                if (oldState == state) {
+                    return false;
+                }
+
+                success = true;
+
+                printJob.setState(state);
+                printJob.setStatus(error);
+                printJob.setCancelling(false);
+
+                if (DEBUG_PRINT_JOB_LIFECYCLE) {
+                    Slog.i(LOG_TAG, "[STATE CHANGED] " + printJob);
+                }
+
+                MetricsLogger.histogram(this, "print_job_state", state);
+                switch (state) {
+                    case PrintJobInfo.STATE_COMPLETED:
+                    case PrintJobInfo.STATE_CANCELED:
+                        mPrintJobs.remove(printJob);
+                        removePrintJobFileLocked(printJob.getId());
+                        // $fall-through$
+
+                    case PrintJobInfo.STATE_FAILED: {
+                        PrinterId printerId = printJob.getPrinterId();
+                        if (printerId != null) {
+                            ComponentName service = printerId.getServiceName();
+                            if (!hasActivePrintJobsForServiceLocked(service)) {
+                                sendOnAllPrintJobsForServiceHandled(service);
+                            }
+                        }
+                    } break;
+
+                    case PrintJobInfo.STATE_QUEUED: {
+                        sendOnPrintJobQueued(new PrintJobInfo(printJob));
+                    }  break;
+                }
+
+                if (shouldPersistPrintJob(printJob)) {
+                    mPersistanceManager.writeStateLocked();
+                }
+
+                if (!hasActivePrintJobsLocked()) {
+                    notifyOnAllPrintJobsHandled();
+                }
+
+                notifyPrintJobUpdated(printJob);
+            }
+        }
+
+        return success;
+!!!71226551.java!!!	setProgress(inout printJobId : PrintJobId, in progress : float) : void
+        synchronized (mLock) {
+            getPrintJobInfo(printJobId, PrintManager.APP_ID_ANY).setProgress(progress);
+
+            mNotificationController.onUpdateNotifications(mPrintJobs);
+        }
+!!!71226679.java!!!	setStatus(inout printJobId : PrintJobId, inout status : CharSequence) : void
+        synchronized (mLock) {
+            PrintJobInfo printJob = getPrintJobInfo(printJobId, PrintManager.APP_ID_ANY);
+
+            if (printJob != null) {
+                printJob.setStatus(status);
+                notifyPrintJobUpdated(printJob);
+            }
+        }
+!!!71226807.java!!!	setStatus(inout printJobId : PrintJobId, in status : int, inout appPackageName : CharSequence) : void
+        synchronized (mLock) {
+            PrintJobInfo printJob = getPrintJobInfo(printJobId, PrintManager.APP_ID_ANY);
+
+            if (printJob != null) {
+                printJob.setStatus(status, appPackageName);
+                notifyPrintJobUpdated(printJob);
+            }
+        }
+!!!71226935.java!!!	hasActivePrintJobsLocked() : boolean
+        final int printJobCount = mPrintJobs.size();
+        for (int i = 0; i < printJobCount; i++) {
+            PrintJobInfo printJob = mPrintJobs.get(i);
+            if (isActiveState(printJob.getState())) {
+                return true;
+            }
+        }
+        return false;
+!!!71227063.java!!!	hasActivePrintJobsForServiceLocked(inout service : ComponentName) : boolean
+        final int printJobCount = mPrintJobs.size();
+        for (int i = 0; i < printJobCount; i++) {
+            PrintJobInfo printJob = mPrintJobs.get(i);
+            if (isActiveState(printJob.getState()) && printJob.getPrinterId() != null
+                    && printJob.getPrinterId().getServiceName().equals(service)) {
+                return true;
+            }
+        }
+        return false;
+!!!71227191.java!!!	isObsoleteState(in printJobState : int) : boolean
+        return (isTerminalState(printJobState)
+                || printJobState == PrintJobInfo.STATE_QUEUED);
+!!!71227319.java!!!	isScheduledState(in printJobState : int) : boolean
+        return printJobState == PrintJobInfo.STATE_QUEUED
+                || printJobState == PrintJobInfo.STATE_STARTED
+                || printJobState == PrintJobInfo.STATE_BLOCKED;
+!!!71227447.java!!!	isActiveState(in printJobState : int) : boolean
+        return printJobState == PrintJobInfo.STATE_CREATED
+                || printJobState == PrintJobInfo.STATE_QUEUED
+                || printJobState == PrintJobInfo.STATE_STARTED
+                || printJobState == PrintJobInfo.STATE_BLOCKED;
+!!!71227575.java!!!	isTerminalState(in printJobState : int) : boolean
+        return printJobState == PrintJobInfo.STATE_COMPLETED
+                || printJobState == PrintJobInfo.STATE_CANCELED;
+!!!71227703.java!!!	setPrintJobTag(inout printJobId : PrintJobId, inout tag : String) : boolean
+        synchronized (mLock) {
+            PrintJobInfo printJob = getPrintJobInfo(printJobId, PrintManager.APP_ID_ANY);
+            if (printJob != null) {
+                String printJobTag = printJob.getTag();
+                if (printJobTag == null) {
+                    if (tag == null) {
+                        return false;
+                    }
+                } else if (printJobTag.equals(tag)) {
+                    return false;
+                }
+                printJob.setTag(tag);
+                if (shouldPersistPrintJob(printJob)) {
+                    mPersistanceManager.writeStateLocked();
+                }
+                return true;
+            }
+        }
+        return false;
+!!!71227831.java!!!	setPrintJobCancelling(inout printJobId : PrintJobId, inout cancelling : boolean) : void
+        synchronized (mLock) {
+            PrintJobInfo printJob = getPrintJobInfo(printJobId, PrintManager.APP_ID_ANY);
+            if (printJob != null) {
+                printJob.setCancelling(cancelling);
+                if (shouldPersistPrintJob(printJob)) {
+                    mPersistanceManager.writeStateLocked();
+                }
+                mNotificationController.onUpdateNotifications(mPrintJobs);
+
+                Message message = mHandlerCaller.obtainMessageO(
+                        HandlerCallerCallback.MSG_ON_PRINT_JOB_STATE_CHANGED,
+                        printJob);
+                mHandlerCaller.executeOrSendMessage(message);
+            }
+        }
+!!!71227959.java!!!	updatePrintJobUserConfigurableOptionsNoPersistence(inout printJob : PrintJobInfo) : void
+        synchronized (mLock) {
+            final int printJobCount = mPrintJobs.size();
+            for (int i = 0; i < printJobCount; i++) {
+                PrintJobInfo cachedPrintJob = mPrintJobs.get(i);
+                if (cachedPrintJob.getId().equals(printJob.getId())) {
+                    cachedPrintJob.setPrinterId(printJob.getPrinterId());
+                    cachedPrintJob.setPrinterName(printJob.getPrinterName());
+                    cachedPrintJob.setCopies(printJob.getCopies());
+                    cachedPrintJob.setDocumentInfo(printJob.getDocumentInfo());
+                    cachedPrintJob.setPages(printJob.getPages());
+                    cachedPrintJob.setAttributes(printJob.getAttributes());
+                    cachedPrintJob.setAdvancedOptions(printJob.getAdvancedOptions());
+                    return;
+                }
+            }
+            throw new IllegalArgumentException("No print job with id:" + printJob.getId());
+        }
+!!!71228087.java!!!	shouldPersistPrintJob(inout printJob : PrintJobInfo) : boolean
+        return printJob.getState() >= PrintJobInfo.STATE_QUEUED;
+!!!71228215.java!!!	notifyOnAllPrintJobsHandled() : void
+        // This has to run on the tread that is persisting the current state
+        // since this call may result in the system unbinding from the spooler
+        // and as a result the spooler process may get killed before the write
+        // completes.
+        new AsyncTask<Void, Void, Void>() {
+            @Override
+            protected Void doInBackground(Void... params) {
+                sendOnAllPrintJobsHandled();
+                return null;
+            }
+        }.executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, (Void[]) null);
+!!!71228343.java!!!	onCustomPrinterIconLoaded(inout printerId : PrinterId, inout icon : Icon) : void
+        mCustomIconCache.onCustomPrinterIconLoaded(printerId, icon);
+!!!71228471.java!!!	getCustomPrinterIcon(inout printerId : PrinterId) : Icon
+        return mCustomIconCache.getIcon(printerId);
+!!!71228599.java!!!	clearCustomPrinterIconCache() : void
+        mCustomIconCache.clear();

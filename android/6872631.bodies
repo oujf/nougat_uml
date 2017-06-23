@@ -1,0 +1,230 @@
+class DccDefaultState
+!!!76602551.java!!!	enter() : void
+            mPhone.mCi.registerForRilConnected(getHandler(),
+                    DataConnection.EVENT_RIL_CONNECTED, null);
+            mPhone.mCi.registerForDataNetworkStateChanged(getHandler(),
+                    DataConnection.EVENT_DATA_STATE_CHANGED, null);
+            if (Build.IS_DEBUGGABLE) {
+                mDcTesterDeactivateAll =
+                        new DcTesterDeactivateAll(mPhone, DcController.this, getHandler());
+            }
+!!!76602679.java!!!	exit() : void
+            if (mPhone != null) {
+                mPhone.mCi.unregisterForRilConnected(getHandler());
+                mPhone.mCi.unregisterForDataNetworkStateChanged(getHandler());
+            }
+            if (mDcTesterDeactivateAll != null) {
+                mDcTesterDeactivateAll.dispose();
+            }
+!!!76602807.java!!!	processMessage(inout msg : Message) : boolean
+            AsyncResult ar;
+
+            switch (msg.what) {
+                case DataConnection.EVENT_RIL_CONNECTED:
+                    ar = (AsyncResult)msg.obj;
+                    if (ar.exception == null) {
+                        if (DBG) {
+                            log("DccDefaultState: msg.what=EVENT_RIL_CONNECTED mRilVersion=" +
+                                ar.result);
+                        }
+                    } else {
+                        log("DccDefaultState: Unexpected exception on EVENT_RIL_CONNECTED");
+                    }
+                    break;
+
+                case DataConnection.EVENT_DATA_STATE_CHANGED:
+                    ar = (AsyncResult)msg.obj;
+                    if (ar.exception == null) {
+                        onDataStateChanged((ArrayList<DataCallResponse>)ar.result);
+                    } else {
+                        log("DccDefaultState: EVENT_DATA_STATE_CHANGED:" +
+                                    " exception; likely radio not available, ignore");
+                    }
+                    break;
+            }
+            return HANDLED;
+!!!76602935.java!!!	onDataStateChanged(inout dcsList : ArrayList<DataCallResponse>) : void
+            if (DBG) {
+                lr("onDataStateChanged: dcsList=" + dcsList
+                        + " mDcListActiveByCid=" + mDcListActiveByCid);
+            }
+            if (VDBG) {
+                log("onDataStateChanged: mDcListAll=" + mDcListAll);
+            }
+
+            // Create hashmap of cid to DataCallResponse
+            HashMap<Integer, DataCallResponse> dataCallResponseListByCid =
+                    new HashMap<Integer, DataCallResponse>();
+            for (DataCallResponse dcs : dcsList) {
+                dataCallResponseListByCid.put(dcs.cid, dcs);
+            }
+
+            // Add a DC that is active but not in the
+            // dcsList to the list of DC's to retry
+            ArrayList<DataConnection> dcsToRetry = new ArrayList<DataConnection>();
+            for (DataConnection dc : mDcListActiveByCid.values()) {
+                if (dataCallResponseListByCid.get(dc.mCid) == null) {
+                    if (DBG) log("onDataStateChanged: add to retry dc=" + dc);
+                    dcsToRetry.add(dc);
+                }
+            }
+            if (DBG) log("onDataStateChanged: dcsToRetry=" + dcsToRetry);
+
+            // Find which connections have changed state and send a notification or cleanup
+            // and any that are in active need to be retried.
+            ArrayList<ApnContext> apnsToCleanup = new ArrayList<ApnContext>();
+
+            boolean isAnyDataCallDormant = false;
+            boolean isAnyDataCallActive = false;
+
+            for (DataCallResponse newState : dcsList) {
+
+                DataConnection dc = mDcListActiveByCid.get(newState.cid);
+                if (dc == null) {
+                    // UNSOL_DATA_CALL_LIST_CHANGED arrived before SETUP_DATA_CALL completed.
+                    loge("onDataStateChanged: no associated DC yet, ignore");
+                    continue;
+                }
+
+                if (dc.mApnContexts.size() == 0) {
+                    if (DBG) loge("onDataStateChanged: no connected apns, ignore");
+                } else {
+                    // Determine if the connection/apnContext should be cleaned up
+                    // or just a notification should be sent out.
+                    if (DBG) log("onDataStateChanged: Found ConnId=" + newState.cid
+                            + " newState=" + newState.toString());
+                    if (newState.active == DATA_CONNECTION_ACTIVE_PH_LINK_INACTIVE) {
+                        if (mDct.isCleanupRequired.get()) {
+                            apnsToCleanup.addAll(dc.mApnContexts.keySet());
+                            mDct.isCleanupRequired.set(false);
+                        } else {
+                            DcFailCause failCause = DcFailCause.fromInt(newState.status);
+                            if (failCause.isRestartRadioFail()) {
+                                if (DBG) {
+                                    log("onDataStateChanged: X restart radio, failCause="
+                                            + failCause);
+                                }
+                                mDct.sendRestartRadio();
+                            } else if (mDct.isPermanentFail(failCause)) {
+                                if (DBG) {
+                                    log("onDataStateChanged: inactive, add to cleanup list. "
+                                            + "failCause=" + failCause);
+                                }
+                                apnsToCleanup.addAll(dc.mApnContexts.keySet());
+                            } else {
+                                if (DBG) {
+                                    log("onDataStateChanged: inactive, add to retry list. "
+                                            + "failCause=" + failCause);
+                                }
+                                dcsToRetry.add(dc);
+                            }
+                        }
+                    } else {
+                        // Its active so update the DataConnections link properties
+                        UpdateLinkPropertyResult result = dc.updateLinkProperty(newState);
+                        if (result.oldLp.equals(result.newLp)) {
+                            if (DBG) log("onDataStateChanged: no change");
+                        } else {
+                            if (result.oldLp.isIdenticalInterfaceName(result.newLp)) {
+                                if (! result.oldLp.isIdenticalDnses(result.newLp) ||
+                                        ! result.oldLp.isIdenticalRoutes(result.newLp) ||
+                                        ! result.oldLp.isIdenticalHttpProxy(result.newLp) ||
+                                        ! result.oldLp.isIdenticalAddresses(result.newLp)) {
+                                    // If the same address type was removed and
+                                    // added we need to cleanup
+                                    CompareResult<LinkAddress> car =
+                                        result.oldLp.compareAddresses(result.newLp);
+                                    if (DBG) {
+                                        log("onDataStateChanged: oldLp=" + result.oldLp +
+                                                " newLp=" + result.newLp + " car=" + car);
+                                    }
+                                    boolean needToClean = false;
+                                    for (LinkAddress added : car.added) {
+                                        for (LinkAddress removed : car.removed) {
+                                            if (NetworkUtils.addressTypeMatches(
+                                                    removed.getAddress(),
+                                                    added.getAddress())) {
+                                                needToClean = true;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    if (needToClean) {
+                                        if (DBG) {
+                                            log("onDataStateChanged: addr change," +
+                                                    " cleanup apns=" + dc.mApnContexts +
+                                                    " oldLp=" + result.oldLp +
+                                                    " newLp=" + result.newLp);
+                                        }
+                                        apnsToCleanup.addAll(dc.mApnContexts.keySet());
+                                    } else {
+                                        if (DBG) log("onDataStateChanged: simple change");
+
+                                        for (ApnContext apnContext : dc.mApnContexts.keySet()) {
+                                             mPhone.notifyDataConnection(
+                                                 PhoneConstants.REASON_LINK_PROPERTIES_CHANGED,
+                                                 apnContext.getApnType());
+                                        }
+                                    }
+                                } else {
+                                    if (DBG) {
+                                        log("onDataStateChanged: no changes");
+                                    }
+                                }
+                            } else {
+                                apnsToCleanup.addAll(dc.mApnContexts.keySet());
+                                if (DBG) {
+                                    log("onDataStateChanged: interface change, cleanup apns="
+                                            + dc.mApnContexts);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (newState.active == DATA_CONNECTION_ACTIVE_PH_LINK_UP) {
+                    isAnyDataCallActive = true;
+                }
+                if (newState.active == DATA_CONNECTION_ACTIVE_PH_LINK_DORMANT) {
+                    isAnyDataCallDormant = true;
+                }
+            }
+
+            if (isAnyDataCallDormant && !isAnyDataCallActive) {
+                // There is no way to indicate link activity per APN right now. So
+                // Link Activity will be considered dormant only when all data calls
+                // are dormant.
+                // If a single data call is in dormant state and none of the data
+                // calls are active broadcast overall link state as dormant.
+                if (DBG) {
+                    log("onDataStateChanged: Data Activity updated to DORMANT. stopNetStatePoll");
+                }
+                mDct.sendStopNetStatPoll(DctConstants.Activity.DORMANT);
+            } else {
+                if (DBG) {
+                    log("onDataStateChanged: Data Activity updated to NONE. " +
+                            "isAnyDataCallActive = " + isAnyDataCallActive +
+                            " isAnyDataCallDormant = " + isAnyDataCallDormant);
+                }
+                if (isAnyDataCallActive) {
+                    mDct.sendStartNetStatPoll(DctConstants.Activity.NONE);
+                }
+            }
+
+            if (DBG) {
+                lr("onDataStateChanged: dcsToRetry=" + dcsToRetry
+                        + " apnsToCleanup=" + apnsToCleanup);
+            }
+
+            // Cleanup connections that have changed
+            for (ApnContext apnContext : apnsToCleanup) {
+               mDct.sendCleanUpConnection(true, apnContext);
+            }
+
+            // Retry connections that have disappeared
+            for (DataConnection dc : dcsToRetry) {
+                if (DBG) log("onDataStateChanged: send EVENT_LOST_CONNECTION dc.mTag=" + dc.mTag);
+                dc.sendMessage(DataConnection.EVENT_LOST_CONNECTION, dc.mTag);
+            }
+
+            if (VDBG) log("onDataStateChanged: X");

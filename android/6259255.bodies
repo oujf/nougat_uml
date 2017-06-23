@@ -1,0 +1,173 @@
+class IconCache
+!!!71148727.java!!!	IconCache(inout osuManager : OSUManager)
+        mOSUManager = osuManager;
+!!!71148855.java!!!	clear() : void
+        mBssQueues.clear();
+        mCache.clear();
+!!!71148983.java!!!	enqueue(inout querySet : IconCache::QuerySet) : boolean
+        boolean newEntry = false;
+        LinkedList<QuerySet> queries = mBssQueues.get(querySet.getBssid());
+        if (queries == null) {
+            queries = new LinkedList<>();
+            mBssQueues.put(querySet.getBssid(), queries);
+            newEntry = true;
+        }
+        queries.addLast(querySet);
+        return newEntry;
+!!!71149111.java!!!	startIconQuery(inout osuInfo : OSUInfo, inout icons : List<IconInfo>) : void
+        Log.d("ZXZ", String.format("Icon query on %012x for %s", osuInfo.getBSSID(), icons));
+        if (icons == null || icons.isEmpty()) {
+            return;
+        }
+
+        QuerySet querySet = new QuerySet(osuInfo, icons);
+        for (QueryEntry entry : querySet.getAllEntries()) {
+            HSIconFileElement iconElement = mCache.get(entry.getKey());
+            if (iconElement != null) {
+                osuInfo.setIconFileElement(iconElement, entry.getKey().getFileName());
+                mOSUManager.iconResults(Arrays.asList(osuInfo));
+                return;
+            }
+        }
+        if (enqueue(querySet)) {
+            initiateQuery(querySet.getBssid());
+        }
+!!!71149239.java!!!	initiateQuery(in bssid : long) : void
+        LinkedList<QuerySet> queryEntries = mBssQueues.get(bssid);
+        if (queryEntries == null) {
+            return;
+        } else if (queryEntries.isEmpty()) {
+            mBssQueues.remove(bssid);
+            return;
+        }
+
+        QuerySet querySet = queryEntries.getFirst();
+        QueryEntry queryEntry = querySet.peek();
+        if (queryEntry.bumpRetry() >= RetryCount) {
+            QueryEntry newEntry = querySet.pop();
+            if (newEntry == null) {
+                // No more entries in this QuerySet, advance to the next set.
+                querySet.getOsuInfo().setIconStatus(OSUInfo.IconStatus.NotAvailable);
+                queryEntries.removeFirst();
+                if (queryEntries.isEmpty()) {
+                    // No further QuerySet on this BSSID, drop the bucket and bail.
+                    mBssQueues.remove(bssid);
+                    return;
+                } else {
+                    querySet = queryEntries.getFirst();
+                    queryEntry = querySet.peek();
+                    queryEntry.bumpRetry();
+                }
+            }
+        }
+        mOSUManager.doIconQuery(bssid, queryEntry.getKey().getFileName());
+!!!71149367.java!!!	notifyIconReceived(in bssid : long, inout fileName : String, inout iconData : byte [[]]) : void
+        Log.d("ZXZ", String.format("Icon '%s':%d received from %012x",
+                fileName, iconData != null ? iconData.length : -1, bssid));
+        IconKey key;
+        HSIconFileElement iconFileElement = null;
+        List<OSUInfo> updates = new ArrayList<>();
+
+        LinkedList<QuerySet> querySets = mBssQueues.get(bssid);
+        if (querySets == null || querySets.isEmpty()) {
+            Log.d(OSUManager.TAG,
+                    String.format("Spurious icon response from %012x for '%s' (%d) bytes",
+                            bssid, fileName, iconData != null ? iconData.length : -1));
+            Log.d("ZXZ", "query set: " + querySets
+                    + ", BSS queues: " + Utils.bssidsToString(mBssQueues.keySet()));
+            return;
+        } else {
+            QuerySet querySet = querySets.removeFirst();
+            if (iconData != null) {
+                try {
+                    iconFileElement = new HSIconFileElement(HSIconFile,
+                            ByteBuffer.wrap(iconData).order(ByteOrder.LITTLE_ENDIAN));
+                } catch (ProtocolException | BufferUnderflowException e) {
+                    Log.e(OSUManager.TAG, "Failed to parse ANQP icon file: " + e);
+                }
+            }
+            key = querySet.updateIcon(fileName, iconFileElement);
+            if (key == null) {
+                Log.d(OSUManager.TAG,
+                        String.format("Spurious icon response from %012x for '%s' (%d) bytes",
+                                bssid, fileName, iconData != null ? iconData.length : -1));
+                Log.d("ZXZ", "query set: " + querySets + ", BSS queues: "
+                        + Utils.bssidsToString(mBssQueues.keySet()));
+                querySets.addFirst(querySet);
+                return;
+            }
+
+            if (iconFileElement != null) {
+                mCache.put(key, iconFileElement);
+            }
+
+            if (querySet.isEmpty()) {
+                mBssQueues.remove(bssid);
+            }
+            updates.add(querySet.getOsuInfo());
+        }
+
+        // Update any other pending entries that matches the ESS of the currently resolved icon
+        Iterator<Map.Entry<Long, LinkedList<QuerySet>>> bssIterator =
+                mBssQueues.entrySet().iterator();
+        while (bssIterator.hasNext()) {
+            Map.Entry<Long, LinkedList<QuerySet>> bssEntries = bssIterator.next();
+            Iterator<QuerySet> querySetIterator = bssEntries.getValue().iterator();
+            while (querySetIterator.hasNext()) {
+                QuerySet querySet = querySetIterator.next();
+                if (querySet.updateIcon(key, iconFileElement)) {
+                    querySetIterator.remove();
+                    updates.add(querySet.getOsuInfo());
+                }
+            }
+            if (bssEntries.getValue().isEmpty()) {
+                bssIterator.remove();
+            }
+        }
+
+        initiateQuery(bssid);
+
+        mOSUManager.iconResults(updates);
+!!!71149495.java!!!	tickle(inout wifiOff : boolean) : void
+        synchronized (mCache) {
+            if (wifiOff) {
+                mBssQueues.clear();
+            } else {
+                long now = System.currentTimeMillis();
+
+                Iterator<Map.Entry<Long, LinkedList<QuerySet>>> bssIterator =
+                        mBssQueues.entrySet().iterator();
+                while (bssIterator.hasNext()) {
+                    // Get the list of entries for this BSSID
+                    Map.Entry<Long, LinkedList<QuerySet>> bssEntries = bssIterator.next();
+                    Iterator<QuerySet> querySetIterator = bssEntries.getValue().iterator();
+                    while (querySetIterator.hasNext()) {
+                        QuerySet querySet = querySetIterator.next();
+                        QueryEntry queryEntry = querySet.peek();
+                        long age = queryEntry.age(now);
+                        if (age > RequeryTimeHigh) {
+                            // Timed out entry, move on to the next.
+                            queryEntry = querySet.pop();
+                            if (queryEntry == null) {
+                                // Empty query set, update status and remove it.
+                                querySet.getOsuInfo()
+                                        .setIconStatus(OSUInfo.IconStatus.NotAvailable);
+                                querySetIterator.remove();
+                            } else {
+                                // Start a query on the next entry and bail out of the set iteration
+                                initiateQuery(querySet.getBssid());
+                                break;
+                            }
+                        } else if (age > RequeryTimeLow) {
+                            // Re-issue queries for qualified entries and bail out of set iteration
+                            initiateQuery(querySet.getBssid());
+                            break;
+                        }
+                    }
+                    if (bssEntries.getValue().isEmpty()) {
+                        // Kill the whole bucket if the set list is empty
+                        bssIterator.remove();
+                    }
+                }
+            }
+        }

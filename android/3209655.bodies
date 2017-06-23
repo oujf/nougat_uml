@@ -1,0 +1,97 @@
+class ApkInspector
+!!!43039031.cpp!!!	FindElfInApkByOffset(in apk_path : std::string, in file_offset : uint64_t) : EmbeddedElf
+  // Already in cache?
+  ApkOffset ami(apk_path, file_offset);
+  auto it = embedded_elf_cache_.find(ami);
+  if (it != embedded_elf_cache_.end()) {
+    return it->second.get();
+  }
+  std::unique_ptr<EmbeddedElf> elf = FindElfInApkByOffsetWithoutCache(apk_path, file_offset);
+  EmbeddedElf* result = elf.get();
+  embedded_elf_cache_[ami] = std::move(elf);
+  return result;
+!!!43039159.cpp!!!	FindElfInApkByName(in apk_path : std::string, in elf_filename : std::string) : std::unique_ptr<EmbeddedElf>
+  if (!IsValidApkPath(apk_path)) {
+    return nullptr;
+  }
+  FileHelper fhelper = FileHelper::OpenReadOnly(apk_path);
+  if (!fhelper) {
+    return nullptr;
+  }
+  ArchiveHelper ahelper(fhelper.fd(), apk_path);
+  if (!ahelper) {
+    return nullptr;
+  }
+  ZipArchiveHandle& handle = ahelper.archive_handle();
+  ZipEntry zentry;
+  int32_t rc = FindEntry(handle, ZipString(elf_filename.c_str()), &zentry);
+  if (rc != 0) {
+    LOG(ERROR) << "failed to find " << elf_filename << " in " << apk_path
+        << ": " << ErrorCodeString(rc);
+    return nullptr;
+  }
+  if (zentry.method != kCompressStored || zentry.compressed_length != zentry.uncompressed_length) {
+    LOG(ERROR) << "shared library " << elf_filename << " in " << apk_path << " is compressed";
+    return nullptr;
+  }
+  return std::unique_ptr<EmbeddedElf>(new EmbeddedElf(apk_path, elf_filename, zentry.offset,
+                                                  zentry.uncompressed_length));
+!!!43039287.cpp!!!	FindElfInApkByOffsetWithoutCache(in apk_path : std::string, in file_offset : uint64_t) : std::unique_ptr<EmbeddedElf>
+  // Crack open the apk(zip) file and take a look.
+  if (!IsValidApkPath(apk_path)) {
+    return nullptr;
+  }
+
+  FileHelper fhelper = FileHelper::OpenReadOnly(apk_path);
+  if (!fhelper) {
+    return nullptr;
+  }
+
+  ArchiveHelper ahelper(fhelper.fd(), apk_path);
+  if (!ahelper) {
+    return nullptr;
+  }
+  ZipArchiveHandle &handle = ahelper.archive_handle();
+
+  // Iterate through the zip file. Look for a zip entry corresponding
+  // to an uncompressed blob whose range intersects with the mmap
+  // offset we're interested in.
+  void* iteration_cookie;
+  if (StartIteration(handle, &iteration_cookie, nullptr, nullptr) < 0) {
+    return nullptr;
+  }
+  ZipEntry zentry;
+  ZipString zname;
+  bool found = false;
+  int zrc;
+  while ((zrc = Next(iteration_cookie, &zentry, &zname)) == 0) {
+    if (zentry.method == kCompressStored &&
+        file_offset >= static_cast<uint64_t>(zentry.offset) &&
+        file_offset < static_cast<uint64_t>(zentry.offset + zentry.uncompressed_length)) {
+      // Found.
+      found = true;
+      break;
+    }
+  }
+  EndIteration(iteration_cookie);
+  if (!found) {
+    return nullptr;
+  }
+
+  // We found something in the zip file at the right spot. Is it an ELF?
+  if (lseek(fhelper.fd(), zentry.offset, SEEK_SET) != zentry.offset) {
+    PLOG(ERROR) << "lseek() failed in " << apk_path << " offset " << zentry.offset;
+    return nullptr;
+  }
+  std::string entry_name;
+  entry_name.resize(zname.name_length,'\0');
+  memcpy(&entry_name[0], zname.name, zname.name_length);
+  if (!IsValidElfFile(fhelper.fd())) {
+    LOG(ERROR) << "problems reading ELF from in " << apk_path << " entry '"
+               << entry_name << "'";
+    return nullptr;
+  }
+
+  // Elf found: add EmbeddedElf to vector, update cache.
+  return std::unique_ptr<EmbeddedElf>(new EmbeddedElf(apk_path, entry_name, zentry.offset,
+                                                      zentry.uncompressed_length));

@@ -1,0 +1,233 @@
+class QCameraPerfLock
+!!!44281783.cpp!!!	~QCameraPerfLock()
+    lock_deinit();
+!!!44281911.cpp!!!	lock_init() : void
+    const char *rc;
+    char value[PROPERTY_VALUE_MAX];
+    int len;
+
+    CDBG("%s E", __func__);
+    Mutex::Autolock lock(mLock);
+
+    property_get("persist.camera.perflock.enable", value, "1");
+    mPerfLockEnable = atoi(value);
+    mCurrentPowerHintEnable = 0;
+#ifdef HAS_MULTIMEDIA_HINTS
+    if (hw_get_module(POWER_HARDWARE_MODULE_ID, (const hw_module_t **)&m_pPowerModule)) {
+        ALOGE("%s: %s module not found", __func__, POWER_HARDWARE_MODULE_ID);
+    }
+#endif
+
+    if (mPerfLockEnable) {
+        perf_lock_acq = NULL;
+        perf_lock_rel = NULL;
+        mPerfLockHandle = -1;
+        /* Retrieve name of vendor extension library */
+        if (property_get("ro.vendor.extension_library", value, NULL) <= 0) {
+            goto cleanup;
+        }
+
+        mDlHandle = dlopen(value, RTLD_NOW | RTLD_LOCAL);
+        if (mDlHandle == NULL) {
+            goto cleanup;
+        }
+
+        dlerror();
+
+        perf_lock_acq = (int (*) (int, int, int[], int))dlsym(mDlHandle, "perf_lock_acq");
+        if ((rc = dlerror()) != NULL) {
+            ALOGE("%s: failed to perf_lock_acq function handle", __func__);
+            goto cleanup;
+        }
+
+        perf_lock_rel = (int (*) (int))dlsym(mDlHandle, "perf_lock_rel");
+        if ((rc = dlerror()) != NULL) {
+            ALOGE("%s: failed to perf_lock_rel function handle", __func__);
+            goto cleanup;
+        }
+        CDBG("%s X", __func__);
+        return;
+
+cleanup:
+        perf_lock_acq  = NULL;
+        perf_lock_rel  = NULL;
+        mPerfLockEnable = 0;
+        if (mDlHandle) {
+            dlclose(mDlHandle);
+            mDlHandle = NULL;
+        }
+    }
+    CDBG("%s X", __func__);
+!!!44282039.cpp!!!	lock_deinit() : void
+    Mutex::Autolock lock(mLock);
+    if (mPerfLockEnable) {
+        CDBG("%s E", __func__);
+        if (mDlHandle) {
+            perf_lock_acq  = NULL;
+            perf_lock_rel  = NULL;
+
+            dlclose(mDlHandle);
+            mDlHandle       = NULL;
+        }
+        mPerfLockEnable = 0;
+        CDBG("%s X", __func__);
+    }
+!!!44282167.cpp!!!	lock_rel() : int32_t
+    int ret = -1;
+    Mutex::Autolock lock(mLock);
+    if (mPerfLockEnable) {
+        CDBG("%s E", __func__);
+        if (mPerfLockHandle < 0) {
+            ALOGE("%s: mPerfLockHandle < 0,check if lock is acquired", __func__);
+            return ret;
+        }
+        CDBG("%s perf_handle_rel %d ",__func__, mPerfLockHandle);
+
+        if ((NULL != perf_lock_rel) && (0 <= mPerfLockHandle)) {
+            ret = (*perf_lock_rel)(mPerfLockHandle);
+            if (ret < 0) {
+                ALOGE("%s: failed to release lock", __func__);
+            }
+            mPerfLockHandle = -1;
+        }
+
+        if ((mCurrentPowerHintEnable == 1) && (mTimerSet == 0)) {
+            powerHintInternal(mCurrentPowerHint, mCurrentPowerHintEnable);
+        }
+        CDBG("%s X", __func__);
+    }
+    return ret;
+!!!44282295.cpp!!!	lock_acq() : int32_t
+    int32_t ret = -1;
+
+    CDBG("%s E", __func__);
+    Mutex::Autolock lock(mLock);
+
+    if (mPerfLockEnable) {
+        int32_t perf_lock_params[] = {
+                ALL_CPUS_PWR_CLPS_DIS,
+                CPU0_MIN_FREQ_TURBO_MAX,
+                CPU4_MIN_FREQ_TURBO_MAX
+        };
+
+        // Disable power hint when acquiring the perf lock
+        if (mCurrentPowerHintEnable) {
+            powerHintInternal(mCurrentPowerHint, 0);
+        }
+
+        if ((NULL != perf_lock_acq) && (mPerfLockHandle < 0)) {
+            ret = (*perf_lock_acq)(mPerfLockHandle, ONE_SEC, perf_lock_params,
+                    sizeof(perf_lock_params) / sizeof(int32_t));
+            CDBG("%s ret %d", __func__, ret);
+            if (ret < 0) {
+                ALOGE("%s: failed to acquire lock", __func__);
+            } else {
+                mPerfLockHandle = ret;
+            }
+        }
+        CDBG("%s perf_handle_acq %d ",__func__, mPerfLockHandle);
+    }
+
+    CDBG("%s X", __func__);
+    return ret;
+!!!44282423.cpp!!!	lock_acq_timed(in timer_val : int32_t) : int32_t
+    int32_t ret = -1;
+
+    CDBG("%s E", __func__);
+    Mutex::Autolock lock(mLock);
+
+    if (mPerfLockEnable) {
+        int32_t perf_lock_params[] = {
+                ALL_CPUS_PWR_CLPS_DIS,
+                CPU0_MIN_FREQ_TURBO_MAX,
+                CPU4_MIN_FREQ_TURBO_MAX
+        };
+        if (mTimerSet) {
+            nsecs_t curElapsedTime = systemTime() - mStartTimeofLock;
+            int32_t pendingTimeout = mPerfLockTimeout - ns2ms(curElapsedTime);
+            timer_val += pendingTimeout;
+        }
+        startTimer(timer_val);
+
+        // Disable power hint when acquiring the perf lock
+        if (mCurrentPowerHintEnable) {
+            CDBG_HIGH("%s mCurrentPowerHintEnable %d", __func__ ,mCurrentPowerHintEnable);
+            powerHintInternal(mCurrentPowerHint, 0);
+        }
+
+        if ((NULL != perf_lock_acq) && (mPerfLockHandleTimed < 0)) {
+            ret = (*perf_lock_acq)(mPerfLockHandleTimed, timer_val, perf_lock_params,
+                    sizeof(perf_lock_params) / sizeof(int32_t));
+            CDBG("%s ret %d", __func__, ret);
+            if (ret < 0) {
+                ALOGE("%s: failed to acquire lock", __func__);
+            } else {
+                mPerfLockHandleTimed = ret;
+            }
+        }
+        CDBG("%s perf_handle_acq %d ",__func__, mPerfLockHandleTimed);
+    }
+
+    CDBG("%s X", __func__);
+    return ret;
+!!!44282551.cpp!!!	lock_rel_timed() : int32_t
+    int ret = -1;
+    Mutex::Autolock lock(mLock);
+    if (mPerfLockEnable) {
+        CDBG("%s E", __func__);
+        if (mPerfLockHandleTimed < 0) {
+            ALOGE("%s: mPerfLockHandle < 0,check if lock is acquired", __func__);
+            return ret;
+        }
+        CDBG("%s perf_handle_rel %d ",__func__, mPerfLockHandleTimed);
+
+        if ((NULL != perf_lock_rel) && (0 <= mPerfLockHandleTimed)) {
+            ret = (*perf_lock_rel)(mPerfLockHandleTimed);
+            if (ret < 0) {
+                ALOGE("%s: failed to release lock", __func__);
+            }
+            mPerfLockHandleTimed = -1;
+        }
+
+        if ((mCurrentPowerHintEnable == 1) && (mTimerSet == 0)) {
+            powerHintInternal(mCurrentPowerHint, mCurrentPowerHintEnable);
+        }
+        CDBG("%s X", __func__);
+    }
+    return ret;
+!!!44282679.cpp!!!	isTimerReset() : bool
+    Mutex::Autolock lock(mLock);
+    if (mPerfLockEnable && mTimerSet) {
+        nsecs_t timeDiff = systemTime() - mStartTimeofLock;
+        if (ns2ms(timeDiff) > (uint32_t)mPerfLockTimeout) {
+            mTimerSet = 0;
+            return true;
+        }
+    }
+    return false;
+!!!44282807.cpp!!!	powerHintInternal(in hint : power_hint_t, in enable : uint32_t) : void
+#ifdef HAS_MULTIMEDIA_HINTS
+    if (m_pPowerModule != NULL) {
+        if (enable == 1) {
+            m_pPowerModule->powerHint(m_pPowerModule, hint, (void *)"state=1");
+        }
+        else {
+            m_pPowerModule->powerHint(m_pPowerModule, hint, (void *)"state=0");
+        }
+    }
+#endif
+!!!44282935.cpp!!!	powerHint(in hint : power_hint_t, in enable : uint32_t) : void
+#ifdef HAS_MULTIMEDIA_HINTS
+    if (mCurrentPowerHintEnable) {
+        //disable previous hint
+        powerHintInternal(mCurrentPowerHint, 0);
+    }
+    powerHintInternal(hint, enable);
+
+    mCurrentPowerHint       = hint;
+    mCurrentPowerHintEnable = enable;
+#endif
+!!!44283063.cpp!!!	startTimer(in timer_val : uint32_t) : void
+    mStartTimeofLock = systemTime();
+    mTimerSet = 1;
+    mPerfLockTimeout = timer_val;

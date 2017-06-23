@@ -1,0 +1,200 @@
+class CdmaInboundSmsHandler
+!!!76553015.java!!!	CdmaInboundSmsHandler(inout context : Context, inout storageMonitor : SmsStorageMonitor, inout phone : Phone, inout smsDispatcher : CdmaSMSDispatcher)
+        super("CdmaInboundSmsHandler", context, storageMonitor, phone,
+                CellBroadcastHandler.makeCellBroadcastHandler(context, phone));
+        mSmsDispatcher = smsDispatcher;
+        mServiceCategoryProgramHandler = CdmaServiceCategoryProgramHandler.makeScpHandler(context,
+                phone.mCi);
+        phone.mCi.setOnNewCdmaSms(getHandler(), EVENT_NEW_SMS, null);
+!!!76553143.java!!!	onQuitting() : void
+        mPhone.mCi.unSetOnNewCdmaSms(getHandler());
+        mCellBroadcastHandler.dispose();
+
+        if (DBG) log("unregistered for 3GPP2 SMS");
+        super.onQuitting();
+!!!76553271.java!!!	makeInboundSmsHandler(inout context : Context, inout storageMonitor : SmsStorageMonitor, inout phone : Phone, inout smsDispatcher : CdmaSMSDispatcher) : CdmaInboundSmsHandler
+        CdmaInboundSmsHandler handler = new CdmaInboundSmsHandler(context, storageMonitor,
+                phone, smsDispatcher);
+        handler.start();
+        return handler;
+!!!76553399.java!!!	is3gpp2() : boolean
+        return true;
+!!!76553527.java!!!	dispatchMessageRadioSpecific(inout smsb : SmsMessageBase) : int
+        SmsMessage sms = (SmsMessage) smsb;
+        boolean isBroadcastType = (SmsEnvelope.MESSAGE_TYPE_BROADCAST == sms.getMessageType());
+
+        // Handle CMAS emergency broadcast messages.
+        if (isBroadcastType) {
+            log("Broadcast type message");
+            SmsCbMessage cbMessage = sms.parseBroadcastSms();
+            if (cbMessage != null) {
+                mCellBroadcastHandler.dispatchSmsMessage(cbMessage);
+            } else {
+                loge("error trying to parse broadcast SMS");
+            }
+            return Intents.RESULT_SMS_HANDLED;
+        }
+
+        // Initialize fingerprint field, and see if we have a network duplicate SMS.
+        mLastDispatchedSmsFingerprint = sms.getIncomingSmsFingerprint();
+        if (mLastAcknowledgedSmsFingerprint != null &&
+                Arrays.equals(mLastDispatchedSmsFingerprint, mLastAcknowledgedSmsFingerprint)) {
+            return Intents.RESULT_SMS_HANDLED;
+        }
+
+        // Decode BD stream and set sms variables.
+        sms.parseSms();
+        int teleService = sms.getTeleService();
+
+        switch (teleService) {
+            case SmsEnvelope.TELESERVICE_VMN:
+            case SmsEnvelope.TELESERVICE_MWI:
+                // handle voicemail indication
+                handleVoicemailTeleservice(sms);
+                return Intents.RESULT_SMS_HANDLED;
+
+            case SmsEnvelope.TELESERVICE_WMT:
+            case SmsEnvelope.TELESERVICE_WEMT:
+                if (sms.isStatusReportMessage()) {
+                    mSmsDispatcher.sendStatusReportMessage(sms);
+                    return Intents.RESULT_SMS_HANDLED;
+                }
+                break;
+
+            case SmsEnvelope.TELESERVICE_SCPT:
+                mServiceCategoryProgramHandler.dispatchSmsMessage(sms);
+                return Intents.RESULT_SMS_HANDLED;
+
+            case SmsEnvelope.TELESERVICE_WAP:
+                // handled below, after storage check
+                break;
+
+            default:
+                loge("unsupported teleservice 0x" + Integer.toHexString(teleService));
+                return Intents.RESULT_SMS_UNSUPPORTED;
+        }
+
+        if (!mStorageMonitor.isStorageAvailable() &&
+                sms.getMessageClass() != SmsConstants.MessageClass.CLASS_0) {
+            // It's a storable message and there's no storage available.  Bail.
+            // (See C.S0015-B v2.0 for a description of "Immediate Display"
+            // messages, which we represent as CLASS_0.)
+            return Intents.RESULT_SMS_OUT_OF_MEMORY;
+        }
+
+        if (SmsEnvelope.TELESERVICE_WAP == teleService) {
+            return processCdmaWapPdu(sms.getUserData(), sms.mMessageRef,
+                    sms.getOriginatingAddress(), sms.getTimestampMillis());
+        }
+
+        return dispatchNormalMessage(smsb);
+!!!76553655.java!!!	acknowledgeLastIncomingSms(inout success : boolean, in result : int, inout response : Message) : void
+        int causeCode = resultToCause(result);
+        mPhone.mCi.acknowledgeLastIncomingCdmaSms(success, causeCode, response);
+
+        if (causeCode == 0) {
+            mLastAcknowledgedSmsFingerprint = mLastDispatchedSmsFingerprint;
+        }
+        mLastDispatchedSmsFingerprint = null;
+!!!76553783.java!!!	onUpdatePhoneObject(inout phone : Phone) : void
+        super.onUpdatePhoneObject(phone);
+        mCellBroadcastHandler.updatePhoneObject(phone);
+!!!76553911.java!!!	resultToCause(in rc : int) : int
+        switch (rc) {
+        case Activity.RESULT_OK:
+        case Intents.RESULT_SMS_HANDLED:
+            // Cause code is ignored on success.
+            return 0;
+        case Intents.RESULT_SMS_OUT_OF_MEMORY:
+            return CommandsInterface.CDMA_SMS_FAIL_CAUSE_RESOURCE_SHORTAGE;
+        case Intents.RESULT_SMS_UNSUPPORTED:
+            return CommandsInterface.CDMA_SMS_FAIL_CAUSE_INVALID_TELESERVICE_ID;
+        case Intents.RESULT_SMS_GENERIC_ERROR:
+        default:
+            return CommandsInterface.CDMA_SMS_FAIL_CAUSE_OTHER_TERMINAL_PROBLEM;
+        }
+!!!76554039.java!!!	handleVoicemailTeleservice(inout sms : SmsMessage) : void
+        int voicemailCount = sms.getNumOfVoicemails();
+        if (DBG) log("Voicemail count=" + voicemailCount);
+
+        // range check
+        if (voicemailCount < 0) {
+            voicemailCount = -1;
+        } else if (voicemailCount > 99) {
+            // C.S0015-B v2, 4.5.12
+            // range: 0-99
+            voicemailCount = 99;
+        }
+        // update voice mail count in phone
+        mPhone.setVoiceMessageCount(voicemailCount);
+!!!76554167.java!!!	processCdmaWapPdu(inout pdu : byte [[]], in referenceNumber : int, inout address : String, in timestamp : long) : int
+        int index = 0;
+
+        int msgType = (0xFF & pdu[index++]);
+        if (msgType != 0) {
+            log("Received a WAP SMS which is not WDP. Discard.");
+            return Intents.RESULT_SMS_HANDLED;
+        }
+        int totalSegments = (0xFF & pdu[index++]);   // >= 1
+        int segment = (0xFF & pdu[index++]);         // >= 0
+
+        if (segment >= totalSegments) {
+            loge("WDP bad segment #" + segment + " expecting 0-" + (totalSegments - 1));
+            return Intents.RESULT_SMS_HANDLED;
+        }
+
+        // Only the first segment contains sourcePort and destination Port
+        int sourcePort = 0;
+        int destinationPort = 0;
+        if (segment == 0) {
+            //process WDP segment
+            sourcePort = (0xFF & pdu[index++]) << 8;
+            sourcePort |= 0xFF & pdu[index++];
+            destinationPort = (0xFF & pdu[index++]) << 8;
+            destinationPort |= 0xFF & pdu[index++];
+            // Some carriers incorrectly send duplicate port fields in omadm wap pushes.
+            // If configured, check for that here
+            if (mCheckForDuplicatePortsInOmadmWapPush) {
+                if (checkDuplicatePortOmadmWapPush(pdu, index)) {
+                    index = index + 4; // skip duplicate port fields
+                }
+            }
+        }
+
+        // Lookup all other related parts
+        log("Received WAP PDU. Type = " + msgType + ", originator = " + address
+                + ", src-port = " + sourcePort + ", dst-port = " + destinationPort
+                + ", ID = " + referenceNumber + ", segment# = " + segment + '/' + totalSegments);
+
+        // pass the user data portion of the PDU to the shared handler in SMSDispatcher
+        byte[] userData = new byte[pdu.length - index];
+        System.arraycopy(pdu, index, userData, 0, pdu.length - index);
+
+        InboundSmsTracker tracker = TelephonyComponentFactory.getInstance().makeInboundSmsTracker(
+                userData, timestamp, destinationPort, true, address, referenceNumber, segment,
+                totalSegments, true, HexDump.toHexString(userData));
+
+        // de-duping is done only for text messages
+        return addTrackerToRawTableAndSendMessage(tracker, false /* don't de-dup */);
+!!!76554295.java!!!	checkDuplicatePortOmadmWapPush(inout origPdu : byte [[]], in index : int) : boolean
+        index += 4;
+        byte[] omaPdu = new byte[origPdu.length - index];
+        System.arraycopy(origPdu, index, omaPdu, 0, omaPdu.length);
+
+        WspTypeDecoder pduDecoder = new WspTypeDecoder(omaPdu);
+        int wspIndex = 2;
+
+        // Process header length field
+        if (!pduDecoder.decodeUintvarInteger(wspIndex)) {
+            return false;
+        }
+
+        wspIndex += pduDecoder.getDecodedDataLength();  // advance to next field
+
+        // Process content type field
+        if (!pduDecoder.decodeContentType(wspIndex)) {
+            return false;
+        }
+
+        String mimeType = pduDecoder.getValueString();
+        return (WspTypeDecoder.CONTENT_TYPE_B_PUSH_SYNCML_NOTI.equals(mimeType));

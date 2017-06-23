@@ -1,0 +1,224 @@
+class RsdCpuScriptIntrinsicBlur
+!!!46930103.cpp!!!	populateScript(inout s : Script) : void
+    s->mHal.info.exportedVariableCount = 2;
+!!!46930231.cpp!!!	invokeFreeChildren() : void
+    mAlloc.clear();
+!!!46930359.cpp!!!	setGlobalVar(in slot : uint32_t, in data : void, in dataLength : size_t) : void
+    rsAssert(slot == 0);
+    mRadius = ((const float *)data)[0];
+    ComputeGaussianWeights();
+!!!46930487.cpp!!!	setGlobalObj(in slot : uint32_t, inout data : ObjectBase) : void
+    rsAssert(slot == 1);
+    mAlloc.set(static_cast<Allocation *>(data));
+!!!46930615.cpp!!!	~RsdCpuScriptIntrinsicBlur()
+    uint32_t threads = mCtx->getThreadCount();
+    if (mScratch) {
+        for (size_t i = 0; i < threads; i++) {
+            if (mScratch[i]) {
+                free(mScratch[i]);
+            }
+        }
+        delete []mScratch;
+    }
+    if (mScratchSize) {
+        delete []mScratchSize;
+    }
+!!!46930743.cpp!!!	RsdCpuScriptIntrinsicBlur(inout ctx : RsdCpuReferenceImpl, in s : Script, in e : Element)
+
+    mRootPtr = nullptr;
+    if (e->getType() == RS_TYPE_UNSIGNED_8) {
+        switch (e->getVectorSize()) {
+        case 1:
+            mRootPtr = &kernelU1;
+            break;
+        case 4:
+            mRootPtr = &kernelU4;
+            break;
+        }
+    }
+    rsAssert(mRootPtr);
+    mRadius = 5;
+
+    mScratch = new void *[mCtx->getThreadCount()];
+    mScratchSize = new size_t[mCtx->getThreadCount()];
+    memset(mScratch, 0, sizeof(void *) * mCtx->getThreadCount());
+    memset(mScratchSize, 0, sizeof(size_t) * mCtx->getThreadCount());
+
+    ComputeGaussianWeights();
+!!!46930871.cpp!!!	kernelU4(in info : RsExpandKernelDriverInfo, in xstart : uint32_t, in xend : uint32_t, in outstep : uint32_t) : void
+
+    float4 stackbuf[2048];
+    float4 *buf = &stackbuf[0];
+    RsdCpuScriptIntrinsicBlur *cp = (RsdCpuScriptIntrinsicBlur *)info->usr;
+    if (!cp->mAlloc.get()) {
+        ALOGE("Blur executed without input, skipping");
+        return;
+    }
+    const uchar *pin = (const uchar *)cp->mAlloc->mHal.drvState.lod[0].mallocPtr;
+    const size_t stride = cp->mAlloc->mHal.drvState.lod[0].stride;
+
+    uchar4 *out = (uchar4 *)info->outPtr[0];
+    uint32_t x1 = xstart;
+    uint32_t x2 = xend;
+
+#if defined(ARCH_ARM_USE_INTRINSICS)
+    if (gArchUseSIMD && info->dim.x >= 4) {
+      rsdIntrinsicBlurU4_K(out, (uchar4 const *)(pin + stride * info->current.y),
+                 info->dim.x, info->dim.y,
+                 stride, x1, info->current.y, x2 - x1, cp->mIradius, cp->mIp + cp->mIradius);
+        return;
+    }
+#endif
+
+    if (info->dim.x > 2048) {
+        if ((info->dim.x > cp->mScratchSize[info->lid]) || !cp->mScratch[info->lid]) {
+            // Pad the side of the allocation by one unit to allow alignment later
+            cp->mScratch[info->lid] = realloc(cp->mScratch[info->lid], (info->dim.x + 1) * 16);
+            cp->mScratchSize[info->lid] = info->dim.x;
+        }
+        // realloc only aligns to 8 bytes so we manually align to 16.
+        buf = (float4 *) ((((intptr_t)cp->mScratch[info->lid]) + 15) & ~0xf);
+    }
+    float4 *fout = (float4 *)buf;
+    int y = info->current.y;
+    if ((y > cp->mIradius) && (y < ((int)info->dim.y - cp->mIradius))) {
+        const uchar *pi = pin + (y - cp->mIradius) * stride;
+        OneVFU4(fout, pi, stride, cp->mFp, cp->mIradius * 2 + 1, 0, info->dim.x);
+    } else {
+        x1 = 0;
+        while(info->dim.x > x1) {
+            OneVU4(info, fout, x1, y, pin, stride, cp->mFp, cp->mIradius);
+            fout++;
+            x1++;
+        }
+    }
+
+    x1 = xstart;
+    while ((x1 < (uint32_t)cp->mIradius) && (x1 < x2)) {
+        OneHU4(info, out, x1, buf, cp->mFp, cp->mIradius);
+        out++;
+        x1++;
+    }
+#if defined(ARCH_X86_HAVE_SSSE3)
+    if (gArchUseSIMD) {
+        if ((x1 + cp->mIradius) < x2) {
+            rsdIntrinsicBlurHFU4_K(out, buf - cp->mIradius, cp->mFp,
+                                   cp->mIradius * 2 + 1, x1, x2 - cp->mIradius);
+            out += (x2 - cp->mIradius) - x1;
+            x1 = x2 - cp->mIradius;
+        }
+    }
+#endif
+    while(x2 > x1) {
+        OneHU4(info, out, x1, buf, cp->mFp, cp->mIradius);
+        out++;
+        x1++;
+    }
+!!!46930999.cpp!!!	kernelU1(in info : RsExpandKernelDriverInfo, in xstart : uint32_t, in xend : uint32_t, in outstep : uint32_t) : void
+    float buf[4 * 2048];
+    RsdCpuScriptIntrinsicBlur *cp = (RsdCpuScriptIntrinsicBlur *)info->usr;
+    if (!cp->mAlloc.get()) {
+        ALOGE("Blur executed without input, skipping");
+        return;
+    }
+    const uchar *pin = (const uchar *)cp->mAlloc->mHal.drvState.lod[0].mallocPtr;
+    const size_t stride = cp->mAlloc->mHal.drvState.lod[0].stride;
+
+    uchar *out = (uchar *)info->outPtr[0];
+    uint32_t x1 = xstart;
+    uint32_t x2 = xend;
+
+#if defined(ARCH_ARM_USE_INTRINSICS)
+    if (gArchUseSIMD && info->dim.x >= 16) {
+        // The specialisation for r<=8 has an awkward prefill case, which is
+        // fiddly to resolve, where starting close to the right edge can cause
+        // a read beyond the end of input.  So avoid that case here.
+        if (cp->mIradius > 8 || (info->dim.x - rsMax(0, (int32_t)x1 - 8)) >= 16) {
+            rsdIntrinsicBlurU1_K(out, pin + stride * info->current.y, info->dim.x, info->dim.y,
+                     stride, x1, info->current.y, x2 - x1, cp->mIradius, cp->mIp + cp->mIradius);
+            return;
+        }
+    }
+#endif
+
+    float *fout = (float *)buf;
+    int y = info->current.y;
+    if ((y > cp->mIradius) && (y < ((int)info->dim.y - cp->mIradius -1))) {
+        const uchar *pi = pin + (y - cp->mIradius) * stride;
+        OneVFU1(fout, pi, stride, cp->mFp, cp->mIradius * 2 + 1, 0, info->dim.x);
+    } else {
+        x1 = 0;
+        while(info->dim.x > x1) {
+            OneVU1(info, fout, x1, y, pin, stride, cp->mFp, cp->mIradius);
+            fout++;
+            x1++;
+        }
+    }
+
+    x1 = xstart;
+    while ((x1 < x2) &&
+           ((x1 < (uint32_t)cp->mIradius) || (((uintptr_t)out) & 0x3))) {
+        OneHU1(info, out, x1, buf, cp->mFp, cp->mIradius);
+        out++;
+        x1++;
+    }
+#if defined(ARCH_X86_HAVE_SSSE3)
+    if (gArchUseSIMD) {
+        if ((x1 + cp->mIradius) < x2) {
+            uint32_t len = x2 - (x1 + cp->mIradius);
+            len &= ~3;
+            if (len > 0) {
+                rsdIntrinsicBlurHFU1_K(out, ((float *)buf) - cp->mIradius, cp->mFp,
+                                       cp->mIradius * 2 + 1, x1, x1 + len);
+                out += len;
+                x1 += len;
+            }
+        }
+    }
+#endif
+    while(x2 > x1) {
+        OneHU1(info, out, x1, buf, cp->mFp, cp->mIradius);
+        out++;
+        x1++;
+    }
+!!!46931127.cpp!!!	ComputeGaussianWeights() : void
+    memset(mFp, 0, sizeof(mFp));
+    memset(mIp, 0, sizeof(mIp));
+
+    // Compute gaussian weights for the blur
+    // e is the euler's number
+    // TODO Define these constants only once
+    float e = 2.718281828459045f;
+    float pi = 3.1415926535897932f;
+    // g(x) = (1 / (sqrt(2 * pi) * sigma)) * e ^ (-x^2 / (2 * sigma^2))
+    // x is of the form [-radius .. 0 .. radius]
+    // and sigma varies with the radius.
+    // Based on some experimental radius values and sigmas,
+    // we approximately fit sigma = f(radius) as
+    // sigma = radius * 0.4  + 0.6
+    // The larger the radius gets, the more our gaussian blur
+    // will resemble a box blur since with large sigma
+    // the gaussian curve begins to lose its shape
+    float sigma = 0.4f * mRadius + 0.6f;
+
+    // Now compute the coefficients. We will store some redundant values to save
+    // some math during the blur calculations precompute some values
+    float coeff1 = 1.0f / (sqrtf(2.0f * pi) * sigma);
+    float coeff2 = - 1.0f / (2.0f * sigma * sigma);
+
+    float normalizeFactor = 0.0f;
+    float floatR = 0.0f;
+    int r;
+    mIradius = (float)ceil(mRadius) + 0.5f;
+    for (r = -mIradius; r <= mIradius; r ++) {
+        floatR = (float)r;
+        mFp[r + mIradius] = coeff1 * powf(e, floatR * floatR * coeff2);
+        normalizeFactor += mFp[r + mIradius];
+    }
+
+    // Now we need to normalize the weights because all our coefficients need to add up to one
+    normalizeFactor = 1.0f / normalizeFactor;
+    for (r = -mIradius; r <= mIradius; r ++) {
+        mFp[r + mIradius] *= normalizeFactor;
+        mIp[r + mIradius] = (uint16_t)(mFp[r + mIradius] * 65536.0f + 0.5f);
+    }

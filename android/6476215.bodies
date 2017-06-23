@@ -1,0 +1,173 @@
+class NetworkStateTrackerHandler
+!!!73046839.java!!!	NetworkStateTrackerHandler(inout looper : Looper)
+            super(looper);
+!!!73046967.java!!!	maybeHandleAsyncChannelMessage(inout msg : Message) : boolean
+            switch (msg.what) {
+                default:
+                    return false;
+                case AsyncChannel.CMD_CHANNEL_HALF_CONNECTED: {
+                    handleAsyncChannelHalfConnect(msg);
+                    break;
+                }
+                case AsyncChannel.CMD_CHANNEL_DISCONNECT: {
+                    NetworkAgentInfo nai = mNetworkAgentInfos.get(msg.replyTo);
+                    if (nai != null) nai.asyncChannel.disconnect();
+                    break;
+                }
+                case AsyncChannel.CMD_CHANNEL_DISCONNECTED: {
+                    handleAsyncChannelDisconnected(msg);
+                    break;
+                }
+            }
+            return true;
+!!!73047095.java!!!	maybeHandleNetworkAgentMessage(inout msg : Message) : void
+            NetworkAgentInfo nai = mNetworkAgentInfos.get(msg.replyTo);
+            if (nai == null) {
+                if (VDBG) {
+                    final String what = sMagicDecoderRing.get(msg.what, Integer.toString(msg.what));
+                    log(String.format("%s from unknown NetworkAgent", what));
+                }
+                return;
+            }
+
+            switch (msg.what) {
+                case NetworkAgent.EVENT_NETWORK_CAPABILITIES_CHANGED: {
+                    final NetworkCapabilities networkCapabilities = (NetworkCapabilities) msg.obj;
+                    if (networkCapabilities.hasCapability(NET_CAPABILITY_CAPTIVE_PORTAL) ||
+                            networkCapabilities.hasCapability(NET_CAPABILITY_VALIDATED)) {
+                        Slog.wtf(TAG, "BUG: " + nai + " has CS-managed capability.");
+                    }
+                    if (nai.everConnected && !nai.networkCapabilities.equalImmutableCapabilities(
+                            networkCapabilities)) {
+                        Slog.wtf(TAG, "BUG: " + nai + " changed immutable capabilities: "
+                                + nai.networkCapabilities + " -> " + networkCapabilities);
+                    }
+                    updateCapabilities(nai, networkCapabilities);
+                    break;
+                }
+                case NetworkAgent.EVENT_NETWORK_PROPERTIES_CHANGED: {
+                    if (VDBG) {
+                        log("Update of LinkProperties for " + nai.name() +
+                                "; created=" + nai.created +
+                                "; everConnected=" + nai.everConnected);
+                    }
+                    LinkProperties oldLp = nai.linkProperties;
+                    synchronized (nai) {
+                        nai.linkProperties = (LinkProperties)msg.obj;
+                    }
+                    if (nai.everConnected) updateLinkProperties(nai, oldLp);
+                    break;
+                }
+                case NetworkAgent.EVENT_NETWORK_INFO_CHANGED: {
+                    NetworkInfo info = (NetworkInfo) msg.obj;
+                    updateNetworkInfo(nai, info);
+                    break;
+                }
+                case NetworkAgent.EVENT_NETWORK_SCORE_CHANGED: {
+                    Integer score = (Integer) msg.obj;
+                    if (score != null) updateNetworkScore(nai, score.intValue());
+                    break;
+                }
+                case NetworkAgent.EVENT_UID_RANGES_ADDED: {
+                    try {
+                        mNetd.addVpnUidRanges(nai.network.netId, (UidRange[])msg.obj);
+                    } catch (Exception e) {
+                        // Never crash!
+                        loge("Exception in addVpnUidRanges: " + e);
+                    }
+                    break;
+                }
+                case NetworkAgent.EVENT_UID_RANGES_REMOVED: {
+                    try {
+                        mNetd.removeVpnUidRanges(nai.network.netId, (UidRange[])msg.obj);
+                    } catch (Exception e) {
+                        // Never crash!
+                        loge("Exception in removeVpnUidRanges: " + e);
+                    }
+                    break;
+                }
+                case NetworkAgent.EVENT_SET_EXPLICITLY_SELECTED: {
+                    if (nai.everConnected && !nai.networkMisc.explicitlySelected) {
+                        loge("ERROR: already-connected network explicitly selected.");
+                    }
+                    nai.networkMisc.explicitlySelected = true;
+                    nai.networkMisc.acceptUnvalidated = (boolean) msg.obj;
+                    break;
+                }
+                case NetworkAgent.EVENT_PACKET_KEEPALIVE: {
+                    mKeepaliveTracker.handleEventPacketKeepalive(nai, msg);
+                    break;
+                }
+            }
+!!!73047223.java!!!	maybeHandleNetworkMonitorMessage(inout msg : Message) : boolean
+            switch (msg.what) {
+                default:
+                    return false;
+                case NetworkMonitor.EVENT_NETWORK_TESTED: {
+                    final NetworkAgentInfo nai;
+                    synchronized (mNetworkForNetId) {
+                        nai = mNetworkForNetId.get(msg.arg2);
+                    }
+                    if (nai != null) {
+                        final boolean valid =
+                                (msg.arg1 == NetworkMonitor.NETWORK_TEST_RESULT_VALID);
+                        if (DBG) log(nai.name() + " validation " + (valid ? "passed" : "failed") +
+                                (msg.obj == null ? "" : " with redirect to " + (String)msg.obj));
+                        if (valid != nai.lastValidated) {
+                            final int oldScore = nai.getCurrentScore();
+                            nai.lastValidated = valid;
+                            nai.everValidated |= valid;
+                            updateCapabilities(nai, nai.networkCapabilities);
+                            // If score has changed, rebroadcast to NetworkFactories. b/17726566
+                            if (oldScore != nai.getCurrentScore()) sendUpdatedScoreToFactories(nai);
+                        }
+                        updateInetCondition(nai);
+                        // Let the NetworkAgent know the state of its network
+                        Bundle redirectUrlBundle = new Bundle();
+                        redirectUrlBundle.putString(NetworkAgent.REDIRECT_URL_KEY, (String)msg.obj);
+                        nai.asyncChannel.sendMessage(
+                                NetworkAgent.CMD_REPORT_NETWORK_STATUS,
+                                (valid ? NetworkAgent.VALID_NETWORK : NetworkAgent.INVALID_NETWORK),
+                                0, redirectUrlBundle);
+                    }
+                    break;
+                }
+                case NetworkMonitor.EVENT_NETWORK_LINGER_COMPLETE: {
+                    NetworkAgentInfo nai = (NetworkAgentInfo)msg.obj;
+                    if (isLiveNetworkAgent(nai, msg.what)) {
+                        handleLingerComplete(nai);
+                    }
+                    break;
+                }
+                case NetworkMonitor.EVENT_PROVISIONING_NOTIFICATION: {
+                    final int netId = msg.arg2;
+                    final boolean visible = (msg.arg1 != 0);
+                    final NetworkAgentInfo nai;
+                    synchronized (mNetworkForNetId) {
+                        nai = mNetworkForNetId.get(netId);
+                    }
+                    // If captive portal status has changed, update capabilities.
+                    if (nai != null && (visible != nai.lastCaptivePortalDetected)) {
+                        nai.lastCaptivePortalDetected = visible;
+                        nai.everCaptivePortalDetected |= visible;
+                        updateCapabilities(nai, nai.networkCapabilities);
+                    }
+                    if (!visible) {
+                        setProvNotificationVisibleIntent(false, netId, null, 0, null, null, false);
+                    } else {
+                        if (nai == null) {
+                            loge("EVENT_PROVISIONING_NOTIFICATION from unknown NetworkMonitor");
+                            break;
+                        }
+                        setProvNotificationVisibleIntent(true, netId, NotificationType.SIGN_IN,
+                                nai.networkInfo.getType(), nai.networkInfo.getExtraInfo(),
+                                (PendingIntent)msg.obj, nai.networkMisc.explicitlySelected);
+                    }
+                    break;
+                }
+            }
+            return true;
+!!!73047351.java!!!	handleMessage(inout msg : Message) : void
+            if (!maybeHandleAsyncChannelMessage(msg) && !maybeHandleNetworkMonitorMessage(msg)) {
+                maybeHandleNetworkAgentMessage(msg);
+            }

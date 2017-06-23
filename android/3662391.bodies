@@ -1,0 +1,348 @@
+class QCamera3YUVChannel
+!!!44239671.cpp!!!	QCamera3YUVChannel(in cam_handle : uint32_t, in channel_handle : uint32_t, inout cam_ops : mm_camera_ops_t, in cb_routine : channel_cb_routine, inout paddingInfo : cam_padding_info_t, inout userData : void, inout stream : camera3_stream_t, in stream_type : cam_stream_type_t, in postprocess_mask : uint32_t, inout metadataChannel : QCamera3Channel)
+
+    mBypass = (postprocess_mask == CAM_QCOM_FEATURE_NONE);
+    mFrameLen = 0;
+    mEdgeMode.edge_mode = CAM_EDGE_MODE_OFF;
+    mEdgeMode.sharpness = 0;
+    mNoiseRedMode = CAM_NOISE_REDUCTION_MODE_OFF;
+    memset(&mCropRegion, 0, sizeof(mCropRegion));
+!!!44239799.cpp!!!	~QCamera3YUVChannel()
+   // Deallocation of heap buffers allocated in mMemory is freed
+   // automatically by its destructor
+!!!44239927.cpp!!!	initialize(in isType : cam_is_type_t) : int32_t
+    ATRACE_CALL();
+    int32_t rc = NO_ERROR;
+    cam_dimension_t streamDim;
+
+    if (NULL == mCamera3Stream) {
+        ALOGE("%s: Camera stream uninitialized", __func__);
+        return NO_INIT;
+    }
+
+    if (1 <= m_numStreams) {
+        // Only one stream per channel supported in v3 Hal
+        return NO_ERROR;
+    }
+
+    mIsType  = isType;
+    mStreamFormat = CALLBACK_FORMAT;
+    streamDim.width = mCamera3Stream->width;
+    streamDim.height = mCamera3Stream->height;
+
+    rc = QCamera3Channel::addStream(mStreamType,
+            mStreamFormat,
+            streamDim,
+            ROTATE_0,
+            mNumBufs,
+            mPostProcMask,
+            mIsType);
+    if (rc < 0) {
+        ALOGE("%s: addStream failed", __func__);
+        return rc;
+    }
+
+    cam_stream_buf_plane_info_t buf_planes;
+    cam_padding_info_t paddingInfo = *mPaddingInfo;
+
+    memset(&buf_planes, 0, sizeof(buf_planes));
+    //to ensure a big enough buffer size set the height and width
+    //padding to max(height padding, width padding)
+    paddingInfo.width_padding = MAX(paddingInfo.width_padding, paddingInfo.height_padding);
+    paddingInfo.height_padding = paddingInfo.width_padding;
+
+    rc = mm_stream_calc_offset_snapshot(mStreamFormat, &streamDim, &paddingInfo,
+            &buf_planes);
+    if (rc < 0) {
+        ALOGE("%s: mm_stream_calc_offset_preview failed", __func__);
+        return rc;
+    }
+
+    mFrameLen = buf_planes.plane_info.frame_len;
+
+    if (NO_ERROR != rc) {
+        ALOGE("%s: Initialize failed, rc = %d", __func__, rc);
+        return rc;
+    }
+
+    /* initialize offline meta memory for input reprocess */
+    rc = QCamera3ProcessingChannel::initialize(isType);
+    if (NO_ERROR != rc) {
+        ALOGE("%s: Processing Channel initialize failed, rc = %d",
+                __func__, rc);
+    }
+
+    return rc;
+!!!44240055.cpp!!!	request(inout buffer : buffer_handle_t, in frameNumber : uint32_t, inout pInputBuffer : camera3_stream_buffer_t, inout metadata : metadata_buffer_t, inout needMetadata : bool) : int32_t
+    int32_t rc = NO_ERROR;
+    int index;
+    Mutex::Autolock lock(mOfflinePpLock);
+
+    CDBG("%s: pInputBuffer is %p", __func__, pInputBuffer);
+    CDBG("%s, frame number %d", __func__, frameNumber);
+    if (NULL == buffer || NULL == metadata) {
+        ALOGE("%s: Invalid buffer/metadata in channel request", __func__);
+        return BAD_VALUE;
+    }
+
+    PpInfo ppInfo;
+    memset(&ppInfo, 0, sizeof(ppInfo));
+    ppInfo.frameNumber = frameNumber;
+    ppInfo.offlinePpFlag = false;
+    if (mBypass && !pInputBuffer ) {
+        ppInfo.offlinePpFlag = needsFramePostprocessing(metadata);
+        ppInfo.output = buffer;
+        mOfflinePpInfoList.push_back(ppInfo);
+    }
+
+    CDBG("%s: offlinePpFlag is %d", __func__, ppInfo.offlinePpFlag);
+    needMetadata = ppInfo.offlinePpFlag;
+    if (!ppInfo.offlinePpFlag) {
+        // regular request
+        return QCamera3ProcessingChannel::request(buffer, frameNumber,
+                pInputBuffer, metadata);
+    } else {
+        if(!m_bIsActive) {
+            rc = start();
+            if (NO_ERROR != rc)
+                return rc;
+        } else {
+            CDBG("%s: Request on an existing stream",__func__);
+        }
+
+        //we need to send this frame through the CPP
+        //Allocate heap memory, then buf done on the buffer
+        uint32_t bufIdx;
+        if (mFreeHeapBufferList.empty()) {
+            rc = mMemory.allocateOne(mFrameLen);
+            if (rc < 0) {
+                ALOGE("%s: Failed allocating heap buffer. Fatal", __func__);
+                return BAD_VALUE;
+            } else {
+                bufIdx = (uint32_t)rc;
+            }
+        } else {
+            bufIdx = *(mFreeHeapBufferList.begin());
+            mFreeHeapBufferList.erase(mFreeHeapBufferList.begin());
+        }
+
+        /* Configure and start postproc if necessary */
+        reprocess_config_t reproc_cfg;
+        cam_dimension_t dim;
+        memset(&reproc_cfg, 0, sizeof(reprocess_config_t));
+        memset(&dim, 0, sizeof(dim));
+        mStreams[0]->getFrameDimension(dim);
+        setReprocConfig(reproc_cfg, NULL, metadata, mStreamFormat, dim);
+
+        // Start postprocessor without input buffer
+        startPostProc(reproc_cfg);
+
+        CDBG("%s: erasing %d", __func__, bufIdx);
+
+        mMemory.markFrameNumber(bufIdx, frameNumber);
+        mStreams[0]->bufDone(bufIdx);
+
+    }
+    return rc;
+!!!44240183.cpp!!!	getReprocessType() : reprocess_type_t
+    return REPROCESS_TYPE_YUV;
+!!!44240311.cpp!!!	streamCbRoutine(inout super_frame : mm_camera_super_buf_t, inout stream : QCamera3Stream) : void
+    ATRACE_CALL();
+    uint8_t frameIndex;
+    int32_t resultFrameNumber;
+
+    if (checkStreamCbErrors(super_frame, stream) != NO_ERROR) {
+        ALOGE("%s: Error with the stream callback", __func__);
+        return;
+    }
+
+    frameIndex = (uint8_t)super_frame->bufs[0]->buf_idx;
+    if(frameIndex >= mNumBufs) {
+         ALOGE("%s: Error, Invalid index for buffer",__func__);
+         stream->bufDone(frameIndex);
+         return;
+    }
+
+    if (mBypass) {
+        List<PpInfo>::iterator ppInfo;
+
+        Mutex::Autolock lock(mOfflinePpLock);
+        resultFrameNumber = mMemory.getFrameNumber(frameIndex);
+        for (ppInfo = mOfflinePpInfoList.begin();
+                ppInfo != mOfflinePpInfoList.end(); ppInfo++) {
+            if (ppInfo->frameNumber == (uint32_t)resultFrameNumber) {
+                break;
+            }
+        }
+        CDBG("%s, frame index %d, frame number %d", __func__, frameIndex, resultFrameNumber);
+        //check the reprocessing required flag against the frame number
+        if (ppInfo == mOfflinePpInfoList.end()) {
+            ALOGE("%s: Error, request for frame number is a reprocess.", __func__);
+            stream->bufDone(frameIndex);
+            return;
+        }
+
+        if (ppInfo->offlinePpFlag) {
+            mm_camera_super_buf_t *frame =
+                    (mm_camera_super_buf_t *)malloc(sizeof(mm_camera_super_buf_t));
+            if (frame == NULL) {
+                ALOGE("%s: Error allocating memory to save received_frame structure.",
+                        __func__);
+                if(stream) {
+                    stream->bufDone(frameIndex);
+                }
+                return;
+            }
+
+            *frame = *super_frame;
+            m_postprocessor.processData(frame, ppInfo->output, resultFrameNumber);
+            free(super_frame);
+            return;
+        } else {
+            if (ppInfo != mOfflinePpInfoList.begin()) {
+                // There is pending reprocess buffer, cache current buffer
+                if (ppInfo->callback_buffer != NULL) {
+                    ALOGE("%s: Fatal: cached callback_buffer is already present",
+                        __func__);
+
+                }
+                ppInfo->callback_buffer = super_frame;
+                return;
+            } else {
+                mOfflinePpInfoList.erase(ppInfo);
+            }
+        }
+    }
+
+    QCamera3ProcessingChannel::streamCbRoutine(super_frame, stream);
+    return;
+!!!44240439.cpp!!!	putStreamBufs() : void
+    QCamera3ProcessingChannel::putStreamBufs();
+
+    // Free allocated heap buffer.
+    mMemory.deallocate();
+    // Clear free heap buffer list.
+    mFreeHeapBufferList.clear();
+    // Clear offlinePpInfoList
+    mOfflinePpInfoList.clear();
+!!!44240567.cpp!!!	reprocessCbRoutine(inout resultBuffer : buffer_handle_t, in resultFrameNumber : uint32_t) : void
+    CDBG("%s E: frame number %d", __func__, resultFrameNumber);
+    Vector<mm_camera_super_buf_t *> pendingCbs;
+
+    /* release the input buffer and input metadata buffer if used */
+    if (0 > mMemory.getHeapBufferIndex(resultFrameNumber)) {
+        /* mOfflineMemory and mOfflineMetaMemory used only for input reprocessing */
+        int32_t rc = releaseOfflineMemory(resultFrameNumber);
+        if (NO_ERROR != rc) {
+            ALOGE("%s: Error releasing offline memory rc = %d", __func__, rc);
+        }
+        /* Since reprocessing is done, send the callback to release the input buffer */
+        if (mChannelCB) {
+            mChannelCB(NULL, NULL, resultFrameNumber, true, mUserData);
+        }
+    }
+
+    if (mBypass) {
+        int32_t rc = handleOfflinePpCallback(resultFrameNumber, pendingCbs);
+        if (rc != NO_ERROR) {
+            return;
+        }
+    }
+
+    issueChannelCb(resultBuffer, resultFrameNumber);
+
+    // Call all pending callbacks to return buffers
+    for (size_t i = 0; i < pendingCbs.size(); i++) {
+        QCamera3ProcessingChannel::streamCbRoutine(
+                pendingCbs[i], mStreams[0]);
+    }
+
+!!!44240695.cpp!!!	needsFramePostprocessing(inout meta : metadata_buffer_t) : bool
+    bool ppNeeded = false;
+
+    //sharpness
+    IF_META_AVAILABLE(cam_edge_application_t, edgeMode,
+            CAM_INTF_META_EDGE_MODE, meta) {
+        mEdgeMode = *edgeMode;
+    }
+
+    //wnr
+    IF_META_AVAILABLE(uint32_t, noiseRedMode,
+            CAM_INTF_META_NOISE_REDUCTION_MODE, meta) {
+        mNoiseRedMode = *noiseRedMode;
+    }
+
+    //crop region
+    IF_META_AVAILABLE(cam_crop_region_t, scalerCropRegion,
+            CAM_INTF_META_SCALER_CROP_REGION, meta) {
+        mCropRegion = *scalerCropRegion;
+    }
+
+    if ((CAM_EDGE_MODE_OFF != mEdgeMode.edge_mode) &&
+            (CAM_EDGE_MODE_ZERO_SHUTTER_LAG != mEdgeMode.edge_mode)) {
+        ppNeeded = true;
+    }
+    if ((CAM_NOISE_REDUCTION_MODE_ZERO_SHUTTER_LAG != mNoiseRedMode) &&
+            (CAM_NOISE_REDUCTION_MODE_OFF != mNoiseRedMode) &&
+            (CAM_NOISE_REDUCTION_MODE_MINIMAL != mNoiseRedMode)) {
+        ppNeeded = true;
+    }
+    if ((mCropRegion.width < (int32_t)mCamera3Stream->width) ||
+            (mCropRegion.height < (int32_t)mCamera3Stream->height)) {
+        ppNeeded = true;
+    }
+
+    return ppNeeded;
+!!!44240823.cpp!!!	handleOfflinePpCallback(in resultFrameNumber : uint32_t, inout pendingCbs : Vector<mm_camera_super_buf_t *>) : int32_t
+    Mutex::Autolock lock(mOfflinePpLock);
+    List<PpInfo>::iterator ppInfo;
+
+    for (ppInfo = mOfflinePpInfoList.begin();
+            ppInfo != mOfflinePpInfoList.end(); ppInfo++) {
+        if (ppInfo->frameNumber == resultFrameNumber) {
+            break;
+        }
+    }
+
+    if (ppInfo == mOfflinePpInfoList.end()) {
+        ALOGI("%s: Request of frame number %d is reprocessing",
+                __func__, resultFrameNumber);
+        return NO_ERROR;
+    } else if (ppInfo != mOfflinePpInfoList.begin()) {
+        ALOGE("%s: callback for frame number %d should be head of list",
+                __func__, resultFrameNumber);
+        return BAD_VALUE;
+    }
+
+    if (ppInfo->offlinePpFlag) {
+        // Need to get the input buffer frame index from the
+        // mMemory object and add that to the free heap buffers list.
+        int32_t bufferIndex =
+                mMemory.getHeapBufferIndex(resultFrameNumber);
+        if (bufferIndex < 0) {
+            ALOGE("%s: Fatal %d: no buffer index for frame number %d",
+                    __func__, bufferIndex, resultFrameNumber);
+            return BAD_VALUE;
+        }
+        mFreeHeapBufferList.push_back(bufferIndex);
+        ppInfo = mOfflinePpInfoList.erase(ppInfo);
+
+        // Return pending buffer callbacks
+        while (ppInfo != mOfflinePpInfoList.end() &&
+                !ppInfo->offlinePpFlag && ppInfo->callback_buffer) {
+
+            // Call stream callbacks for cached buffers
+            pendingCbs.push_back(ppInfo->callback_buffer);
+
+            ppInfo = mOfflinePpInfoList.erase(ppInfo);
+        }
+
+    } else {
+        ALOGE("%s: Fatal: request of frame number %d doesn't need"
+                " offline postprocessing. However there is"
+                " reprocessing callback.", __func__,
+                resultFrameNumber);
+        return BAD_VALUE;
+    }
+
+    return NO_ERROR;

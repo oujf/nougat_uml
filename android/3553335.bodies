@@ -1,0 +1,155 @@
+class AppMgmtSession
+!!!44073783.cpp!!!	setupMgmt(in appMsg : hub_message_t, in cmd : uint32_t) : int
+    const hub_app_name_t &appName = *static_cast<const hub_app_name_t*>(appMsg->message);
+    if (appMsg->message_len != sizeof(appName)) {
+        return -EINVAL;
+    }
+
+    char data[MAX_RX_PACKET];
+    MessageBuf buf(data, sizeof(data));
+    buf.writeU8(cmd);
+    writeAppName(buf, appName);
+    setState(MGMT);
+
+    return sendToSystem(buf.getData(), buf.getPos());
+!!!44073911.cpp!!!	handleTransfer(inout rsp : NanohubRsp) : int
+    if (rsp.cmd != NANOHUB_CONT_UPLOAD && rsp.cmd != NANOHUB_START_UPLOAD)
+        return 1;
+
+    char data[MAX_RX_PACKET];
+    MessageBuf buf(data, sizeof(data));
+
+    static_assert(NANOHUB_UPLOAD_CHUNK_SZ_MAX <= (MAX_RX_PACKET-5),
+                  "Invalid chunk size");
+
+    if (mPos < mLen) {
+        uint32_t chunkSize = mLen - mPos;
+
+        if (chunkSize > NANOHUB_UPLOAD_CHUNK_SZ_MAX) {
+            chunkSize = NANOHUB_UPLOAD_CHUNK_SZ_MAX;
+        }
+
+        buf.writeU8(NANOHUB_CONT_UPLOAD);
+        buf.writeU32(mPos);
+        buf.writeRaw(&mData[mPos], chunkSize);
+        mPos += chunkSize;
+    } else {
+        buf.writeU8(NANOHUB_FINISH_UPLOAD);
+        setState(FINISH);
+    }
+
+    return sendToSystem(buf.getData(), buf.getPos());
+!!!44074039.cpp!!!	handleFinish(inout rsp : NanohubRsp) : int
+    if (rsp.cmd != NANOHUB_FINISH_UPLOAD)
+        return 1;
+
+    int ret = 0;
+    const bool success = rsp.status != 0;
+    mData.clear();
+
+    if (success) {
+        char data[MAX_RX_PACKET];
+        MessageBuf buf(data, sizeof(data));
+        // until app header is passed, we don't know who to start, so we reboot
+        buf.writeU8(NANOHUB_REBOOT);
+        setState(RELOAD);
+        ret = sendToSystem(buf.getData(), buf.getPos());
+    } else {
+        int32_t result = NANOHUB_APP_NOT_LOADED;
+
+        sendToApp(mCmd, &result, sizeof(result));
+        complete();
+    }
+
+    return ret;
+!!!44074167.cpp!!!	handleReload(inout rsp : NanohubRsp) : int
+    int32_t result = NANOHUB_APP_LOADED;
+
+    ALOGI("Nanohub reboot status: %08" PRIX32, rsp.status);
+
+    sendToApp(mCmd, &result, sizeof(result));
+    complete();
+
+    return 0;
+!!!44074295.cpp!!!	handleMgmt(inout rsp : NanohubRsp) : int
+    Mutex::Autolock _l(mLock);
+    bool valid = false;
+
+    ALOGI("Nanohub MGMT response: CMD=%02X; STATUS=%08" PRIX32, rsp.cmd, rsp.status);
+
+    switch (rsp.cmd) {
+    case NANOHUB_EXT_APPS_OFF:
+        valid = mCmd == CONTEXT_HUB_APPS_DISABLE;
+        break;
+    case NANOHUB_EXT_APPS_ON:
+        valid = mCmd == CONTEXT_HUB_APPS_ENABLE;
+        break;
+    case NANOHUB_EXT_APP_DELETE:
+        valid = mCmd == CONTEXT_HUB_UNLOAD_APP;
+        break;
+    default:
+        return 1;
+    }
+
+    if (!valid) {
+        ALOGE("Invalid response for this state: APP CMD=%02X", mCmd);
+        return -EINVAL;
+    }
+
+    sendToApp(mCmd, &rsp.status, sizeof(rsp.status));
+    complete();
+
+    return 0;
+!!!44074551.cpp!!!	handleRx(inout buf : MessageBuf) : int
+    int ret = 0;
+    Mutex::Autolock _l(mLock);
+    NanohubRsp rsp(buf);
+
+    switch (getState()) {
+    case TRANSFER:
+        ret = handleTransfer(rsp);
+        break;
+    case FINISH:
+        ret = handleFinish(rsp);
+        break;
+    case RELOAD:
+        ret = handleReload(rsp);
+        break;
+    case MGMT:
+        ret = handleMgmt(rsp);
+        break;
+    }
+
+    return ret;
+!!!44074679.cpp!!!	setup(in appMsg : hub_message_t) : int
+    Mutex::Autolock _l(mLock);
+
+    mCmd = appMsg->message_type;
+    mLen = appMsg->message_len;
+    mPos = 0;
+
+    switch (mCmd) {
+    case  CONTEXT_HUB_APPS_ENABLE:
+        return setupMgmt(appMsg, NANOHUB_EXT_APPS_ON);
+    case  CONTEXT_HUB_APPS_DISABLE:
+        return setupMgmt(appMsg, NANOHUB_EXT_APPS_OFF);
+    case  CONTEXT_HUB_UNLOAD_APP:
+        return setupMgmt(appMsg, NANOHUB_EXT_APP_DELETE);
+    case  CONTEXT_HUB_LOAD_OS:
+    case  CONTEXT_HUB_LOAD_APP:
+        const uint8_t *p = static_cast<const uint8_t*>(appMsg->message);
+        mData.clear();
+        mData = std::vector<uint8_t>(p, p + mLen);
+        setState(TRANSFER);
+
+        char data[MAX_RX_PACKET];
+        MessageBuf buf(data, sizeof(data));
+        buf.writeU8(NANOHUB_START_UPLOAD);
+        buf.writeU8(mCmd == CONTEXT_HUB_LOAD_OS ? 1 : 0);
+        buf.writeU32(mLen);
+
+        return sendToSystem(buf.getData(), buf.getPos());
+    break;
+    }
+
+    return -EINVAL;

@@ -1,0 +1,189 @@
+class PlaybackSynthesisCallback
+!!!80979127.java!!!	PlaybackSynthesisCallback(inout audioParams : TextToSpeechService::AudioOutputParams, inout audioTrackHandler : AudioPlaybackHandler, inout dispatcher : TextToSpeechService::UtteranceProgressDispatcher, inout callerIdentity : Object, inout logger : AbstractEventLogger, inout clientIsUsingV2 : boolean)
+        super(clientIsUsingV2);
+        mAudioParams = audioParams;
+        mAudioTrackHandler = audioTrackHandler;
+        mDispatcher = dispatcher;
+        mCallerIdentity = callerIdentity;
+        mLogger = logger;
+        mStatusCode = TextToSpeech.SUCCESS;
+!!!80979255.java!!!	stop() : void
+        if (DBG) Log.d(TAG, "stop()");
+
+        SynthesisPlaybackQueueItem item;
+        synchronized (mStateLock) {
+            if (mDone) {
+                return;
+            }
+            if (mStatusCode == TextToSpeech.STOPPED) {
+                Log.w(TAG, "stop() called twice");
+                return;
+            }
+
+            item = mItem;
+            mStatusCode = TextToSpeech.STOPPED;
+        }
+
+        if (item != null) {
+            // This might result in the synthesis thread being woken up, at which
+            // point it will write an additional buffer to the item - but we
+            // won't worry about that because the audio playback queue will be cleared
+            // soon after (see SynthHandler#stop(String).
+            item.stop(TextToSpeech.STOPPED);
+        } else {
+            // This happens when stop() or error() were called before start() was.
+
+            // In all other cases, mAudioTrackHandler.stop() will
+            // result in onSynthesisDone being called, and we will
+            // write data there.
+            mLogger.onCompleted(TextToSpeech.STOPPED);
+            mDispatcher.dispatchOnStop();
+        }
+!!!80979383.java!!!	getMaxBufferSize() : int
+        // The AudioTrack buffer will be at least MIN_AUDIO_BUFFER_SIZE, so that should always be
+        // a safe buffer size to pass in.
+        return MIN_AUDIO_BUFFER_SIZE;
+!!!80979511.java!!!	hasStarted() : boolean
+        synchronized (mStateLock) {
+            return mItem != null;
+        }
+!!!80979639.java!!!	hasFinished() : boolean
+        synchronized (mStateLock) {
+            return mDone;
+        }
+!!!80979767.java!!!	start(in sampleRateInHz : int, in audioFormat : int, in channelCount : int) : int
+        if (DBG) Log.d(TAG, "start(" + sampleRateInHz + "," + audioFormat + "," + channelCount
+                + ")");
+        if (audioFormat != AudioFormat.ENCODING_PCM_8BIT &&
+            audioFormat != AudioFormat.ENCODING_PCM_16BIT &&
+            audioFormat != AudioFormat.ENCODING_PCM_FLOAT) {
+            Log.w(TAG, "Audio format encoding " + audioFormat + " not supported. Please use one " +
+                       "of AudioFormat.ENCODING_PCM_8BIT, AudioFormat.ENCODING_PCM_16BIT or " +
+                       "AudioFormat.ENCODING_PCM_FLOAT");
+        }
+        mDispatcher.dispatchOnBeginSynthesis(sampleRateInHz, audioFormat, channelCount);
+
+        int channelConfig = BlockingAudioTrack.getChannelConfig(channelCount);
+
+        synchronized (mStateLock) {
+            if (channelConfig == 0) {
+                Log.e(TAG, "Unsupported number of channels :" + channelCount);
+                mStatusCode = TextToSpeech.ERROR_OUTPUT;
+                return TextToSpeech.ERROR;
+            }
+            if (mStatusCode == TextToSpeech.STOPPED) {
+                if (DBG) Log.d(TAG, "stop() called before start(), returning.");
+                return errorCodeOnStop();
+            }
+            if (mStatusCode != TextToSpeech.SUCCESS) {
+                if (DBG) Log.d(TAG, "Error was raised");
+                return TextToSpeech.ERROR;
+            }
+            if (mItem != null) {
+                Log.e(TAG, "Start called twice");
+                return TextToSpeech.ERROR;
+            }
+            SynthesisPlaybackQueueItem item = new SynthesisPlaybackQueueItem(
+                    mAudioParams, sampleRateInHz, audioFormat, channelCount,
+                    mDispatcher, mCallerIdentity, mLogger);
+            mAudioTrackHandler.enqueue(item);
+            mItem = item;
+        }
+
+        return TextToSpeech.SUCCESS;
+!!!80979895.java!!!	audioAvailable(inout buffer : byte [[]], in offset : int, in length : int) : int
+        if (DBG) Log.d(TAG, "audioAvailable(byte[" + buffer.length + "]," + offset + "," + length
+                + ")");
+
+        if (length > getMaxBufferSize() || length <= 0) {
+            throw new IllegalArgumentException("buffer is too large or of zero length (" +
+                    + length + " bytes)");
+        }
+
+        SynthesisPlaybackQueueItem item = null;
+        synchronized (mStateLock) {
+            if (mItem == null) {
+                mStatusCode = TextToSpeech.ERROR_OUTPUT;
+                return TextToSpeech.ERROR;
+            }
+            if (mStatusCode != TextToSpeech.SUCCESS) {
+                if (DBG) Log.d(TAG, "Error was raised");
+                return TextToSpeech.ERROR;
+            }
+            if (mStatusCode == TextToSpeech.STOPPED) {
+                return errorCodeOnStop();
+            }
+            item = mItem;
+        }
+
+        // Sigh, another copy.
+        final byte[] bufferCopy = new byte[length];
+        System.arraycopy(buffer, offset, bufferCopy, 0, length);
+        mDispatcher.dispatchOnAudioAvailable(bufferCopy);
+
+        // Might block on mItem.this, if there are too many buffers waiting to
+        // be consumed.
+        try {
+            item.put(bufferCopy);
+        } catch (InterruptedException ie) {
+            synchronized (mStateLock) {
+                mStatusCode = TextToSpeech.ERROR_OUTPUT;
+                return TextToSpeech.ERROR;
+            }
+        }
+
+        mLogger.onEngineDataReceived();
+        return TextToSpeech.SUCCESS;
+!!!80980023.java!!!	done() : int
+        if (DBG) Log.d(TAG, "done()");
+
+        int statusCode = 0;
+        SynthesisPlaybackQueueItem item = null;
+        synchronized (mStateLock) {
+            if (mDone) {
+                Log.w(TAG, "Duplicate call to done()");
+                // Not an error that would prevent synthesis. Hence no
+                // setStatusCode
+                return TextToSpeech.ERROR;
+            }
+            if (mStatusCode == TextToSpeech.STOPPED) {
+                if (DBG) Log.d(TAG, "Request has been aborted.");
+                return errorCodeOnStop();
+            }
+            mDone = true;
+
+            if (mItem == null) {
+                // .done() was called before .start. Treat it as successful synthesis
+                // for a client, despite service bad implementation.
+                Log.w(TAG, "done() was called before start() call");
+                if (mStatusCode == TextToSpeech.SUCCESS) {
+                    mDispatcher.dispatchOnSuccess();
+                } else {
+                    mDispatcher.dispatchOnError(mStatusCode);
+                }
+                mLogger.onEngineComplete();
+                return TextToSpeech.ERROR;
+            }
+
+            item = mItem;
+            statusCode = mStatusCode;
+        }
+
+        // Signal done or error to item
+        if (statusCode == TextToSpeech.SUCCESS) {
+            item.done();
+        } else {
+            item.stop(statusCode);
+        }
+        mLogger.onEngineComplete();
+        return TextToSpeech.SUCCESS;
+!!!80980151.java!!!	error() : void
+        error(TextToSpeech.ERROR_SYNTHESIS);
+!!!80980279.java!!!	error(in errorCode : int) : void
+        if (DBG) Log.d(TAG, "error() [will call stop]");
+        synchronized (mStateLock) {
+            if (mDone) {
+                return;
+            }
+            mStatusCode = errorCode;
+        }

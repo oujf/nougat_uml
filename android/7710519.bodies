@@ -1,0 +1,299 @@
+class ProcessList
+!!!84482231.java!!!	ProcessList()
+        MemInfoReader minfo = new MemInfoReader();
+        minfo.readMemInfo();
+        mTotalMemMb = minfo.getTotalSize()/(1024*1024);
+        updateOomLevels(0, 0, false);
+!!!84482359.java!!!	applyDisplaySize(inout wm : WindowManagerService) : void
+        if (!mHaveDisplaySize) {
+            Point p = new Point();
+            wm.getBaseDisplaySize(Display.DEFAULT_DISPLAY, p);
+            if (p.x != 0 && p.y != 0) {
+                updateOomLevels(p.x, p.y, true);
+                mHaveDisplaySize = true;
+            }
+        }
+!!!84482487.java!!!	updateOomLevels(in displayWidth : int, in displayHeight : int, inout write : boolean) : void
+        // Scale buckets from avail memory: at 300MB we use the lowest values to
+        // 700MB or more for the top values.
+        float scaleMem = ((float)(mTotalMemMb-350))/(700-350);
+
+        // Scale buckets from screen size.
+        int minSize = 480*800;  //  384000
+        int maxSize = 1280*800; // 1024000  230400 870400  .264
+        float scaleDisp = ((float)(displayWidth*displayHeight)-minSize)/(maxSize-minSize);
+        if (false) {
+            Slog.i("XXXXXX", "scaleMem=" + scaleMem);
+            Slog.i("XXXXXX", "scaleDisp=" + scaleDisp + " dw=" + displayWidth
+                    + " dh=" + displayHeight);
+        }
+
+        float scale = scaleMem > scaleDisp ? scaleMem : scaleDisp;
+        if (scale < 0) scale = 0;
+        else if (scale > 1) scale = 1;
+        int minfree_adj = Resources.getSystem().getInteger(
+                com.android.internal.R.integer.config_lowMemoryKillerMinFreeKbytesAdjust);
+        int minfree_abs = Resources.getSystem().getInteger(
+                com.android.internal.R.integer.config_lowMemoryKillerMinFreeKbytesAbsolute);
+        if (false) {
+            Slog.i("XXXXXX", "minfree_adj=" + minfree_adj + " minfree_abs=" + minfree_abs);
+        }
+
+        final boolean is64bit = Build.SUPPORTED_64_BIT_ABIS.length > 0;
+
+        for (int i=0; i<mOomAdj.length; i++) {
+            int low = mOomMinFreeLow[i];
+            int high = mOomMinFreeHigh[i];
+            if (is64bit) {
+                // Increase the high min-free levels for cached processes for 64-bit
+                if (i == 4) high = (high*3)/2;
+                else if (i == 5) high = (high*7)/4;
+            }
+            mOomMinFree[i] = (int)(low + ((high-low)*scale));
+        }
+
+        if (minfree_abs >= 0) {
+            for (int i=0; i<mOomAdj.length; i++) {
+                mOomMinFree[i] = (int)((float)minfree_abs * mOomMinFree[i]
+                        / mOomMinFree[mOomAdj.length - 1]);
+            }
+        }
+
+        if (minfree_adj != 0) {
+            for (int i=0; i<mOomAdj.length; i++) {
+                mOomMinFree[i] += (int)((float)minfree_adj * mOomMinFree[i]
+                        / mOomMinFree[mOomAdj.length - 1]);
+                if (mOomMinFree[i] < 0) {
+                    mOomMinFree[i] = 0;
+                }
+            }
+        }
+
+        // The maximum size we will restore a process from cached to background, when under
+        // memory duress, is 1/3 the size we have reserved for kernel caches and other overhead
+        // before killing background processes.
+        mCachedRestoreLevel = (getMemLevel(ProcessList.CACHED_APP_MAX_ADJ)/1024) / 3;
+
+        // Ask the kernel to try to keep enough memory free to allocate 3 full
+        // screen 32bpp buffers without entering direct reclaim.
+        int reserve = displayWidth * displayHeight * 4 * 3 / 1024;
+        int reserve_adj = Resources.getSystem().getInteger(com.android.internal.R.integer.config_extraFreeKbytesAdjust);
+        int reserve_abs = Resources.getSystem().getInteger(com.android.internal.R.integer.config_extraFreeKbytesAbsolute);
+
+        if (reserve_abs >= 0) {
+            reserve = reserve_abs;
+        }
+
+        if (reserve_adj != 0) {
+            reserve += reserve_adj;
+            if (reserve < 0) {
+                reserve = 0;
+            }
+        }
+
+        if (write) {
+            ByteBuffer buf = ByteBuffer.allocate(4 * (2*mOomAdj.length + 1));
+            buf.putInt(LMK_TARGET);
+            for (int i=0; i<mOomAdj.length; i++) {
+                buf.putInt((mOomMinFree[i]*1024)/PAGE_SIZE);
+                buf.putInt(mOomAdj[i]);
+            }
+
+            writeLmkd(buf);
+            SystemProperties.set("sys.sysctl.extra_free_kbytes", Integer.toString(reserve));
+        }
+        // GB: 2048,3072,4096,6144,7168,8192
+        // HC: 8192,10240,12288,14336,16384,20480
+!!!84482615.java!!!	computeEmptyProcessLimit(in totalProcessLimit : int) : int
+        return totalProcessLimit/2;
+!!!84482743.java!!!	buildOomTag(inout prefix : String, inout space : String, in val : int, in base : int) : String
+        if (val == base) {
+            if (space == null) return prefix;
+            return prefix + "  ";
+        }
+        return prefix + "+" + Integer.toString(val-base);
+!!!84482871.java!!!	makeOomAdjString(in setAdj : int) : String
+        if (setAdj >= ProcessList.CACHED_APP_MIN_ADJ) {
+            return buildOomTag("cch", "  ", setAdj, ProcessList.CACHED_APP_MIN_ADJ);
+        } else if (setAdj >= ProcessList.SERVICE_B_ADJ) {
+            return buildOomTag("svcb ", null, setAdj, ProcessList.SERVICE_B_ADJ);
+        } else if (setAdj >= ProcessList.PREVIOUS_APP_ADJ) {
+            return buildOomTag("prev ", null, setAdj, ProcessList.PREVIOUS_APP_ADJ);
+        } else if (setAdj >= ProcessList.HOME_APP_ADJ) {
+            return buildOomTag("home ", null, setAdj, ProcessList.HOME_APP_ADJ);
+        } else if (setAdj >= ProcessList.SERVICE_ADJ) {
+            return buildOomTag("svc  ", null, setAdj, ProcessList.SERVICE_ADJ);
+        } else if (setAdj >= ProcessList.HEAVY_WEIGHT_APP_ADJ) {
+            return buildOomTag("hvy  ", null, setAdj, ProcessList.HEAVY_WEIGHT_APP_ADJ);
+        } else if (setAdj >= ProcessList.BACKUP_APP_ADJ) {
+            return buildOomTag("bkup ", null, setAdj, ProcessList.BACKUP_APP_ADJ);
+        } else if (setAdj >= ProcessList.PERCEPTIBLE_APP_ADJ) {
+            return buildOomTag("prcp ", null, setAdj, ProcessList.PERCEPTIBLE_APP_ADJ);
+        } else if (setAdj >= ProcessList.VISIBLE_APP_ADJ) {
+            return buildOomTag("vis  ", null, setAdj, ProcessList.VISIBLE_APP_ADJ);
+        } else if (setAdj >= ProcessList.FOREGROUND_APP_ADJ) {
+            return buildOomTag("fore ", null, setAdj, ProcessList.FOREGROUND_APP_ADJ);
+        } else if (setAdj >= ProcessList.PERSISTENT_SERVICE_ADJ) {
+            return buildOomTag("psvc ", null, setAdj, ProcessList.PERSISTENT_SERVICE_ADJ);
+        } else if (setAdj >= ProcessList.PERSISTENT_PROC_ADJ) {
+            return buildOomTag("pers ", null, setAdj, ProcessList.PERSISTENT_PROC_ADJ);
+        } else if (setAdj >= ProcessList.SYSTEM_ADJ) {
+            return buildOomTag("sys  ", null, setAdj, ProcessList.SYSTEM_ADJ);
+        } else if (setAdj >= ProcessList.NATIVE_ADJ) {
+            return buildOomTag("ntv  ", null, setAdj, ProcessList.NATIVE_ADJ);
+        } else {
+            return Integer.toString(setAdj);
+        }
+!!!84482999.java!!!	makeProcStateString(in curProcState : int) : String
+        String procState;
+        switch (curProcState) {
+            case -1:
+                procState = "N ";
+                break;
+            case ActivityManager.PROCESS_STATE_PERSISTENT:
+                procState = "P ";
+                break;
+            case ActivityManager.PROCESS_STATE_PERSISTENT_UI:
+                procState = "PU";
+                break;
+            case ActivityManager.PROCESS_STATE_TOP:
+                procState = "T ";
+                break;
+            case ActivityManager.PROCESS_STATE_BOUND_FOREGROUND_SERVICE:
+                procState = "SB";
+                break;
+            case ActivityManager.PROCESS_STATE_FOREGROUND_SERVICE:
+                procState = "SF";
+                break;
+            case ActivityManager.PROCESS_STATE_TOP_SLEEPING:
+                procState = "TS";
+                break;
+            case ActivityManager.PROCESS_STATE_IMPORTANT_FOREGROUND:
+                procState = "IF";
+                break;
+            case ActivityManager.PROCESS_STATE_IMPORTANT_BACKGROUND:
+                procState = "IB";
+                break;
+            case ActivityManager.PROCESS_STATE_BACKUP:
+                procState = "BU";
+                break;
+            case ActivityManager.PROCESS_STATE_HEAVY_WEIGHT:
+                procState = "HW";
+                break;
+            case ActivityManager.PROCESS_STATE_SERVICE:
+                procState = "S ";
+                break;
+            case ActivityManager.PROCESS_STATE_RECEIVER:
+                procState = "R ";
+                break;
+            case ActivityManager.PROCESS_STATE_HOME:
+                procState = "HO";
+                break;
+            case ActivityManager.PROCESS_STATE_LAST_ACTIVITY:
+                procState = "LA";
+                break;
+            case ActivityManager.PROCESS_STATE_CACHED_ACTIVITY:
+                procState = "CA";
+                break;
+            case ActivityManager.PROCESS_STATE_CACHED_ACTIVITY_CLIENT:
+                procState = "Ca";
+                break;
+            case ActivityManager.PROCESS_STATE_CACHED_EMPTY:
+                procState = "CE";
+                break;
+            default:
+                procState = "??";
+                break;
+        }
+        return procState;
+!!!84483127.java!!!	appendRamKb(inout sb : StringBuilder, in ramKb : long) : void
+        for (int j=0, fact=10; j<6; j++, fact*=10) {
+            if (ramKb < fact) {
+                sb.append(' ');
+            }
+        }
+        sb.append(ramKb);
+!!!84483255.java!!!	procStatesDifferForMem(in procState1 : int, in procState2 : int) : boolean
+        return sProcStateToProcMem[procState1] != sProcStateToProcMem[procState2];
+!!!84483383.java!!!	minTimeFromStateChange(inout test : boolean) : long
+        return test ? PSS_TEST_MIN_TIME_FROM_STATE_CHANGE : PSS_MIN_TIME_FROM_STATE_CHANGE;
+!!!84483511.java!!!	computeNextPssTime(in procState : int, inout first : boolean, inout test : boolean, inout sleeping : boolean, in now : long) : long
+        final long[] table = test
+                ? (first
+                        ? sTestFirstAwakePssTimes
+                        : sTestSameAwakePssTimes)
+                : (first
+                        ? sFirstAwakePssTimes
+                        : sSameAwakePssTimes);
+        return now + table[procState];
+!!!84483639.java!!!	getMemLevel(in adjustment : int) : long
+        for (int i=0; i<mOomAdj.length; i++) {
+            if (adjustment <= mOomAdj[i]) {
+                return mOomMinFree[i] * 1024;
+            }
+        }
+        return mOomMinFree[mOomAdj.length-1] * 1024;
+!!!84483767.java!!!	getCachedRestoreThresholdKb() : long
+        return mCachedRestoreLevel;
+!!!84483895.java!!!	setOomAdj(in pid : int, in uid : int, in amt : int) : void
+        if (amt == UNKNOWN_ADJ)
+            return;
+
+        long start = SystemClock.elapsedRealtime();
+        ByteBuffer buf = ByteBuffer.allocate(4 * 4);
+        buf.putInt(LMK_PROCPRIO);
+        buf.putInt(pid);
+        buf.putInt(uid);
+        buf.putInt(amt);
+        writeLmkd(buf);
+        long now = SystemClock.elapsedRealtime();
+        if ((now-start) > 250) {
+            Slog.w("ActivityManager", "SLOW OOM ADJ: " + (now-start) + "ms for pid " + pid
+                    + " = " + amt);
+        }
+!!!84484023.java!!!	remove(in pid : int) : void
+        ByteBuffer buf = ByteBuffer.allocate(4 * 2);
+        buf.putInt(LMK_PROCREMOVE);
+        buf.putInt(pid);
+        writeLmkd(buf);
+!!!84484151.java!!!	openLmkdSocket() : boolean
+        try {
+            sLmkdSocket = new LocalSocket(LocalSocket.SOCKET_SEQPACKET);
+            sLmkdSocket.connect(
+                new LocalSocketAddress("lmkd",
+                        LocalSocketAddress.Namespace.RESERVED));
+            sLmkdOutputStream = sLmkdSocket.getOutputStream();
+        } catch (IOException ex) {
+            Slog.w(TAG, "lowmemorykiller daemon socket open failed");
+            sLmkdSocket = null;
+            return false;
+        }
+
+        return true;
+!!!84484279.java!!!	writeLmkd(inout buf : ByteBuffer) : void
+
+        for (int i = 0; i < 3; i++) {
+            if (sLmkdSocket == null) {
+                    if (openLmkdSocket() == false) {
+                        try {
+                            Thread.sleep(1000);
+                        } catch (InterruptedException ie) {
+                        }
+                        continue;
+                    }
+            }
+
+            try {
+                sLmkdOutputStream.write(buf.array(), 0, buf.position());
+                return;
+            } catch (IOException ex) {
+                Slog.w(TAG, "Error writing to lowmemorykiller socket");
+
+                try {
+                    sLmkdSocket.close();
+                } catch (IOException ex2) {
+                }
+
+                sLmkdSocket = null;
+            }
+        }

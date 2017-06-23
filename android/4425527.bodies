@@ -1,0 +1,316 @@
+class InputHub
+!!!44996407.cpp!!!	~InputHub()
+    ::close(mEpollFd);
+    ::close(mINotifyFd);
+    ::close(mWakeEventFd);
+
+    if (manageWakeLocks()) {
+        release_wake_lock(WAKE_LOCK_ID);
+    }
+!!!44996535.cpp!!!	registerDevicePath(in path : std::string) : status_t
+    ALOGV("registering device path %s", path.c_str());
+    int wd = inotify_add_watch(mINotifyFd, path.c_str(), IN_DELETE | IN_CREATE);
+    if (wd < 0) {
+        ALOGE("Could not add %s to INotify watch. errno=%d", path.c_str(), errno);
+        return -errno;
+    }
+    mWatchedPaths[wd] = path;
+    scanDir(path);
+    return OK;
+!!!44996663.cpp!!!	unregisterDevicePath(in path : std::string) : status_t
+    int wd = -1;
+    for (auto pair : mWatchedPaths) {
+        if (pair.second == path) {
+            wd = pair.first;
+            break;
+        }
+    }
+
+    if (wd == -1) {
+        return BAD_VALUE;
+    }
+    mWatchedPaths.erase(wd);
+    if (inotify_rm_watch(mINotifyFd, wd) != 0) {
+        return -errno;
+    }
+    return OK;
+!!!44996791.cpp!!!	poll() : status_t
+    bool deviceChange = false;
+
+    if (manageWakeLocks()) {
+        // Mind the wake lock dance!
+        // If we're relying on wake locks, we hold a wake lock at all times
+        // except during epoll_wait(). This works due to some subtle
+        // choreography. When a device driver has pending (unread) events, it
+        // acquires a kernel wake lock. However, once the last pending event
+        // has been read, the device driver will release the kernel wake lock.
+        // To prevent the system from going to sleep when this happens, the
+        // InputHub holds onto its own user wake lock while the client is
+        // processing events. Thus the system can only sleep if there are no
+        // events pending or currently being processed.
+        release_wake_lock(WAKE_LOCK_ID);
+    }
+
+    struct epoll_event pendingEventItems[EPOLL_MAX_EVENTS];
+    int pollResult = epoll_wait(mEpollFd, pendingEventItems, EPOLL_MAX_EVENTS, NO_TIMEOUT);
+
+    if (manageWakeLocks()) {
+        acquire_wake_lock(PARTIAL_WAKE_LOCK, WAKE_LOCK_ID);
+    }
+
+    if (pollResult == 0) {
+        ALOGW("epoll_wait should not return 0 with no timeout");
+        return UNKNOWN_ERROR;
+    }
+    if (pollResult < 0) {
+        // An error occurred. Return even if it's EINTR, and let the caller
+        // restart the poll.
+        ALOGE("epoll_wait returned with errno=%d", errno);
+        return -errno;
+    }
+
+    // pollResult > 0: there are events to process
+    nsecs_t now = systemTime(SYSTEM_TIME_MONOTONIC);
+    std::vector<int> removedDeviceFds;
+    int inputFd = -1;
+    std::shared_ptr<InputDeviceNode> deviceNode;
+    for (int i = 0; i < pollResult; ++i) {
+        const struct epoll_event& eventItem = pendingEventItems[i];
+
+        int dataFd = static_cast<int>(eventItem.data.u32);
+        if (dataFd == mINotifyFd) {
+            if (eventItem.events & EPOLLIN) {
+                deviceChange = true;
+            } else {
+                ALOGW("Received unexpected epoll event 0x%08x for INotify.", eventItem.events);
+            }
+            continue;
+        }
+
+        if (dataFd == mWakeEventFd) {
+            if (eventItem.events & EPOLLIN) {
+                ALOGV("awoken after wake()");
+                uint64_t u;
+                ssize_t nRead = TEMP_FAILURE_RETRY(read(mWakeEventFd, &u, sizeof(uint64_t)));
+                if (nRead != sizeof(uint64_t)) {
+                    ALOGW("Could not read event fd; waking anyway.");
+                }
+            } else {
+                ALOGW("Received unexpected epoll event 0x%08x for wake event.",
+                        eventItem.events);
+            }
+            continue;
+        }
+
+        // Update the fd and device node when the fd changes. When several
+        // events are read back-to-back with the same fd, this saves many reads
+        // from the hash table.
+        if (inputFd != dataFd) {
+            inputFd = dataFd;
+            deviceNode = mDeviceNodes[inputFd];
+        }
+        if (deviceNode == nullptr) {
+            ALOGE("could not find device node for fd %d", inputFd);
+            continue;
+        }
+        if (eventItem.events & EPOLLIN) {
+            struct input_event ievs[INPUT_MAX_EVENTS];
+            for (;;) {
+                ssize_t readSize = TEMP_FAILURE_RETRY(read(inputFd, ievs, sizeof(ievs)));
+                if (readSize == 0 || (readSize < 0 && errno == ENODEV)) {
+                    ALOGW("could not get event, removed? (fd: %d, size: %d errno: %d)",
+                            inputFd, readSize, errno);
+
+                    removedDeviceFds.push_back(inputFd);
+                    break;
+                } else if (readSize < 0) {
+                    if (errno != EAGAIN && errno != EINTR) {
+                        ALOGW("could not get event. errno=%d", errno);
+                    }
+                    break;
+                } else if (readSize % sizeof(input_event) != 0) {
+                    ALOGE("could not get event. wrong size=%d", readSize);
+                    break;
+                } else {
+                    size_t count = static_cast<size_t>(readSize) / sizeof(struct input_event);
+                    for (size_t i = 0; i < count; ++i) {
+                        auto& iev = ievs[i];
+                        auto when = s2ns(iev.time.tv_sec) + us2ns(iev.time.tv_usec);
+                        InputEvent inputEvent = { when, iev.type, iev.code, iev.value };
+                        mInputCallback->onInputEvent(deviceNode, inputEvent, now);
+                    }
+                }
+            }
+        } else if (eventItem.events & EPOLLHUP) {
+            ALOGI("Removing device fd %d due to epoll hangup event.", inputFd);
+            removedDeviceFds.push_back(inputFd);
+        } else {
+            ALOGW("Received unexpected epoll event 0x%08x for device fd %d",
+                    eventItem.events, inputFd);
+        }
+    }
+
+    if (removedDeviceFds.size()) {
+        for (auto deviceFd : removedDeviceFds) {
+            auto deviceNode = mDeviceNodes[deviceFd];
+            if (deviceNode != nullptr) {
+                status_t ret = closeNodeByFd(deviceFd);
+                if (ret != OK) {
+                    ALOGW("Could not close device with fd %d. errno=%d", deviceFd, ret);
+                } else {
+                    mInputCallback->onDeviceRemoved(deviceNode);
+                }
+            }
+        }
+    }
+
+    if (deviceChange) {
+        readNotify();
+    }
+
+    return OK;
+!!!44996919.cpp!!!	wake() : status_t
+    ALOGV("wake() called");
+
+    uint64_t u = 1;
+    ssize_t nWrite = TEMP_FAILURE_RETRY(write(mWakeEventFd, &u, sizeof(uint64_t)));
+
+    if (nWrite != sizeof(uint64_t) && errno != EAGAIN) {
+        ALOGW("Could not write wake signal, errno=%d", errno);
+        return -errno;
+    }
+    return OK;
+!!!44997047.cpp!!!	dump(inout dump : String8) : void
+    // TODO
+!!!44997175.cpp!!!	readNotify() : status_t
+    char event_buf[512];
+    struct inotify_event* event;
+
+    ssize_t res = TEMP_FAILURE_RETRY(read(mINotifyFd, event_buf, sizeof(event_buf)));
+    if (res < static_cast<int>(sizeof(*event))) {
+        ALOGW("could not get inotify event, %s\n", strerror(errno));
+        return -errno;
+    }
+
+    size_t event_pos = 0;
+    nsecs_t now = systemTime(SYSTEM_TIME_MONOTONIC);
+    while (res >= static_cast<int>(sizeof(*event))) {
+        event = reinterpret_cast<struct inotify_event*>(event_buf + event_pos);
+        if (event->len) {
+            std::string path = mWatchedPaths[event->wd];
+            path.append("/").append(event->name);
+            ALOGV("inotify event for path %s", path.c_str());
+
+            if (event->mask & IN_CREATE) {
+                auto deviceNode = openNode(path);
+                if (deviceNode == nullptr) {
+                    ALOGE("could not open device node %s. err=%d", path.c_str(), res);
+                } else {
+                    mInputCallback->onDeviceAdded(deviceNode);
+                }
+            } else {
+                auto deviceNode = findNodeByPath(path);
+                if (deviceNode != nullptr) {
+                    status_t ret = closeNode(deviceNode.get());
+                    if (ret != OK) {
+                        ALOGW("Could not close device %s. errno=%d", path.c_str(), ret);
+                    } else {
+                        mInputCallback->onDeviceRemoved(deviceNode);
+                    }
+                } else {
+                    ALOGW("could not find device node for %s", path.c_str());
+                }
+            }
+        }
+        int event_size = sizeof(*event) + event->len;
+        res -= event_size;
+        event_pos += event_size;
+    }
+
+    return OK;
+!!!44997303.cpp!!!	scanDir(in path : std::string) : status_t
+    auto dir = ::opendir(path.c_str());
+    if (dir == nullptr) {
+        ALOGE("could not open device path %s to scan for devices. err=%d", path.c_str(), errno);
+        return -errno;
+    }
+
+    while (auto dirent = readdir(dir)) {
+        if (strcmp(dirent->d_name, ".") == 0 ||
+            strcmp(dirent->d_name, "..") == 0) {
+            continue;
+        }
+        std::string filename = path + "/" + dirent->d_name;
+        auto node = openNode(filename);
+        if (node == nullptr) {
+            ALOGE("could not open device node %s", filename.c_str());
+        } else {
+            mInputCallback->onDeviceAdded(node);
+        }
+    }
+    ::closedir(dir);
+    return OK;
+!!!44997431.cpp!!!	openNode(in path : std::string) : std::shared_ptr<InputDeviceNode>
+    ALOGV("opening %s...", path.c_str());
+    auto evdevNode = std::shared_ptr<EvdevDeviceNode>(EvdevDeviceNode::openDeviceNode(path));
+    if (evdevNode == nullptr) {
+        return nullptr;
+    }
+
+    auto fd = evdevNode->getFd();
+    ALOGV("opened %s with fd %d", path.c_str(), fd);
+    mDeviceNodes[fd] = evdevNode;
+    struct epoll_event eventItem{};
+    eventItem.events = EPOLLIN;
+    if (mWakeupMechanism == WakeMechanism::EPOLL_WAKEUP) {
+        eventItem.events |= EPOLLWAKEUP;
+    }
+    eventItem.data.u32 = fd;
+    if (epoll_ctl(mEpollFd, EPOLL_CTL_ADD, fd, &eventItem)) {
+        ALOGE("Could not add device fd to epoll instance. errno=%d", errno);
+        return nullptr;
+    }
+
+    if (mNeedToCheckSuspendBlockIoctl) {
+#ifndef EVIOCSSUSPENDBLOCK
+        // uapi headers don't include EVIOCSSUSPENDBLOCK, and future kernels
+        // will use an epoll flag instead, so as long as we want to support this
+        // feature, we need to be prepared to define the ioctl ourselves.
+#define EVIOCSSUSPENDBLOCK _IOW('E', 0x91, int)
+#endif
+        if (TEMP_FAILURE_RETRY(ioctl(fd, EVIOCSSUSPENDBLOCK, 1))) {
+            // no wake mechanism, continue using explicit wake locks
+            ALOGI("Using explicit wakelocks to block suspend while processing input events.");
+        } else {
+            mWakeupMechanism = WakeMechanism::LEGACY_EVDEV_SUSPENDBLOCK_IOCTL;
+            // release any held wakelocks since we won't need them anymore
+            release_wake_lock(WAKE_LOCK_ID);
+            ALOGI("Using EVIOCSSUSPENDBLOCK to block suspend while processing input events.");
+        }
+        mNeedToCheckSuspendBlockIoctl = false;
+    }
+
+    return evdevNode;
+!!!44997559.cpp!!!	closeNode(in node : InputDeviceNode) : status_t
+    for (auto pair : mDeviceNodes) {
+        if (pair.second.get() == node) {
+            return closeNodeByFd(pair.first);
+        }
+    }
+    return BAD_VALUE;
+!!!44997687.cpp!!!	closeNodeByFd(in fd : int) : status_t
+    status_t ret = OK;
+    if (epoll_ctl(mEpollFd, EPOLL_CTL_DEL, fd, NULL)) {
+        ALOGW("Could not remove device fd from epoll instance. errno=%d", errno);
+        ret = -errno;
+    }
+    mDeviceNodes.erase(fd);
+    ::close(fd);
+    return ret;
+!!!44997815.cpp!!!	findNodeByPath(in path : std::string) : std::shared_ptr<InputDeviceNode>
+    for (auto pair : mDeviceNodes) {
+        if (pair.second->getPath() == path) return pair.second;
+    }
+    return nullptr;
+!!!44997943.cpp!!!	manageWakeLocks() : bool
+    return mWakeupMechanism != WakeMechanism::EPOLL_WAKEUP;

@@ -1,0 +1,558 @@
+class EphemeralApplicationRegistry
+!!!74197687.java!!!	EphemeralApplicationRegistry(inout service : PackageManagerService)
+        mService = service;
+!!!74197815.java!!!	getEphemeralApplicationCookieLPw(inout packageName : String, in userId : int) : byte
+        if (!ENABLED) {
+            return EmptyArray.BYTE;
+        }
+        pruneUninstalledEphemeralAppsLPw(userId);
+
+        File cookieFile = peekEphemeralCookieFile(packageName, userId);
+        if (cookieFile != null && cookieFile.exists()) {
+            try {
+                return IoUtils.readFileAsByteArray(cookieFile.toString());
+            } catch (IOException e) {
+                Slog.w(LOG_TAG, "Error reading cookie file: " + cookieFile);
+            }
+        }
+        return null;
+!!!74197943.java!!!	setEphemeralApplicationCookieLPw(inout packageName : String, inout cookie : byte [[]], in userId : int) : boolean
+        if (!ENABLED) {
+            return false;
+        }
+        pruneUninstalledEphemeralAppsLPw(userId);
+
+        PackageParser.Package pkg = mService.mPackages.get(packageName);
+        if (pkg == null) {
+            return false;
+        }
+
+        if (!isValidCookie(mService.mContext, cookie)) {
+            return false;
+        }
+
+        File appDir = getEphemeralApplicationDir(pkg.packageName, userId);
+        if (!appDir.exists() && !appDir.mkdirs()) {
+            return false;
+        }
+
+        File cookieFile = computeEphemeralCookieFile(pkg, userId);
+        if (cookieFile.exists() && !cookieFile.delete()) {
+            return false;
+        }
+
+        try (FileOutputStream fos = new FileOutputStream(cookieFile)) {
+            fos.write(cookie, 0, cookie.length);
+        } catch (IOException e) {
+            Slog.w(LOG_TAG, "Error writing cookie file: " + cookieFile);
+            return false;
+        }
+        return true;
+!!!74198071.java!!!	getEphemeralApplicationIconLPw(inout packageName : String, in userId : int) : Bitmap
+        if (!ENABLED) {
+            return null;
+        }
+        pruneUninstalledEphemeralAppsLPw(userId);
+
+        File iconFile = new File(getEphemeralApplicationDir(packageName, userId),
+                EPHEMERAL_APP_ICON_FILE);
+        if (iconFile.exists()) {
+            return BitmapFactory.decodeFile(iconFile.toString());
+        }
+        return null;
+!!!74198199.java!!!	getEphemeralApplicationsLPw(in userId : int) : EphemeralApplicationInfo
+        if (!ENABLED) {
+            return Collections.emptyList();
+        }
+        pruneUninstalledEphemeralAppsLPw(userId);
+
+        List<EphemeralApplicationInfo> result = getInstalledEphemeralApplicationsLPr(userId);
+        result.addAll(getUninstalledEphemeralApplicationsLPr(userId));
+        return result;
+!!!74198327.java!!!	onPackageInstalledLPw(inout pkg : PackageParser::Package) : void
+        if (!ENABLED) {
+            return;
+        }
+        PackageSetting ps = (PackageSetting) pkg.mExtras;
+        if (ps == null) {
+            return;
+        }
+        for (int userId : UserManagerService.getInstance().getUserIds()) {
+            pruneUninstalledEphemeralAppsLPw(userId);
+
+            // Ignore not installed apps
+            if (mService.mPackages.get(pkg.packageName) == null || !ps.getInstalled(userId)) {
+                continue;
+            }
+
+            // Propagate permissions before removing any state
+            propagateEphemeralAppPermissionsIfNeeded(pkg, userId);
+
+            // Remove the in-memory state
+            if (mUninstalledEphemeralApps != null) {
+                List<UninstalledEphemeralAppState> uninstalledAppStates =
+                        mUninstalledEphemeralApps.get(userId);
+                if (uninstalledAppStates != null) {
+                    final int appCount = uninstalledAppStates.size();
+                    for (int i = 0; i < appCount; i++) {
+                        UninstalledEphemeralAppState uninstalledAppState =
+                                uninstalledAppStates.get(i);
+                        if (uninstalledAppState.mEphemeralApplicationInfo
+                                .getPackageName().equals(pkg.packageName)) {
+                            uninstalledAppStates.remove(i);
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // Remove the on-disk state except the cookie
+            File ephemeralAppDir = getEphemeralApplicationDir(pkg.packageName, userId);
+            new File(ephemeralAppDir, EPHEMERAL_APP_METADATA_FILE).delete();
+            new File(ephemeralAppDir, EPHEMERAL_APP_ICON_FILE).delete();
+
+            // If app signature changed - wipe the cookie
+            File currentCookieFile = peekEphemeralCookieFile(pkg.packageName, userId);
+            if (currentCookieFile == null) {
+                continue;
+            }
+            File expectedCookeFile = computeEphemeralCookieFile(pkg, userId);
+            if (!currentCookieFile.equals(expectedCookeFile)) {
+                Slog.i(LOG_TAG, "Signature for package " + pkg.packageName
+                        + " changed - dropping cookie");
+                currentCookieFile.delete();
+            }
+        }
+!!!74198455.java!!!	onPackageUninstalledLPw(inout pkg : PackageParser::Package) : void
+        if (!ENABLED) {
+            return;
+        }
+        if (pkg == null) {
+            return;
+        }
+        PackageSetting ps = (PackageSetting) pkg.mExtras;
+        if (ps == null) {
+            return;
+        }
+        for (int userId : UserManagerService.getInstance().getUserIds()) {
+            pruneUninstalledEphemeralAppsLPw(userId);
+
+            if (mService.mPackages.get(pkg.packageName) != null && ps.getInstalled(userId)) {
+                continue;
+            }
+
+            if (pkg.applicationInfo.isEphemeralApp()) {
+                // Add a record for an uninstalled ephemeral app
+                addUninstalledEphemeralAppLPw(pkg, userId);
+            } else {
+                // Deleting an app prunes all ephemeral state such as cookie
+                deleteDir(getEphemeralApplicationDir(pkg.packageName, userId));
+            }
+        }
+!!!74198583.java!!!	onUserRemovedLPw(in userId : int) : void
+        if (!ENABLED) {
+            return;
+        }
+        if (mUninstalledEphemeralApps != null) {
+            mUninstalledEphemeralApps.remove(userId);
+        }
+        deleteDir(getEphemeralApplicationsDir(userId));
+!!!74198711.java!!!	addUninstalledEphemeralAppLPw(inout pkg : PackageParser::Package, in userId : int) : void
+        EphemeralApplicationInfo uninstalledApp = createEphemeralAppInfoForPackage(pkg, userId);
+        if (uninstalledApp == null) {
+            return;
+        }
+        if (mUninstalledEphemeralApps == null) {
+            mUninstalledEphemeralApps = new SparseArray<>();
+        }
+        List<UninstalledEphemeralAppState> uninstalledAppStates =
+                mUninstalledEphemeralApps.get(userId);
+        if (uninstalledAppStates == null) {
+            uninstalledAppStates = new ArrayList<>();
+            mUninstalledEphemeralApps.put(userId, uninstalledAppStates);
+        }
+        UninstalledEphemeralAppState uninstalledAppState = new UninstalledEphemeralAppState(
+                uninstalledApp, System.currentTimeMillis());
+        uninstalledAppStates.add(uninstalledAppState);
+
+        writeUninstalledEphemeralAppMetadata(uninstalledApp, userId);
+        writeEphemeralApplicationIconLPw(pkg, userId);
+!!!74198839.java!!!	writeEphemeralApplicationIconLPw(inout pkg : PackageParser::Package, in userId : int) : void
+        File appDir = getEphemeralApplicationDir(pkg.packageName, userId);
+        if (!appDir.exists()) {
+            return;
+        }
+
+        Drawable icon = pkg.applicationInfo.loadIcon(mService.mContext.getPackageManager());
+
+        final Bitmap bitmap;
+        if (icon instanceof BitmapDrawable) {
+            bitmap = ((BitmapDrawable) icon).getBitmap();
+        } else  {
+            bitmap = Bitmap.createBitmap(icon.getIntrinsicWidth(),
+                    icon.getIntrinsicHeight(), Bitmap.Config.ARGB_8888);
+            Canvas canvas = new Canvas(bitmap);
+            icon.draw(canvas);
+        }
+
+        File iconFile = new File(getEphemeralApplicationDir(pkg.packageName, userId),
+                EPHEMERAL_APP_ICON_FILE);
+
+        try (FileOutputStream out = new FileOutputStream(iconFile)) {
+            bitmap.compress(Bitmap.CompressFormat.PNG, 100, out);
+        } catch (Exception e) {
+            Slog.e(LOG_TAG, "Error writing ephemeral app icon", e);
+        }
+!!!74198967.java!!!	pruneUninstalledEphemeralAppsLPw(in userId : int) : void
+        final long maxCacheDurationMillis = Settings.Global.getLong(
+                mService.mContext.getContentResolver(),
+                Settings.Global.UNINSTALLED_EPHEMERAL_APP_CACHE_DURATION_MILLIS,
+                DEFAULT_UNINSTALLED_EPHEMERAL_APP_CACHE_DURATION_MILLIS);
+
+        // Prune in-memory state
+        if (mUninstalledEphemeralApps != null) {
+            List<UninstalledEphemeralAppState> uninstalledAppStates =
+                    mUninstalledEphemeralApps.get(userId);
+            if (uninstalledAppStates != null) {
+                final int appCount = uninstalledAppStates.size();
+                for (int j = appCount - 1; j >= 0; j--) {
+                    UninstalledEphemeralAppState uninstalledAppState = uninstalledAppStates.get(j);
+                    final long elapsedCachingMillis = System.currentTimeMillis()
+                            - uninstalledAppState.mTimestamp;
+                    if (elapsedCachingMillis > maxCacheDurationMillis) {
+                        uninstalledAppStates.remove(j);
+                    }
+                }
+                if (uninstalledAppStates.isEmpty()) {
+                    mUninstalledEphemeralApps.remove(userId);
+                }
+            }
+        }
+
+        // Prune on-disk state
+        File ephemeralAppsDir = getEphemeralApplicationsDir(userId);
+        if (!ephemeralAppsDir.exists()) {
+            return;
+        }
+        File[] files = ephemeralAppsDir.listFiles();
+        if (files == null) {
+            return;
+        }
+        for (File ephemeralDir : files) {
+            if (!ephemeralDir.isDirectory()) {
+                continue;
+            }
+
+            File metadataFile = new File(ephemeralDir, EPHEMERAL_APP_METADATA_FILE);
+            if (!metadataFile.exists()) {
+                continue;
+            }
+
+            final long elapsedCachingMillis = System.currentTimeMillis()
+                    - metadataFile.lastModified();
+            if (elapsedCachingMillis > maxCacheDurationMillis) {
+                deleteDir(ephemeralDir);
+            }
+        }
+!!!74199095.java!!!	getInstalledEphemeralApplicationsLPr(in userId : int) : EphemeralApplicationInfo
+        List<EphemeralApplicationInfo> result = null;
+
+        final int packageCount = mService.mPackages.size();
+        for (int i = 0; i < packageCount; i++) {
+            PackageParser.Package pkg = mService.mPackages.valueAt(i);
+            if (!pkg.applicationInfo.isEphemeralApp()) {
+                continue;
+            }
+            EphemeralApplicationInfo info = createEphemeralAppInfoForPackage(pkg, userId);
+            if (info == null) {
+                continue;
+            }
+            if (result == null) {
+                result = new ArrayList<>();
+            }
+            result.add(info);
+        }
+
+        return result;
+!!!74199223.java!!!	createEphemeralAppInfoForPackage(inout pkg : PackageParser::Package, in userId : int) : EphemeralApplicationInfo
+        PackageSetting ps = (PackageSetting) pkg.mExtras;
+        if (ps == null) {
+            return null;
+        }
+        PackageUserState userState = ps.readUserState(userId);
+        if (userState == null || !userState.installed || userState.hidden) {
+            return null;
+        }
+
+        String[] requestedPermissions = new String[pkg.requestedPermissions.size()];
+        pkg.requestedPermissions.toArray(requestedPermissions);
+
+        Set<String> permissions = ps.getPermissionsState().getPermissions(userId);
+        String[] grantedPermissions = new String[permissions.size()];
+        permissions.toArray(grantedPermissions);
+
+        return new EphemeralApplicationInfo(pkg.applicationInfo,
+                requestedPermissions, grantedPermissions);
+!!!74199351.java!!!	getUninstalledEphemeralApplicationsLPr(in userId : int) : EphemeralApplicationInfo
+        List<UninstalledEphemeralAppState> uninstalledAppStates =
+                getUninstalledEphemeralAppStatesLPr(userId);
+        if (uninstalledAppStates == null || uninstalledAppStates.isEmpty()) {
+            return Collections.emptyList();
+        }
+
+        List<EphemeralApplicationInfo> uninstalledApps = new ArrayList<>();
+        final int stateCount = uninstalledAppStates.size();
+        for (int i = 0; i < stateCount; i++) {
+            UninstalledEphemeralAppState uninstalledAppState = uninstalledAppStates.get(i);
+            uninstalledApps.add(uninstalledAppState.mEphemeralApplicationInfo);
+        }
+        return uninstalledApps;
+!!!74199479.java!!!	propagateEphemeralAppPermissionsIfNeeded(inout pkg : PackageParser::Package, in userId : int) : void
+        EphemeralApplicationInfo appInfo = getOrParseUninstalledEphemeralAppInfo(pkg.packageName, userId);
+        if (appInfo == null) {
+            return;
+        }
+        if (ArrayUtils.isEmpty(appInfo.getGrantedPermissions())) {
+            return;
+        }
+        final long identity = Binder.clearCallingIdentity();
+        try {
+            for (String grantedPermission : appInfo.getGrantedPermissions()) {
+                mService.grantRuntimePermission(pkg.packageName, grantedPermission, userId);
+            }
+        } finally {
+            Binder.restoreCallingIdentity(identity);
+        }
+!!!74199607.java!!!	getOrParseUninstalledEphemeralAppInfo(inout packageName : String, in userId : int) : EphemeralApplicationInfo
+        if (mUninstalledEphemeralApps != null) {
+            List<UninstalledEphemeralAppState> uninstalledAppStates =
+                    mUninstalledEphemeralApps.get(userId);
+            if (uninstalledAppStates != null) {
+                final int appCount = uninstalledAppStates.size();
+                for (int i = 0; i < appCount; i++) {
+                    UninstalledEphemeralAppState uninstalledAppState = uninstalledAppStates.get(i);
+                    if (uninstalledAppState.mEphemeralApplicationInfo
+                            .getPackageName().equals(packageName)) {
+                        return uninstalledAppState.mEphemeralApplicationInfo;
+                    }
+                }
+            }
+        }
+
+        File metadataFile = new File(getEphemeralApplicationDir(packageName, userId),
+                EPHEMERAL_APP_METADATA_FILE);
+        UninstalledEphemeralAppState uninstalledAppState = parseMetadataFile(metadataFile);
+        if (uninstalledAppState == null) {
+            return null;
+        }
+
+        return uninstalledAppState.mEphemeralApplicationInfo;
+!!!74199735.java!!!	getUninstalledEphemeralAppStatesLPr(in userId : int) : EphemeralApplicationRegistry::UninstalledEphemeralAppState
+        List<UninstalledEphemeralAppState> uninstalledAppStates = null;
+        if (mUninstalledEphemeralApps != null) {
+            uninstalledAppStates = mUninstalledEphemeralApps.get(userId);
+            if (uninstalledAppStates != null) {
+                return uninstalledAppStates;
+            }
+        }
+
+        File ephemeralAppsDir = getEphemeralApplicationsDir(userId);
+        if (ephemeralAppsDir.exists()) {
+            File[] files = ephemeralAppsDir.listFiles();
+            if (files != null) {
+                for (File ephemeralDir : files) {
+                    if (!ephemeralDir.isDirectory()) {
+                        continue;
+                    }
+                    File metadataFile = new File(ephemeralDir,
+                            EPHEMERAL_APP_METADATA_FILE);
+                    UninstalledEphemeralAppState uninstalledAppState =
+                            parseMetadataFile(metadataFile);
+                    if (uninstalledAppState == null) {
+                        continue;
+                    }
+                    if (uninstalledAppStates == null) {
+                        uninstalledAppStates = new ArrayList<>();
+                    }
+                    uninstalledAppStates.add(uninstalledAppState);
+                }
+            }
+        }
+
+        if (uninstalledAppStates != null) {
+            if (mUninstalledEphemeralApps == null) {
+                mUninstalledEphemeralApps = new SparseArray<>();
+            }
+            mUninstalledEphemeralApps.put(userId, uninstalledAppStates);
+        }
+
+        return uninstalledAppStates;
+!!!74199863.java!!!	isValidCookie(inout context : Context, inout cookie : byte [[]]) : boolean
+        if (ArrayUtils.isEmpty(cookie)) {
+            return true;
+        }
+        return cookie.length <= context.getPackageManager().getEphemeralCookieMaxSizeBytes();
+!!!74199991.java!!!	parseMetadataFile(inout metadataFile : File) : EphemeralApplicationRegistry::UninstalledEphemeralAppState
+        if (!metadataFile.exists()) {
+            return null;
+        }
+        FileInputStream in;
+        try {
+            in = new AtomicFile(metadataFile).openRead();
+        } catch (FileNotFoundException fnfe) {
+            Slog.i(LOG_TAG, "No ephemeral metadata file");
+            return null;
+        }
+
+        final File ephemeralDir = metadataFile.getParentFile();
+        final long timestamp = metadataFile.lastModified();
+        final String packageName = ephemeralDir.getName();
+
+        try {
+            XmlPullParser parser = Xml.newPullParser();
+            parser.setInput(in, StandardCharsets.UTF_8.name());
+            return new UninstalledEphemeralAppState(
+                    parseMetadata(parser, packageName), timestamp);
+        } catch (XmlPullParserException | IOException e) {
+            throw new IllegalStateException("Failed parsing ephemeral"
+                    + " metadata file: " + metadataFile, e);
+        } finally {
+            IoUtils.closeQuietly(in);
+        }
+!!!74200119.java!!!	computeEphemeralCookieFile(inout pkg : PackageParser::Package, in userId : int) : File
+        File appDir = getEphemeralApplicationDir(pkg.packageName, userId);
+        String cookieFile = EPHEMERAL_APP_COOKIE_FILE_PREFIX + computePackageCertDigest(pkg)
+                + EPHEMERAL_APP_COOKIE_FILE_SIFFIX;
+        return new File(appDir, cookieFile);
+!!!74200247.java!!!	peekEphemeralCookieFile(inout packageName : String, in userId : int) : File
+        File appDir = getEphemeralApplicationDir(packageName, userId);
+        if (!appDir.exists()) {
+            return null;
+        }
+        for (File file : appDir.listFiles()) {
+            if (!file.isDirectory()
+                    && file.getName().startsWith(EPHEMERAL_APP_COOKIE_FILE_PREFIX)
+                    && file.getName().endsWith(EPHEMERAL_APP_COOKIE_FILE_SIFFIX)) {
+                return file;
+            }
+        }
+        return null;
+!!!74200375.java!!!	parseMetadata(inout parser : XmlPullParser, inout packageName : String) : EphemeralApplicationInfo
+        final int outerDepth = parser.getDepth();
+        while (XmlUtils.nextElementWithin(parser, outerDepth)) {
+            if (TAG_PACKAGE.equals(parser.getName())) {
+                return parsePackage(parser, packageName);
+            }
+        }
+        return null;
+!!!74200503.java!!!	parsePackage(inout parser : XmlPullParser, inout packageName : String) : EphemeralApplicationInfo
+        String label = parser.getAttributeValue(null, ATTR_LABEL);
+
+        List<String> outRequestedPermissions = new ArrayList<>();
+        List<String> outGrantedPermissions = new ArrayList<>();
+
+        final int outerDepth = parser.getDepth();
+        while (XmlUtils.nextElementWithin(parser, outerDepth)) {
+            if (TAG_PERMS.equals(parser.getName())) {
+                parsePermissions(parser, outRequestedPermissions, outGrantedPermissions);
+            }
+        }
+
+        String[] requestedPermissions = new String[outRequestedPermissions.size()];
+        outRequestedPermissions.toArray(requestedPermissions);
+
+        String[] grantedPermissions = new String[outGrantedPermissions.size()];
+        outGrantedPermissions.toArray(grantedPermissions);
+
+        return new EphemeralApplicationInfo(packageName, label,
+                requestedPermissions, grantedPermissions);
+!!!74200631.java!!!	parsePermissions(inout parser : XmlPullParser, inout outRequestedPermissions : List<String>, inout outGrantedPermissions : List<String>) : void
+        final int outerDepth = parser.getDepth();
+        while (XmlUtils.nextElementWithin(parser,outerDepth)) {
+            if (TAG_PERM.equals(parser.getName())) {
+                String permission = XmlUtils.readStringAttribute(parser, ATTR_NAME);
+                outRequestedPermissions.add(permission);
+                if (XmlUtils.readBooleanAttribute(parser, ATTR_GRANTED)) {
+                    outGrantedPermissions.add(permission);
+                }
+            }
+        }
+!!!74200759.java!!!	writeUninstalledEphemeralAppMetadata(inout ephemeralApp : EphemeralApplicationInfo, in userId : int) : void
+        File appDir = getEphemeralApplicationDir(ephemeralApp.getPackageName(), userId);
+        if (!appDir.exists() && !appDir.mkdirs()) {
+            return;
+        }
+
+        File metadataFile = new File(appDir, EPHEMERAL_APP_METADATA_FILE);
+
+        AtomicFile destination = new AtomicFile(metadataFile);
+        FileOutputStream out = null;
+        try {
+            out = destination.startWrite();
+
+            XmlSerializer serializer = Xml.newSerializer();
+            serializer.setOutput(out, StandardCharsets.UTF_8.name());
+            serializer.setFeature("http://xmlpull.org/v1/doc/features.html#indent-output", true);
+
+            serializer.startDocument(null, true);
+
+            serializer.startTag(null, TAG_PACKAGE);
+            serializer.attribute(null, ATTR_LABEL, ephemeralApp.loadLabel(
+                    mService.mContext.getPackageManager()).toString());
+
+            serializer.startTag(null, TAG_PERMS);
+            for (String permission : ephemeralApp.getRequestedPermissions()) {
+                serializer.startTag(null, TAG_PERM);
+                serializer.attribute(null, ATTR_NAME, permission);
+                if (ArrayUtils.contains(ephemeralApp.getGrantedPermissions(), permission)) {
+                    serializer.attribute(null, ATTR_GRANTED, String.valueOf(true));
+                }
+                serializer.endTag(null, TAG_PERM);
+            }
+            serializer.endTag(null, TAG_PERMS);
+
+            serializer.endTag(null, TAG_PACKAGE);
+
+            serializer.endDocument();
+            destination.finishWrite(out);
+        } catch (Throwable t) {
+            Slog.wtf(LOG_TAG, "Failed to write ephemeral state, restoring backup", t);
+            destination.failWrite(out);
+        } finally {
+            IoUtils.closeQuietly(out);
+        }
+!!!74200887.java!!!	computePackageCertDigest(inout pkg : PackageParser::Package) : String
+        MessageDigest messageDigest;
+        try {
+            messageDigest = MessageDigest.getInstance("SHA256");
+        } catch (NoSuchAlgorithmException e) {
+            /* can't happen */
+            return null;
+        }
+
+        messageDigest.update(pkg.mSignatures[0].toByteArray());
+
+        final byte[] digest = messageDigest.digest();
+        final int digestLength = digest.length;
+        final int charCount = 2 * digestLength;
+
+        final char[] chars = new char[charCount];
+        for (int i = 0; i < digestLength; i++) {
+            final int byteHex = digest[i] & 0xFF;
+            chars[i * 2] = HEX_ARRAY[byteHex >>> 4];
+            chars[i * 2 + 1] = HEX_ARRAY[byteHex & 0x0F];
+        }
+        return new String(chars);
+!!!74201015.java!!!	getEphemeralApplicationsDir(in userId : int) : File
+        return new File(Environment.getUserSystemDirectory(userId),
+                EPHEMERAL_APPS_FOLDER);
+!!!74201143.java!!!	getEphemeralApplicationDir(inout packageName : String, in userId : int) : File
+        return new File (getEphemeralApplicationsDir(userId), packageName);
+!!!74201271.java!!!	deleteDir(inout dir : File) : void
+        File[] files = dir.listFiles();
+        if (files != null) {
+            for (File file : dir.listFiles()) {
+                deleteDir(file);
+            }
+        }
+        dir.delete();

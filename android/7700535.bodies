@@ -1,0 +1,385 @@
+class UiModeManagerService
+!!!84209591.java!!!	UiModeManagerService(inout context : Context)
+        super(context);
+!!!84209719.java!!!	buildHomeIntent(inout category : String) : Intent
+        Intent intent = new Intent(Intent.ACTION_MAIN);
+        intent.addCategory(category);
+        intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK
+                | Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED);
+        return intent;
+!!!84209847.java!!!	onStart() : void
+        final Context context = getContext();
+
+        final PowerManager powerManager =
+                (PowerManager) context.getSystemService(Context.POWER_SERVICE);
+        mWakeLock = powerManager.newWakeLock(PowerManager.FULL_WAKE_LOCK, TAG);
+
+        context.registerReceiver(mDockModeReceiver,
+                new IntentFilter(Intent.ACTION_DOCK_EVENT));
+        context.registerReceiver(mBatteryReceiver,
+                new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
+
+        mConfiguration.setToDefaults();
+
+        final Resources res = context.getResources();
+        mDefaultUiModeType = res.getInteger(
+                com.android.internal.R.integer.config_defaultUiModeType);
+        mCarModeKeepsScreenOn = (res.getInteger(
+                com.android.internal.R.integer.config_carDockKeepsScreenOn) == 1);
+        mDeskModeKeepsScreenOn = (res.getInteger(
+                com.android.internal.R.integer.config_deskDockKeepsScreenOn) == 1);
+        mEnableCarDockLaunch = res.getBoolean(
+                com.android.internal.R.bool.config_enableCarDockHomeLaunch);
+        mUiModeLocked = res.getBoolean(com.android.internal.R.bool.config_lockUiMode);
+        mNightModeLocked = res.getBoolean(com.android.internal.R.bool.config_lockDayNightMode);
+
+        final PackageManager pm = context.getPackageManager();
+        mTelevision = pm.hasSystemFeature(PackageManager.FEATURE_TELEVISION)
+                || pm.hasSystemFeature(PackageManager.FEATURE_LEANBACK);
+        mWatch = pm.hasSystemFeature(PackageManager.FEATURE_WATCH);
+
+        final int defaultNightMode = res.getInteger(
+                com.android.internal.R.integer.config_defaultNightMode);
+        mNightMode = Settings.Secure.getInt(context.getContentResolver(),
+                Settings.Secure.UI_NIGHT_MODE, defaultNightMode);
+
+        // Update the initial, static configurations.
+        synchronized (this) {
+            updateConfigurationLocked();
+            sendConfigurationLocked();
+        }
+
+        publishBinderService(Context.UI_MODE_SERVICE, mService);
+!!!84209975.java!!!	dumpImpl(inout pw : PrintWriter) : void
+        synchronized (mLock) {
+            pw.println("Current UI Mode Service state:");
+            pw.print("  mDockState="); pw.print(mDockState);
+                    pw.print(" mLastBroadcastState="); pw.println(mLastBroadcastState);
+            pw.print("  mNightMode="); pw.print(mNightMode);
+                    pw.print(" mNightModeLocked="); pw.print(mNightModeLocked);
+                    pw.print(" mCarModeEnabled="); pw.print(mCarModeEnabled);
+                    pw.print(" mComputedNightMode="); pw.print(mComputedNightMode);
+                    pw.print(" mCarModeEnableFlags="); pw.print(mCarModeEnableFlags);
+                    pw.print(" mEnableCarDockLaunch="); pw.println(mEnableCarDockLaunch);
+            pw.print("  mCurUiMode=0x"); pw.print(Integer.toHexString(mCurUiMode));
+                    pw.print(" mUiModeLocked="); pw.print(mUiModeLocked);
+                    pw.print(" mSetUiMode=0x"); pw.println(Integer.toHexString(mSetUiMode));
+            pw.print("  mHoldingConfiguration="); pw.print(mHoldingConfiguration);
+                    pw.print(" mSystemReady="); pw.println(mSystemReady);
+            if (mTwilightManager != null) {
+                // We may not have a TwilightManager.
+                pw.print("  mTwilightService.getCurrentState()=");
+                pw.println(mTwilightManager.getCurrentState());
+            }
+        }
+!!!84210103.java!!!	onBootPhase(in phase : int) : void
+        if (phase == SystemService.PHASE_SYSTEM_SERVICES_READY) {
+            synchronized (mLock) {
+                mTwilightManager = getLocalService(TwilightManager.class);
+                if (mTwilightManager != null) {
+                    mTwilightManager.registerListener(mTwilightListener, mHandler);
+                }
+                mSystemReady = true;
+                mCarModeEnabled = mDockState == Intent.EXTRA_DOCK_STATE_CAR;
+                updateComputedNightModeLocked();
+                updateLocked(0, 0);
+            }
+        }
+!!!84210231.java!!!	setCarModeLocked(inout enabled : boolean, in flags : int) : void
+        if (mCarModeEnabled != enabled) {
+            mCarModeEnabled = enabled;
+        }
+        mCarModeEnableFlags = flags;
+!!!84210359.java!!!	updateDockState(in newState : int) : void
+        synchronized (mLock) {
+            if (newState != mDockState) {
+                mDockState = newState;
+                setCarModeLocked(mDockState == Intent.EXTRA_DOCK_STATE_CAR, 0);
+                if (mSystemReady) {
+                    updateLocked(UiModeManager.ENABLE_CAR_MODE_GO_CAR_HOME, 0);
+                }
+            }
+        }
+!!!84210487.java!!!	isDeskDockState(in state : int) : boolean
+        switch (state) {
+            case Intent.EXTRA_DOCK_STATE_DESK:
+            case Intent.EXTRA_DOCK_STATE_LE_DESK:
+            case Intent.EXTRA_DOCK_STATE_HE_DESK:
+                return true;
+            default:
+                return false;
+        }
+!!!84210615.java!!!	updateConfigurationLocked() : void
+        int uiMode = mDefaultUiModeType;
+        if (mUiModeLocked) {
+            // no-op, keeps default one
+        } else if (mTelevision) {
+            uiMode = Configuration.UI_MODE_TYPE_TELEVISION;
+        } else if (mWatch) {
+            uiMode = Configuration.UI_MODE_TYPE_WATCH;
+        } else if (mCarModeEnabled) {
+            uiMode = Configuration.UI_MODE_TYPE_CAR;
+        } else if (isDeskDockState(mDockState)) {
+            uiMode = Configuration.UI_MODE_TYPE_DESK;
+        }
+
+        if (mNightMode == UiModeManager.MODE_NIGHT_AUTO) {
+            updateComputedNightModeLocked();
+            uiMode |= mComputedNightMode ? Configuration.UI_MODE_NIGHT_YES
+                    : Configuration.UI_MODE_NIGHT_NO;
+        } else {
+            uiMode |= mNightMode << 4;
+        }
+
+        if (LOG) {
+            Slog.d(TAG,
+                "updateConfigurationLocked: mDockState=" + mDockState
+                + "; mCarMode=" + mCarModeEnabled
+                + "; mNightMode=" + mNightMode
+                + "; uiMode=" + uiMode);
+        }
+
+        mCurUiMode = uiMode;
+        if (!mHoldingConfiguration) {
+            mConfiguration.uiMode = uiMode;
+        }
+!!!84210743.java!!!	sendConfigurationLocked() : void
+        if (mSetUiMode != mConfiguration.uiMode) {
+            mSetUiMode = mConfiguration.uiMode;
+
+            try {
+                ActivityManagerNative.getDefault().updateConfiguration(mConfiguration);
+            } catch (RemoteException e) {
+                Slog.w(TAG, "Failure communicating with activity manager", e);
+            }
+        }
+!!!84210871.java!!!	updateLocked(in enableFlags : int, in disableFlags : int) : void
+        String action = null;
+        String oldAction = null;
+        if (mLastBroadcastState == Intent.EXTRA_DOCK_STATE_CAR) {
+            adjustStatusBarCarModeLocked();
+            oldAction = UiModeManager.ACTION_EXIT_CAR_MODE;
+        } else if (isDeskDockState(mLastBroadcastState)) {
+            oldAction = UiModeManager.ACTION_EXIT_DESK_MODE;
+        }
+
+        if (mCarModeEnabled) {
+            if (mLastBroadcastState != Intent.EXTRA_DOCK_STATE_CAR) {
+                adjustStatusBarCarModeLocked();
+
+                if (oldAction != null) {
+                    getContext().sendBroadcastAsUser(new Intent(oldAction), UserHandle.ALL);
+                }
+                mLastBroadcastState = Intent.EXTRA_DOCK_STATE_CAR;
+                action = UiModeManager.ACTION_ENTER_CAR_MODE;
+            }
+        } else if (isDeskDockState(mDockState)) {
+            if (!isDeskDockState(mLastBroadcastState)) {
+                if (oldAction != null) {
+                    getContext().sendBroadcastAsUser(new Intent(oldAction), UserHandle.ALL);
+                }
+                mLastBroadcastState = mDockState;
+                action = UiModeManager.ACTION_ENTER_DESK_MODE;
+            }
+        } else {
+            mLastBroadcastState = Intent.EXTRA_DOCK_STATE_UNDOCKED;
+            action = oldAction;
+        }
+
+        if (action != null) {
+            if (LOG) {
+                Slog.v(TAG, String.format(
+                    "updateLocked: preparing broadcast: action=%s enable=0x%08x disable=0x%08x",
+                    action, enableFlags, disableFlags));
+            }
+
+            // Send the ordered broadcast; the result receiver will receive after all
+            // broadcasts have been sent. If any broadcast receiver changes the result
+            // code from the initial value of RESULT_OK, then the result receiver will
+            // not launch the corresponding dock application. This gives apps a chance
+            // to override the behavior and stay in their app even when the device is
+            // placed into a dock.
+            Intent intent = new Intent(action);
+            intent.putExtra("enableFlags", enableFlags);
+            intent.putExtra("disableFlags", disableFlags);
+            getContext().sendOrderedBroadcastAsUser(intent, UserHandle.CURRENT, null,
+                    mResultReceiver, null, Activity.RESULT_OK, null, null);
+
+            // Attempting to make this transition a little more clean, we are going
+            // to hold off on doing a configuration change until we have finished
+            // the broadcast and started the home activity.
+            mHoldingConfiguration = true;
+            updateConfigurationLocked();
+        } else {
+            String category = null;
+            if (mCarModeEnabled) {
+                if (mEnableCarDockLaunch
+                        && (enableFlags & UiModeManager.ENABLE_CAR_MODE_GO_CAR_HOME) != 0) {
+                    category = Intent.CATEGORY_CAR_DOCK;
+                }
+            } else if (isDeskDockState(mDockState)) {
+                if (ENABLE_LAUNCH_DESK_DOCK_APP
+                        && (enableFlags & UiModeManager.ENABLE_CAR_MODE_GO_CAR_HOME) != 0) {
+                    category = Intent.CATEGORY_DESK_DOCK;
+                }
+            } else {
+                if ((disableFlags & UiModeManager.DISABLE_CAR_MODE_GO_HOME) != 0) {
+                    category = Intent.CATEGORY_HOME;
+                }
+            }
+
+            if (LOG) {
+                Slog.v(TAG, "updateLocked: null action, mDockState="
+                        + mDockState +", category=" + category);
+            }
+
+            sendConfigurationAndStartDreamOrDockAppLocked(category);
+        }
+
+        // keep screen on when charging and in car mode
+        boolean keepScreenOn = mCharging &&
+                ((mCarModeEnabled && mCarModeKeepsScreenOn &&
+                  (mCarModeEnableFlags & UiModeManager.ENABLE_CAR_MODE_ALLOW_SLEEP) == 0) ||
+                 (mCurUiMode == Configuration.UI_MODE_TYPE_DESK && mDeskModeKeepsScreenOn));
+        if (keepScreenOn != mWakeLock.isHeld()) {
+            if (keepScreenOn) {
+                mWakeLock.acquire();
+            } else {
+                mWakeLock.release();
+            }
+        }
+!!!84210999.java!!!	updateAfterBroadcastLocked(inout action : String, in enableFlags : int, in disableFlags : int) : void
+        // Launch a dock activity
+        String category = null;
+        if (UiModeManager.ACTION_ENTER_CAR_MODE.equals(action)) {
+            // Only launch car home when car mode is enabled and the caller
+            // has asked us to switch to it.
+            if (mEnableCarDockLaunch
+                    && (enableFlags & UiModeManager.ENABLE_CAR_MODE_GO_CAR_HOME) != 0) {
+                category = Intent.CATEGORY_CAR_DOCK;
+            }
+        } else if (UiModeManager.ACTION_ENTER_DESK_MODE.equals(action)) {
+            // Only launch car home when desk mode is enabled and the caller
+            // has asked us to switch to it.  Currently re-using the car
+            // mode flag since we don't have a formal API for "desk mode".
+            if (ENABLE_LAUNCH_DESK_DOCK_APP
+                    && (enableFlags & UiModeManager.ENABLE_CAR_MODE_GO_CAR_HOME) != 0) {
+                category = Intent.CATEGORY_DESK_DOCK;
+            }
+        } else {
+            // Launch the standard home app if requested.
+            if ((disableFlags & UiModeManager.DISABLE_CAR_MODE_GO_HOME) != 0) {
+                category = Intent.CATEGORY_HOME;
+            }
+        }
+
+        if (LOG) {
+            Slog.v(TAG, String.format(
+                "Handling broadcast result for action %s: enable=0x%08x, disable=0x%08x, "
+                    + "category=%s",
+                action, enableFlags, disableFlags, category));
+        }
+
+        sendConfigurationAndStartDreamOrDockAppLocked(category);
+!!!84211127.java!!!	sendConfigurationAndStartDreamOrDockAppLocked(inout category : String) : void
+        // Update the configuration but don't send it yet.
+        mHoldingConfiguration = false;
+        updateConfigurationLocked();
+
+        // Start the dock app, if there is one.
+        boolean dockAppStarted = false;
+        if (category != null) {
+            // Now we are going to be careful about switching the
+            // configuration and starting the activity -- we need to
+            // do this in a specific order under control of the
+            // activity manager, to do it cleanly.  So compute the
+            // new config, but don't set it yet, and let the
+            // activity manager take care of both the start and config
+            // change.
+            Intent homeIntent = buildHomeIntent(category);
+            if (Sandman.shouldStartDockApp(getContext(), homeIntent)) {
+                try {
+                    int result = ActivityManagerNative.getDefault().startActivityWithConfig(
+                            null, null, homeIntent, null, null, null, 0, 0,
+                            mConfiguration, null, UserHandle.USER_CURRENT);
+                    if (result >= ActivityManager.START_SUCCESS) {
+                        dockAppStarted = true;
+                    } else if (result != ActivityManager.START_INTENT_NOT_RESOLVED) {
+                        Slog.e(TAG, "Could not start dock app: " + homeIntent
+                                + ", startActivityWithConfig result " + result);
+                    }
+                } catch (RemoteException ex) {
+                    Slog.e(TAG, "Could not start dock app: " + homeIntent, ex);
+                }
+            }
+        }
+
+        // Send the new configuration.
+        sendConfigurationLocked();
+
+        // If we did not start a dock app, then start dreaming if supported.
+        if (category != null && !dockAppStarted) {
+            Sandman.startDreamWhenDockedIfAppropriate(getContext());
+        }
+!!!84211255.java!!!	adjustStatusBarCarModeLocked() : void
+        final Context context = getContext();
+        if (mStatusBarManager == null) {
+            mStatusBarManager = (StatusBarManager)
+                    context.getSystemService(Context.STATUS_BAR_SERVICE);
+        }
+
+        // Fear not: StatusBarManagerService manages a list of requests to disable
+        // features of the status bar; these are ORed together to form the
+        // active disabled list. So if (for example) the device is locked and
+        // the status bar should be totally disabled, the calls below will
+        // have no effect until the device is unlocked.
+        if (mStatusBarManager != null) {
+            mStatusBarManager.disable(mCarModeEnabled
+                ? StatusBarManager.DISABLE_NOTIFICATION_TICKER
+                : StatusBarManager.DISABLE_NONE);
+        }
+
+        if (mNotificationManager == null) {
+            mNotificationManager = (NotificationManager)
+                    context.getSystemService(Context.NOTIFICATION_SERVICE);
+        }
+
+        if (mNotificationManager != null) {
+            if (mCarModeEnabled) {
+                Intent carModeOffIntent = new Intent(context, DisableCarModeActivity.class);
+
+                Notification.Builder n = new Notification.Builder(context)
+                        .setSmallIcon(R.drawable.stat_notify_car_mode)
+                        .setDefaults(Notification.DEFAULT_LIGHTS)
+                        .setOngoing(true)
+                        .setWhen(0)
+                        .setColor(context.getColor(
+                                com.android.internal.R.color.system_notification_accent_color))
+                        .setContentTitle(
+                                context.getString(R.string.car_mode_disable_notification_title))
+                        .setContentText(
+                                context.getString(R.string.car_mode_disable_notification_message))
+                        .setContentIntent(
+                                PendingIntent.getActivityAsUser(context, 0, carModeOffIntent, 0,
+                                        null, UserHandle.CURRENT));
+                mNotificationManager.notifyAsUser(null,
+                        R.string.car_mode_disable_notification_title, n.build(), UserHandle.ALL);
+            } else {
+                mNotificationManager.cancelAsUser(null,
+                        R.string.car_mode_disable_notification_title, UserHandle.ALL);
+            }
+        }
+!!!84211383.java!!!	updateTwilight() : void
+        synchronized (mLock) {
+            if (mNightMode == UiModeManager.MODE_NIGHT_AUTO) {
+                updateComputedNightModeLocked();
+                updateLocked(0, 0);
+            }
+        }
+!!!84211511.java!!!	updateComputedNightModeLocked() : void
+        if (mTwilightManager != null) {
+            TwilightState state = mTwilightManager.getCurrentState();
+            if (state != null) {
+                mComputedNightMode = state.isNight();
+            }
+        }

@@ -1,0 +1,72 @@
+class PtracerThread
+!!!42842423.cpp!!!	PtracerThread(in func : std::function<int()>)
+  stack_ = std::make_unique<Stack>(PTHREAD_STACK_MIN);
+  if (stack_->top() == nullptr) {
+    LOG_ALWAYS_FATAL("failed to mmap child stack: %s", strerror(errno));
+  }
+
+  func_ = std::function<int()>{[&, func]() -> int {
+    // In the child thread, lock and unlock the mutex to wait for the parent
+    // to finish setting up for the child thread
+    std::unique_lock<std::mutex> lk(m_);
+    lk.unlock();
+    _exit(func());
+  }};
+!!!42842551.cpp!!!	~PtracerThread()
+  Kill();
+  Join();
+  ClearTracer();
+  stack_ = nullptr;
+!!!42842679.cpp!!!	Start() : bool
+  std::unique_lock<std::mutex> lk(m_);
+
+  // Convert from void(*)(void*) to lambda with captures
+  auto proxy = [](void *arg) -> int {
+    prctl(PR_SET_NAME, "libmemunreachable ptrace thread");
+    return (*reinterpret_cast<std::function<int()>*>(arg))();
+  };
+
+  child_pid_ = clone(proxy, stack_->top(),
+       CLONE_VM|CLONE_FS|CLONE_FILES/*|CLONE_UNTRACED*/,
+       reinterpret_cast<void*>(&func_));
+  if (child_pid_ < 0) {
+    ALOGE("failed to clone child: %s", strerror(errno));
+    return false;
+  }
+
+  SetTracer(child_pid_);
+
+  lk.unlock();
+
+  return true;
+!!!42842807.cpp!!!	Join() : int
+  if (child_pid_ == -1) {
+    return -1;
+  }
+  int status;
+  int ret = TEMP_FAILURE_RETRY(waitpid(child_pid_, &status, __WALL));
+  if (ret < 0) {
+    ALOGE("waitpid %d failed: %s", child_pid_, strerror(errno));
+    return -1;
+  }
+
+  child_pid_ = -1;
+
+  if (WIFEXITED(status)) {
+    return WEXITSTATUS(status);
+  } else if (WIFSIGNALED(status)) {
+    return -WTERMSIG(status);
+  } else {
+    ALOGE("unexpected status %x", status);
+    return -1;
+  }
+!!!42842935.cpp!!!	SetTracer(in tracer_pid : pid_t) : void
+  prctl(PR_SET_PTRACER, tracer_pid);
+!!!42843063.cpp!!!	ClearTracer() : void
+  prctl(PR_SET_PTRACER, 0);
+!!!42843191.cpp!!!	Kill() : void
+  if (child_pid_ == -1) {
+    return;
+  }
+
+  syscall(SYS_tkill, child_pid_, SIGKILL);

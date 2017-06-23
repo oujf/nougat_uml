@@ -1,0 +1,490 @@
+class QCamera3ProcessingChannel
+!!!44232503.cpp!!!	QCamera3ProcessingChannel(in cam_handle : uint32_t, in channel_handle : uint32_t, inout cam_ops : mm_camera_ops_t, in cb_routine : channel_cb_routine, inout paddingInfo : cam_padding_info_t, inout userData : void, inout stream : camera3_stream_t, in stream_type : cam_stream_type_t, in postprocess_mask : uint32_t, inout metadataChannel : QCamera3Channel, in numBuffers : uint32_t = MAX_INFLIGHT_REQUESTS)
+    int32_t rc = m_postprocessor.init(&mMemory, mPostProcMask);
+    if (rc != 0) {
+        ALOGE("Init Postprocessor failed");
+    }
+!!!44232631.cpp!!!	~QCamera3ProcessingChannel()
+    stop();
+
+    int32_t rc = m_postprocessor.stop();
+    if (rc != NO_ERROR) {
+        ALOGE("%s: Postprocessor stop failed", __func__);
+    }
+
+    rc = m_postprocessor.deinit();
+    if (rc != 0) {
+        ALOGE("De-init Postprocessor failed");
+    }
+
+    if (0 < mOfflineMetaMemory.getCnt()) {
+        mOfflineMetaMemory.deallocate();
+    }
+    if (0 < mOfflineMemory.getCnt()) {
+        mOfflineMemory.unregisterBuffers();
+    }
+!!!44232759.cpp!!!	initialize(in isType : cam_is_type_t) : int32_t
+    int32_t rc = NO_ERROR;
+    rc = mOfflineMetaMemory.allocateAll(sizeof(metadata_buffer_t));
+    if (rc == NO_ERROR) {
+        Mutex::Autolock lock(mFreeOfflineMetaBuffersLock);
+        mFreeOfflineMetaBuffersList.clear();
+        for (uint32_t i = 0; i < mNumBuffers + (MAX_REPROCESS_PIPELINE_STAGES - 1);
+                i++) {
+            mFreeOfflineMetaBuffersList.push_back(i);
+        }
+    } else {
+        ALOGE("%s: Could not allocate offline meta buffers for input reprocess",
+                __func__);
+    }
+    return rc;
+!!!44232887.cpp!!!	request(inout buffer : buffer_handle_t, in frameNumber : uint32_t, inout pInputBuffer : camera3_stream_buffer_t, inout metadata : metadata_buffer_t) : int32_t
+    int32_t rc = NO_ERROR;
+    int index;
+
+    if (NULL == buffer || NULL == metadata) {
+        ALOGE("%s: Invalid buffer/metadata in channel request", __func__);
+        return BAD_VALUE;
+    }
+
+    if (pInputBuffer) {
+        //need to send to reprocessing
+        CDBG("%s: Got a request with input buffer, output streamType = %d", __func__, mStreamType);
+        reprocess_config_t reproc_cfg;
+        cam_dimension_t dim;
+        memset(&reproc_cfg, 0, sizeof(reprocess_config_t));
+        memset(&dim, 0, sizeof(dim));
+        setReprocConfig(reproc_cfg, pInputBuffer, metadata, mStreamFormat, dim);
+        startPostProc(reproc_cfg);
+
+        qcamera_fwk_input_pp_data_t *src_frame = NULL;
+        src_frame = (qcamera_fwk_input_pp_data_t *)calloc(1,
+                sizeof(qcamera_fwk_input_pp_data_t));
+        if (src_frame == NULL) {
+            ALOGE("%s: No memory for src frame", __func__);
+            return NO_MEMORY;
+        }
+        rc = setFwkInputPPData(src_frame, pInputBuffer, &reproc_cfg, metadata, buffer, frameNumber);
+        if (NO_ERROR != rc) {
+            ALOGE("%s: Error %d while setting framework input PP data", __func__, rc);
+            free(src_frame);
+            return rc;
+        }
+        CDBG_HIGH("%s: Post-process started", __func__);
+        CDBG_HIGH("%s: Issue call to reprocess", __func__);
+        m_postprocessor.processData(src_frame);
+    } else {
+        //need to fill output buffer with new data and return
+        if(!m_bIsActive) {
+            rc = registerBuffer(buffer, mIsType);
+            if (NO_ERROR != rc) {
+                ALOGE("%s: On-the-fly buffer registration failed %d",
+                        __func__, rc);
+                return rc;
+            }
+
+            rc = start();
+            if (NO_ERROR != rc)
+                return rc;
+        } else {
+            CDBG("%s: Request on an existing stream",__func__);
+        }
+
+        index = mMemory.getMatchBufIndex((void*)buffer);
+        if(index < 0) {
+            rc = registerBuffer(buffer, mIsType);
+            if (NO_ERROR != rc) {
+                ALOGE("%s: On-the-fly buffer registration failed %d",
+                        __func__, rc);
+                return rc;
+            }
+
+            index = mMemory.getMatchBufIndex((void*)buffer);
+            if (index < 0) {
+                ALOGE("%s: Could not find object among registered buffers",
+                        __func__);
+                return DEAD_OBJECT;
+            }
+        }
+        rc = mStreams[0]->bufDone(index);
+        if(rc != NO_ERROR) {
+            ALOGE("%s: Failed to Q new buffer to stream",__func__);
+            return rc;
+        }
+        rc = mMemory.markFrameNumber(index, frameNumber);
+    }
+    return rc;
+!!!44233015.cpp!!!	streamCbRoutine(inout super_frame : mm_camera_super_buf_t, inout stream : QCamera3Stream) : void
+     ATRACE_CALL();
+    //FIXME Q Buf back in case of error?
+    uint8_t frameIndex;
+    buffer_handle_t *resultBuffer;
+    int32_t resultFrameNumber;
+    camera3_stream_buffer_t result;
+
+    if (checkStreamCbErrors(super_frame, stream) != NO_ERROR) {
+        ALOGE("%s: Error with the stream callback", __func__);
+        return;
+    }
+
+    frameIndex = (uint8_t)super_frame->bufs[0]->buf_idx;
+    if(frameIndex >= mNumBufs) {
+         ALOGE("%s: Error, Invalid index for buffer",__func__);
+         stream->bufDone(frameIndex);
+         return;
+    }
+
+    ////Use below data to issue framework callback
+    resultBuffer = (buffer_handle_t *)mMemory.getBufferHandle(frameIndex);
+    resultFrameNumber = mMemory.getFrameNumber(frameIndex);
+
+    result.stream = mCamera3Stream;
+    result.buffer = resultBuffer;
+    if (IS_BUFFER_ERROR(super_frame->bufs[0]->flags)) {
+        result.status = CAMERA3_BUFFER_STATUS_ERROR;
+        ALOGW("%s: %d CAMERA3_BUFFER_STATUS_ERROR for stream_type: %d",
+            __func__, __LINE__, mStreams[0]->getMyType());
+    } else {
+        result.status = CAMERA3_BUFFER_STATUS_OK;
+    }
+    result.acquire_fence = -1;
+    result.release_fence = -1;
+    if(mPerFrameMapUnmapEnable) {
+        int32_t rc = stream->bufRelease(frameIndex);
+        if (NO_ERROR != rc) {
+            ALOGE("%s: Error %d releasing stream buffer %d",
+                    __func__, rc, frameIndex);
+        }
+
+        rc = mMemory.unregisterBuffer(frameIndex);
+        if (NO_ERROR != rc) {
+            ALOGE("%s: Error %d unregistering stream buffer %d",
+                    __func__, rc, frameIndex);
+        }
+    }
+
+    if (0 <= resultFrameNumber) {
+        if (mChannelCB) {
+            mChannelCB(NULL, &result, (uint32_t)resultFrameNumber, false, mUserData);
+        }
+    } else {
+        ALOGE("%s: Bad frame number", __func__);
+    }
+    free(super_frame);
+    return;
+!!!44233143.cpp!!!	getStreamBufs(in len : uint32_t) : QCamera3StreamMem
+    return &mMemory;
+!!!44233271.cpp!!!	putStreamBufs() : void
+    mMemory.unregisterBuffers();
+
+    /* Reclaim all the offline metabuffers and push them to free list */
+    {
+        Mutex::Autolock lock(mFreeOfflineMetaBuffersLock);
+        mFreeOfflineMetaBuffersList.clear();
+        for (uint32_t i = 0; i < mOfflineMetaMemory.getCnt(); i++) {
+            mFreeOfflineMetaBuffersList.push_back(i);
+        }
+    }
+!!!44233399.cpp!!!	registerBuffer(inout buffer : buffer_handle_t, in isType : cam_is_type_t) : int32_t
+    ATRACE_CALL();
+    int rc = 0;
+    mIsType = isType;
+    cam_stream_type_t streamType;
+
+    if ((uint32_t)mMemory.getCnt() > (mNumBufs - 1)) {
+        ALOGE("%s: Trying to register more buffers than initially requested",
+                __func__);
+        return BAD_VALUE;
+    }
+
+    if (0 == m_numStreams) {
+        rc = initialize(mIsType);
+        if (rc != NO_ERROR) {
+            ALOGE("%s: Couldn't initialize camera stream %d",
+                    __func__, rc);
+            return rc;
+        }
+    }
+
+    streamType = mStreams[0]->getMyType();
+    rc = mMemory.registerBuffer(buffer, streamType);
+    if (ALREADY_EXISTS == rc) {
+        return NO_ERROR;
+    } else if (NO_ERROR != rc) {
+        ALOGE("%s: Buffer %p couldn't be registered %d", __func__, buffer, rc);
+        return rc;
+    }
+
+    return rc;
+!!!44233527.cpp!!!	stop() : int32_t
+    int32_t rc = NO_ERROR;
+    if(!m_bIsActive) {
+        ALOGE("%s: Attempt to stop inactive channel",__func__);
+        return rc;
+    }
+
+    m_postprocessor.stop();
+    mPostProcStarted = false;
+    rc |= QCamera3Channel::stop();
+    return rc;
+!!!44233783.cpp!!!	reprocessCbRoutine(inout resultBuffer : buffer_handle_t, in resultFrameNumber : uint32_t) : void
+    ATRACE_CALL();
+    int rc = NO_ERROR;
+
+    rc = releaseOfflineMemory(resultFrameNumber);
+    if (NO_ERROR != rc) {
+        ALOGE("%s: Error releasing offline memory %d", __func__, rc);
+    }
+    /* Since reprocessing is done, send the callback to release the input buffer */
+    if (mChannelCB) {
+        mChannelCB(NULL, NULL, resultFrameNumber, true, mUserData);
+    }
+    issueChannelCb(resultBuffer, resultFrameNumber);
+
+    return;
+!!!44233911.cpp!!!	queueReprocMetadata(inout metadata : mm_camera_super_buf_t) : int32_t
+    return m_postprocessor.processPPMetadata(metadata);
+!!!44234039.cpp!!!	metadataBufDone(inout recvd_frame : mm_camera_super_buf_t) : int32_t
+    int32_t rc = NO_ERROR;;
+    if ((NULL == m_pMetaChannel) || (NULL == recvd_frame)) {
+        ALOGE("%s: Metadata channel or metadata buffer invalid", __func__);
+        return BAD_VALUE;
+    }
+
+    rc = ((QCamera3MetadataChannel*)m_pMetaChannel)->bufDone(recvd_frame);
+
+    return rc;
+!!!44234167.cpp!!!	translateStreamTypeAndFormat(inout stream : camera3_stream_t, inout streamType : cam_stream_type_t, inout streamFormat : cam_format_t) : int32_t
+    switch (stream->format) {
+        case HAL_PIXEL_FORMAT_YCbCr_420_888:
+            if(stream->stream_type == CAMERA3_STREAM_INPUT){
+                streamType = CAM_STREAM_TYPE_SNAPSHOT;
+                streamFormat = SNAPSHOT_FORMAT;
+            } else {
+                streamType = CAM_STREAM_TYPE_CALLBACK;
+                streamFormat = CALLBACK_FORMAT;
+            }
+            break;
+        case HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED:
+            if (stream->usage & GRALLOC_USAGE_HW_VIDEO_ENCODER) {
+                streamType = CAM_STREAM_TYPE_VIDEO;
+                streamFormat = VIDEO_FORMAT;
+            } else if(stream->stream_type == CAMERA3_STREAM_INPUT ||
+                    stream->stream_type == CAMERA3_STREAM_BIDIRECTIONAL ||
+                    IS_USAGE_ZSL(stream->usage)){
+                streamType = CAM_STREAM_TYPE_SNAPSHOT;
+                streamFormat = SNAPSHOT_FORMAT;
+            } else {
+                streamType = CAM_STREAM_TYPE_PREVIEW;
+                streamFormat = PREVIEW_FORMAT;
+            }
+            break;
+        case HAL_PIXEL_FORMAT_RAW_OPAQUE:
+        case HAL_PIXEL_FORMAT_RAW16:
+        case HAL_PIXEL_FORMAT_RAW10:
+            streamType = CAM_STREAM_TYPE_RAW;
+            streamFormat = CAM_FORMAT_BAYER_MIPI_RAW_10BPP_GBRG;
+            break;
+        default:
+            return -EINVAL;
+    }
+    CDBG("%s: fwk_format = %d, streamType = %d, streamFormat = %d", __func__,
+            stream->format, streamType, streamFormat);
+    return NO_ERROR;
+!!!44234295.cpp!!!	setReprocConfig(inout reproc_cfg : reprocess_config_t, inout pInputBuffer : camera3_stream_buffer_t, inout metadata : metadata_buffer_t, in streamFormat : cam_format_t, in dim : cam_dimension_t) : int32_t
+    int32_t rc = 0;
+    reproc_cfg.padding = mPaddingInfo;
+    //to ensure a big enough buffer size set the height and width
+    //padding to max(height padding, width padding)
+    if (reproc_cfg.padding->height_padding > reproc_cfg.padding->width_padding) {
+       reproc_cfg.padding->width_padding = reproc_cfg.padding->height_padding;
+    } else {
+       reproc_cfg.padding->height_padding = reproc_cfg.padding->width_padding;
+    }
+    if (NULL != pInputBuffer) {
+        reproc_cfg.input_stream_dim.width = (int32_t)pInputBuffer->stream->width;
+        reproc_cfg.input_stream_dim.height = (int32_t)pInputBuffer->stream->height;
+    } else {
+        reproc_cfg.input_stream_dim.width = (int32_t)dim.width;
+        reproc_cfg.input_stream_dim.height = (int32_t)dim.height;
+    }
+    reproc_cfg.src_channel = this;
+    reproc_cfg.output_stream_dim.width = mCamera3Stream->width;
+    reproc_cfg.output_stream_dim.height = mCamera3Stream->height;
+    reproc_cfg.reprocess_type = getReprocessType();
+
+    //offset calculation
+    if (NULL != pInputBuffer) {
+        rc = translateStreamTypeAndFormat(pInputBuffer->stream,
+                reproc_cfg.stream_type, reproc_cfg.stream_format);
+        if (rc != NO_ERROR) {
+            ALOGE("%s: Stream format %d is not supported", __func__,
+                    pInputBuffer->stream->format);
+            return rc;
+        }
+    } else {
+        reproc_cfg.stream_type = mStreamType;
+        reproc_cfg.stream_format = streamFormat;
+    }
+
+    switch (reproc_cfg.stream_type) {
+        case CAM_STREAM_TYPE_PREVIEW:
+            rc = mm_stream_calc_offset_preview(streamFormat,
+                    &reproc_cfg.input_stream_dim,
+                    &reproc_cfg.input_stream_plane_info);
+            break;
+        case CAM_STREAM_TYPE_VIDEO:
+            rc = mm_stream_calc_offset_video(&reproc_cfg.input_stream_dim,
+                    &reproc_cfg.input_stream_plane_info);
+            break;
+        case CAM_STREAM_TYPE_RAW:
+            rc = mm_stream_calc_offset_raw(streamFormat, &reproc_cfg.input_stream_dim,
+                    reproc_cfg.padding, &reproc_cfg.input_stream_plane_info);
+            break;
+        case CAM_STREAM_TYPE_SNAPSHOT:
+        case CAM_STREAM_TYPE_CALLBACK:
+        default:
+            rc = mm_stream_calc_offset_snapshot(streamFormat, &reproc_cfg.input_stream_dim,
+                    reproc_cfg.padding, &reproc_cfg.input_stream_plane_info);
+            break;
+    }
+    if (rc != 0) {
+        ALOGE("%s: Stream %d plane info calculation failed!", __func__, mStreamType);
+    }
+
+    return rc;
+!!!44234423.cpp!!!	setFwkInputPPData(inout src_frame : qcamera_fwk_input_pp_data_t, inout pInputBuffer : camera3_stream_buffer_t, inout reproc_cfg : reprocess_config_t, inout metadata : metadata_buffer_t, inout output_buffer : buffer_handle_t, in frameNumber : uint32_t) : int32_t
+    int32_t rc = NO_ERROR;
+    int input_index = mOfflineMemory.getMatchBufIndex((void*)pInputBuffer->buffer);
+    if(input_index < 0) {
+        rc = mOfflineMemory.registerBuffer(pInputBuffer->buffer, mStreamType);
+        if (NO_ERROR != rc) {
+            ALOGE("%s: On-the-fly input buffer registration failed %d",
+                    __func__, rc);
+            return rc;
+        }
+        input_index = mOfflineMemory.getMatchBufIndex((void*)pInputBuffer->buffer);
+        if (input_index < 0) {
+            ALOGE("%s: Could not find object among registered buffers",__func__);
+            return DEAD_OBJECT;
+        }
+    }
+    mOfflineMemory.markFrameNumber(input_index, frameNumber);
+
+    src_frame->src_frame = *pInputBuffer;
+    rc = mOfflineMemory.getBufDef(reproc_cfg->input_stream_plane_info.plane_info,
+            src_frame->input_buffer, input_index);
+    if (rc != 0) {
+        return rc;
+    }
+    if (mYUVDump) {
+       dumpYUV(&src_frame->input_buffer, reproc_cfg->input_stream_dim,
+               reproc_cfg->input_stream_plane_info.plane_info, 1);
+    }
+
+    cam_dimension_t dim = {sizeof(metadata_buffer_t), 1};
+    cam_stream_buf_plane_info_t meta_planes;
+    rc = mm_stream_calc_offset_metadata(&dim, mPaddingInfo, &meta_planes);
+    if (rc != 0) {
+        ALOGE("%s: Metadata stream plane info calculation failed!", __func__);
+        return rc;
+    }
+    uint32_t metaBufIdx;
+    {
+        Mutex::Autolock lock(mFreeOfflineMetaBuffersLock);
+        if (mFreeOfflineMetaBuffersList.empty()) {
+            ALOGE("%s: mFreeOfflineMetaBuffersList is null. Fatal", __func__);
+            return BAD_VALUE;
+        }
+
+        metaBufIdx = *(mFreeOfflineMetaBuffersList.begin());
+        mFreeOfflineMetaBuffersList.erase(mFreeOfflineMetaBuffersList.begin());
+        CDBG("%s: erasing %d, mFreeOfflineMetaBuffersList.size %d", __func__, metaBufIdx,
+                mFreeOfflineMetaBuffersList.size());
+    }
+
+    mOfflineMetaMemory.markFrameNumber(metaBufIdx, frameNumber);
+
+    mm_camera_buf_def_t meta_buf;
+    cam_frame_len_offset_t offset = meta_planes.plane_info;
+    rc = mOfflineMetaMemory.getBufDef(offset, meta_buf, metaBufIdx);
+    if (NO_ERROR != rc) {
+        return rc;
+    }
+    memcpy(meta_buf.buffer, metadata, sizeof(metadata_buffer_t));
+    src_frame->metadata_buffer = meta_buf;
+    src_frame->reproc_config = *reproc_cfg;
+    src_frame->output_buffer = output_buffer;
+    src_frame->frameNumber = frameNumber;
+    return rc;
+!!!44234551.cpp!!!	checkStreamCbErrors(inout super_frame : mm_camera_super_buf_t, inout stream : QCamera3Stream) : int32_t
+    if (NULL == stream) {
+        ALOGE("%s: Invalid stream", __func__);
+        return BAD_VALUE;
+    }
+
+    if(NULL == super_frame) {
+         ALOGE("%s: Invalid Super buffer",__func__);
+         return BAD_VALUE;
+    }
+
+    if(super_frame->num_bufs != 1) {
+         ALOGE("%s: Multiple streams are not supported",__func__);
+         return BAD_VALUE;
+    }
+    if(NULL == super_frame->bufs[0]) {
+         ALOGE("%s: Error, Super buffer frame does not contain valid buffer",
+                  __func__);
+         return BAD_VALUE;
+    }
+    return NO_ERROR;
+!!!44234679.cpp!!!	getStreamSize(inout dim : cam_dimension_t) : int32_t
+    if (mCamera3Stream) {
+        dim.width = mCamera3Stream->width;
+        dim.height = mCamera3Stream->height;
+        return NO_ERROR;
+    } else {
+        return BAD_VALUE;
+    }
+!!!44234935.cpp!!!	startPostProc(in config : reprocess_config_t) : void
+    if(!mPostProcStarted) {
+        m_postprocessor.start(config);
+        mPostProcStarted = true;
+    }
+!!!44235063.cpp!!!	issueChannelCb(inout resultBuffer : buffer_handle_t, in resultFrameNumber : uint32_t) : void
+    camera3_stream_buffer_t result;
+    //Use below data to issue framework callback
+    result.stream = mCamera3Stream;
+    result.buffer = resultBuffer;
+    result.status = CAMERA3_BUFFER_STATUS_OK;
+    result.acquire_fence = -1;
+    result.release_fence = -1;
+
+    if (mChannelCB) {
+        mChannelCB(NULL, &result, resultFrameNumber, false, mUserData);
+    }
+!!!44235191.cpp!!!	releaseOfflineMemory(in resultFrameNumber : uint32_t) : int32_t
+    int32_t rc = NO_ERROR;
+    int32_t inputBufIndex =
+            mOfflineMemory.getGrallocBufferIndex(resultFrameNumber);
+    if (0 <= inputBufIndex) {
+        rc = mOfflineMemory.unregisterBuffer(inputBufIndex);
+    } else {
+        ALOGE("%s: Could not find offline input buffer, resultFrameNumber %d",
+                __func__, resultFrameNumber);
+    }
+    if (rc != NO_ERROR) {
+        ALOGE("%s: Failed to unregister offline input buffer", __func__);
+    }
+
+    int32_t metaBufIndex =
+            mOfflineMetaMemory.getHeapBufferIndex(resultFrameNumber);
+    if (0 <= metaBufIndex) {
+        Mutex::Autolock lock(mFreeOfflineMetaBuffersLock);
+        mFreeOfflineMetaBuffersList.push_back((uint32_t)metaBufIndex);
+    } else {
+        ALOGE("%s: Could not find offline meta buffer, resultFrameNumber %d",
+                __func__, resultFrameNumber);
+    }
+
+    return rc;

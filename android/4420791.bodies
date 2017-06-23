@@ -1,0 +1,407 @@
+class Camera
+!!!44970423.cpp!!!	Camera(in id : int)
+    memset(&mTemplates, 0, sizeof(mTemplates));
+    memset(&mDevice, 0, sizeof(mDevice));
+    mDevice.common.tag    = HARDWARE_DEVICE_TAG;
+    mDevice.common.version = CAMERA_DEVICE_API_VERSION_3_0;
+    mDevice.common.close  = close_device;
+    mDevice.ops           = const_cast<camera3_device_ops_t*>(&sOps);
+    mDevice.priv          = this;
+!!!44970551.cpp!!!	~Camera()
+    if (mStaticInfo != NULL) {
+        free_camera_metadata(mStaticInfo);
+    }
+!!!44970679.cpp!!!	open(in module : hw_module_t, inout device : hw_device_t) : int
+    ALOGI("%s:%d: Opening camera device", __func__, mId);
+    ATRACE_CALL();
+    android::Mutex::Autolock al(mDeviceLock);
+
+    if (mBusy) {
+        ALOGE("%s:%d: Error! Camera device already opened", __func__, mId);
+        return -EBUSY;
+    }
+
+    // TODO: open camera dev nodes, etc
+    mBusy = true;
+    mDevice.common.module = const_cast<hw_module_t*>(module);
+    *device = &mDevice.common;
+    return 0;
+!!!44970807.cpp!!!	getInfo(inout info : camera_info) : int
+    android::Mutex::Autolock al(mStaticInfoLock);
+
+    info->facing = CAMERA_FACING_FRONT;
+    info->orientation = 0;
+    info->device_version = mDevice.common.version;
+    if (mStaticInfo == NULL) {
+        mStaticInfo = initStaticInfo();
+    }
+    info->static_camera_characteristics = mStaticInfo;
+    return 0;
+!!!44970935.cpp!!!	close() : int
+    ALOGI("%s:%d: Closing camera device", __func__, mId);
+    ATRACE_CALL();
+    android::Mutex::Autolock al(mDeviceLock);
+
+    if (!mBusy) {
+        ALOGE("%s:%d: Error! Camera device not open", __func__, mId);
+        return -EINVAL;
+    }
+
+    // TODO: close camera dev nodes, etc
+    mBusy = false;
+    return 0;
+!!!44971063.cpp!!!	initialize(in callback_ops : camera3_callback_ops_t) : int
+    int res;
+
+    ALOGV("%s:%d: callback_ops=%p", __func__, mId, callback_ops);
+    mCallbackOps = callback_ops;
+    // per-device specific initialization
+    res = initDevice();
+    if (res != 0) {
+        ALOGE("%s:%d: Failed to initialize device!", __func__, mId);
+        return res;
+    }
+    return 0;
+!!!44971191.cpp!!!	configureStreams(inout stream_config : camera3_stream_configuration_t) : int
+    camera3_stream_t *astream;
+    Stream **newStreams = NULL;
+
+    ALOGV("%s:%d: stream_config=%p", __func__, mId, stream_config);
+    ATRACE_CALL();
+    android::Mutex::Autolock al(mDeviceLock);
+
+    if (stream_config == NULL) {
+        ALOGE("%s:%d: NULL stream configuration array", __func__, mId);
+        return -EINVAL;
+    }
+    if (stream_config->num_streams == 0) {
+        ALOGE("%s:%d: Empty stream configuration array", __func__, mId);
+        return -EINVAL;
+    }
+
+    // Create new stream array
+    newStreams = new Stream*[stream_config->num_streams];
+    ALOGV("%s:%d: Number of Streams: %d", __func__, mId,
+            stream_config->num_streams);
+
+    // Mark all current streams unused for now
+    for (int i = 0; i < mNumStreams; i++)
+        mStreams[i]->mReuse = false;
+    // Fill new stream array with reused streams and new streams
+    for (unsigned int i = 0; i < stream_config->num_streams; i++) {
+        astream = stream_config->streams[i];
+        if (astream->max_buffers > 0) {
+            ALOGV("%s:%d: Reusing stream %d", __func__, mId, i);
+            newStreams[i] = reuseStream(astream);
+        } else {
+            ALOGV("%s:%d: Creating new stream %d", __func__, mId, i);
+            newStreams[i] = new Stream(mId, astream);
+        }
+
+        if (newStreams[i] == NULL) {
+            ALOGE("%s:%d: Error processing stream %d", __func__, mId, i);
+            goto err_out;
+        }
+        astream->priv = newStreams[i];
+    }
+
+    // Verify the set of streams in aggregate
+    if (!isValidStreamSet(newStreams, stream_config->num_streams)) {
+        ALOGE("%s:%d: Invalid stream set", __func__, mId);
+        goto err_out;
+    }
+
+    // Set up all streams (calculate usage/max_buffers for each)
+    setupStreams(newStreams, stream_config->num_streams);
+
+    // Destroy all old streams and replace stream array with new one
+    destroyStreams(mStreams, mNumStreams);
+    mStreams = newStreams;
+    mNumStreams = stream_config->num_streams;
+
+    // Clear out last seen settings metadata
+    setSettings(NULL);
+    return 0;
+
+err_out:
+    // Clean up temporary streams, preserve existing mStreams/mNumStreams
+    destroyStreams(newStreams, stream_config->num_streams);
+    return -EINVAL;
+!!!44971319.cpp!!!	registerStreamBuffers(in buf_set : camera3_stream_buffer_set_t) : int
+    ALOGV("%s:%d: buffer_set=%p", __func__, mId, buf_set);
+    if (buf_set == NULL) {
+        ALOGE("%s:%d: NULL buffer set", __func__, mId);
+        return -EINVAL;
+    }
+    if (buf_set->stream == NULL) {
+        ALOGE("%s:%d: NULL stream handle", __func__, mId);
+        return -EINVAL;
+    }
+    Stream *stream = reinterpret_cast<Stream*>(buf_set->stream->priv);
+    return stream->registerBuffers(buf_set);
+!!!44971447.cpp!!!	constructDefaultRequestSettings(in type : int) : camera_metadata_t
+    ALOGV("%s:%d: type=%d", __func__, mId, type);
+
+    if (!isValidTemplateType(type)) {
+        ALOGE("%s:%d: Invalid template request type: %d", __func__, mId, type);
+        return NULL;
+    }
+    return mTemplates[type];
+!!!44971575.cpp!!!	processCaptureRequest(inout request : camera3_capture_request_t) : int
+    camera3_capture_result result;
+
+    ALOGV("%s:%d: request=%p", __func__, mId, request);
+    ATRACE_CALL();
+
+    if (request == NULL) {
+        ALOGE("%s:%d: NULL request recieved", __func__, mId);
+        return -EINVAL;
+    }
+
+    ALOGV("%s:%d: Request Frame:%d Settings:%p", __func__, mId,
+            request->frame_number, request->settings);
+
+    // NULL indicates use last settings
+    if (request->settings == NULL) {
+        if (mSettings == NULL) {
+            ALOGE("%s:%d: NULL settings without previous set Frame:%d Req:%p",
+                    __func__, mId, request->frame_number, request);
+            return -EINVAL;
+        }
+    } else {
+        setSettings(request->settings);
+    }
+
+    if (request->input_buffer != NULL) {
+        ALOGV("%s:%d: Reprocessing input buffer %p", __func__, mId,
+                request->input_buffer);
+
+        if (!isValidReprocessSettings(request->settings)) {
+            ALOGE("%s:%d: Invalid settings for reprocess request: %p",
+                    __func__, mId, request->settings);
+            return -EINVAL;
+        }
+    } else {
+        ALOGV("%s:%d: Capturing new frame.", __func__, mId);
+
+        if (!isValidCaptureSettings(request->settings)) {
+            ALOGE("%s:%d: Invalid settings for capture request: %p",
+                    __func__, mId, request->settings);
+            return -EINVAL;
+        }
+    }
+
+    if (request->num_output_buffers <= 0) {
+        ALOGE("%s:%d: Invalid number of output buffers: %d", __func__, mId,
+                request->num_output_buffers);
+        return -EINVAL;
+    }
+    result.num_output_buffers = request->num_output_buffers;
+    result.output_buffers = new camera3_stream_buffer_t[result.num_output_buffers];
+    for (unsigned int i = 0; i < request->num_output_buffers; i++) {
+        int res = processCaptureBuffer(&request->output_buffers[i],
+                const_cast<camera3_stream_buffer_t*>(&result.output_buffers[i]));
+        if (res)
+            goto err_out;
+    }
+
+    result.frame_number = request->frame_number;
+    // TODO: return actual captured/reprocessed settings
+    result.result = request->settings;
+    // TODO: asynchronously return results
+    notifyShutter(request->frame_number, 0);
+    mCallbackOps->process_capture_result(mCallbackOps, &result);
+
+    return 0;
+
+err_out:
+    delete [] result.output_buffers;
+    // TODO: this should probably be a total device failure; transient for now
+    return -EINVAL;
+!!!44971703.cpp!!!	dump(in fd : int) : void
+    ALOGV("%s:%d: Dumping to fd %d", __func__, mId, fd);
+    ATRACE_CALL();
+    android::Mutex::Autolock al(mDeviceLock);
+
+    dprintf(fd, "Camera ID: %d (Busy: %d)\n", mId, mBusy);
+
+    // TODO: dump all settings
+    dprintf(fd, "Most Recent Settings: (%p)\n", mSettings);
+
+    dprintf(fd, "Number of streams: %d\n", mNumStreams);
+    for (int i = 0; i < mNumStreams; i++) {
+        dprintf(fd, "Stream %d/%d:\n", i, mNumStreams);
+        mStreams[i]->dump(fd);
+    }
+!!!44972215.cpp!!!	setTemplate(in type : int, inout settings : camera_metadata_t) : int
+    android::Mutex::Autolock al(mDeviceLock);
+
+    if (!isValidTemplateType(type)) {
+        ALOGE("%s:%d: Invalid template request type: %d", __func__, mId, type);
+        return -EINVAL;
+    }
+
+    if (mTemplates[type] != NULL) {
+        ALOGE("%s:%d: Setting already constructed template type %s(%d)",
+                __func__, mId, templateToString(type), type);
+        return -EINVAL;
+    }
+
+    // Make a durable copy of the underlying metadata
+    mTemplates[type] = clone_camera_metadata(settings);
+    if (mTemplates[type] == NULL) {
+        ALOGE("%s:%d: Failed to clone metadata %p for template type %s(%d)",
+                __func__, mId, settings, templateToString(type), type);
+        return -EINVAL;
+    }
+    return 0;
+!!!44972343.cpp!!!	templateToString(in type : int) : char
+    switch (type) {
+    case CAMERA3_TEMPLATE_PREVIEW:
+        return "CAMERA3_TEMPLATE_PREVIEW";
+    case CAMERA3_TEMPLATE_STILL_CAPTURE:
+        return "CAMERA3_TEMPLATE_STILL_CAPTURE";
+    case CAMERA3_TEMPLATE_VIDEO_RECORD:
+        return "CAMERA3_TEMPLATE_VIDEO_RECORD";
+    case CAMERA3_TEMPLATE_VIDEO_SNAPSHOT:
+        return "CAMERA3_TEMPLATE_VIDEO_SNAPSHOT";
+    case CAMERA3_TEMPLATE_ZERO_SHUTTER_LAG:
+        return "CAMERA3_TEMPLATE_ZERO_SHUTTER_LAG";
+    }
+    // TODO: support vendor templates
+    return "Invalid template type!";
+!!!44972471.cpp!!!	reuseStream(inout astream : camera3_stream_t) : Stream
+    Stream *priv = reinterpret_cast<Stream*>(astream->priv);
+    // Verify the re-used stream's parameters match
+    if (!priv->isValidReuseStream(mId, astream)) {
+        ALOGE("%s:%d: Mismatched parameter in reused stream", __func__, mId);
+        return NULL;
+    }
+    // Mark stream to be reused
+    priv->mReuse = true;
+    return priv;
+!!!44972599.cpp!!!	destroyStreams(inout streams : Stream, in count : int) : void
+    if (streams == NULL)
+        return;
+    for (int i = 0; i < count; i++) {
+        // Only destroy streams that weren't reused
+        if (streams[i] != NULL && !streams[i]->mReuse)
+            delete streams[i];
+    }
+    delete [] streams;
+!!!44972727.cpp!!!	isValidStreamSet(inout streams : Stream, in count : int) : bool
+    int inputs = 0;
+    int outputs = 0;
+
+    if (streams == NULL) {
+        ALOGE("%s:%d: NULL stream configuration streams", __func__, mId);
+        return false;
+    }
+    if (count == 0) {
+        ALOGE("%s:%d: Zero count stream configuration streams", __func__, mId);
+        return false;
+    }
+    // Validate there is at most one input stream and at least one output stream
+    for (int i = 0; i < count; i++) {
+        // A stream may be both input and output (bidirectional)
+        if (streams[i]->isInputType())
+            inputs++;
+        if (streams[i]->isOutputType())
+            outputs++;
+    }
+    ALOGV("%s:%d: Configuring %d output streams and %d input streams",
+            __func__, mId, outputs, inputs);
+    if (outputs < 1) {
+        ALOGE("%s:%d: Stream config must have >= 1 output", __func__, mId);
+        return false;
+    }
+    if (inputs > 1) {
+        ALOGE("%s:%d: Stream config must have <= 1 input", __func__, mId);
+        return false;
+    }
+    // TODO: check for correct number of Bayer/YUV/JPEG/Encoder streams
+    return true;
+!!!44972855.cpp!!!	setupStreams(inout streams : Stream, in count : int) : void
+    /*
+     * This is where the HAL has to decide internally how to handle all of the
+     * streams, and then produce usage and max_buffer values for each stream.
+     * Note, the stream array has been checked before this point for ALL invalid
+     * conditions, so it must find a successful configuration for this stream
+     * array.  The HAL may not return an error from this point.
+     *
+     * In this demo HAL, we just set all streams to be the same dummy values;
+     * real implementations will want to avoid USAGE_SW_{READ|WRITE}_OFTEN.
+     */
+    for (int i = 0; i < count; i++) {
+        uint32_t usage = 0;
+
+        if (streams[i]->isOutputType())
+            usage |= GRALLOC_USAGE_SW_WRITE_OFTEN |
+                     GRALLOC_USAGE_HW_CAMERA_WRITE;
+        if (streams[i]->isInputType())
+            usage |= GRALLOC_USAGE_SW_READ_OFTEN |
+                     GRALLOC_USAGE_HW_CAMERA_READ;
+
+        streams[i]->setUsage(usage);
+        streams[i]->setMaxBuffers(1);
+    }
+!!!44972983.cpp!!!	setSettings(in new_settings : camera_metadata_t) : void
+    if (mSettings != NULL) {
+        free_camera_metadata(mSettings);
+        mSettings = NULL;
+    }
+
+    if (new_settings != NULL)
+        mSettings = clone_camera_metadata(new_settings);
+!!!44973111.cpp!!!	isValidReprocessSettings(in settings : camera_metadata_t) : bool
+    // TODO: reject settings that cannot be reprocessed
+    // input buffers unimplemented, use this to reject reprocessing requests
+    ALOGE("%s:%d: Input buffer reprocessing not implemented", __func__, mId);
+    return false;
+!!!44973239.cpp!!!	processCaptureBuffer(in in : camera3_stream_buffer_t, inout out : camera3_stream_buffer_t) : int
+    if (in->acquire_fence != -1) {
+        int res = sync_wait(in->acquire_fence, CAMERA_SYNC_TIMEOUT);
+        if (res == -ETIME) {
+            ALOGE("%s:%d: Timeout waiting on buffer acquire fence",
+                    __func__, mId);
+            return res;
+        } else if (res) {
+            ALOGE("%s:%d: Error waiting on buffer acquire fence: %s(%d)",
+                    __func__, mId, strerror(-res), res);
+            return res;
+        }
+    }
+
+    out->stream = in->stream;
+    out->buffer = in->buffer;
+    out->status = CAMERA3_BUFFER_STATUS_OK;
+    // TODO: use driver-backed release fences
+    out->acquire_fence = -1;
+    out->release_fence = -1;
+
+    // TODO: lock and software-paint buffer
+    return 0;
+!!!44973367.cpp!!!	notifyShutter(in frame_number : uint32_t, in timestamp : uint64_t) : void
+    int res;
+    struct timespec ts;
+
+    // If timestamp is 0, get timestamp from right now instead
+    if (timestamp == 0) {
+        ALOGW("%s:%d: No timestamp provided, using CLOCK_BOOTTIME",
+                __func__, mId);
+        res = clock_gettime(CLOCK_BOOTTIME, &ts);
+        if (res == 0) {
+            timestamp = ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+        } else {
+            ALOGE("%s:%d: No timestamp and failed to get CLOCK_BOOTTIME %s(%d)",
+                    __func__, mId, strerror(errno), errno);
+        }
+    }
+    camera3_notify_msg_t m;
+    memset(&m, 0, sizeof(m));
+    m.type = CAMERA3_MSG_SHUTTER;
+    m.message.shutter.frame_number = frame_number;
+    m.message.shutter.timestamp = timestamp;
+    mCallbackOps->notify(mCallbackOps, &m);
+!!!44973495.cpp!!!	isValidTemplateType(in type : int) : bool
+    return type < 1 || type >= CAMERA3_TEMPLATE_COUNT;

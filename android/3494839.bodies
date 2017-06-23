@@ -1,0 +1,396 @@
+class ReadoutThread
+!!!43946679.cpp!!!	ReadoutThread(inout parent : EmulatedFakeCamera2)
+    mInFlightQueue = new InFlightQueue[kInFlightQueueSize];
+    mInFlightHead = 0;
+    mInFlightTail = 0;
+!!!43946807.cpp!!!	~ReadoutThread()
+    delete mInFlightQueue;
+!!!43946935.cpp!!!	readyToRun() : status_t
+    Mutex::Autolock lock(mInputMutex);
+    ALOGV("Starting up ReadoutThread");
+    mRunning = true;
+    mInputSignal.signal();
+    return NO_ERROR;
+!!!43947063.cpp!!!	waitUntilRunning() : status_t
+    Mutex::Autolock lock(mInputMutex);
+    if (!mRunning) {
+        ALOGV("Waiting for readout thread to start");
+        mInputSignal.wait(mInputMutex);
+    }
+    return OK;
+!!!43947191.cpp!!!	waitForReady(in timeout : nsecs_t) : bool
+    status_t res;
+    Mutex::Autolock lock(mInputMutex);
+    while (!readyForNextCapture()) {
+        res = mReadySignal.waitRelative(mInputMutex, timeout);
+        if (res == TIMED_OUT) return false;
+        if (res != OK) {
+            ALOGE("%s: Error waiting for ready: %s (%d)", __FUNCTION__,
+                    strerror(-res), res);
+            return false;
+        }
+    }
+    return true;
+!!!43947319.cpp!!!	setNextOperation(in isCapture : bool, inout request : camera_metadata_t, inout buffers : Buffers) : void
+    Mutex::Autolock lock(mInputMutex);
+    if ( !readyForNextCapture() ) {
+        ALOGE("In flight queue full, dropping captures");
+        mParent->signalError();
+        return;
+    }
+    mInFlightQueue[mInFlightTail].isCapture = isCapture;
+    mInFlightQueue[mInFlightTail].request = request;
+    mInFlightQueue[mInFlightTail].buffers = buffers;
+    mInFlightTail = (mInFlightTail + 1) % kInFlightQueueSize;
+    mRequestCount++;
+
+    if (!mActive) {
+        mActive = true;
+        mInputSignal.signal();
+    }
+!!!43947447.cpp!!!	isStreamInUse(in id : uint32_t) : bool
+    // acquire in same order as threadLoop
+    Mutex::Autolock iLock(mInternalsMutex);
+    Mutex::Autolock lock(mInputMutex);
+
+    size_t i = mInFlightHead;
+    while (i != mInFlightTail) {
+        for (size_t j = 0; j < mInFlightQueue[i].buffers->size(); j++) {
+            if ( (*(mInFlightQueue[i].buffers))[j].streamId == (int)id )
+                return true;
+        }
+        i = (i + 1) % kInFlightQueueSize;
+    }
+
+
+    if (mBuffers != NULL) {
+        for (i = 0; i < mBuffers->size(); i++) {
+            if ( (*mBuffers)[i].streamId == (int)id) return true;
+        }
+    }
+
+    return false;
+!!!43947575.cpp!!!	getInProgressCount() : int
+    Mutex::Autolock lock(mInputMutex);
+
+    return mRequestCount;
+!!!43947703.cpp!!!	threadLoop() : bool
+    static const nsecs_t kWaitPerLoop = 10000000L; // 10 ms
+    status_t res;
+    int32_t frameNumber;
+
+    // Check if we're currently processing or just waiting
+    {
+        Mutex::Autolock lock(mInputMutex);
+        if (!mActive) {
+            // Inactive, keep waiting until we've been signaled
+            res = mInputSignal.waitRelative(mInputMutex, kWaitPerLoop);
+            if (res != NO_ERROR && res != TIMED_OUT) {
+                ALOGE("%s: Error waiting for capture requests: %d",
+                        __FUNCTION__, res);
+                mParent->signalError();
+                return false;
+            }
+            if (!mActive) return true;
+        }
+        // Active, see if we need a new request
+        if (mRequest == NULL) {
+            if (mInFlightHead == mInFlightTail) {
+                // Go inactive
+                ALOGV("Waiting for sensor data");
+                mActive = false;
+                return true;
+            } else {
+                Mutex::Autolock iLock(mInternalsMutex);
+                mReadySignal.signal();
+                mIsCapture = mInFlightQueue[mInFlightHead].isCapture;
+                mRequest = mInFlightQueue[mInFlightHead].request;
+                mBuffers  = mInFlightQueue[mInFlightHead].buffers;
+                mInFlightQueue[mInFlightHead].request = NULL;
+                mInFlightQueue[mInFlightHead].buffers = NULL;
+                mInFlightHead = (mInFlightHead + 1) % kInFlightQueueSize;
+                ALOGV("Ready to read out request %p, %zu buffers",
+                        mRequest, mBuffers->size());
+            }
+        }
+    }
+
+    // Active with request, wait on sensor to complete
+
+    nsecs_t captureTime;
+
+    if (mIsCapture) {
+        bool gotFrame;
+        gotFrame = mParent->mSensor->waitForNewFrame(kWaitPerLoop,
+                &captureTime);
+
+        if (!gotFrame) return true;
+    }
+
+    Mutex::Autolock iLock(mInternalsMutex);
+
+    camera_metadata_entry_t entry;
+    if (!mIsCapture) {
+        res = find_camera_metadata_entry(mRequest,
+                ANDROID_SENSOR_TIMESTAMP,
+            &entry);
+        if (res != NO_ERROR) {
+            ALOGE("%s: error reading reprocessing timestamp: %s (%d)",
+                    __FUNCTION__, strerror(-res), res);
+            mParent->signalError();
+            return false;
+        }
+        captureTime = entry.data.i64[0];
+    }
+
+    res = find_camera_metadata_entry(mRequest,
+            ANDROID_REQUEST_FRAME_COUNT,
+            &entry);
+    if (res != NO_ERROR) {
+        ALOGE("%s: error reading frame count tag: %s (%d)",
+                __FUNCTION__, strerror(-res), res);
+        mParent->signalError();
+        return false;
+    }
+    frameNumber = *entry.data.i32;
+
+    res = find_camera_metadata_entry(mRequest,
+            ANDROID_REQUEST_METADATA_MODE,
+            &entry);
+    if (res != NO_ERROR) {
+        ALOGE("%s: error reading metadata mode tag: %s (%d)",
+                __FUNCTION__, strerror(-res), res);
+        mParent->signalError();
+        return false;
+    }
+
+    // Got sensor data and request, construct frame and send it out
+    ALOGV("Readout: Constructing metadata and frames for request %d",
+            frameNumber);
+
+    if (*entry.data.u8 == ANDROID_REQUEST_METADATA_MODE_FULL) {
+        ALOGV("Readout: Metadata requested, constructing");
+
+        camera_metadata_t *frame = NULL;
+
+        size_t frame_entries = get_camera_metadata_entry_count(mRequest);
+        size_t frame_data    = get_camera_metadata_data_count(mRequest);
+
+        // TODO: Dynamically calculate based on enabled statistics, etc
+        frame_entries += 10;
+        frame_data += 100;
+
+        res = mParent->mFrameQueueDst->dequeue_frame(mParent->mFrameQueueDst,
+                frame_entries, frame_data, &frame);
+
+        if (res != NO_ERROR || frame == NULL) {
+            ALOGE("%s: Unable to dequeue frame metadata buffer", __FUNCTION__);
+            mParent->signalError();
+            return false;
+        }
+
+        res = append_camera_metadata(frame, mRequest);
+        if (res != NO_ERROR) {
+            ALOGE("Unable to append request metadata");
+        }
+
+        if (mIsCapture) {
+            add_camera_metadata_entry(frame,
+                    ANDROID_SENSOR_TIMESTAMP,
+                    &captureTime,
+                    1);
+
+            collectStatisticsMetadata(frame);
+            // TODO: Collect all final values used from sensor in addition to timestamp
+        }
+
+        ALOGV("Readout: Enqueue frame %d", frameNumber);
+        mParent->mFrameQueueDst->enqueue_frame(mParent->mFrameQueueDst,
+                frame);
+    }
+    ALOGV("Readout: Free request");
+    res = mParent->mRequestQueueSrc->free_request(mParent->mRequestQueueSrc, mRequest);
+    if (res != NO_ERROR) {
+        ALOGE("%s: Unable to return request buffer to queue: %d",
+                __FUNCTION__, res);
+        mParent->signalError();
+        return false;
+    }
+    mRequest = NULL;
+
+    int compressedBufferIndex = -1;
+    ALOGV("Readout: Processing %zu buffers", mBuffers->size());
+    for (size_t i = 0; i < mBuffers->size(); i++) {
+        const StreamBuffer &b = (*mBuffers)[i];
+        ALOGV("Readout:    Buffer %zu: Stream %d, %d x %d, format 0x%x, stride %d",
+                i, b.streamId, b.width, b.height, b.format, b.stride);
+        if (b.streamId > 0) {
+            if (b.format == HAL_PIXEL_FORMAT_BLOB) {
+                // Assumes only one BLOB buffer type per capture
+                compressedBufferIndex = i;
+            } else {
+                ALOGV("Readout:    Sending image buffer %zu (%p) to output stream %d",
+                        i, (void*)*(b.buffer), b.streamId);
+                GraphicBufferMapper::get().unlock(*(b.buffer));
+                const Stream &s = mParent->getStreamInfo(b.streamId);
+                res = s.ops->enqueue_buffer(s.ops, captureTime, b.buffer);
+                if (res != OK) {
+                    ALOGE("Error enqueuing image buffer %p: %s (%d)", b.buffer,
+                            strerror(-res), res);
+                    mParent->signalError();
+                }
+            }
+        }
+    }
+
+    if (compressedBufferIndex == -1) {
+        delete mBuffers;
+    } else {
+        ALOGV("Readout:  Starting JPEG compression for buffer %d, stream %d",
+                compressedBufferIndex,
+                (*mBuffers)[compressedBufferIndex].streamId);
+        mJpegTimestamp = captureTime;
+        // Takes ownership of mBuffers
+        mParent->mJpegCompressor->start(mBuffers, this);
+    }
+    mBuffers = NULL;
+
+    Mutex::Autolock l(mInputMutex);
+    mRequestCount--;
+    ALOGV("Readout: Done with request %d", frameNumber);
+    return true;
+!!!43947831.cpp!!!	readyForNextCapture() : bool
+    return (mInFlightTail + 1) % kInFlightQueueSize != mInFlightHead;
+!!!43947959.cpp!!!	collectStatisticsMetadata(inout frame : camera_metadata_t) : status_t
+    // Completely fake face rectangles, don't correspond to real faces in scene
+    ALOGV("Readout:    Collecting statistics metadata");
+
+    status_t res;
+    camera_metadata_entry_t entry;
+    res = find_camera_metadata_entry(frame,
+                ANDROID_STATISTICS_FACE_DETECT_MODE,
+                &entry);
+    if (res != OK) {
+        ALOGE("%s: Unable to find face detect mode!", __FUNCTION__);
+        return BAD_VALUE;
+    }
+
+    if (entry.data.u8[0] == ANDROID_STATISTICS_FACE_DETECT_MODE_OFF) return OK;
+
+    // The coordinate system for the face regions is the raw sensor pixel
+    // coordinates. Here, we map from the scene coordinates (0-19 in both axis)
+    // to raw pixels, for the scene defined in fake-pipeline2/Scene.cpp. We
+    // approximately place two faces on top of the windows of the house. No
+    // actual faces exist there, but might one day. Note that this doesn't
+    // account for the offsets used to account for aspect ratio differences, so
+    // the rectangles don't line up quite right.
+    const size_t numFaces = 2;
+    int32_t rects[numFaces * 4] = {
+        static_cast<int32_t>(Sensor::kResolution[0] * 10 / 20),
+        static_cast<int32_t>(Sensor::kResolution[1] * 15 / 20),
+        static_cast<int32_t>(Sensor::kResolution[0] * 12 / 20),
+        static_cast<int32_t>(Sensor::kResolution[1] * 17 / 20),
+
+        static_cast<int32_t>(Sensor::kResolution[0] * 16 / 20),
+        static_cast<int32_t>(Sensor::kResolution[1] * 15 / 20),
+        static_cast<int32_t>(Sensor::kResolution[0] * 18 / 20),
+        static_cast<int32_t>(Sensor::kResolution[1] * 17 / 20)
+    };
+    // To simulate some kind of real detection going on, we jitter the rectangles on
+    // each frame by a few pixels in each dimension.
+    for (size_t i = 0; i < numFaces * 4; i++) {
+        rects[i] += (int32_t)(((float)rand() / RAND_MAX) * 6 - 3);
+    }
+    // The confidence scores (0-100) are similarly jittered.
+    uint8_t scores[numFaces] = { 85, 95 };
+    for (size_t i = 0; i < numFaces; i++) {
+        scores[i] += (int32_t)(((float)rand() / RAND_MAX) * 10 - 5);
+    }
+
+    res = add_camera_metadata_entry(frame, ANDROID_STATISTICS_FACE_RECTANGLES,
+            rects, numFaces * 4);
+    if (res != OK) {
+        ALOGE("%s: Unable to add face rectangles!", __FUNCTION__);
+        return BAD_VALUE;
+    }
+
+    res = add_camera_metadata_entry(frame, ANDROID_STATISTICS_FACE_SCORES,
+            scores, numFaces);
+    if (res != OK) {
+        ALOGE("%s: Unable to add face scores!", __FUNCTION__);
+        return BAD_VALUE;
+    }
+
+    if (entry.data.u8[0] == ANDROID_STATISTICS_FACE_DETECT_MODE_SIMPLE) return OK;
+
+    // Advanced face detection options - add eye/mouth coordinates.  The
+    // coordinates in order are (leftEyeX, leftEyeY, rightEyeX, rightEyeY,
+    // mouthX, mouthY). The mapping is the same as the face rectangles.
+    int32_t features[numFaces * 6] = {
+        static_cast<int32_t>(Sensor::kResolution[0] * 10.5 / 20),
+        static_cast<int32_t>(Sensor::kResolution[1] * 16 / 20),
+        static_cast<int32_t>(Sensor::kResolution[0] * 11.5 / 20),
+        static_cast<int32_t>(Sensor::kResolution[1] * 16 / 20),
+        static_cast<int32_t>(Sensor::kResolution[0] * 11 / 20),
+        static_cast<int32_t>(Sensor::kResolution[1] * 16.5 / 20),
+
+        static_cast<int32_t>(Sensor::kResolution[0] * 16.5 / 20),
+        static_cast<int32_t>(Sensor::kResolution[1] * 16 / 20),
+        static_cast<int32_t>(Sensor::kResolution[0] * 17.5 / 20),
+        static_cast<int32_t>(Sensor::kResolution[1] * 16 / 20),
+        static_cast<int32_t>(Sensor::kResolution[0] * 17 / 20),
+        static_cast<int32_t>(Sensor::kResolution[1] * 16.5 / 20),
+    };
+    // Jitter these a bit less than the rects
+    for (size_t i = 0; i < numFaces * 6; i++) {
+        features[i] += (int32_t)(((float)rand() / RAND_MAX) * 4 - 2);
+    }
+    // These are unique IDs that are used to identify each face while it's
+    // visible to the detector (if a face went away and came back, it'd get a
+    // new ID).
+    int32_t ids[numFaces] = {
+        100, 200
+    };
+
+    res = add_camera_metadata_entry(frame, ANDROID_STATISTICS_FACE_LANDMARKS,
+            features, numFaces * 6);
+    if (res != OK) {
+        ALOGE("%s: Unable to add face landmarks!", __FUNCTION__);
+        return BAD_VALUE;
+    }
+
+    res = add_camera_metadata_entry(frame, ANDROID_STATISTICS_FACE_IDS,
+            ids, numFaces);
+    if (res != OK) {
+        ALOGE("%s: Unable to add face scores!", __FUNCTION__);
+        return BAD_VALUE;
+    }
+
+    return OK;
+!!!43948087.cpp!!!	onJpegDone(in jpegBuffer : StreamBuffer, in success : bool) : void
+    status_t res;
+    if (!success) {
+        ALOGE("%s: Error queueing compressed image buffer %p",
+                __FUNCTION__, jpegBuffer.buffer);
+        mParent->signalError();
+        return;
+    }
+
+    // Write to JPEG output stream
+    ALOGV("%s: Compression complete, pushing to stream %d", __FUNCTION__,
+            jpegBuffer.streamId);
+
+    GraphicBufferMapper::get().unlock(*(jpegBuffer.buffer));
+    const Stream &s = mParent->getStreamInfo(jpegBuffer.streamId);
+    res = s.ops->enqueue_buffer(s.ops, mJpegTimestamp, jpegBuffer.buffer);
+!!!43948215.cpp!!!	onJpegInputDone(in inputBuffer : StreamBuffer) : void
+    status_t res;
+    GraphicBufferMapper::get().unlock(*(inputBuffer.buffer));
+    const ReprocessStream &s =
+            mParent->getReprocessStreamInfo(-inputBuffer.streamId);
+    res = s.ops->release_buffer(s.ops, inputBuffer.buffer);
+    if (res != OK) {
+        ALOGE("Error releasing reprocess buffer %p: %s (%d)",
+                inputBuffer.buffer, strerror(-res), res);
+        mParent->signalError();
+    }

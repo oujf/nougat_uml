@@ -1,0 +1,720 @@
+class PermutationWriter
+!!!46924983.cpp!!!	writeJavaArgumentClass(in scalar : bool, inout javaGeneratedArgumentClasses : set<string>) : void
+    string name;
+    if (scalar) {
+        name = mJavaArgumentsClassName;
+    } else {
+        name = mJavaArgumentsNClassName;
+    }
+
+    // Make sure we have not generated the argument class already.
+    if (!testAndSet(name, javaGeneratedArgumentClasses)) {
+        mJava->indent() << "public class " << name;
+        mJava->startBlock();
+
+        for (auto p : mAllInputsAndOutputs) {
+            bool isFieldArray = !scalar && p->mVectorSize != "1";
+            bool isFloatyField = p->isOutParameter && p->isFloatType && mPermutation.getTest() != "custom";
+
+            mJava->indent() << "public ";
+            if (isFloatyField) {
+                *mJava << "Target.Floaty";
+            } else {
+                *mJava << p->javaBaseType;
+            }
+            if (isFieldArray) {
+                *mJava << "[]";
+            }
+            *mJava << " " << p->variableName << ";\n";
+
+            // For Float16 parameters, add an extra 'double' field in the class
+            // to hold the Double value converted from the input.
+            if (p->isFloat16Parameter() && !isFloatyField) {
+                mJava->indent() << "public double";
+                if (isFieldArray) {
+                    *mJava << "[]";
+                }
+                *mJava << " " + p->variableName << "Double;\n";
+            }
+        }
+        mJava->endBlock();
+        *mJava << "\n";
+    }
+!!!46925111.cpp!!!	writeJavaCheckMethod(in generateCallToVerifier : bool) : void
+    mJava->indent() << "private void " << mJavaCheckMethodName << "()";
+    mJava->startBlock();
+
+    // Generate the input allocations and initialization.
+    for (auto p : mAllInputsAndOutputs) {
+        if (!p->isOutParameter) {
+            writeJavaInputAllocationDefinition(*p);
+        }
+    }
+    // Generate code to enforce ordering between two allocations if needed.
+    for (auto p : mAllInputsAndOutputs) {
+        if (!p->isOutParameter && !p->smallerParameter.empty()) {
+            string smallerAlloc = "in" + capitalize(p->smallerParameter);
+            mJava->indent() << "enforceOrdering(" << smallerAlloc << ", " << p->javaAllocName
+                            << ");\n";
+        }
+    }
+
+    // Generate code to check the full and relaxed scripts.
+    writeJavaCallToRs(false, generateCallToVerifier);
+    writeJavaCallToRs(true, generateCallToVerifier);
+
+    mJava->endBlock();
+    *mJava << "\n";
+!!!46925239.cpp!!!	writeJavaInputAllocationDefinition(in param : ParameterDefinition) : void
+    string dataType;
+    char vectorSize;
+    convertToRsType(param.rsType, &dataType, &vectorSize);
+
+    const string seed = hashString(mJavaCheckMethodName + param.javaAllocName);
+    mJava->indent() << "Allocation " << param.javaAllocName << " = ";
+    if (param.compatibleTypeIndex >= 0) {
+        if (TYPES[param.typeIndex].kind == FLOATING_POINT) {
+            writeJavaRandomCompatibleFloatAllocation(dataType, seed, vectorSize,
+                                                     TYPES[param.compatibleTypeIndex],
+                                                     TYPES[param.typeIndex]);
+        } else {
+            writeJavaRandomCompatibleIntegerAllocation(dataType, seed, vectorSize,
+                                                       TYPES[param.compatibleTypeIndex],
+                                                       TYPES[param.typeIndex]);
+        }
+    } else if (!param.minValue.empty()) {
+        *mJava << "createRandomFloatAllocation(mRS, Element.DataType." << dataType << ", "
+               << vectorSize << ", " << seed << ", " << param.minValue << ", " << param.maxValue
+               << ")";
+    } else {
+        /* TODO Instead of passing always false, check whether we are doing a limited test.
+         * Use instead: (mPermutation.getTest() == "limited" ? "false" : "true")
+         */
+        *mJava << "createRandomAllocation(mRS, Element.DataType." << dataType << ", " << vectorSize
+               << ", " << seed << ", false)";
+    }
+    *mJava << ";\n";
+!!!46925367.cpp!!!	writeJavaRandomCompatibleFloatAllocation(in dataType : string, in seed : string, in vectorSize : char, in compatibleType : NumericalType, in generatedType : NumericalType) : void
+    *mJava << "createRandomFloatAllocation"
+           << "(mRS, Element.DataType." << dataType << ", " << vectorSize << ", " << seed << ", ";
+    double minValue = 0.0;
+    double maxValue = 0.0;
+    switch (compatibleType.kind) {
+        case FLOATING_POINT: {
+            // We're generating floating point values.  We just worry about the exponent.
+            // Subtract 1 for the exponent sign.
+            int bits = min(compatibleType.exponentBits, generatedType.exponentBits) - 1;
+            maxValue = ldexp(0.95, (1 << bits) - 1);
+            minValue = -maxValue;
+            break;
+        }
+        case UNSIGNED_INTEGER:
+            maxValue = maxDoubleForInteger(compatibleType.significantBits,
+                                           generatedType.significantBits);
+            minValue = 0.0;
+            break;
+        case SIGNED_INTEGER:
+            maxValue = maxDoubleForInteger(compatibleType.significantBits,
+                                           generatedType.significantBits);
+            minValue = -maxValue - 1.0;
+            break;
+    }
+    *mJava << scientific << std::setprecision(19);
+    *mJava << minValue << ", " << maxValue << ")";
+    mJava->unsetf(ios_base::floatfield);
+!!!46925495.cpp!!!	writeJavaRandomCompatibleIntegerAllocation(in dataType : string, in seed : string, in vectorSize : char, in compatibleType : NumericalType, in generatedType : NumericalType) : void
+    *mJava << "createRandomIntegerAllocation"
+           << "(mRS, Element.DataType." << dataType << ", " << vectorSize << ", " << seed << ", ";
+
+    if (compatibleType.kind == FLOATING_POINT) {
+        // Currently, all floating points can take any number we generate.
+        bool isSigned = generatedType.kind == SIGNED_INTEGER;
+        *mJava << (isSigned ? "true" : "false") << ", " << generatedType.significantBits;
+    } else {
+        bool isSigned =
+                    compatibleType.kind == SIGNED_INTEGER && generatedType.kind == SIGNED_INTEGER;
+        *mJava << (isSigned ? "true" : "false") << ", "
+               << min(compatibleType.significantBits, generatedType.significantBits);
+    }
+    *mJava << ")";
+!!!46925623.cpp!!!	writeJavaOutputAllocationDefinition(in param : ParameterDefinition) : void
+    string dataType;
+    char vectorSize;
+    convertToRsType(param.rsType, &dataType, &vectorSize);
+    mJava->indent() << "Allocation " << param.javaAllocName << " = Allocation.createSized(mRS, "
+                    << "getElement(mRS, Element.DataType." << dataType << ", " << vectorSize
+                    << "), INPUTSIZE);\n";
+!!!46925751.cpp!!!	writeJavaVerifyScalarMethod(in verifierValidates : bool) : void
+    writeJavaVerifyMethodHeader();
+    mJava->startBlock();
+
+    string vectorSize = "1";
+    for (auto p : mAllInputsAndOutputs) {
+        writeJavaArrayInitialization(*p);
+        if (p->mVectorSize != "1" && p->mVectorSize != vectorSize) {
+            if (vectorSize == "1") {
+                vectorSize = p->mVectorSize;
+            } else {
+                cerr << "Error.  Had vector " << vectorSize << " and " << p->mVectorSize << "\n";
+            }
+        }
+    }
+
+    mJava->indent() << "StringBuilder message = new StringBuilder();\n";
+    mJava->indent() << "boolean errorFound = false;\n";
+    mJava->indent() << "for (int i = 0; i < INPUTSIZE; i++)";
+    mJava->startBlock();
+
+    mJava->indent() << "for (int j = 0; j < " << vectorSize << " ; j++)";
+    mJava->startBlock();
+
+    mJava->indent() << "// Extract the inputs.\n";
+    mJava->indent() << mJavaArgumentsClassName << " args = new " << mJavaArgumentsClassName
+                    << "();\n";
+    for (auto p : mAllInputsAndOutputs) {
+        if (!p->isOutParameter) {
+            mJava->indent() << "args." << p->variableName << " = " << p->javaArrayName << "[i";
+            if (p->vectorWidth != "1") {
+                *mJava << " * " << p->vectorWidth << " + j";
+            }
+            *mJava << "];\n";
+
+            // Convert the Float16 parameter to double and store it in the appropriate field in the
+            // Arguments class.
+            if (p->isFloat16Parameter()) {
+                mJava->indent() << "args." << p->doubleVariableName
+                                << " = Float16Utils.convertFloat16ToDouble(args."
+                                << p->variableName << ");\n";
+            }
+        }
+    }
+    const bool hasFloat = mPermutation.hasFloatAnswers();
+    if (verifierValidates) {
+        mJava->indent() << "// Extract the outputs.\n";
+        for (auto p : mAllInputsAndOutputs) {
+            if (p->isOutParameter) {
+                mJava->indent() << "args." << p->variableName << " = " << p->javaArrayName
+                                << "[i * " << p->vectorWidth << " + j];\n";
+                if (p->isFloat16Parameter()) {
+                    mJava->indent() << "args." << p->doubleVariableName
+                                    << " = Float16Utils.convertFloat16ToDouble(args."
+                                    << p->variableName << ");\n";
+                }
+            }
+        }
+        mJava->indent() << "// Ask the CoreMathVerifier to validate.\n";
+        if (hasFloat) {
+            writeJavaCreateTarget();
+        }
+        mJava->indent() << "String errorMessage = CoreMathVerifier."
+                        << mJavaVerifierVerifyMethodName << "(args";
+        if (hasFloat) {
+            *mJava << ", target";
+        }
+        *mJava << ");\n";
+        mJava->indent() << "boolean valid = errorMessage == null;\n";
+    } else {
+        mJava->indent() << "// Figure out what the outputs should have been.\n";
+        if (hasFloat) {
+            writeJavaCreateTarget();
+        }
+        mJava->indent() << "CoreMathVerifier." << mJavaVerifierComputeMethodName << "(args";
+        if (hasFloat) {
+            *mJava << ", target";
+        }
+        *mJava << ");\n";
+        mJava->indent() << "// Validate the outputs.\n";
+        mJava->indent() << "boolean valid = true;\n";
+        for (auto p : mAllInputsAndOutputs) {
+            if (p->isOutParameter) {
+                writeJavaTestAndSetValid(*p, "", "[i * " + p->vectorWidth + " + j]");
+            }
+        }
+    }
+
+    mJava->indent() << "if (!valid)";
+    mJava->startBlock();
+    mJava->indent() << "if (!errorFound)";
+    mJava->startBlock();
+    mJava->indent() << "errorFound = true;\n";
+
+    for (auto p : mAllInputsAndOutputs) {
+        if (p->isOutParameter) {
+            writeJavaAppendOutputToMessage(*p, "", "[i * " + p->vectorWidth + " + j]",
+                                           verifierValidates);
+        } else {
+            writeJavaAppendInputToMessage(*p, "args." + p->variableName);
+        }
+    }
+    if (verifierValidates) {
+        mJava->indent() << "message.append(errorMessage);\n";
+    }
+    mJava->indent() << "message.append(\"Errors at\");\n";
+    mJava->endBlock();
+
+    mJava->indent() << "message.append(\" [\");\n";
+    mJava->indent() << "message.append(Integer.toString(i));\n";
+    mJava->indent() << "message.append(\", \");\n";
+    mJava->indent() << "message.append(Integer.toString(j));\n";
+    mJava->indent() << "message.append(\"]\");\n";
+
+    mJava->endBlock();
+    mJava->endBlock();
+    mJava->endBlock();
+
+    mJava->indent() << "assertFalse(\"Incorrect output for " << mJavaCheckMethodName << "\" +\n";
+    mJava->indentPlus()
+                << "(relaxed ? \"_relaxed\" : \"\") + \":\\n\" + message.toString(), errorFound);\n";
+
+    mJava->endBlock();
+    *mJava << "\n";
+!!!46925879.cpp!!!	writeJavaVerifyVectorMethod() : void
+    writeJavaVerifyMethodHeader();
+    mJava->startBlock();
+
+    for (auto p : mAllInputsAndOutputs) {
+        writeJavaArrayInitialization(*p);
+    }
+    mJava->indent() << "StringBuilder message = new StringBuilder();\n";
+    mJava->indent() << "boolean errorFound = false;\n";
+    mJava->indent() << "for (int i = 0; i < INPUTSIZE; i++)";
+    mJava->startBlock();
+
+    mJava->indent() << mJavaArgumentsNClassName << " args = new " << mJavaArgumentsNClassName
+                    << "();\n";
+
+    mJava->indent() << "// Create the appropriate sized arrays in args\n";
+    for (auto p : mAllInputsAndOutputs) {
+        if (p->mVectorSize != "1") {
+            string type = p->javaBaseType;
+            if (p->isOutParameter && p->isFloatType) {
+                type = "Target.Floaty";
+            }
+            mJava->indent() << "args." << p->variableName << " = new " << type << "["
+                            << p->mVectorSize << "];\n";
+            if (p->isFloat16Parameter() && !p->isOutParameter) {
+                mJava->indent() << "args." << p->variableName << "Double = new double["
+                                << p->mVectorSize << "];\n";
+            }
+        }
+    }
+
+    mJava->indent() << "// Fill args with the input values\n";
+    for (auto p : mAllInputsAndOutputs) {
+        if (!p->isOutParameter) {
+            if (p->mVectorSize == "1") {
+                mJava->indent() << "args." << p->variableName << " = " << p->javaArrayName << "[i]"
+                                << ";\n";
+                // Convert the Float16 parameter to double and store it in the appropriate field in
+                // the Arguments class.
+                if (p->isFloat16Parameter()) {
+                    mJava->indent() << "args." << p->doubleVariableName << " = "
+                                    << "Float16Utils.convertFloat16ToDouble(args."
+                                    << p->variableName << ");\n";
+                }
+            } else {
+                mJava->indent() << "for (int j = 0; j < " << p->mVectorSize << " ; j++)";
+                mJava->startBlock();
+                mJava->indent() << "args." << p->variableName << "[j] = "
+                                << p->javaArrayName << "[i * " << p->vectorWidth << " + j]"
+                                << ";\n";
+
+                // Convert the Float16 parameter to double and store it in the appropriate field in
+                // the Arguments class.
+                if (p->isFloat16Parameter()) {
+                    mJava->indent() << "args." << p->doubleVariableName << "[j] = "
+                                    << "Float16Utils.convertFloat16ToDouble(args."
+                                    << p->variableName << "[j]);\n";
+                }
+                mJava->endBlock();
+            }
+        }
+    }
+    writeJavaCreateTarget();
+    mJava->indent() << "CoreMathVerifier." << mJavaVerifierComputeMethodName
+                    << "(args, target);\n\n";
+
+    mJava->indent() << "// Compare the expected outputs to the actual values returned by RS.\n";
+    mJava->indent() << "boolean valid = true;\n";
+    for (auto p : mAllInputsAndOutputs) {
+        if (p->isOutParameter) {
+            writeJavaVectorComparison(*p);
+        }
+    }
+
+    mJava->indent() << "if (!valid)";
+    mJava->startBlock();
+    mJava->indent() << "if (!errorFound)";
+    mJava->startBlock();
+    mJava->indent() << "errorFound = true;\n";
+
+    for (auto p : mAllInputsAndOutputs) {
+        if (p->isOutParameter) {
+            writeJavaAppendVectorOutputToMessage(*p);
+        } else {
+            writeJavaAppendVectorInputToMessage(*p);
+        }
+    }
+    mJava->indent() << "message.append(\"Errors at\");\n";
+    mJava->endBlock();
+
+    mJava->indent() << "message.append(\" [\");\n";
+    mJava->indent() << "message.append(Integer.toString(i));\n";
+    mJava->indent() << "message.append(\"]\");\n";
+
+    mJava->endBlock();
+    mJava->endBlock();
+
+    mJava->indent() << "assertFalse(\"Incorrect output for " << mJavaCheckMethodName << "\" +\n";
+    mJava->indentPlus()
+                << "(relaxed ? \"_relaxed\" : \"\") + \":\\n\" + message.toString(), errorFound);\n";
+
+    mJava->endBlock();
+    *mJava << "\n";
+!!!46926007.cpp!!!	writeJavaCreateTarget() : void
+    string name = mPermutation.getName();
+
+    const char* functionType = "NORMAL";
+    size_t end = name.find('_');
+    if (end != string::npos) {
+        if (name.compare(0, end, "native") == 0) {
+            functionType = "NATIVE";
+        } else if (name.compare(0, end, "half") == 0) {
+            functionType = "HALF";
+        } else if (name.compare(0, end, "fast") == 0) {
+            functionType = "FAST";
+        }
+    }
+
+    string floatType = mReturnParam->specType;
+    const char* precisionStr = "";
+    if (floatType.compare("f16") == 0) {
+        precisionStr = "HALF";
+    } else if (floatType.compare("f32") == 0) {
+        precisionStr = "FLOAT";
+    } else if (floatType.compare("f64") == 0) {
+        precisionStr = "DOUBLE";
+    } else {
+        cerr << "Error. Unreachable.  Return type is not floating point\n";
+    }
+
+    mJava->indent() << "Target target = new Target(Target.FunctionType." <<
+                    functionType << ", Target.ReturnType." << precisionStr <<
+                    ", relaxed);\n";
+!!!46926135.cpp!!!	writeJavaVerifyMethodHeader() : void
+    mJava->indent() << "private void " << mJavaVerifyMethodName << "(";
+    for (auto p : mAllInputsAndOutputs) {
+        *mJava << "Allocation " << p->javaAllocName << ", ";
+    }
+    *mJava << "boolean relaxed)";
+!!!46926263.cpp!!!	writeJavaArrayInitialization(in p : ParameterDefinition) : void
+    mJava->indent() << p.javaBaseType << "[] " << p.javaArrayName << " = new " << p.javaBaseType
+                    << "[INPUTSIZE * " << p.vectorWidth << "];\n";
+
+    /* For basic types, populate the array with values, to help understand failures.  We have had
+     * bugs where the output buffer was all 0.  We were not sure if there was a failed copy or
+     * the GPU driver was copying zeroes.
+     */
+    if (p.typeIndex >= 0) {
+        mJava->indent() << "Arrays.fill(" << p.javaArrayName << ", (" << TYPES[p.typeIndex].javaType
+                        << ") 42);\n";
+    }
+
+    mJava->indent() << p.javaAllocName << ".copyTo(" << p.javaArrayName << ");\n";
+!!!46926391.cpp!!!	writeJavaTestAndSetValid(in p : ParameterDefinition, in argsIndex : string, in actualIndex : string) : void
+    writeJavaTestOneValue(p, argsIndex, actualIndex);
+    mJava->startBlock();
+    mJava->indent() << "valid = false;\n";
+    mJava->endBlock();
+!!!46926519.cpp!!!	writeJavaTestOneValue(in p : ParameterDefinition, in argsIndex : string, in actualIndex : string) : void
+    string actualOut;
+    if (p.isFloat16Parameter()) {
+        // For Float16 values, the output needs to be converted to Double.
+        actualOut = "Float16Utils.convertFloat16ToDouble(" + p.javaArrayName + actualIndex + ")";
+    } else {
+        actualOut = p.javaArrayName + actualIndex;
+    }
+
+    mJava->indent() << "if (";
+    if (p.isFloatType) {
+        *mJava << "!args." << p.variableName << argsIndex << ".couldBe(" << actualOut;
+        const string s = mPermutation.getPrecisionLimit();
+        if (!s.empty()) {
+            *mJava << ", " << s;
+        }
+        *mJava << ")";
+    } else {
+        *mJava << "args." << p.variableName << argsIndex << " != " << p.javaArrayName
+               << actualIndex;
+    }
+
+    if (p.undefinedIfOutIsNan && mReturnParam) {
+        *mJava << " && !args." << mReturnParam->variableName << argsIndex << ".isNaN()";
+    }
+    *mJava << ")";
+!!!46926647.cpp!!!	writeJavaVectorComparison(in p : ParameterDefinition) : void
+    if (p.mVectorSize == "1") {
+        writeJavaTestAndSetValid(p, "", "[i]");
+    } else {
+        mJava->indent() << "for (int j = 0; j < " << p.mVectorSize << " ; j++)";
+        mJava->startBlock();
+        writeJavaTestAndSetValid(p, "[j]", "[i * " + p.vectorWidth + " + j]");
+        mJava->endBlock();
+    }
+!!!46926775.cpp!!!	writeJavaAppendOutputToMessage(in p : ParameterDefinition, in argsIndex : string, in actualIndex : string, in verifierValidates : bool) : void
+    if (verifierValidates) {
+        mJava->indent() << "message.append(\"Output " << p.variableName << ": \");\n";
+        mJava->indent() << "appendVariableToMessage(message, args." << p.variableName << argsIndex
+                        << ");\n";
+        writeJavaAppendNewLineToMessage();
+        if (p.isFloat16Parameter()) {
+            writeJavaAppendNewLineToMessage();
+            mJava->indent() << "message.append(\"Output " << p.variableName
+                            << " (in double): \");\n";
+            mJava->indent() << "appendVariableToMessage(message, args." << p.doubleVariableName
+                            << ");\n";
+            writeJavaAppendNewLineToMessage();
+        }
+    } else {
+        mJava->indent() << "message.append(\"Expected output " << p.variableName << ": \");\n";
+        mJava->indent() << "appendVariableToMessage(message, args." << p.variableName << argsIndex
+                        << ");\n";
+        writeJavaAppendNewLineToMessage();
+
+        mJava->indent() << "message.append(\"Actual   output " << p.variableName << ": \");\n";
+        mJava->indent() << "appendVariableToMessage(message, " << p.javaArrayName << actualIndex
+                        << ");\n";
+
+        if (p.isFloat16Parameter()) {
+            writeJavaAppendNewLineToMessage();
+            mJava->indent() << "message.append(\"Actual   output " << p.variableName
+                            << " (in double): \");\n";
+            mJava->indent() << "appendVariableToMessage(message, Float16Utils.convertFloat16ToDouble("
+                            << p.javaArrayName << actualIndex << "));\n";
+        }
+
+        writeJavaTestOneValue(p, argsIndex, actualIndex);
+        mJava->startBlock();
+        mJava->indent() << "message.append(\" FAIL\");\n";
+        mJava->endBlock();
+        writeJavaAppendNewLineToMessage();
+    }
+!!!46926903.cpp!!!	writeJavaAppendInputToMessage(in p : ParameterDefinition, in actual : string) : void
+    mJava->indent() << "message.append(\"Input " << p.variableName << ": \");\n";
+    mJava->indent() << "appendVariableToMessage(message, " << actual << ");\n";
+    writeJavaAppendNewLineToMessage();
+!!!46927031.cpp!!!	writeJavaAppendNewLineToMessage() : void
+    mJava->indent() << "message.append(\"\\n\");\n";
+!!!46927159.cpp!!!	writeJavaAppendVectorInputToMessage(in p : ParameterDefinition) : void
+    if (p.mVectorSize == "1") {
+        writeJavaAppendInputToMessage(p, p.javaArrayName + "[i]");
+    } else {
+        mJava->indent() << "for (int j = 0; j < " << p.mVectorSize << " ; j++)";
+        mJava->startBlock();
+        writeJavaAppendInputToMessage(p, p.javaArrayName + "[i * " + p.vectorWidth + " + j]");
+        mJava->endBlock();
+    }
+!!!46927287.cpp!!!	writeJavaAppendVectorOutputToMessage(in p : ParameterDefinition) : void
+    if (p.mVectorSize == "1") {
+        writeJavaAppendOutputToMessage(p, "", "[i]", false);
+    } else {
+        mJava->indent() << "for (int j = 0; j < " << p.mVectorSize << " ; j++)";
+        mJava->startBlock();
+        writeJavaAppendOutputToMessage(p, "[j]", "[i * " + p.vectorWidth + " + j]", false);
+        mJava->endBlock();
+    }
+!!!46927415.cpp!!!	writeJavaCallToRs(in relaxed : bool, in generateCallToVerifier : bool) : void
+    string script = "script";
+    if (relaxed) {
+        script += "Relaxed";
+    }
+
+    mJava->indent() << "try";
+    mJava->startBlock();
+
+    for (auto p : mAllInputsAndOutputs) {
+        if (p->isOutParameter) {
+            writeJavaOutputAllocationDefinition(*p);
+        }
+    }
+
+    for (auto p : mPermutation.getParams()) {
+        if (p != mFirstInputParam) {
+            mJava->indent() << script << ".set_" << p->rsAllocName << "(" << p->javaAllocName
+                            << ");\n";
+        }
+    }
+
+    mJava->indent() << script << ".forEach_" << mRsKernelName << "(";
+    bool needComma = false;
+    if (mFirstInputParam) {
+        *mJava << mFirstInputParam->javaAllocName;
+        needComma = true;
+    }
+    if (mReturnParam) {
+        if (needComma) {
+            *mJava << ", ";
+        }
+        *mJava << mReturnParam->variableName << ");\n";
+    }
+
+    if (generateCallToVerifier) {
+        mJava->indent() << mJavaVerifyMethodName << "(";
+        for (auto p : mAllInputsAndOutputs) {
+            *mJava << p->variableName << ", ";
+        }
+
+        if (relaxed) {
+            *mJava << "true";
+        } else {
+            *mJava << "false";
+        }
+        *mJava << ");\n";
+    }
+    mJava->decreaseIndent();
+    mJava->indent() << "} catch (Exception e) {\n";
+    mJava->increaseIndent();
+    mJava->indent() << "throw new RSRuntimeException(\"RenderScript. Can't invoke forEach_"
+                    << mRsKernelName << ": \" + e.toString());\n";
+    mJava->endBlock();
+!!!46927543.cpp!!!	writeRsAllocationDefinition(in param : ParameterDefinition, inout rsAllocationsGenerated : set<string>) : void
+    if (!testAndSet(param.rsAllocName, rsAllocationsGenerated)) {
+        *mRs << "rs_allocation " << param.rsAllocName << ";\n";
+    }
+!!!46927671.cpp!!!	PermutationWriter(inout permutation : FunctionPermutation, inout rsFile : GeneratedFile, inout javaFile : GeneratedFile)
+    mRsKernelName = "test" + capitalize(permutation.getName());
+
+    mJavaArgumentsClassName = "Arguments";
+    mJavaArgumentsNClassName = "Arguments";
+    const string trunk = capitalize(permutation.getNameTrunk());
+    mJavaCheckMethodName = "check" + trunk;
+    mJavaVerifyMethodName = "verifyResults" + trunk;
+
+    for (auto p : permutation.getParams()) {
+        mAllInputsAndOutputs.push_back(p);
+        if (mFirstInputParam == nullptr && !p->isOutParameter) {
+            mFirstInputParam = p;
+        }
+    }
+    mReturnParam = permutation.getReturn();
+    if (mReturnParam) {
+        mAllInputsAndOutputs.push_back(mReturnParam);
+    }
+
+    for (auto p : mAllInputsAndOutputs) {
+        const string capitalizedRsType = capitalize(p->rsType);
+        const string capitalizedBaseType = capitalize(p->rsBaseType);
+        mRsKernelName += capitalizedRsType;
+        mJavaArgumentsClassName += capitalizedBaseType;
+        mJavaArgumentsNClassName += capitalizedBaseType;
+        if (p->mVectorSize != "1") {
+            mJavaArgumentsNClassName += "N";
+        }
+        mJavaCheckMethodName += capitalizedRsType;
+        mJavaVerifyMethodName += capitalizedRsType;
+    }
+    mJavaVerifierComputeMethodName = "compute" + trunk;
+    mJavaVerifierVerifyMethodName = "verify" + trunk;
+!!!46927927.cpp!!!	writeRsSection(inout rsAllocationsGenerated : set<string>) : void
+    // Write the allocation declarations we'll need.
+    for (auto p : mPermutation.getParams()) {
+        // Don't need allocation for one input and one return value.
+        if (p != mFirstInputParam) {
+            writeRsAllocationDefinition(*p, rsAllocationsGenerated);
+        }
+    }
+    *mRs << "\n";
+
+    // Write the function header.
+    if (mReturnParam) {
+        *mRs << mReturnParam->rsType;
+    } else {
+        *mRs << "void";
+    }
+    *mRs << " __attribute__((kernel)) " << mRsKernelName;
+    *mRs << "(";
+    bool needComma = false;
+    if (mFirstInputParam) {
+        *mRs << mFirstInputParam->rsType << " " << mFirstInputParam->variableName;
+        needComma = true;
+    }
+    if (mPermutation.getOutputCount() > 1 || mPermutation.getInputCount() > 1) {
+        if (needComma) {
+            *mRs << ", ";
+        }
+        *mRs << "unsigned int x";
+    }
+    *mRs << ")";
+    mRs->startBlock();
+
+    // Write the local variable declarations and initializations.
+    for (auto p : mPermutation.getParams()) {
+        if (p == mFirstInputParam) {
+            continue;
+        }
+        mRs->indent() << p->rsType << " " << p->variableName;
+        if (p->isOutParameter) {
+            *mRs << " = 0;\n";
+        } else {
+            *mRs << " = rsGetElementAt_" << p->rsType << "(" << p->rsAllocName << ", x);\n";
+        }
+    }
+
+    // Write the function call.
+    if (mReturnParam) {
+        if (mPermutation.getOutputCount() > 1) {
+            mRs->indent() << mReturnParam->rsType << " " << mReturnParam->variableName << " = ";
+        } else {
+            mRs->indent() << "return ";
+        }
+    }
+    *mRs << mPermutation.getName() << "(";
+    needComma = false;
+    for (auto p : mPermutation.getParams()) {
+        if (needComma) {
+            *mRs << ", ";
+        }
+        if (p->isOutParameter) {
+            *mRs << "&";
+        }
+        *mRs << p->variableName;
+        needComma = true;
+    }
+    *mRs << ");\n";
+
+    if (mPermutation.getOutputCount() > 1) {
+        // Write setting the extra out parameters into the allocations.
+        for (auto p : mPermutation.getParams()) {
+            if (p->isOutParameter) {
+                mRs->indent() << "rsSetElementAt_" << p->rsType << "(" << p->rsAllocName << ", ";
+                // Check if we need to use '&' for this type of argument.
+                char lastChar = p->variableName.back();
+                if (lastChar >= '0' && lastChar <= '9') {
+                    *mRs << "&";
+                }
+                *mRs << p->variableName << ", x);\n";
+            }
+        }
+        if (mReturnParam) {
+            mRs->indent() << "return " << mReturnParam->variableName << ";\n";
+        }
+    }
+    mRs->endBlock();
+!!!46928055.cpp!!!	writeJavaSection(inout javaGeneratedArgumentClasses : set<string>) : void
+    // By default, we test the results using item by item comparison.
+    const string test = mPermutation.getTest();
+    if (test == "scalar" || test == "limited") {
+        writeJavaArgumentClass(true, javaGeneratedArgumentClasses);
+        writeJavaCheckMethod(true);
+        writeJavaVerifyScalarMethod(false);
+    } else if (test == "custom") {
+        writeJavaArgumentClass(true, javaGeneratedArgumentClasses);
+        writeJavaCheckMethod(true);
+        writeJavaVerifyScalarMethod(true);
+    } else if (test == "vector") {
+        writeJavaArgumentClass(false, javaGeneratedArgumentClasses);
+        writeJavaCheckMethod(true);
+        writeJavaVerifyVectorMethod();
+    } else if (test == "noverify") {
+        writeJavaCheckMethod(false);
+    }

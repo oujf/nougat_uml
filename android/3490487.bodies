@@ -1,0 +1,144 @@
+class CallbackNotifier
+!!!43912631.cpp!!!	setCallbacks(in notify_cb : camera_notify_callback, in data_cb : camera_data_callback, in data_cb_timestamp : camera_data_timestamp_callback, in get_memory : camera_request_memory, inout user : void) : void
+    ALOGV("%s: %p, %p, %p, %p (%p)",
+         __FUNCTION__, notify_cb, data_cb, data_cb_timestamp, get_memory, user);
+
+    Mutex::Autolock locker(&mObjectLock);
+    mNotifyCB = notify_cb;
+    mDataCB = data_cb;
+    mDataCBTimestamp = data_cb_timestamp;
+    mGetMemoryCB = get_memory;
+    mCBOpaque = user;
+!!!43912759.cpp!!!	enableMessage(in msg_type : uint) : void
+    ALOGV("%s: msg_type = 0x%x", __FUNCTION__, msg_type);
+    PrintMessages(msg_type);
+
+    Mutex::Autolock locker(&mObjectLock);
+    mMessageEnabler |= msg_type;
+    ALOGV("**** Currently enabled messages:");
+    PrintMessages(mMessageEnabler);
+!!!43912887.cpp!!!	disableMessage(in msg_type : uint) : void
+    ALOGV("%s: msg_type = 0x%x", __FUNCTION__, msg_type);
+    PrintMessages(msg_type);
+
+    Mutex::Autolock locker(&mObjectLock);
+    mMessageEnabler &= ~msg_type;
+    ALOGV("**** Currently enabled messages:");
+    PrintMessages(mMessageEnabler);
+!!!43913015.cpp!!!	storeMetaDataInBuffers(in enable : bool) : status_t
+    // Return error if metadata is request, otherwise silently agree.
+    return enable ? INVALID_OPERATION : NO_ERROR;
+!!!43913143.cpp!!!	enableVideoRecording(in fps : int) : status_t
+    ALOGV("%s: FPS = %d", __FUNCTION__, fps);
+
+    Mutex::Autolock locker(&mObjectLock);
+    mVideoRecEnabled = true;
+    mLastFrameTimestamp = 0;
+    mFrameRefreshFreq = 1000000000LL / fps;
+
+    return NO_ERROR;
+!!!43913271.cpp!!!	disableVideoRecording() : void
+    ALOGV("%s:", __FUNCTION__);
+
+    Mutex::Autolock locker(&mObjectLock);
+    mVideoRecEnabled = false;
+    mLastFrameTimestamp = 0;
+    mFrameRefreshFreq = 0;
+!!!43913399.cpp!!!	releaseRecordingFrame(in opaque : void) : void
+    List<camera_memory_t*>::iterator it = mCameraMemoryTs.begin();
+    for( ; it != mCameraMemoryTs.end(); ++it ) {
+        if ( (*it)->data == opaque ) {
+            (*it)->release( *it );
+            mCameraMemoryTs.erase(it);
+            break;
+        }
+    }
+!!!43913783.cpp!!!	cleanupCBNotifier() : void
+    Mutex::Autolock locker(&mObjectLock);
+    mMessageEnabler = 0;
+    mNotifyCB = NULL;
+    mDataCB = NULL;
+    mDataCBTimestamp = NULL;
+    mGetMemoryCB = NULL;
+    mCBOpaque = NULL;
+    mLastFrameTimestamp = 0;
+    mFrameRefreshFreq = 0;
+    mJpegQuality = 90;
+    mVideoRecEnabled = false;
+    mTakingPicture = false;
+!!!43913911.cpp!!!	onNextFrameAvailable(in frame : void, in timestamp : nsecs_t, inout camera_dev : EmulatedCameraDevice) : void
+    if (isMessageEnabled(CAMERA_MSG_VIDEO_FRAME) && isVideoRecordingEnabled() &&
+            isNewVideoFrameTime(timestamp)) {
+        camera_memory_t* cam_buff =
+            mGetMemoryCB(-1, camera_dev->getFrameBufferSize(), 1, NULL);
+        if (NULL != cam_buff && NULL != cam_buff->data) {
+            memcpy(cam_buff->data, frame, camera_dev->getFrameBufferSize());
+            mDataCBTimestamp(timestamp, CAMERA_MSG_VIDEO_FRAME,
+                               cam_buff, 0, mCBOpaque);
+
+            mCameraMemoryTs.push_back( cam_buff );
+        } else {
+            ALOGE("%s: Memory failure in CAMERA_MSG_VIDEO_FRAME", __FUNCTION__);
+        }
+    }
+
+    if (isMessageEnabled(CAMERA_MSG_PREVIEW_FRAME)) {
+        camera_memory_t* cam_buff =
+            mGetMemoryCB(-1, camera_dev->getFrameBufferSize(), 1, NULL);
+        if (NULL != cam_buff && NULL != cam_buff->data) {
+            memcpy(cam_buff->data, frame, camera_dev->getFrameBufferSize());
+            mDataCB(CAMERA_MSG_PREVIEW_FRAME, cam_buff, 0, NULL, mCBOpaque);
+            cam_buff->release(cam_buff);
+        } else {
+            ALOGE("%s: Memory failure in CAMERA_MSG_PREVIEW_FRAME", __FUNCTION__);
+        }
+    }
+
+    if (mTakingPicture) {
+        /* This happens just once. */
+        mTakingPicture = false;
+        /* The sequence of callbacks during picture taking is:
+         *  - CAMERA_MSG_SHUTTER
+         *  - CAMERA_MSG_RAW_IMAGE_NOTIFY
+         *  - CAMERA_MSG_COMPRESSED_IMAGE
+         */
+        if (isMessageEnabled(CAMERA_MSG_SHUTTER)) {
+            mNotifyCB(CAMERA_MSG_SHUTTER, 0, 0, mCBOpaque);
+        }
+        if (isMessageEnabled(CAMERA_MSG_RAW_IMAGE_NOTIFY)) {
+            mNotifyCB(CAMERA_MSG_RAW_IMAGE_NOTIFY, 0, 0, mCBOpaque);
+        }
+        if (isMessageEnabled(CAMERA_MSG_COMPRESSED_IMAGE)) {
+            /* Compress the frame to JPEG. Note that when taking pictures, we
+             * have requested camera device to provide us with NV21 frames. */
+            NV21JpegCompressor compressor;
+            status_t res =
+                compressor.compressRawImage(frame, camera_dev->getFrameWidth(),
+                                            camera_dev->getFrameHeight(),
+                                            mJpegQuality);
+            if (res == NO_ERROR) {
+                camera_memory_t* jpeg_buff =
+                    mGetMemoryCB(-1, compressor.getCompressedSize(), 1, NULL);
+                if (NULL != jpeg_buff && NULL != jpeg_buff->data) {
+                    compressor.getCompressedImage(jpeg_buff->data);
+                    mDataCB(CAMERA_MSG_COMPRESSED_IMAGE, jpeg_buff, 0, NULL, mCBOpaque);
+                    jpeg_buff->release(jpeg_buff);
+                } else {
+                    ALOGE("%s: Memory failure in CAMERA_MSG_VIDEO_FRAME", __FUNCTION__);
+                }
+            } else {
+                ALOGE("%s: Compression failure in CAMERA_MSG_VIDEO_FRAME", __FUNCTION__);
+            }
+        }
+    }
+!!!43914039.cpp!!!	onCameraDeviceError(in err : int) : void
+    if (isMessageEnabled(CAMERA_MSG_ERROR) && mNotifyCB != NULL) {
+        mNotifyCB(CAMERA_MSG_ERROR, err, 0, mCBOpaque);
+    }
+!!!43914423.cpp!!!	isNewVideoFrameTime(in timestamp : nsecs_t) : bool
+    Mutex::Autolock locker(&mObjectLock);
+    if ((timestamp - mLastFrameTimestamp) >= mFrameRefreshFreq) {
+        mLastFrameTimestamp = timestamp;
+        return true;
+    }
+    return false;

@@ -1,0 +1,418 @@
+class TvInputHardwareManager
+!!!85533495.java!!!	TvInputHardwareManager(inout context : Context, inout listener : TvInputHardwareManager::Listener)
+        mContext = context;
+        mListener = listener;
+        mAudioManager = (AudioManager) context.getSystemService(Context.AUDIO_SERVICE);
+        mHal.init();
+!!!85533623.java!!!	onBootPhase(in phase : int) : void
+        if (phase == SystemService.PHASE_SYSTEM_SERVICES_READY) {
+            IHdmiControlService hdmiControlService = IHdmiControlService.Stub.asInterface(
+                    ServiceManager.getService(Context.HDMI_CONTROL_SERVICE));
+            if (hdmiControlService != null) {
+                try {
+                    hdmiControlService.addHotplugEventListener(mHdmiHotplugEventListener);
+                    hdmiControlService.addDeviceEventListener(mHdmiDeviceEventListener);
+                    hdmiControlService.addSystemAudioModeChangeListener(
+                            mHdmiSystemAudioModeChangeListener);
+                    mHdmiDeviceList.addAll(hdmiControlService.getInputDevices());
+                } catch (RemoteException e) {
+                    Slog.w(TAG, "Error registering listeners to HdmiControlService:", e);
+                }
+            } else {
+                Slog.w(TAG, "HdmiControlService is not available");
+            }
+            final IntentFilter filter = new IntentFilter();
+            filter.addAction(AudioManager.VOLUME_CHANGED_ACTION);
+            filter.addAction(AudioManager.STREAM_MUTE_CHANGED_ACTION);
+            mContext.registerReceiver(mVolumeReceiver, filter);
+            updateVolume();
+        }
+!!!85533751.java!!!	onDeviceAvailable(inout info : TvInputHardwareInfo, inout configs : TvStreamConfig [[]]) : void
+        synchronized (mLock) {
+            Connection connection = new Connection(info);
+            connection.updateConfigsLocked(configs);
+            mConnections.put(info.getDeviceId(), connection);
+            buildHardwareListLocked();
+            mHandler.obtainMessage(
+                    ListenerHandler.HARDWARE_DEVICE_ADDED, 0, 0, info).sendToTarget();
+            if (info.getType() == TvInputHardwareInfo.TV_INPUT_TYPE_HDMI) {
+                processPendingHdmiDeviceEventsLocked();
+            }
+        }
+!!!85533879.java!!!	buildHardwareListLocked() : void
+        mHardwareList.clear();
+        for (int i = 0; i < mConnections.size(); ++i) {
+            mHardwareList.add(mConnections.valueAt(i).getHardwareInfoLocked());
+        }
+!!!85534007.java!!!	onDeviceUnavailable(in deviceId : int) : void
+        synchronized (mLock) {
+            Connection connection = mConnections.get(deviceId);
+            if (connection == null) {
+                Slog.e(TAG, "onDeviceUnavailable: Cannot find a connection with " + deviceId);
+                return;
+            }
+            connection.resetLocked(null, null, null, null, null);
+            mConnections.remove(deviceId);
+            buildHardwareListLocked();
+            TvInputHardwareInfo info = connection.getHardwareInfoLocked();
+            if (info.getType() == TvInputHardwareInfo.TV_INPUT_TYPE_HDMI) {
+                // Remove HDMI devices linked with this hardware.
+                for (Iterator<HdmiDeviceInfo> it = mHdmiDeviceList.iterator(); it.hasNext();) {
+                    HdmiDeviceInfo deviceInfo = it.next();
+                    if (deviceInfo.getPortId() == info.getHdmiPortId()) {
+                        mHandler.obtainMessage(ListenerHandler.HDMI_DEVICE_REMOVED, 0, 0,
+                                deviceInfo).sendToTarget();
+                        it.remove();
+                    }
+                }
+            }
+            mHandler.obtainMessage(
+                    ListenerHandler.HARDWARE_DEVICE_REMOVED, 0, 0, info).sendToTarget();
+        }
+!!!85534135.java!!!	onStreamConfigurationChanged(in deviceId : int, inout configs : TvStreamConfig [[]]) : void
+        synchronized (mLock) {
+            Connection connection = mConnections.get(deviceId);
+            if (connection == null) {
+                Slog.e(TAG, "StreamConfigurationChanged: Cannot find a connection with "
+                        + deviceId);
+                return;
+            }
+            connection.updateConfigsLocked(configs);
+            String inputId = mHardwareInputIdMap.get(deviceId);
+            if (inputId != null) {
+                mHandler.obtainMessage(ListenerHandler.STATE_CHANGED,
+                        convertConnectedToState(configs.length > 0), 0, inputId).sendToTarget();
+            }
+            ITvInputHardwareCallback callback = connection.getCallbackLocked();
+            if (callback != null) {
+                try {
+                    callback.onStreamConfigChanged(configs);
+                } catch (RemoteException e) {
+                    Slog.e(TAG, "error in onStreamConfigurationChanged", e);
+                }
+            }
+        }
+!!!85534263.java!!!	onFirstFrameCaptured(in deviceId : int, in streamId : int) : void
+        synchronized (mLock) {
+            Connection connection = mConnections.get(deviceId);
+            if (connection == null) {
+                Slog.e(TAG, "FirstFrameCaptured: Cannot find a connection with "
+                        + deviceId);
+                return;
+            }
+            Runnable runnable = connection.getOnFirstFrameCapturedLocked();
+            if (runnable != null) {
+                runnable.run();
+                connection.setOnFirstFrameCapturedLocked(null);
+            }
+        }
+!!!85534391.java!!!	getHardwareList() : TvInputHardwareInfo
+        synchronized (mLock) {
+            return Collections.unmodifiableList(mHardwareList);
+        }
+!!!85534519.java!!!	getHdmiDeviceList() : HdmiDeviceInfo
+        synchronized (mLock) {
+            return Collections.unmodifiableList(mHdmiDeviceList);
+        }
+!!!85534647.java!!!	checkUidChangedLocked(inout connection : TvInputHardwareManager::Connection, in callingUid : int, in resolvedUserId : int) : boolean
+        Integer connectionCallingUid = connection.getCallingUidLocked();
+        Integer connectionResolvedUserId = connection.getResolvedUserIdLocked();
+        return connectionCallingUid == null || connectionResolvedUserId == null
+                || connectionCallingUid != callingUid || connectionResolvedUserId != resolvedUserId;
+!!!85534775.java!!!	convertConnectedToState(inout connected : boolean) : int
+        if (connected) {
+            return INPUT_STATE_CONNECTED;
+        } else {
+            return INPUT_STATE_DISCONNECTED;
+        }
+!!!85534903.java!!!	addHardwareInput(in deviceId : int, inout info : TvInputInfo) : void
+        synchronized (mLock) {
+            String oldInputId = mHardwareInputIdMap.get(deviceId);
+            if (oldInputId != null) {
+                Slog.w(TAG, "Trying to override previous registration: old = "
+                        + mInputMap.get(oldInputId) + ":" + deviceId + ", new = "
+                        + info + ":" + deviceId);
+            }
+            mHardwareInputIdMap.put(deviceId, info.getId());
+            mInputMap.put(info.getId(), info);
+
+            // Process pending state changes
+
+            // For logical HDMI devices, they have information from HDMI CEC signals.
+            for (int i = 0; i < mHdmiStateMap.size(); ++i) {
+                TvInputHardwareInfo hardwareInfo =
+                        findHardwareInfoForHdmiPortLocked(mHdmiStateMap.keyAt(i));
+                if (hardwareInfo == null) {
+                    continue;
+                }
+                String inputId = mHardwareInputIdMap.get(hardwareInfo.getDeviceId());
+                if (inputId != null && inputId.equals(info.getId())) {
+                    mHandler.obtainMessage(ListenerHandler.STATE_CHANGED,
+                            convertConnectedToState(mHdmiStateMap.valueAt(i)), 0,
+                            inputId).sendToTarget();
+                    return;
+                }
+            }
+            // For the rest of the devices, we can tell by the number of available streams.
+            Connection connection = mConnections.get(deviceId);
+            if (connection != null) {
+                mHandler.obtainMessage(ListenerHandler.STATE_CHANGED,
+                        convertConnectedToState(connection.getConfigsLocked().length > 0), 0,
+                        info.getId()).sendToTarget();
+            }
+        }
+!!!85535031.java!!!	indexOfEqualValue(inout map : SparseArray, inout value : T) : int
+        for (int i = 0; i < map.size(); ++i) {
+            if (map.valueAt(i).equals(value)) {
+                return i;
+            }
+        }
+        return -1;
+!!!85535159.java!!!	intArrayContains(inout array : int [[]], in value : int) : boolean
+        for (int element : array) {
+            if (element == value) return true;
+        }
+        return false;
+!!!85535287.java!!!	addHdmiInput(in id : int, inout info : TvInputInfo) : void
+        if (info.getType() != TvInputInfo.TYPE_HDMI) {
+            throw new IllegalArgumentException("info (" + info + ") has non-HDMI type.");
+        }
+        synchronized (mLock) {
+            String parentId = info.getParentId();
+            int parentIndex = indexOfEqualValue(mHardwareInputIdMap, parentId);
+            if (parentIndex < 0) {
+                throw new IllegalArgumentException("info (" + info + ") has invalid parentId.");
+            }
+            String oldInputId = mHdmiInputIdMap.get(id);
+            if (oldInputId != null) {
+                Slog.w(TAG, "Trying to override previous registration: old = "
+                        + mInputMap.get(oldInputId) + ":" + id + ", new = "
+                        + info + ":" + id);
+            }
+            mHdmiInputIdMap.put(id, info.getId());
+            mInputMap.put(info.getId(), info);
+        }
+!!!85535415.java!!!	removeHardwareInput(inout inputId : String) : void
+        synchronized (mLock) {
+            mInputMap.remove(inputId);
+            int hardwareIndex = indexOfEqualValue(mHardwareInputIdMap, inputId);
+            if (hardwareIndex >= 0) {
+                mHardwareInputIdMap.removeAt(hardwareIndex);
+            }
+            int deviceIndex = indexOfEqualValue(mHdmiInputIdMap, inputId);
+            if (deviceIndex >= 0) {
+                mHdmiInputIdMap.removeAt(deviceIndex);
+            }
+        }
+!!!85535543.java!!!	acquireHardware(in deviceId : int, inout callback : ITvInputHardwareCallback, inout info : TvInputInfo, in callingUid : int, in resolvedUserId : int) : ITvInputHardware
+        if (callback == null) {
+            throw new NullPointerException();
+        }
+        synchronized (mLock) {
+            Connection connection = mConnections.get(deviceId);
+            if (connection == null) {
+                Slog.e(TAG, "Invalid deviceId : " + deviceId);
+                return null;
+            }
+            if (checkUidChangedLocked(connection, callingUid, resolvedUserId)) {
+                TvInputHardwareImpl hardware =
+                        new TvInputHardwareImpl(connection.getHardwareInfoLocked());
+                try {
+                    callback.asBinder().linkToDeath(connection, 0);
+                } catch (RemoteException e) {
+                    hardware.release();
+                    return null;
+                }
+                connection.resetLocked(hardware, callback, info, callingUid, resolvedUserId);
+            }
+            return connection.getHardwareLocked();
+        }
+!!!85535671.java!!!	releaseHardware(in deviceId : int, inout hardware : ITvInputHardware, in callingUid : int, in resolvedUserId : int) : void
+        synchronized (mLock) {
+            Connection connection = mConnections.get(deviceId);
+            if (connection == null) {
+                Slog.e(TAG, "Invalid deviceId : " + deviceId);
+                return;
+            }
+            if (connection.getHardwareLocked() != hardware
+                    || checkUidChangedLocked(connection, callingUid, resolvedUserId)) {
+                return;
+            }
+            connection.resetLocked(null, null, null, null, null);
+        }
+!!!85535799.java!!!	findHardwareInfoForHdmiPortLocked(in port : int) : TvInputHardwareInfo
+        for (TvInputHardwareInfo hardwareInfo : mHardwareList) {
+            if (hardwareInfo.getType() == TvInputHardwareInfo.TV_INPUT_TYPE_HDMI
+                    && hardwareInfo.getHdmiPortId() == port) {
+                return hardwareInfo;
+            }
+        }
+        return null;
+!!!85535927.java!!!	findDeviceIdForInputIdLocked(inout inputId : String) : int
+        for (int i = 0; i < mConnections.size(); ++i) {
+            Connection connection = mConnections.get(i);
+            if (connection.getInfoLocked().getId().equals(inputId)) {
+                return i;
+            }
+        }
+        return -1;
+!!!85536055.java!!!	getAvailableTvStreamConfigList(inout inputId : String, in callingUid : int, in resolvedUserId : int) : TvStreamConfig
+        List<TvStreamConfig> configsList = new ArrayList<>();
+        synchronized (mLock) {
+            int deviceId = findDeviceIdForInputIdLocked(inputId);
+            if (deviceId < 0) {
+                Slog.e(TAG, "Invalid inputId : " + inputId);
+                return configsList;
+            }
+            Connection connection = mConnections.get(deviceId);
+            for (TvStreamConfig config : connection.getConfigsLocked()) {
+                if (config.getType() == TvStreamConfig.STREAM_TYPE_BUFFER_PRODUCER) {
+                    configsList.add(config);
+                }
+            }
+        }
+        return configsList;
+!!!85536183.java!!!	captureFrame(inout inputId : String, inout surface : Surface, in config : TvStreamConfig, in callingUid : int, in resolvedUserId : int) : boolean
+        synchronized (mLock) {
+            int deviceId = findDeviceIdForInputIdLocked(inputId);
+            if (deviceId < 0) {
+                Slog.e(TAG, "Invalid inputId : " + inputId);
+                return false;
+            }
+            Connection connection = mConnections.get(deviceId);
+            final TvInputHardwareImpl hardwareImpl = connection.getHardwareImplLocked();
+            if (hardwareImpl != null) {
+                // Stop previous capture.
+                Runnable runnable = connection.getOnFirstFrameCapturedLocked();
+                if (runnable != null) {
+                    runnable.run();
+                    connection.setOnFirstFrameCapturedLocked(null);
+                }
+
+                boolean result = hardwareImpl.startCapture(surface, config);
+                if (result) {
+                    connection.setOnFirstFrameCapturedLocked(new Runnable() {
+                        @Override
+                        public void run() {
+                            hardwareImpl.stopCapture(config);
+                        }
+                    });
+                }
+                return result;
+            }
+        }
+        return false;
+!!!85536311.java!!!	processPendingHdmiDeviceEventsLocked() : void
+        for (Iterator<Message> it = mPendingHdmiDeviceEvents.iterator(); it.hasNext(); ) {
+            Message msg = it.next();
+            HdmiDeviceInfo deviceInfo = (HdmiDeviceInfo) msg.obj;
+            TvInputHardwareInfo hardwareInfo =
+                    findHardwareInfoForHdmiPortLocked(deviceInfo.getPortId());
+            if (hardwareInfo != null) {
+                msg.sendToTarget();
+                it.remove();
+            }
+        }
+!!!85536439.java!!!	updateVolume() : void
+        mCurrentMaxIndex = mAudioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
+        mCurrentIndex = mAudioManager.getStreamVolume(AudioManager.STREAM_MUSIC);
+!!!85536567.java!!!	handleVolumeChange(inout context : Context, inout intent : Intent) : void
+        String action = intent.getAction();
+        switch (action) {
+            case AudioManager.VOLUME_CHANGED_ACTION: {
+                int streamType = intent.getIntExtra(AudioManager.EXTRA_VOLUME_STREAM_TYPE, -1);
+                if (streamType != AudioManager.STREAM_MUSIC) {
+                    return;
+                }
+                int index = intent.getIntExtra(AudioManager.EXTRA_VOLUME_STREAM_VALUE, 0);
+                if (index == mCurrentIndex) {
+                    return;
+                }
+                mCurrentIndex = index;
+                break;
+            }
+            case AudioManager.STREAM_MUTE_CHANGED_ACTION: {
+                int streamType = intent.getIntExtra(AudioManager.EXTRA_VOLUME_STREAM_TYPE, -1);
+                if (streamType != AudioManager.STREAM_MUSIC) {
+                    return;
+                }
+                // volume index will be updated at onMediaStreamVolumeChanged() through
+                // updateVolume().
+                break;
+            }
+            default:
+                Slog.w(TAG, "Unrecognized intent: " + intent);
+                return;
+        }
+        synchronized (mLock) {
+            for (int i = 0; i < mConnections.size(); ++i) {
+                TvInputHardwareImpl hardwareImpl = mConnections.valueAt(i).getHardwareImplLocked();
+                if (hardwareImpl != null) {
+                    hardwareImpl.onMediaStreamVolumeChanged();
+                }
+            }
+        }
+!!!85536695.java!!!	getMediaStreamVolume() : float
+        return (float) mCurrentIndex / (float) mCurrentMaxIndex;
+!!!85536823.java!!!	dump(inout fd : FileDescriptor, in writer : PrintWriter, inout args : String [[]]) : void
+        final IndentingPrintWriter pw = new IndentingPrintWriter(writer, "  ");
+        if (mContext.checkCallingOrSelfPermission(android.Manifest.permission.DUMP)
+                != PackageManager.PERMISSION_GRANTED) {
+            pw.println("Permission Denial: can't dump TvInputHardwareManager from pid="
+                    + Binder.getCallingPid() + ", uid=" + Binder.getCallingUid());
+            return;
+        }
+
+        synchronized (mLock) {
+            pw.println("TvInputHardwareManager Info:");
+            pw.increaseIndent();
+            pw.println("mConnections: deviceId -> Connection");
+            pw.increaseIndent();
+            for (int i = 0; i < mConnections.size(); i++) {
+                int deviceId = mConnections.keyAt(i);
+                Connection mConnection = mConnections.valueAt(i);
+                pw.println(deviceId + ": " + mConnection);
+
+            }
+            pw.decreaseIndent();
+
+            pw.println("mHardwareList:");
+            pw.increaseIndent();
+            for (TvInputHardwareInfo tvInputHardwareInfo : mHardwareList) {
+                pw.println(tvInputHardwareInfo);
+            }
+            pw.decreaseIndent();
+
+            pw.println("mHdmiDeviceList:");
+            pw.increaseIndent();
+            for (HdmiDeviceInfo hdmiDeviceInfo : mHdmiDeviceList) {
+                pw.println(hdmiDeviceInfo);
+            }
+            pw.decreaseIndent();
+
+            pw.println("mHardwareInputIdMap: deviceId -> inputId");
+            pw.increaseIndent();
+            for (int i = 0 ; i < mHardwareInputIdMap.size(); i++) {
+                int deviceId = mHardwareInputIdMap.keyAt(i);
+                String inputId = mHardwareInputIdMap.valueAt(i);
+                pw.println(deviceId + ": " + inputId);
+            }
+            pw.decreaseIndent();
+
+            pw.println("mHdmiInputIdMap: id -> inputId");
+            pw.increaseIndent();
+            for (int i = 0; i < mHdmiInputIdMap.size(); i++) {
+                int id = mHdmiInputIdMap.keyAt(i);
+                String inputId = mHdmiInputIdMap.valueAt(i);
+                pw.println(id + ": " + inputId);
+            }
+            pw.decreaseIndent();
+
+            pw.println("mInputMap: inputId -> inputInfo");
+            pw.increaseIndent();
+            for(Map.Entry<String, TvInputInfo> entry : mInputMap.entrySet()) {
+                pw.println(entry.getKey() + ": " + entry.getValue());
+            }
+            pw.decreaseIndent();
+            pw.decreaseIndent();
+        }

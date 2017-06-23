@@ -1,0 +1,80 @@
+class AuthTokenTable
+!!!43280055.cpp!!!	AddAuthenticationToken(in auth_token : hw_auth_token_t) : void
+    Entry new_entry(auth_token, clock_function_());
+    RemoveEntriesSupersededBy(new_entry);
+    if (entries_.size() >= max_entries_) {
+        LOG_W("Auth token table filled up; replacing oldest entry", 0);
+        *min_element(entries_) = std::move(new_entry);
+    } else {
+        entries_.push_back(std::move(new_entry));
+    }
+!!!43280183.cpp!!!	FindAuthorization(in key_info : AuthorizationSet, in purpose : keymaster_purpose_t, in op_handle : keymaster_operation_handle_t, in found : hw_auth_token_t) : AuthTokenTable::Error
+    if (!KeyRequiresAuthentication(key_info, purpose))
+        return AUTH_NOT_REQUIRED;
+
+    hw_authenticator_type_t auth_type = HW_AUTH_NONE;
+    key_info.GetTagValue(TAG_USER_AUTH_TYPE, &auth_type);
+
+    std::vector<uint64_t> key_sids;
+    ExtractSids(key_info, &key_sids);
+
+    if (KeyRequiresAuthPerOperation(key_info, purpose))
+        return FindAuthPerOpAuthorization(key_sids, auth_type, op_handle, found);
+    else
+        return FindTimedAuthorization(key_sids, auth_type, key_info, found);
+!!!43280439.cpp!!!	MarkCompleted(in op_handle : keymaster_operation_handle_t) : void
+    auto found = find_if(entries_, [&](Entry& e) { return e.token()->challenge == op_handle; });
+    if (found == entries_.end())
+        return;
+
+    assert(!IsSupersededBySomeEntry(*found));
+    found->mark_completed();
+
+    if (IsSupersededBySomeEntry(*found))
+        entries_.erase(found);
+!!!43280567.cpp!!!	Clear() : void
+    entries_.clear();
+!!!43282615.cpp!!!	FindAuthPerOpAuthorization(in sids : std::vector<uint64_t>, in auth_type : hw_authenticator_type_t, in op_handle : keymaster_operation_handle_t, in found : hw_auth_token_t) : AuthTokenTable::Error
+    if (op_handle == 0)
+        return OP_HANDLE_REQUIRED;
+
+    auto matching_op = find_if(
+        entries_, [&](Entry& e) { return e.token()->challenge == op_handle && !e.completed(); });
+
+    if (matching_op == entries_.end())
+        return AUTH_TOKEN_NOT_FOUND;
+
+    if (!matching_op->SatisfiesAuth(sids, auth_type))
+        return AUTH_TOKEN_WRONG_SID;
+
+    *found = matching_op->token();
+    return OK;
+!!!43282743.cpp!!!	FindTimedAuthorization(in sids : std::vector<uint64_t>, in auth_type : hw_authenticator_type_t, in key_info : AuthorizationSet, in found : hw_auth_token_t) : AuthTokenTable::Error
+    Entry* newest_match = NULL;
+    for (auto& entry : entries_)
+        if (entry.SatisfiesAuth(sids, auth_type) && entry.is_newer_than(newest_match))
+            newest_match = &entry;
+
+    if (!newest_match)
+        return AUTH_TOKEN_NOT_FOUND;
+
+    uint32_t timeout;
+    key_info.GetTagValue(TAG_AUTH_TIMEOUT, &timeout);
+    time_t now = clock_function_();
+    if (static_cast<int64_t>(newest_match->time_received()) + timeout < static_cast<int64_t>(now))
+        return AUTH_TOKEN_EXPIRED;
+
+    newest_match->UpdateLastUse(now);
+    *found = newest_match->token();
+    return OK;
+!!!43282871.cpp!!!	ExtractSids(in key_info : AuthorizationSet, inout sids : std::vector<uint64_t>) : void
+    assert(sids);
+    for (auto& param : key_info)
+        if (param.tag == TAG_USER_SECURE_ID)
+            sids->push_back(param.long_integer);
+!!!43282999.cpp!!!	RemoveEntriesSupersededBy(in entry : AuthTokenTable::Entry) : void
+    entries_.erase(remove_if(entries_, [&](Entry& e) { return entry.Supersedes(e); }),
+                   entries_.end());
+!!!43283127.cpp!!!	IsSupersededBySomeEntry(in entry : AuthTokenTable::Entry) : bool
+    return std::any_of(entries_.begin(), entries_.end(),
+                       [&](Entry& e) { return e.Supersedes(entry); });

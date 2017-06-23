@@ -1,0 +1,405 @@
+class FingerprintService
+!!!84737463.java!!!	FingerprintService(inout context : Context)
+        super(context);
+        mContext = context;
+        mKeyguardPackage = ComponentName.unflattenFromString(context.getResources().getString(
+                com.android.internal.R.string.config_keyguardComponent)).getPackageName();
+        mAppOps = context.getSystemService(AppOpsManager.class);
+        mPowerManager = mContext.getSystemService(PowerManager.class);
+        mAlarmManager = mContext.getSystemService(AlarmManager.class);
+        mContext.registerReceiver(mLockoutReceiver, new IntentFilter(ACTION_LOCKOUT_RESET),
+                RESET_FINGERPRINT_LOCKOUT, null /* handler */);
+        mUserManager = UserManager.get(mContext);
+!!!84737591.java!!!	binderDied() : void
+        Slog.v(TAG, "fingerprintd died");
+        mDaemon = null;
+        handleError(mHalDeviceId, FingerprintManager.FINGERPRINT_ERROR_HW_UNAVAILABLE);
+!!!84737719.java!!!	getFingerprintDaemon() : IFingerprintDaemon
+        if (mDaemon == null) {
+            mDaemon = IFingerprintDaemon.Stub.asInterface(ServiceManager.getService(FINGERPRINTD));
+            if (mDaemon != null) {
+                try {
+                    mDaemon.asBinder().linkToDeath(this, 0);
+                    mDaemon.init(mDaemonCallback);
+                    mHalDeviceId = mDaemon.openHal();
+                    if (mHalDeviceId != 0) {
+                        updateActiveGroup(ActivityManager.getCurrentUser(), null);
+                    } else {
+                        Slog.w(TAG, "Failed to open Fingerprint HAL!");
+                        mDaemon = null;
+                    }
+                } catch (RemoteException e) {
+                    Slog.e(TAG, "Failed to open fingeprintd HAL", e);
+                    mDaemon = null; // try again later!
+                }
+            } else {
+                Slog.w(TAG, "fingerprint service not available");
+            }
+        }
+        return mDaemon;
+!!!84737847.java!!!	handleEnumerate(in deviceId : long, inout fingerIds : int [[]], inout groupIds : int [[]]) : void
+        if (fingerIds.length != groupIds.length) {
+            Slog.w(TAG, "fingerIds and groupIds differ in length: f[]="
+                    + Arrays.toString(fingerIds) + ", g[]=" + Arrays.toString(groupIds));
+            return;
+        }
+        if (DEBUG) Slog.w(TAG, "Enumerate: f[]=" + fingerIds + ", g[]=" + groupIds);
+        // TODO: update fingerprint/name pairs
+!!!84737975.java!!!	handleError(in deviceId : long, in error : int) : void
+        ClientMonitor client = mCurrentClient;
+        if (client != null && client.onError(error)) {
+            removeClient(client);
+        }
+        if (DEBUG) Slog.v(TAG, "handleError(client="
+                + (client != null ? client.getOwnerString() : "null") + ", error = " + error + ")");
+        // This is the magic code that starts the next client when the old client finishes.
+        if (error == FingerprintManager.FINGERPRINT_ERROR_CANCELED) {
+            mHandler.removeCallbacks(mResetClientState);
+            if (mPendingClient != null) {
+                if (DEBUG) Slog.v(TAG, "start pending client " + mPendingClient.getOwnerString());
+                startClient(mPendingClient, false);
+                mPendingClient = null;
+            }
+        }
+!!!84738103.java!!!	handleRemoved(in deviceId : long, in fingerId : int, in groupId : int) : void
+        ClientMonitor client = mCurrentClient;
+        if (client != null && client.onRemoved(fingerId, groupId)) {
+            removeClient(client);
+        }
+!!!84738231.java!!!	handleAuthenticated(in deviceId : long, in fingerId : int, in groupId : int) : void
+        ClientMonitor client = mCurrentClient;
+        if (client != null && client.onAuthenticated(fingerId, groupId)) {
+            removeClient(client);
+        }
+!!!84738359.java!!!	handleAcquired(in deviceId : long, in acquiredInfo : int) : void
+        ClientMonitor client = mCurrentClient;
+        if (client != null && client.onAcquired(acquiredInfo)) {
+            removeClient(client);
+        }
+!!!84738487.java!!!	handleEnrollResult(in deviceId : long, in fingerId : int, in groupId : int, in remaining : int) : void
+        ClientMonitor client = mCurrentClient;
+        if (client != null && client.onEnrollResult(fingerId, groupId, remaining)) {
+            removeClient(client);
+        }
+!!!84738615.java!!!	userActivity() : void
+        long now = SystemClock.uptimeMillis();
+        mPowerManager.userActivity(now, PowerManager.USER_ACTIVITY_EVENT_TOUCH, 0);
+!!!84738743.java!!!	handleUserSwitching(in userId : int) : void
+        updateActiveGroup(userId, null);
+!!!84738871.java!!!	removeClient(inout client : ClientMonitor) : void
+        if (client != null) {
+            client.destroy();
+            if (client != mCurrentClient && mCurrentClient != null) {
+                Slog.w(TAG, "Unexpected client: " + client.getOwnerString() + "expected: "
+                        + mCurrentClient != null ? mCurrentClient.getOwnerString() : "null");
+            }
+        }
+        if (mCurrentClient != null) {
+            if (DEBUG) Slog.v(TAG, "Done with client: " + client.getOwnerString());
+            mCurrentClient = null;
+        }
+!!!84738999.java!!!	inLockoutMode() : boolean
+        return mFailedAttempts >= MAX_FAILED_ATTEMPTS;
+!!!84739127.java!!!	scheduleLockoutReset() : void
+        mAlarmManager.set(AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                SystemClock.elapsedRealtime() + FAIL_LOCKOUT_TIMEOUT_MS, getLockoutResetIntent());
+!!!84739255.java!!!	cancelLockoutReset() : void
+        mAlarmManager.cancel(getLockoutResetIntent());
+!!!84739383.java!!!	getLockoutResetIntent() : PendingIntent
+        return PendingIntent.getBroadcast(mContext, 0,
+                new Intent(ACTION_LOCKOUT_RESET), PendingIntent.FLAG_UPDATE_CURRENT);
+!!!84739511.java!!!	startPreEnroll(inout token : IBinder) : long
+        IFingerprintDaemon daemon = getFingerprintDaemon();
+        if (daemon == null) {
+            Slog.w(TAG, "startPreEnroll: no fingeprintd!");
+            return 0;
+        }
+        try {
+            return daemon.preEnroll();
+        } catch (RemoteException e) {
+            Slog.e(TAG, "startPreEnroll failed", e);
+        }
+        return 0;
+!!!84739639.java!!!	startPostEnroll(inout token : IBinder) : int
+        IFingerprintDaemon daemon = getFingerprintDaemon();
+        if (daemon == null) {
+            Slog.w(TAG, "startPostEnroll: no fingeprintd!");
+            return 0;
+        }
+        try {
+            return daemon.postEnroll();
+        } catch (RemoteException e) {
+            Slog.e(TAG, "startPostEnroll failed", e);
+        }
+        return 0;
+!!!84739767.java!!!	startClient(inout newClient : ClientMonitor, inout initiatedByClient : boolean) : void
+        ClientMonitor currentClient = mCurrentClient;
+        if (currentClient != null) {
+            if (DEBUG) Slog.v(TAG, "request stop current client " + currentClient.getOwnerString());
+            currentClient.stop(initiatedByClient);
+            mPendingClient = newClient;
+            mHandler.removeCallbacks(mResetClientState);
+            mHandler.postDelayed(mResetClientState, CANCEL_TIMEOUT_LIMIT);
+        } else if (newClient != null) {
+            mCurrentClient = newClient;
+            if (DEBUG) Slog.v(TAG, "starting client "
+                    + newClient.getClass().getSuperclass().getSimpleName()
+                    + "(" + newClient.getOwnerString() + ")"
+                    + ", initiatedByClient = " + initiatedByClient + ")");
+            newClient.start();
+        }
+!!!84739895.java!!!	startRemove(inout token : IBinder, in fingerId : int, in groupId : int, in userId : int, inout receiver : IFingerprintServiceReceiver, inout restricted : boolean) : void
+        IFingerprintDaemon daemon = getFingerprintDaemon();
+        if (daemon == null) {
+            Slog.w(TAG, "startRemove: no fingeprintd!");
+            return;
+        }
+        RemovalClient client = new RemovalClient(getContext(), mHalDeviceId, token,
+                receiver, fingerId, groupId, userId, restricted, token.toString()) {
+            @Override
+            public void notifyUserActivity() {
+                FingerprintService.this.userActivity();
+            }
+
+            @Override
+            public IFingerprintDaemon getFingerprintDaemon() {
+                return FingerprintService.this.getFingerprintDaemon();
+            }
+        };
+        startClient(client, true);
+!!!84740023.java!!!	getEnrolledFingerprints(in userId : int) : Fingerprint
+        return mFingerprintUtils.getFingerprintsForUser(mContext, userId);
+!!!84740151.java!!!	hasEnrolledFingerprints(in userId : int) : boolean
+        if (userId != UserHandle.getCallingUserId()) {
+            checkPermission(INTERACT_ACROSS_USERS);
+        }
+        return mFingerprintUtils.getFingerprintsForUser(mContext, userId).size() > 0;
+!!!84740279.java!!!	hasPermission(inout permission : String) : boolean
+        return getContext().checkCallingOrSelfPermission(permission)
+                == PackageManager.PERMISSION_GRANTED;
+!!!84740407.java!!!	checkPermission(inout permission : String) : void
+        getContext().enforceCallingOrSelfPermission(permission,
+                "Must have " + permission + " permission.");
+!!!84740535.java!!!	getEffectiveUserId(in userId : int) : int
+        UserManager um = UserManager.get(mContext);
+        if (um != null) {
+            final long callingIdentity = Binder.clearCallingIdentity();
+            userId = um.getCredentialOwnerProfile(userId);
+            Binder.restoreCallingIdentity(callingIdentity);
+        } else {
+            Slog.e(TAG, "Unable to acquire UserManager");
+        }
+        return userId;
+!!!84740663.java!!!	isCurrentUserOrProfile(in userId : int) : boolean
+        UserManager um = UserManager.get(mContext);
+
+        // Allow current user or profiles of the current user...
+        for (int profileId : um.getEnabledProfileIds(userId)) {
+            if (profileId == userId) {
+                return true;
+            }
+        }
+        return false;
+!!!84740791.java!!!	isForegroundActivity(in uid : int, in pid : int) : boolean
+        try {
+            List<RunningAppProcessInfo> procs =
+                    ActivityManagerNative.getDefault().getRunningAppProcesses();
+            int N = procs.size();
+            for (int i = 0; i < N; i++) {
+                RunningAppProcessInfo proc = procs.get(i);
+                if (proc.pid == pid && proc.uid == uid
+                        && proc.importance == IMPORTANCE_FOREGROUND) {
+                    return true;
+                }
+            }
+        } catch (RemoteException e) {
+            Slog.w(TAG, "am.getRunningAppProcesses() failed");
+        }
+        return false;
+!!!84740919.java!!!	canUseFingerprint(inout opPackageName : String, inout foregroundOnly : boolean, in uid : int, in pid : int) : boolean
+        checkPermission(USE_FINGERPRINT);
+        if (isKeyguard(opPackageName)) {
+            return true; // Keyguard is always allowed
+        }
+        if (!isCurrentUserOrProfile(UserHandle.getCallingUserId())) {
+            Slog.w(TAG,"Rejecting " + opPackageName + " ; not a current user or profile");
+            return false;
+        }
+        if (mAppOps.noteOp(AppOpsManager.OP_USE_FINGERPRINT, uid, opPackageName)
+                != AppOpsManager.MODE_ALLOWED) {
+            Slog.w(TAG, "Rejecting " + opPackageName + " ; permission denied");
+            return false;
+        }
+        if (foregroundOnly && !isForegroundActivity(uid, pid)) {
+            Slog.w(TAG, "Rejecting " + opPackageName + " ; not in foreground");
+            return false;
+        }
+        return true;
+!!!84741047.java!!!	isKeyguard(inout clientPackage : String) : boolean
+        return mKeyguardPackage.equals(clientPackage);
+!!!84741175.java!!!	addLockoutResetMonitor(inout monitor : FingerprintService::FingerprintServiceLockoutResetMonitor) : void
+        if (!mLockoutMonitors.contains(monitor)) {
+            mLockoutMonitors.add(monitor);
+        }
+!!!84741303.java!!!	removeLockoutResetCallback(inout monitor : FingerprintService::FingerprintServiceLockoutResetMonitor) : void
+        mLockoutMonitors.remove(monitor);
+!!!84741431.java!!!	notifyLockoutResetMonitors() : void
+        for (int i = 0; i < mLockoutMonitors.size(); i++) {
+            mLockoutMonitors.get(i).sendLockoutReset();
+        }
+!!!84741559.java!!!	startAuthentication(inout token : IBinder, in opId : long, in callingUserId : int, in groupId : int, inout receiver : IFingerprintServiceReceiver, in flags : int, inout restricted : boolean, inout opPackageName : String) : void
+        updateActiveGroup(groupId, opPackageName);
+
+        if (DEBUG) Slog.v(TAG, "startAuthentication(" + opPackageName + ")");
+
+        AuthenticationClient client = new AuthenticationClient(getContext(), mHalDeviceId, token,
+                receiver, mCurrentUserId, groupId, opId, restricted, opPackageName) {
+            @Override
+            public boolean handleFailedAttempt() {
+                mFailedAttempts++;
+                if (inLockoutMode()) {
+                    // Failing multiple times will continue to push out the lockout time.
+                    scheduleLockoutReset();
+                    return true;
+                }
+                return false;
+            }
+
+            @Override
+            public void resetFailedAttempts() {
+                FingerprintService.this.resetFailedAttempts();
+            }
+
+            @Override
+            public void notifyUserActivity() {
+                FingerprintService.this.userActivity();
+            }
+
+            @Override
+            public IFingerprintDaemon getFingerprintDaemon() {
+                return FingerprintService.this.getFingerprintDaemon();
+            }
+        };
+
+        if (inLockoutMode()) {
+            Slog.v(TAG, "In lockout mode; disallowing authentication");
+            // Don't bother starting the client. Just send the error message.
+            if (!client.onError(FingerprintManager.FINGERPRINT_ERROR_LOCKOUT)) {
+                Slog.w(TAG, "Cannot send timeout message to client");
+            }
+            return;
+        }
+        startClient(client, true /* initiatedByClient */);
+!!!84741687.java!!!	startEnrollment(inout token : IBinder, inout cryptoToken : byte [[]], in userId : int, inout receiver : IFingerprintServiceReceiver, in flags : int, inout restricted : boolean, inout opPackageName : String) : void
+        updateActiveGroup(userId, opPackageName);
+
+        final int groupId = userId; // default group for fingerprint enrollment
+
+        EnrollClient client = new EnrollClient(getContext(), mHalDeviceId, token, receiver,
+                userId, groupId, cryptoToken, restricted, opPackageName) {
+
+            @Override
+            public IFingerprintDaemon getFingerprintDaemon() {
+                return FingerprintService.this.getFingerprintDaemon();
+            }
+
+            @Override
+            public void notifyUserActivity() {
+                FingerprintService.this.userActivity();
+            }
+        };
+        startClient(client, true /* initiatedByClient */);
+!!!84741815.java!!!	resetFailedAttempts() : void
+        if (DEBUG && inLockoutMode()) {
+            Slog.v(TAG, "Reset fingerprint lockout");
+        }
+        mFailedAttempts = 0;
+        // If we're asked to reset failed attempts externally (i.e. from Keyguard),
+        // the alarm might still be pending; remove it.
+        cancelLockoutReset();
+        notifyLockoutResetMonitors();
+!!!84744375.java!!!	dumpInternal(inout pw : PrintWriter) : void
+        JSONObject dump = new JSONObject();
+        try {
+            dump.put("service", "Fingerprint Manager");
+
+            JSONArray sets = new JSONArray();
+            for (UserInfo user : UserManager.get(getContext()).getUsers()) {
+                final int userId = user.getUserHandle().getIdentifier();
+                final int N = mFingerprintUtils.getFingerprintsForUser(mContext, userId).size();
+                JSONObject set = new JSONObject();
+                set.put("id", userId);
+                set.put("count", N);
+                sets.put(set);
+            }
+
+            dump.put("prints", sets);
+        } catch (JSONException e) {
+            Slog.e(TAG, "dump formatting failure", e);
+        }
+        pw.println(dump);
+!!!84744503.java!!!	onStart() : void
+        publishBinderService(Context.FINGERPRINT_SERVICE, new FingerprintServiceWrapper());
+        IFingerprintDaemon daemon = getFingerprintDaemon();
+        if (DEBUG) Slog.v(TAG, "Fingerprint HAL id: " + mHalDeviceId);
+        listenForUserSwitches();
+!!!84744631.java!!!	updateActiveGroup(in userId : int, inout clientPackage : String) : void
+        IFingerprintDaemon daemon = getFingerprintDaemon();
+        if (daemon != null) {
+            try {
+                userId = getUserOrWorkProfileId(clientPackage, userId);
+                if (userId != mCurrentUserId) {
+                    final File systemDir = Environment.getUserSystemDirectory(userId);
+                    final File fpDir = new File(systemDir, FP_DATA_DIR);
+                    if (!fpDir.exists()) {
+                        if (!fpDir.mkdir()) {
+                            Slog.v(TAG, "Cannot make directory: " + fpDir.getAbsolutePath());
+                            return;
+                        }
+                        // Calling mkdir() from this process will create a directory with our
+                        // permissions (inherited from the containing dir). This command fixes
+                        // the label.
+                        if (!SELinux.restorecon(fpDir)) {
+                            Slog.w(TAG, "Restorecons failed. Directory will have wrong label.");
+                            return;
+                        }
+                    }
+                    daemon.setActiveGroup(userId, fpDir.getAbsolutePath().getBytes());
+                    mCurrentUserId = userId;
+                }
+                mCurrentAuthenticatorId = daemon.getAuthenticatorId();
+            } catch (RemoteException e) {
+                Slog.e(TAG, "Failed to setActiveGroup():", e);
+            }
+        }
+!!!84744759.java!!!	getUserOrWorkProfileId(inout clientPackage : String, in userId : int) : int
+        if (!isKeyguard(clientPackage) && isWorkProfile(userId)) {
+            return userId;
+        }
+        return getEffectiveUserId(userId);
+!!!84744887.java!!!	isWorkProfile(in userId : int) : boolean
+        UserInfo info = mUserManager.getUserInfo(userId);
+        return info != null && info.isManagedProfile();
+!!!84745015.java!!!	listenForUserSwitches() : void
+        try {
+            ActivityManagerNative.getDefault().registerUserSwitchObserver(
+                new SynchronousUserSwitchObserver() {
+                    @Override
+                    public void onUserSwitching(int newUserId) throws RemoteException {
+                        mHandler.obtainMessage(MSG_USER_SWITCHING, newUserId, 0 /* unused */)
+                                .sendToTarget();
+                    }
+                    @Override
+                    public void onUserSwitchComplete(int newUserId) throws RemoteException {
+                        // Ignore.
+                    }
+                    @Override
+                    public void onForegroundProfileSwitch(int newProfileId) {
+                        // Ignore.
+                    }
+                });
+        } catch (RemoteException e) {
+            Slog.w(TAG, "Failed to listen for user switching event" ,e);
+        }
+!!!84745143.java!!!	getAuthenticatorId(inout opPackageName : String) : long
+        return mCurrentAuthenticatorId;

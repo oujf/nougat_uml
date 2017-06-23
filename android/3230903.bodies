@@ -1,0 +1,119 @@
+class RsaKeyFactory
+!!!43191095.cpp!!!	GenerateKey(in key_description : AuthorizationSet, inout key_blob : KeymasterKeyBlob, inout hw_enforced : AuthorizationSet, inout sw_enforced : AuthorizationSet) : keymaster_error_t
+    if (!key_blob || !hw_enforced || !sw_enforced)
+        return KM_ERROR_OUTPUT_PARAMETER_NULL;
+
+    AuthorizationSet authorizations(key_description);
+
+    uint64_t public_exponent;
+    if (!authorizations.GetTagValue(TAG_RSA_PUBLIC_EXPONENT, &public_exponent)) {
+        LOG_E("%s", "No public exponent specified for RSA key generation");
+        return KM_ERROR_INVALID_ARGUMENT;
+    }
+
+    uint32_t key_size;
+    if (!authorizations.GetTagValue(TAG_KEY_SIZE, &key_size)) {
+        LOG_E("No key size specified for RSA key generation", 0);
+        return KM_ERROR_UNSUPPORTED_KEY_SIZE;
+    }
+    if (key_size % 8 != 0 || key_size > kMaximumRsaKeySize) {
+        LOG_E("Invalid key size of %u bits specified for RSA key generation", key_size);
+        return KM_ERROR_UNSUPPORTED_KEY_SIZE;
+    }
+
+    UniquePtr<BIGNUM, BIGNUM_Delete> exponent(BN_new());
+    UniquePtr<RSA, RsaKey::RSA_Delete> rsa_key(RSA_new());
+    UniquePtr<EVP_PKEY, EVP_PKEY_Delete> pkey(EVP_PKEY_new());
+    if (exponent.get() == NULL || rsa_key.get() == NULL || pkey.get() == NULL)
+        return KM_ERROR_MEMORY_ALLOCATION_FAILED;
+
+    if (!BN_set_word(exponent.get(), public_exponent) ||
+        !RSA_generate_key_ex(rsa_key.get(), key_size, exponent.get(), NULL /* callback */))
+        return TranslateLastOpenSslError();
+
+    if (EVP_PKEY_set1_RSA(pkey.get(), rsa_key.get()) != 1)
+        return TranslateLastOpenSslError();
+
+    KeymasterKeyBlob key_material;
+    keymaster_error_t error = EvpKeyToKeyMaterial(pkey.get(), &key_material);
+    if (error != KM_ERROR_OK)
+        return error;
+
+    return context_->CreateKeyBlob(authorizations, KM_ORIGIN_GENERATED, key_material, key_blob,
+                                   hw_enforced, sw_enforced);
+!!!43191223.cpp!!!	ImportKey(in key_description : AuthorizationSet, in input_key_material_format : keymaster_key_format_t, in input_key_material : KeymasterKeyBlob, inout output_key_blob : KeymasterKeyBlob, inout hw_enforced : AuthorizationSet, inout sw_enforced : AuthorizationSet) : keymaster_error_t
+    if (!output_key_blob || !hw_enforced || !sw_enforced)
+        return KM_ERROR_OUTPUT_PARAMETER_NULL;
+
+    AuthorizationSet authorizations;
+    uint64_t public_exponent;
+    uint32_t key_size;
+    keymaster_error_t error =
+        UpdateImportKeyDescription(key_description, input_key_material_format, input_key_material,
+                                   &authorizations, &public_exponent, &key_size);
+    if (error != KM_ERROR_OK)
+        return error;
+    return context_->CreateKeyBlob(authorizations, KM_ORIGIN_IMPORTED, input_key_material,
+                                   output_key_blob, hw_enforced, sw_enforced);
+!!!43191351.cpp!!!	CreateEmptyKey(in hw_enforced : AuthorizationSet, in sw_enforced : AuthorizationSet, inout key : UniquePtr<AsymmetricKey>) : keymaster_error_t
+    keymaster_error_t error;
+    key->reset(new (std::nothrow) RsaKey(hw_enforced, sw_enforced, &error));
+    if (!key->get())
+        error = KM_ERROR_MEMORY_ALLOCATION_FAILED;
+    return error;
+!!!43191479.cpp!!!	GetOperationFactory(in purpose : keymaster_purpose_t) : OperationFactory
+    switch (purpose) {
+    case KM_PURPOSE_SIGN:
+        return &sign_factory;
+    case KM_PURPOSE_VERIFY:
+        return &verify_factory;
+    case KM_PURPOSE_ENCRYPT:
+        return &encrypt_factory;
+    case KM_PURPOSE_DECRYPT:
+        return &decrypt_factory;
+    default:
+        return nullptr;
+    }
+!!!43191863.cpp!!!	UpdateImportKeyDescription(in key_description : AuthorizationSet, in key_format : keymaster_key_format_t, in key_material : KeymasterKeyBlob, inout updated_description : AuthorizationSet, inout public_exponent : uint64_t, inout key_size : uint32_t) : keymaster_error_t
+    if (!updated_description || !public_exponent || !key_size)
+        return KM_ERROR_OUTPUT_PARAMETER_NULL;
+
+    UniquePtr<EVP_PKEY, EVP_PKEY_Delete> pkey;
+    keymaster_error_t error =
+        KeyMaterialToEvpKey(key_format, key_material, keymaster_key_type(), &pkey);
+    if (error != KM_ERROR_OK)
+        return error;
+
+    UniquePtr<RSA, RsaKey::RSA_Delete> rsa_key(EVP_PKEY_get1_RSA(pkey.get()));
+    if (!rsa_key.get())
+        return TranslateLastOpenSslError();
+
+    updated_description->Reinitialize(key_description);
+
+    *public_exponent = BN_get_word(rsa_key->e);
+    if (*public_exponent == 0xffffffffL)
+        return KM_ERROR_INVALID_KEY_BLOB;
+    if (!updated_description->GetTagValue(TAG_RSA_PUBLIC_EXPONENT, public_exponent))
+        updated_description->push_back(TAG_RSA_PUBLIC_EXPONENT, *public_exponent);
+    if (*public_exponent != BN_get_word(rsa_key->e)) {
+        LOG_E("Imported public exponent (%u) does not match specified public exponent (%u)",
+              *public_exponent, BN_get_word(rsa_key->e));
+        return KM_ERROR_IMPORT_PARAMETER_MISMATCH;
+    }
+
+    *key_size = RSA_size(rsa_key.get()) * 8;
+    if (!updated_description->GetTagValue(TAG_KEY_SIZE, key_size))
+        updated_description->push_back(TAG_KEY_SIZE, *key_size);
+    if (RSA_size(rsa_key.get()) * 8 != *key_size) {
+        LOG_E("Imported key size (%u bits) does not match specified key size (%u bits)",
+              RSA_size(rsa_key.get()) * 8, *key_size);
+        return KM_ERROR_IMPORT_PARAMETER_MISMATCH;
+    }
+
+    keymaster_algorithm_t algorithm = KM_ALGORITHM_RSA;
+    if (!updated_description->GetTagValue(TAG_ALGORITHM, &algorithm))
+        updated_description->push_back(TAG_ALGORITHM, KM_ALGORITHM_RSA);
+    if (algorithm != KM_ALGORITHM_RSA)
+        return KM_ERROR_IMPORT_PARAMETER_MISMATCH;
+
+    return KM_ERROR_OK;

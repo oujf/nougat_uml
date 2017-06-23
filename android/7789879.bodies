@@ -1,0 +1,116 @@
+class OtaDexoptService
+!!!85187383.java!!!	OtaDexoptService(inout context : Context, inout packageManagerService : PackageManagerService)
+        this.mContext = context;
+        this.mPackageManagerService = packageManagerService;
+
+        // Use the package manager install and install lock here for the OTA dex optimizer.
+        mPackageDexOptimizer = new OTADexoptPackageDexOptimizer(packageManagerService.mInstaller,
+                packageManagerService.mInstallLock, context);
+
+        // Now it's time to check whether we need to move any A/B artifacts.
+        moveAbArtifacts(packageManagerService.mInstaller);
+!!!85187511.java!!!	main(inout context : Context, inout packageManagerService : PackageManagerService) : OtaDexoptService
+        OtaDexoptService ota = new OtaDexoptService(context, packageManagerService);
+        ServiceManager.addService("otadexopt", ota);
+
+        return ota;
+!!!85187639.java!!!	onShellCommand(inout in : FileDescriptor, inout out : FileDescriptor, inout err : FileDescriptor, inout args : String [[]], inout resultReceiver : ResultReceiver) : void
+        (new OtaDexoptShellCommand(this)).exec(
+                this, in, out, err, args, resultReceiver);
+!!!85187767.java!!!	prepare() : void
+        if (mDexoptPackages != null) {
+            throw new IllegalStateException("already called prepare()");
+        }
+        synchronized (mPackageManagerService.mPackages) {
+            mDexoptPackages = PackageManagerServiceUtils.getPackagesForDexopt(
+                    mPackageManagerService.mPackages.values(), mPackageManagerService);
+        }
+!!!85187895.java!!!	cleanup() : void
+        if (DEBUG_DEXOPT) {
+            Log.i(TAG, "Cleaning up OTA Dexopt state.");
+        }
+        mDexoptPackages = null;
+!!!85188023.java!!!	isDone() : boolean
+        if (mDexoptPackages == null) {
+            throw new IllegalStateException("done() called before prepare()");
+        }
+
+        return mDexoptPackages.isEmpty();
+!!!85188151.java!!!	dexoptNextPackage() : void
+        if (mDexoptPackages == null) {
+            throw new IllegalStateException("dexoptNextPackage() called before prepare()");
+        }
+        if (mDexoptPackages.isEmpty()) {
+            // Tolerate repeated calls.
+            return;
+        }
+
+        PackageParser.Package nextPackage = mDexoptPackages.remove(0);
+
+        if (DEBUG_DEXOPT) {
+            Log.i(TAG, "Processing " + nextPackage.packageName + " for OTA dexopt.");
+        }
+
+        // Check for low space.
+        // TODO: If apps are not installed in the internal /data partition, we should compare
+        //       against that storage's free capacity.
+        File dataDir = Environment.getDataDirectory();
+        @SuppressWarnings("deprecation")
+        long lowThreshold = StorageManager.from(mContext).getStorageLowBytes(dataDir);
+        if (lowThreshold == 0) {
+            throw new IllegalStateException("Invalid low memory threshold");
+        }
+        long usableSpace = dataDir.getUsableSpace();
+        if (usableSpace < lowThreshold) {
+            Log.w(TAG, "Not running dexopt on " + nextPackage.packageName + " due to low memory: " +
+                    usableSpace);
+            return;
+        }
+
+        mPackageDexOptimizer.performDexOpt(nextPackage, nextPackage.usesLibraryFiles,
+                null /* ISAs */, false /* checkProfiles */,
+                getCompilerFilterForReason(PackageManagerService.REASON_AB_OTA));
+!!!85188279.java!!!	moveAbArtifacts(inout installer : Installer) : void
+        if (mDexoptPackages != null) {
+            throw new IllegalStateException("Should not be ota-dexopting when trying to move.");
+        }
+
+        // Look into all packages.
+        Collection<PackageParser.Package> pkgs = mPackageManagerService.getPackages();
+        for (PackageParser.Package pkg : pkgs) {
+            if (pkg == null) {
+                continue;
+            }
+
+            // Does the package have code? If not, there won't be any artifacts.
+            if (!PackageDexOptimizer.canOptimizePackage(pkg)) {
+                continue;
+            }
+            if (pkg.codePath == null) {
+                Slog.w(TAG, "Package " + pkg + " can be optimized but has null codePath");
+                continue;
+            }
+
+            // If the path is in /system or /vendor, ignore. It will have been ota-dexopted into
+            // /data/ota and moved into the dalvik-cache already.
+            if (pkg.codePath.startsWith("/system") || pkg.codePath.startsWith("/vendor")) {
+                continue;
+            }
+
+            final String[] instructionSets = getAppDexInstructionSets(pkg.applicationInfo);
+            final List<String> paths = pkg.getAllCodePathsExcludingResourceOnly();
+            final String[] dexCodeInstructionSets = getDexCodeInstructionSets(instructionSets);
+            for (String dexCodeInstructionSet : dexCodeInstructionSets) {
+                for (String path : paths) {
+                    String oatDir = PackageDexOptimizer.getOatDir(new File(pkg.codePath)).
+                            getAbsolutePath();
+
+                    // TODO: Check first whether there is an artifact, to save the roundtrip time.
+
+                    try {
+                        installer.moveAb(path, dexCodeInstructionSet, oatDir);
+                    } catch (InstallerException e) {
+                    }
+                }
+            }
+        }

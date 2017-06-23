@@ -1,0 +1,177 @@
+class SPDIFEncoder
+!!!43208119.cpp!!!	SPDIFEncoder(in format : audio_format_t)
+    switch(format) {
+        case AUDIO_FORMAT_AC3:
+        case AUDIO_FORMAT_E_AC3:
+            mFramer = new AC3FrameScanner();
+            break;
+        case AUDIO_FORMAT_DTS:
+        case AUDIO_FORMAT_DTS_HD:
+            mFramer = new DTSFrameScanner();
+            break;
+        default:
+            break;
+    }
+
+    // This a programmer error. Call isFormatSupported() first.
+    LOG_ALWAYS_FATAL_IF((mFramer == NULL),
+        "SPDIFEncoder: invalid audio format = 0x%08X", format);
+
+    mBurstBufferSizeBytes = sizeof(uint16_t)
+            * SPDIF_ENCODED_CHANNEL_COUNT
+            * mFramer->getMaxSampleFramesPerSyncFrame();
+
+    ALOGI("SPDIFEncoder: mBurstBufferSizeBytes = %zu, littleEndian = %d",
+            mBurstBufferSizeBytes, isLittleEndian());
+    mBurstBuffer = new uint16_t[mBurstBufferSizeBytes >> 1];
+    clearBurstBuffer();
+!!!43208375.cpp!!!	~SPDIFEncoder()
+    delete[] mBurstBuffer;
+    delete mFramer;
+!!!43208503.cpp!!!	write(in buffer : void, in numBytes : size_t) : ssize_t
+    size_t bytesLeft = numBytes;
+    const uint8_t *data = (const uint8_t *)buffer;
+    ALOGV("SPDIFEncoder: mScanning = %d, write(buffer[0] = 0x%02X, numBytes = %zu)",
+        mScanning, (uint) *data, numBytes);
+    while (bytesLeft > 0) {
+        if (mScanning) {
+        // Look for beginning of next encoded frame.
+            if (mFramer->scan(*data)) {
+                if (mByteCursor == 0) {
+                    startDataBurst();
+                } else if (mFramer->isFirstInBurst()) {
+                    // Make sure that this frame is at the beginning of the data burst.
+                    flushBurstBuffer();
+                    startDataBurst();
+                }
+                mPayloadBytesPending = startSyncFrame();
+                mScanning = false;
+            }
+            data++;
+            bytesLeft--;
+        } else {
+            // Write payload until we hit end of frame.
+            size_t bytesToWrite = bytesLeft;
+            // Only write as many as we need to finish the frame.
+            if (bytesToWrite > mPayloadBytesPending) {
+                bytesToWrite = mPayloadBytesPending;
+            }
+            writeBurstBufferBytes(data, bytesToWrite);
+
+            data += bytesToWrite;
+            bytesLeft -= bytesToWrite;
+            mPayloadBytesPending -= bytesToWrite;
+
+            // If we have all the payload then send a data burst.
+            if (mPayloadBytesPending == 0) {
+                if (mFramer->isLastInBurst()) {
+                    flushBurstBuffer();
+                }
+                mScanning = true;
+            }
+        }
+    }
+    return numBytes;
+!!!43209015.cpp!!!	getBytesPerOutputFrame() : int
+    return SPDIF_ENCODED_CHANNEL_COUNT * sizeof(int16_t);
+!!!43209143.cpp!!!	isFormatSupported(in format : audio_format_t) : bool
+    switch(format) {
+        case AUDIO_FORMAT_AC3:
+        case AUDIO_FORMAT_E_AC3:
+        case AUDIO_FORMAT_DTS:
+        case AUDIO_FORMAT_DTS_HD:
+            return true;
+        default:
+            return false;
+    }
+!!!43209271.cpp!!!	reset() : void
+    ALOGV("SPDIFEncoder: reset()");
+    clearBurstBuffer();
+    if (mFramer != NULL) {
+        mFramer->resetBurst();
+    }
+    mPayloadBytesPending = 0;
+    mScanning = true;
+!!!43209399.cpp!!!	clearBurstBuffer() : void
+    if (mBurstBuffer) {
+        memset(mBurstBuffer, 0, mBurstBufferSizeBytes);
+    }
+    mByteCursor = 0;
+!!!43209527.cpp!!!	writeBurstBufferShorts(in buffer : uint16_t, in numShorts : size_t) : void
+    // avoid static analyser warning
+    LOG_ALWAYS_FATAL_IF((mBurstBuffer == NULL), "mBurstBuffer never allocated");
+    mByteCursor = (mByteCursor + 1) & ~1; // round up to even byte
+    size_t bytesToWrite = numShorts * sizeof(uint16_t);
+    if ((mByteCursor + bytesToWrite) > mBurstBufferSizeBytes) {
+        ALOGE("SPDIFEncoder: Burst buffer overflow!");
+        reset();
+        return;
+    }
+    memcpy(&mBurstBuffer[mByteCursor >> 1], buffer, bytesToWrite);
+    mByteCursor += bytesToWrite;
+!!!43209655.cpp!!!	writeBurstBufferBytes(in buffer : uint8_t, in numBytes : size_t) : void
+    size_t bytesToWrite = numBytes;
+    if ((mByteCursor + bytesToWrite) > mBurstBufferSizeBytes) {
+        ALOGE("SPDIFEncoder: Burst buffer overflow!");
+        clearBurstBuffer();
+        return;
+    }
+    uint16_t pad = mBurstBuffer[mByteCursor >> 1];
+    for (size_t i = 0; i < bytesToWrite; i++) {
+        if (mByteCursor & 1 ) {
+            pad |= *buffer++; // put second byte in LSB
+            mBurstBuffer[mByteCursor >> 1] = pad;
+            pad = 0;
+        } else {
+            pad |= (*buffer++) << 8; // put first byte in MSB
+        }
+        mByteCursor++;
+    }
+    // Save partially filled short.
+    if (mByteCursor & 1 ){
+        mBurstBuffer[mByteCursor >> 1] = pad;
+    }
+!!!43209783.cpp!!!	sendZeroPad() : void
+    // Pad remainder of burst with zeros.
+    size_t burstSize = mFramer->getSampleFramesPerSyncFrame() * sizeof(uint16_t)
+            * SPDIF_ENCODED_CHANNEL_COUNT;
+    if (mByteCursor > burstSize) {
+        ALOGE("SPDIFEncoder: Burst buffer, contents too large!");
+        clearBurstBuffer();
+    } else {
+        // We don't have to write zeros because buffer already set to zero
+        // by clearBurstBuffer(). Just pretend we wrote zeros by
+        // incrementing cursor.
+        mByteCursor = burstSize;
+    }
+!!!43209911.cpp!!!	flushBurstBuffer() : void
+    const int preambleSize = 4 * sizeof(uint16_t);
+    if (mByteCursor > preambleSize) {
+        // Set lengthCode for valid payload before zeroPad.
+        uint16_t numBytes = (mByteCursor - preambleSize);
+        mBurstBuffer[3] = mFramer->convertBytesToLengthCode(numBytes);
+
+        sendZeroPad();
+        writeOutput(mBurstBuffer, mByteCursor);
+    }
+    reset();
+!!!43210039.cpp!!!	startDataBurst() : void
+    // Encode IEC61937-1 Burst Preamble
+    uint16_t preamble[4];
+
+    uint16_t burstInfo = (mBitstreamNumber << 13)
+        | (mFramer->getDataTypeInfo() << 8)
+        | mFramer->getDataType();
+
+    mRateMultiplier = mFramer->getRateMultiplier();
+
+    preamble[0] = kSPDIFSync1;
+    preamble[1] = kSPDIFSync2;
+    preamble[2] = burstInfo;
+    preamble[3] = 0; // lengthCode - This will get set after the buffer is full.
+    writeBurstBufferShorts(preamble, 4);
+!!!43210167.cpp!!!	startSyncFrame() : size_t
+    // Write start of encoded frame that was buffered in frame detector.
+    size_t syncSize = mFramer->getHeaderSizeBytes();
+    writeBurstBufferBytes(mFramer->getHeaderAddress(), syncSize);
+    return mFramer->getFrameSizeBytes() - syncSize;

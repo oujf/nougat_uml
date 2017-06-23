@@ -1,0 +1,374 @@
+class MediaCodec
+!!!69646647.java!!!	createDecoderByType(inout type : String) : MediaCodec
+        return new MediaCodec(type, true /* nameIsType */, false /* encoder */);
+!!!69646775.java!!!	createEncoderByType(inout type : String) : MediaCodec
+        return new MediaCodec(type, true /* nameIsType */, true /* encoder */);
+!!!69646903.java!!!	createByCodecName(inout name : String) : MediaCodec
+        return new MediaCodec(
+                name, false /* nameIsType */, false /* unused */);
+!!!69647031.java!!!	MediaCodec(inout name : String, inout nameIsType : boolean, inout encoder : boolean)
+        Looper looper;
+        if ((looper = Looper.myLooper()) != null) {
+            mEventHandler = new EventHandler(this, looper);
+        } else if ((looper = Looper.getMainLooper()) != null) {
+            mEventHandler = new EventHandler(this, looper);
+        } else {
+            mEventHandler = null;
+        }
+        mCallbackHandler = mEventHandler;
+        mOnFrameRenderedHandler = mEventHandler;
+
+        mBufferLock = new Object();
+
+        native_setup(name, nameIsType, encoder);
+!!!69647159.java!!!	finalize() : void
+        native_finalize();
+!!!69647287.java!!!	reset() : void
+        freeAllTrackedBuffers(); // free buffers first
+        native_reset();
+!!!69647543.java!!!	release() : void
+        freeAllTrackedBuffers(); // free buffers first
+        native_release();
+!!!69647799.java!!!	configure(inout format : MediaFormat, inout surface : Surface, inout crypto : MediaCrypto, in flags : int) : void
+        String[] keys = null;
+        Object[] values = null;
+
+        if (format != null) {
+            Map<String, Object> formatMap = format.getMap();
+            keys = new String[formatMap.size()];
+            values = new Object[formatMap.size()];
+
+            int i = 0;
+            for (Map.Entry<String, Object> entry: formatMap.entrySet()) {
+                if (entry.getKey().equals(MediaFormat.KEY_AUDIO_SESSION_ID)) {
+                    int sessionId = 0;
+                    try {
+                        sessionId = (Integer)entry.getValue();
+                    }
+                    catch (Exception e) {
+                        throw new IllegalArgumentException("Wrong Session ID Parameter!");
+                    }
+                    keys[i] = "audio-hw-sync";
+                    values[i] = AudioSystem.getAudioHwSyncForSession(sessionId);
+                } else {
+                    keys[i] = entry.getKey();
+                    values[i] = entry.getValue();
+                }
+                ++i;
+            }
+        }
+
+        mHasSurface = surface != null;
+
+        native_configure(keys, values, surface, crypto, flags);
+!!!69647927.java!!!	setOutputSurface(inout surface : Surface) : void
+        if (!mHasSurface) {
+            throw new IllegalStateException("codec was not configured for an output surface");
+        }
+        native_setSurface(surface);
+!!!69648183.java!!!	createPersistentInputSurface() : Surface
+        return native_createPersistentInputSurface();
+!!!69648567.java!!!	setInputSurface(inout surface : Surface) : void
+        if (!(surface instanceof PersistentSurface)) {
+            throw new IllegalArgumentException("not a PersistentSurface");
+        }
+        native_setInputSurface(surface);
+!!!69649463.java!!!	start() : void
+        native_start();
+        synchronized(mBufferLock) {
+            cacheBuffers(true /* input */);
+            cacheBuffers(false /* input */);
+        }
+!!!69649719.java!!!	stop() : void
+        native_stop();
+        freeAllTrackedBuffers();
+
+        synchronized (mListenerLock) {
+            if (mCallbackHandler != null) {
+                mCallbackHandler.removeMessages(EVENT_SET_CALLBACK);
+                mCallbackHandler.removeMessages(EVENT_CALLBACK);
+            }
+            if (mOnFrameRenderedHandler != null) {
+                mOnFrameRenderedHandler.removeMessages(EVENT_FRAME_RENDERED);
+            }
+        }
+!!!69649975.java!!!	flush() : void
+        synchronized(mBufferLock) {
+            invalidateByteBuffers(mCachedInputBuffers);
+            invalidateByteBuffers(mCachedOutputBuffers);
+            mDequeuedInputBuffers.clear();
+            mDequeuedOutputBuffers.clear();
+        }
+        native_flush();
+!!!69651127.java!!!	queueInputBuffer(in index : int, in offset : int, in size : int, in presentationTimeUs : long, in flags : int) : void
+        synchronized(mBufferLock) {
+            invalidateByteBuffer(mCachedInputBuffers, index);
+            mDequeuedInputBuffers.remove(index);
+        }
+        try {
+            native_queueInputBuffer(
+                    index, offset, size, presentationTimeUs, flags);
+        } catch (CryptoException | IllegalStateException e) {
+            revalidateByteBuffer(mCachedInputBuffers, index);
+            throw e;
+        }
+!!!69652279.java!!!	queueSecureInputBuffer(in index : int, in offset : int, inout info : MediaCodec::CryptoInfo, in presentationTimeUs : long, in flags : int) : void
+        synchronized(mBufferLock) {
+            invalidateByteBuffer(mCachedInputBuffers, index);
+            mDequeuedInputBuffers.remove(index);
+        }
+        try {
+            native_queueSecureInputBuffer(
+                    index, offset, info, presentationTimeUs, flags);
+        } catch (CryptoException | IllegalStateException e) {
+            revalidateByteBuffer(mCachedInputBuffers, index);
+            throw e;
+        }
+!!!69652535.java!!!	dequeueInputBuffer(in timeoutUs : long) : int
+        int res = native_dequeueInputBuffer(timeoutUs);
+        if (res >= 0) {
+            synchronized(mBufferLock) {
+                validateInputByteBuffer(mCachedInputBuffers, res);
+            }
+        }
+        return res;
+!!!69652791.java!!!	dequeueOutputBuffer(inout info : MediaCodec::BufferInfo, in timeoutUs : long) : int
+        int res = native_dequeueOutputBuffer(info, timeoutUs);
+        synchronized(mBufferLock) {
+            if (res == INFO_OUTPUT_BUFFERS_CHANGED) {
+                cacheBuffers(false /* input */);
+            } else if (res >= 0) {
+                validateOutputByteBuffer(mCachedOutputBuffers, res, info);
+                if (mHasSurface) {
+                    mDequeuedOutputInfos.put(res, info.dup());
+                }
+            }
+        }
+        return res;
+!!!69653047.java!!!	releaseOutputBuffer(in index : int, inout render : boolean) : void
+        BufferInfo info = null;
+        synchronized(mBufferLock) {
+            invalidateByteBuffer(mCachedOutputBuffers, index);
+            mDequeuedOutputBuffers.remove(index);
+            if (mHasSurface) {
+                info = mDequeuedOutputInfos.remove(index);
+            }
+        }
+        releaseOutputBuffer(index, render, false /* updatePTS */, 0 /* dummy */);
+!!!69653175.java!!!	releaseOutputBuffer(in index : int, in renderTimestampNs : long) : void
+        BufferInfo info = null;
+        synchronized(mBufferLock) {
+            invalidateByteBuffer(mCachedOutputBuffers, index);
+            mDequeuedOutputBuffers.remove(index);
+            if (mHasSurface) {
+                info = mDequeuedOutputInfos.remove(index);
+            }
+        }
+        releaseOutputBuffer(
+                index, true /* render */, true /* updatePTS */, renderTimestampNs);
+!!!69653559.java!!!	getOutputFormat() : MediaFormat
+        return new MediaFormat(getFormatNative(false /* input */));
+!!!69653687.java!!!	getInputFormat() : MediaFormat
+        return new MediaFormat(getFormatNative(true /* input */));
+!!!69653815.java!!!	getOutputFormat(in index : int) : MediaFormat
+        return new MediaFormat(getOutputFormatNative(index));
+!!!69655095.java!!!	invalidateByteBuffer(inout buffers : ByteBuffer [[]], in index : int) : void
+        if (buffers != null && index >= 0 && index < buffers.length) {
+            ByteBuffer buffer = buffers[index];
+            if (buffer != null) {
+                buffer.setAccessible(false);
+            }
+        }
+!!!69655223.java!!!	validateInputByteBuffer(inout buffers : ByteBuffer [[]], in index : int) : void
+        if (buffers != null && index >= 0 && index < buffers.length) {
+            ByteBuffer buffer = buffers[index];
+            if (buffer != null) {
+                buffer.setAccessible(true);
+                buffer.clear();
+            }
+        }
+!!!69655351.java!!!	revalidateByteBuffer(inout buffers : ByteBuffer [[]], in index : int) : void
+        synchronized(mBufferLock) {
+            if (buffers != null && index >= 0 && index < buffers.length) {
+                ByteBuffer buffer = buffers[index];
+                if (buffer != null) {
+                    buffer.setAccessible(true);
+                }
+            }
+        }
+!!!69655479.java!!!	validateOutputByteBuffer(inout buffers : ByteBuffer [[]], in index : int, inout info : MediaCodec::BufferInfo) : void
+        if (buffers != null && index >= 0 && index < buffers.length) {
+            ByteBuffer buffer = buffers[index];
+            if (buffer != null) {
+                buffer.setAccessible(true);
+                buffer.limit(info.offset + info.size).position(info.offset);
+            }
+        }
+!!!69655607.java!!!	invalidateByteBuffers(inout buffers : ByteBuffer [[]]) : void
+        if (buffers != null) {
+            for (ByteBuffer buffer: buffers) {
+                if (buffer != null) {
+                    buffer.setAccessible(false);
+                }
+            }
+        }
+!!!69655735.java!!!	freeByteBuffer(inout buffer : ByteBuffer) : void
+        if (buffer != null /* && buffer.isDirect() */) {
+            // all of our ByteBuffers are direct
+            java.nio.NioUtils.freeDirectBuffer(buffer);
+        }
+!!!69655863.java!!!	freeByteBuffers(inout buffers : ByteBuffer [[]]) : void
+        if (buffers != null) {
+            for (ByteBuffer buffer: buffers) {
+                freeByteBuffer(buffer);
+            }
+        }
+!!!69655991.java!!!	freeAllTrackedBuffers() : void
+        synchronized(mBufferLock) {
+            freeByteBuffers(mCachedInputBuffers);
+            freeByteBuffers(mCachedOutputBuffers);
+            mCachedInputBuffers = null;
+            mCachedOutputBuffers = null;
+            mDequeuedInputBuffers.clear();
+            mDequeuedOutputBuffers.clear();
+        }
+!!!69656119.java!!!	cacheBuffers(inout input : boolean) : void
+        ByteBuffer[] buffers = null;
+        try {
+            buffers = getBuffers(input);
+            invalidateByteBuffers(buffers);
+        } catch (IllegalStateException e) {
+            // we don't get buffers in async mode
+        }
+        if (input) {
+            mCachedInputBuffers = buffers;
+        } else {
+            mCachedOutputBuffers = buffers;
+        }
+!!!69656247.java!!!	getInputBuffers() : ByteBuffer
+        if (mCachedInputBuffers == null) {
+            throw new IllegalStateException();
+        }
+        // FIXME: check codec status
+        return mCachedInputBuffers;
+!!!69656375.java!!!	getOutputBuffers() : ByteBuffer
+        if (mCachedOutputBuffers == null) {
+            throw new IllegalStateException();
+        }
+        // FIXME: check codec status
+        return mCachedOutputBuffers;
+!!!69656503.java!!!	getInputBuffer(in index : int) : ByteBuffer
+        ByteBuffer newBuffer = getBuffer(true /* input */, index);
+        synchronized(mBufferLock) {
+            invalidateByteBuffer(mCachedInputBuffers, index);
+            mDequeuedInputBuffers.put(index, newBuffer);
+        }
+        return newBuffer;
+!!!69656631.java!!!	getInputImage(in index : int) : Image
+        Image newImage = getImage(true /* input */, index);
+        synchronized(mBufferLock) {
+            invalidateByteBuffer(mCachedInputBuffers, index);
+            mDequeuedInputBuffers.put(index, newImage);
+        }
+        return newImage;
+!!!69656759.java!!!	getOutputBuffer(in index : int) : ByteBuffer
+        ByteBuffer newBuffer = getBuffer(false /* input */, index);
+        synchronized(mBufferLock) {
+            invalidateByteBuffer(mCachedOutputBuffers, index);
+            mDequeuedOutputBuffers.put(index, newBuffer);
+        }
+        return newBuffer;
+!!!69656887.java!!!	getOutputImage(in index : int) : Image
+        Image newImage = getImage(false /* input */, index);
+        synchronized(mBufferLock) {
+            invalidateByteBuffer(mCachedOutputBuffers, index);
+            mDequeuedOutputBuffers.put(index, newImage);
+        }
+        return newImage;
+!!!69657271.java!!!	setParameters(inout params : Bundle) : void
+        if (params == null) {
+            return;
+        }
+
+        String[] keys = new String[params.size()];
+        Object[] values = new Object[params.size()];
+
+        int i = 0;
+        for (final String key: params.keySet()) {
+            keys[i] = key;
+            values[i] = params.get(key);
+            ++i;
+        }
+
+        setParameters(keys, values);
+!!!69657399.java!!!	setCallback(inout cb : MediaCodec::Callback, inout handler : Handler) : void
+        if (cb != null) {
+            synchronized (mListenerLock) {
+                EventHandler newHandler = getEventHandlerOn(handler, mCallbackHandler);
+                // NOTE: there are no callbacks on the handler at this time, but check anyways
+                // even if we were to extend this to be callable dynamically, it must
+                // be called when codec is flushed, so no messages are pending.
+                if (newHandler != mCallbackHandler) {
+                    mCallbackHandler.removeMessages(EVENT_SET_CALLBACK);
+                    mCallbackHandler.removeMessages(EVENT_CALLBACK);
+                    mCallbackHandler = newHandler;
+                }
+            }
+        } else if (mCallbackHandler != null) {
+            mCallbackHandler.removeMessages(EVENT_SET_CALLBACK);
+            mCallbackHandler.removeMessages(EVENT_CALLBACK);
+        }
+
+        if (mCallbackHandler != null) {
+            // set java callback on main handler
+            Message msg = mCallbackHandler.obtainMessage(EVENT_SET_CALLBACK, 0, 0, cb);
+            mCallbackHandler.sendMessage(msg);
+
+            // set native handler here, don't post to handler because
+            // it may cause the callback to be delayed and set in a wrong state.
+            // Note that native codec may start sending events to the callback
+            // handler after this returns.
+            native_setCallback(cb);
+        }
+!!!69657527.java!!!	setCallback(inout cb : MediaCodec::Callback) : void
+        setCallback(cb, null /* handler */);
+!!!69657783.java!!!	setOnFrameRenderedListener(inout listener : MediaCodec::OnFrameRenderedListener, inout handler : Handler) : void
+        synchronized (mListenerLock) {
+            mOnFrameRenderedListener = listener;
+            if (listener != null) {
+                EventHandler newHandler = getEventHandlerOn(handler, mOnFrameRenderedHandler);
+                if (newHandler != mOnFrameRenderedHandler) {
+                    mOnFrameRenderedHandler.removeMessages(EVENT_FRAME_RENDERED);
+                }
+                mOnFrameRenderedHandler = newHandler;
+            } else if (mOnFrameRenderedHandler != null) {
+                mOnFrameRenderedHandler.removeMessages(EVENT_FRAME_RENDERED);
+            }
+            native_enableOnFrameRenderedListener(listener != null);
+        }
+!!!69658039.java!!!	getEventHandlerOn(inout handler : Handler, inout lastHandler : MediaCodec::EventHandler) : MediaCodec::EventHandler
+        if (handler == null) {
+            return mEventHandler;
+        } else {
+            Looper looper = handler.getLooper();
+            if (lastHandler.getLooper() == looper) {
+                return lastHandler;
+            } else {
+                return new EventHandler(this, looper);
+            }
+        }
+!!!69658679.java!!!	postEventFromNative(in what : int, in arg1 : int, in arg2 : int, inout obj : Object) : void
+        synchronized (mListenerLock) {
+            EventHandler handler = mEventHandler;
+            if (what == EVENT_CALLBACK) {
+                handler = mCallbackHandler;
+            } else if (what == EVENT_FRAME_RENDERED) {
+                handler = mOnFrameRenderedHandler;
+            }
+            if (handler != null) {
+                Message msg = handler.obtainMessage(what, arg1, arg2, obj);
+                handler.sendMessage(msg);
+            }
+        }
+!!!69658935.java!!!	getCodecInfo() : MediaCodecInfo
+        return MediaCodecList.getInfoFor(getName());

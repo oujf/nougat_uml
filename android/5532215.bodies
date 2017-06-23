@@ -1,0 +1,636 @@
+class RsdCpuScriptImpl
+!!!46898999.cpp!!!	init(in resName : char, in cacheDir : char, in bitcode : uint8_t, in bitcodeSize : size_t, in flags : uint32_t, in bccPluginName : char = nullptr) : bool
+    //ALOGE("rsdScriptCreate %p %p %p %p %i %i %p", rsc, resName, cacheDir,
+    // bitcode, bitcodeSize, flags, lookupFunc);
+    //ALOGE("rsdScriptInit %p %p", rsc, script);
+
+    mCtx->lockMutex();
+#ifndef RS_COMPATIBILITY_LIB
+    bool useRSDebugContext = false;
+
+    bcinfo::MetadataExtractor bitcodeMetadata((const char *) bitcode, bitcodeSize);
+    if (!bitcodeMetadata.extract()) {
+        ALOGE("Could not extract metadata from bitcode");
+        mCtx->unlockMutex();
+        return false;
+    }
+
+    const char* core_lib = findCoreLib(bitcodeMetadata, (const char*)bitcode, bitcodeSize);
+
+    if (mCtx->getContext()->getContextType() == RS_CONTEXT_TYPE_DEBUG) {
+        useRSDebugContext = true;
+    }
+
+    int optLevel = mCtx->getContext()->getOptLevel();
+
+    std::string bcFileName(cacheDir);
+    bcFileName.append("/");
+    bcFileName.append(resName);
+    bcFileName.append(".bc");
+
+    std::vector<const char*> compileArguments;
+    bool emitGlobalInfo = mCtx->getEmbedGlobalInfo();
+    bool emitGlobalInfoSkipConstant = mCtx->getEmbedGlobalInfoSkipConstant();
+    setCompileArguments(&compileArguments, bcFileName, cacheDir, resName, core_lib,
+                        useRSDebugContext, bccPluginName, emitGlobalInfo,
+                        optLevel, emitGlobalInfoSkipConstant);
+
+    mChecksumNeeded = isChecksumNeeded(cacheDir);
+    if (mChecksumNeeded) {
+        std::vector<const char *> bccFiles = { BCC_EXE_PATH,
+                                               core_lib,
+                                             };
+
+        // The last argument of compileArguments is a nullptr, so remove 1 from
+        // the size.
+        std::unique_ptr<const char> compileCommandLine(
+            rsuJoinStrings(compileArguments.size()-1, compileArguments.data()));
+
+        mBuildChecksum = constructBuildChecksum(bitcode, bitcodeSize,
+                                                compileCommandLine.get(),
+                                                bccFiles.data(), bccFiles.size());
+
+        if (mBuildChecksum == 0) {
+            // cannot compute checksum but verification is enabled
+            mCtx->unlockMutex();
+            return false;
+        }
+    }
+    else {
+        // add a dummy/constant as a checksum if verification is disabled
+        mBuildChecksum = 0xabadcafe;
+    }
+
+    // Append build checksum to commandline
+    // Handle the terminal nullptr in compileArguments
+    compileArguments.pop_back();
+    compileArguments.push_back("-build-checksum");
+    std::stringstream ss;
+    ss << std::hex << mBuildChecksum;
+    compileArguments.push_back(ss.str().c_str());
+    compileArguments.push_back(nullptr);
+
+    if (!is_force_recompile() && !useRSDebugContext) {
+        mScriptSO = SharedLibraryUtils::loadSharedLibrary(cacheDir, resName);
+
+        // Read RS info from the shared object to detect checksum mismatch
+        if (mScriptSO != nullptr && !storeRSInfoFromSO()) {
+            dlclose(mScriptSO);
+            mScriptSO = nullptr;
+        }
+    }
+
+    // If we can't, it's either not there or out of date.  We compile the bit code and try loading
+    // again.
+    if (mScriptSO == nullptr) {
+        if (!compileBitcode(bcFileName, (const char*)bitcode, bitcodeSize,
+                            compileArguments))
+        {
+            ALOGE("bcc: FAILS to compile '%s'", resName);
+            mCtx->unlockMutex();
+            return false;
+        }
+
+        if (!SharedLibraryUtils::createSharedLibrary(mCtx->getContext()->getDriverName(),
+                                                     cacheDir, resName)) {
+            ALOGE("Linker: Failed to link object file '%s'", resName);
+            mCtx->unlockMutex();
+            return false;
+        }
+
+        mScriptSO = SharedLibraryUtils::loadSharedLibrary(cacheDir, resName);
+        if (mScriptSO == nullptr) {
+            ALOGE("Unable to load '%s'", resName);
+            mCtx->unlockMutex();
+            return false;
+        }
+
+        // Read RS symbol information from the .so.
+        if (!storeRSInfoFromSO()) {
+            goto error;
+        }
+    }
+
+    mBitcodeFilePath.setTo(bcFileName.c_str());
+
+#else  // RS_COMPATIBILITY_LIB is defined
+    const char *nativeLibDir = mCtx->getContext()->getNativeLibDir();
+    mScriptSO = SharedLibraryUtils::loadSharedLibrary(cacheDir, resName, nativeLibDir);
+
+    if (!mScriptSO) {
+        goto error;
+    }
+
+    if (!storeRSInfoFromSO()) {
+        goto error;
+    }
+#endif
+    mCtx->unlockMutex();
+    return true;
+
+error:
+
+    mCtx->unlockMutex();
+    if (mScriptSO) {
+        dlclose(mScriptSO);
+        mScriptSO = nullptr;
+    }
+    return false;
+!!!46899127.cpp!!!	populateScript(inout script : Script) : void
+    // Copy info over to runtime
+    script->mHal.info.exportedFunctionCount = mScriptExec->getExportedFunctionCount();
+    script->mHal.info.exportedReduceCount = mScriptExec->getExportedReduceCount();
+    script->mHal.info.exportedForEachCount = mScriptExec->getExportedForEachCount();
+    script->mHal.info.exportedVariableCount = mScriptExec->getExportedVariableCount();
+    script->mHal.info.exportedPragmaCount = mScriptExec->getPragmaCount();;
+    script->mHal.info.exportedPragmaKeyList = mScriptExec->getPragmaKeys();
+    script->mHal.info.exportedPragmaValueList = mScriptExec->getPragmaValues();
+
+    // Bug, need to stash in metadata
+    if (mRootExpand) {
+        script->mHal.info.root = mRootExpand;
+    } else {
+        script->mHal.info.root = mRoot;
+    }
+!!!46899255.cpp!!!	invokeFunction(in slot : uint32_t, in params : void, in paramLength : size_t) : void
+    //ALOGE("invoke %i %p %zu", slot, params, paramLength);
+    void * ap = nullptr;
+
+#if defined(__x86_64__)
+    // The invoked function could have input parameter of vector type for example float4 which
+    // requires void* params to be 16 bytes aligned when using SSE instructions for x86_64 platform.
+    // So try to align void* params before passing them into RS exported function.
+
+    if ((uint8_t)(uint64_t)params & 0x0F) {
+        if ((ap = (void*)memalign(16, paramLength)) != nullptr) {
+            memcpy(ap, params, paramLength);
+        } else {
+            ALOGE("x86_64: invokeFunction memalign error, still use params which"
+                  " is not 16 bytes aligned.");
+        }
+    }
+#endif
+
+    RsdCpuScriptImpl * oldTLS = mCtx->setTLS(this);
+    reinterpret_cast<void (*)(const void *, uint32_t)>(
+        mScriptExec->getInvokeFunction(slot))(ap? (const void *) ap: params, paramLength);
+
+#if defined(__x86_64__)
+    free(ap);
+#endif
+
+    mCtx->setTLS(oldTLS);
+!!!46899383.cpp!!!	invokeRoot() : int
+    RsdCpuScriptImpl * oldTLS = mCtx->setTLS(this);
+    int ret = mRoot();
+    mCtx->setTLS(oldTLS);
+    return ret;
+!!!46899767.cpp!!!	invokeForEach(in slot : uint32_t, in ains : Allocation, in inLen : uint32_t, inout aout : Allocation, in usr : void, in usrLen : uint32_t, in sc : RsScriptCall) : void
+
+    MTLaunchStructForEach mtls;
+
+    if (forEachMtlsSetup(ains, inLen, aout, usr, usrLen, sc, &mtls)) {
+        forEachKernelSetup(slot, &mtls);
+
+        RsdCpuScriptImpl * oldTLS = mCtx->setTLS(this);
+        mCtx->launchForEach(ains, inLen, aout, sc, &mtls);
+        mCtx->setTLS(oldTLS);
+    }
+!!!46899895.cpp!!!	invokeReduce(in slot : uint32_t, in ains : Allocation, in inLen : uint32_t, inout aout : Allocation, in sc : RsScriptCall) : void
+  MTLaunchStructReduce mtls;
+
+  if (reduceMtlsSetup(ains, inLen, aout, sc, &mtls)) {
+    reduceKernelSetup(slot, &mtls);
+    RsdCpuScriptImpl *oldTLS = mCtx->setTLS(this);
+    mCtx->launchReduce(ains, inLen, aout, &mtls);
+    mCtx->setTLS(oldTLS);
+  }
+!!!46900023.cpp!!!	invokeInit() : void
+    if (mInit) {
+        mInit();
+    }
+!!!46900151.cpp!!!	invokeFreeChildren() : void
+    if (mFreeChildren) {
+        mFreeChildren();
+    }
+!!!46900279.cpp!!!	setGlobalVar(in slot : uint32_t, in data : void, in dataLength : size_t) : void
+    //rsAssert(!script->mFieldIsObject[slot]);
+    //ALOGE("setGlobalVar %i %p %zu", slot, data, dataLength);
+
+    //if (mIntrinsicID) {
+        //mIntrinsicFuncs.setVar(dc, script, drv->mIntrinsicData, slot, data, dataLength);
+        //return;
+    //}
+
+    int32_t *destPtr = reinterpret_cast<int32_t *>(mScriptExec->getFieldAddress(slot));
+    if (!destPtr) {
+        //ALOGV("Calling setVar on slot = %i which is null", slot);
+        return;
+    }
+
+    memcpy(destPtr, data, dataLength);
+!!!46900407.cpp!!!	getGlobalVar(in slot : uint32_t, inout data : void, in dataLength : size_t) : void
+    //rsAssert(!script->mFieldIsObject[slot]);
+    //ALOGE("getGlobalVar %i %p %zu", slot, data, dataLength);
+
+    int32_t *srcPtr = reinterpret_cast<int32_t *>(mScriptExec->getFieldAddress(slot));
+    if (!srcPtr) {
+        //ALOGV("Calling setVar on slot = %i which is null", slot);
+        return;
+    }
+    memcpy(data, srcPtr, dataLength);
+!!!46900535.cpp!!!	setGlobalVarWithElemDims(in slot : uint32_t, in data : void, in dataLength : size_t, in elem : Element, in dims : uint32_t, in dimLength : size_t) : void
+    int32_t *destPtr = reinterpret_cast<int32_t *>(mScriptExec->getFieldAddress(slot));
+    if (!destPtr) {
+        //ALOGV("Calling setVar on slot = %i which is null", slot);
+        return;
+    }
+
+    // We want to look at dimension in terms of integer components,
+    // but dimLength is given in terms of bytes.
+    dimLength /= sizeof(int);
+
+    // Only a single dimension is currently supported.
+    rsAssert(dimLength == 1);
+    if (dimLength == 1) {
+        // First do the increment loop.
+        size_t stride = elem->getSizeBytes();
+        const char *cVal = reinterpret_cast<const char *>(data);
+        for (uint32_t i = 0; i < dims[0]; i++) {
+            elem->incRefs(cVal);
+            cVal += stride;
+        }
+
+        // Decrement loop comes after (to prevent race conditions).
+        char *oldVal = reinterpret_cast<char *>(destPtr);
+        for (uint32_t i = 0; i < dims[0]; i++) {
+            elem->decRefs(oldVal);
+            oldVal += stride;
+        }
+    }
+
+    memcpy(destPtr, data, dataLength);
+!!!46900663.cpp!!!	setGlobalBind(in slot : uint32_t, inout data : Allocation) : void
+
+    //rsAssert(!script->mFieldIsObject[slot]);
+    //ALOGE("setGlobalBind %i %p", slot, data);
+
+    int32_t *destPtr = reinterpret_cast<int32_t *>(mScriptExec->getFieldAddress(slot));
+    if (!destPtr) {
+        //ALOGV("Calling setVar on slot = %i which is null", slot);
+        return;
+    }
+
+    void *ptr = nullptr;
+    mBoundAllocs[slot] = data;
+    if (data) {
+        ptr = data->mHal.drvState.lod[0].mallocPtr;
+    }
+    memcpy(destPtr, &ptr, sizeof(void *));
+!!!46900791.cpp!!!	setGlobalObj(in slot : uint32_t, inout data : ObjectBase) : void
+
+    //rsAssert(script->mFieldIsObject[slot]);
+    //ALOGE("setGlobalObj %i %p", slot, data);
+
+    int32_t *destPtr = reinterpret_cast<int32_t *>(mScriptExec->getFieldAddress(slot));
+    if (!destPtr) {
+        //ALOGV("Calling setVar on slot = %i which is null", slot);
+        return;
+    }
+
+    rsrSetObject(mCtx->getContext(), (rs_object_base *)destPtr, data);
+!!!46900919.cpp!!!	getFieldName(in slot : uint32_t) : char
+    return mScriptExec->getFieldName(slot);
+!!!46901047.cpp!!!	~RsdCpuScriptImpl()
+    delete mScriptExec;
+    delete[] mBoundAllocs;
+    if (mScriptSO) {
+        dlclose(mScriptSO);
+    }
+!!!46901175.cpp!!!	RsdCpuScriptImpl(inout ctx : RsdCpuReferenceImpl, in s : Script)
+    mCtx = ctx;
+    mScript = s;
+
+    mScriptSO = nullptr;
+
+    mRoot = nullptr;
+    mRootExpand = nullptr;
+    mInit = nullptr;
+    mFreeChildren = nullptr;
+    mScriptExec = nullptr;
+
+    mBoundAllocs = nullptr;
+    mIntrinsicData = nullptr;
+    mIsThreadable = true;
+
+    mBuildChecksum = 0;
+    mChecksumNeeded = false;
+!!!46901431.cpp!!!	forEachMtlsSetup(in ains : Allocation, in inLen : uint32_t, inout aout : Allocation, in usr : void, in usrLen : uint32_t, in sc : RsScriptCall, inout mtls : MTLaunchStructForEach) : bool
+    if (ains == nullptr && inLen != 0) {
+        mCtx->getContext()->setError(RS_ERROR_BAD_SCRIPT,
+          "rsForEach called with none-zero inLen with null in allocations");
+        return false;
+    }
+
+    memset(mtls, 0, sizeof(MTLaunchStructForEach));
+    mtls->dimPtr = &mtls->fep.dim;
+
+    for (int index = inLen; --index >= 0;) {
+        if (allocationLODIsNull(ains[index])) {
+            mCtx->getContext()->setError(RS_ERROR_BAD_SCRIPT,
+                                         "rsForEach called with null in allocations");
+            return false;
+        }
+    }
+
+    if (allocationLODIsNull(aout)) {
+        mCtx->getContext()->setError(RS_ERROR_BAD_SCRIPT,
+                                     "rsForEach called with null out allocations");
+        return false;
+    }
+
+    if (inLen > 0) {
+        const Allocation *ain0   = ains[0];
+        const Type       *inType = ain0->getType();
+
+        mtls->fep.dim.x = inType->getDimX();
+        mtls->fep.dim.y = inType->getDimY();
+        mtls->fep.dim.z = inType->getDimZ();
+
+        for (int Index = inLen; --Index >= 1;) {
+            if (!ain0->hasSameDims(ains[Index])) {
+                mCtx->getContext()->setError(RS_ERROR_BAD_SCRIPT,
+                  "Failed to launch kernel; dimensions of input"
+                  "allocations do not match.");
+                return false;
+            }
+        }
+    } else if (aout != nullptr) {
+        const Type *outType = aout->getType();
+
+        mtls->fep.dim.x = outType->getDimX();
+        mtls->fep.dim.y = outType->getDimY();
+        mtls->fep.dim.z = outType->getDimZ();
+
+    } else if (sc != nullptr) {
+        mtls->fep.dim.x = sc->xEnd;
+        mtls->fep.dim.y = sc->yEnd;
+        mtls->fep.dim.z = 0;
+    } else {
+        mCtx->getContext()->setError(RS_ERROR_BAD_SCRIPT,
+                                     "rsForEach called with null allocations");
+        return false;
+    }
+
+    if (inLen > 0 && aout != nullptr) {
+        if (!ains[0]->hasSameDims(aout)) {
+            mCtx->getContext()->setError(RS_ERROR_BAD_SCRIPT,
+              "Failed to launch kernel; dimensions of input and output allocations do not match.");
+
+            return false;
+        }
+    }
+
+    if (!setUpMtlsDimensions(mtls, mtls->fep.dim, sc)) {
+        return false;
+    }
+
+    // The X & Y walkers always want 0-1 min even if dim is not present
+    mtls->end.x    = rsMax((uint32_t)1, mtls->end.x);
+    mtls->end.y    = rsMax((uint32_t)1, mtls->end.y);
+    mtls->rs       = mCtx;
+    if (ains) {
+        memcpy(mtls->ains, ains, inLen * sizeof(ains[0]));
+    }
+    mtls->aout[0]    = aout;
+    mtls->fep.usr    = usr;
+    mtls->fep.usrLen = usrLen;
+    mtls->mSliceSize = 1;
+    mtls->mSliceNum  = 0;
+
+    mtls->isThreadable  = mIsThreadable;
+
+    if (inLen > 0) {
+        mtls->fep.inLen = inLen;
+        for (int index = inLen; --index >= 0;) {
+            mtls->fep.inPtr[index] = (const uint8_t*)ains[index]->mHal.drvState.lod[0].mallocPtr;
+            mtls->fep.inStride[index] = ains[index]->getType()->getElementSizeBytes();
+        }
+    }
+
+    if (aout != nullptr) {
+        mtls->fep.outPtr[0] = (uint8_t *)aout->mHal.drvState.lod[0].mallocPtr;
+        mtls->fep.outStride[0] = aout->getType()->getElementSizeBytes();
+    }
+
+    // All validation passed, ok to launch threads
+    return true;
+!!!46901559.cpp!!!	forEachKernelSetup(in slot : uint32_t, inout mtls : MTLaunchStructForEach) : void
+    mtls->script = this;
+    mtls->fep.slot = slot;
+    mtls->kernel = mScriptExec->getForEachFunction(slot);
+    rsAssert(mtls->kernel != nullptr);
+!!!46901687.cpp!!!	reduceMtlsSetup(in ains : Allocation, in inLen : uint32_t, in aout : Allocation, in sc : RsScriptCall, inout mtls : MTLaunchStructReduce) : bool
+    rsAssert(ains && (inLen >= 1) && aout);
+    memset(mtls, 0, sizeof(MTLaunchStructReduce));
+    mtls->dimPtr = &mtls->redp.dim;
+
+    for (int index = inLen; --index >= 0;) {
+        if (allocationLODIsNull(ains[index])) {
+            mCtx->getContext()->setError(RS_ERROR_BAD_SCRIPT,
+                                         "reduce called with null in allocations");
+            return false;
+        }
+    }
+
+    if (allocationLODIsNull(aout)) {
+        mCtx->getContext()->setError(RS_ERROR_BAD_SCRIPT,
+                                     "reduce called with null out allocation");
+        return false;
+    }
+
+    const Allocation *ain0   = ains[0];
+    const Type       *inType = ain0->getType();
+
+    mtls->redp.dim.x = inType->getDimX();
+    mtls->redp.dim.y = inType->getDimY();
+    mtls->redp.dim.z = inType->getDimZ();
+
+    for (int Index = inLen; --Index >= 1;) {
+        if (!ain0->hasSameDims(ains[Index])) {
+            mCtx->getContext()->setError(RS_ERROR_BAD_SCRIPT,
+                                         "Failed to launch reduction kernel;"
+                                         "dimensions of input allocations do not match.");
+            return false;
+        }
+    }
+
+    if (!setUpMtlsDimensions(mtls, mtls->redp.dim, sc)) {
+        return false;
+    }
+
+    // The X & Y walkers always want 0-1 min even if dim is not present
+    mtls->end.x = rsMax((uint32_t)1, mtls->end.x);
+    mtls->end.y = rsMax((uint32_t)1, mtls->end.y);
+
+    mtls->rs = mCtx;
+
+    mtls->mSliceNum    = 0;
+    mtls->mSliceSize   = 1;
+    mtls->isThreadable = mIsThreadable;
+
+    // Set up output,
+    mtls->redp.outLen = 1;
+    mtls->redp.outPtr[0] = (uint8_t *)aout->mHal.drvState.lod[0].mallocPtr;
+    mtls->redp.outStride[0] = aout->getType()->getElementSizeBytes();
+
+    // Set up input.
+    memcpy(mtls->ains, ains, inLen * sizeof(ains[0]));
+    mtls->redp.inLen = inLen;
+    for (int index = inLen; --index >= 0;) {
+        mtls->redp.inPtr[index] = (const uint8_t*)ains[index]->mHal.drvState.lod[0].mallocPtr;
+        mtls->redp.inStride[index] = ains[index]->getType()->getElementSizeBytes();
+    }
+
+    // All validation passed, ok to launch threads
+    return true;
+!!!46901815.cpp!!!	reduceKernelSetup(in slot : uint32_t, inout mtls : MTLaunchStructReduce) : void
+    mtls->script = this;
+    mtls->redp.slot = slot;
+
+    const ReduceDescription *desc = mScriptExec->getReduceDescription(slot);
+    mtls->accumFunc = desc->accumFunc;
+    mtls->initFunc  = desc->initFunc;   // might legally be nullptr
+    mtls->combFunc  = desc->combFunc;   // might legally be nullptr
+    mtls->outFunc   = desc->outFunc;    // might legally be nullptr
+    mtls->accumSize = desc->accumSize;
+
+    rsAssert(mtls->accumFunc != nullptr);
+!!!46902199.cpp!!!	getAllocationForPointer(in ptr : void) : Allocation
+    if (!ptr) {
+        return nullptr;
+    }
+
+    for (uint32_t ct=0; ct < mScript->mHal.info.exportedVariableCount; ct++) {
+        Allocation *a = mBoundAllocs[ct];
+        if (!a) continue;
+        if (a->mHal.drvState.lod[0].mallocPtr == ptr) {
+            return a;
+        }
+    }
+    ALOGE("rsGetAllocation, failed to find %p", ptr);
+    return nullptr;
+!!!46902327.cpp!!!	storeRSInfoFromSO() : bool
+    // The shared object may have an invalid build checksum.
+    // Validate and fail early.
+    mScriptExec = ScriptExecutable::createFromSharedObject(
+            mScriptSO, mChecksumNeeded ? mBuildChecksum : 0);
+
+    if (mScriptExec == nullptr) {
+        return false;
+    }
+
+    mRoot = (RootFunc_t) dlsym(mScriptSO, "root");
+    if (mRoot) {
+        //ALOGE("Found root(): %p", mRoot);
+    }
+    mRootExpand = (RootFunc_t) dlsym(mScriptSO, "root.expand");
+    if (mRootExpand) {
+        //ALOGE("Found root.expand(): %p", mRootExpand);
+    }
+    mInit = (InitOrDtorFunc_t) dlsym(mScriptSO, "init");
+    if (mInit) {
+        //ALOGE("Found init(): %p", mInit);
+    }
+    mFreeChildren = (InitOrDtorFunc_t) dlsym(mScriptSO, ".rs.dtor");
+    if (mFreeChildren) {
+        //ALOGE("Found .rs.dtor(): %p", mFreeChildren);
+    }
+
+    size_t varCount = mScriptExec->getExportedVariableCount();
+    if (varCount > 0) {
+        mBoundAllocs = new Allocation *[varCount];
+        memset(mBoundAllocs, 0, varCount * sizeof(*mBoundAllocs));
+    }
+
+    mIsThreadable = mScriptExec->getThreadable();
+    //ALOGE("Script isThreadable? %d", mIsThreadable);
+
+    if (kDebugGlobalVariables) {
+        mScriptExec->dumpGlobalInfo();
+    }
+
+    return true;
+!!!46902455.cpp!!!	getGlobalEntries() : int
+    return mScriptExec->getGlobalEntries();
+!!!46902583.cpp!!!	getGlobalName(in i : int) : char
+    return mScriptExec->getGlobalName(i);
+!!!46902711.cpp!!!	getGlobalAddress(in i : int) : void
+    return mScriptExec->getGlobalAddress(i);
+!!!46902839.cpp!!!	getGlobalSize(in i : int) : size_t
+    return mScriptExec->getGlobalSize(i);
+!!!46902967.cpp!!!	getGlobalProperties(in i : int) : uint32_t
+    return mScriptExec->getGlobalProperties(i);
+!!!46903095.cpp!!!	findCoreLib(in ME : bcinfo::MetadataExtractor, in bitcode : char, in bitcodeSize : size_t) : char
+    const char* defaultLib = SYSLIBPATH"/libclcore.bc";
+
+    // If we're debugging, use the debug library.
+    if (mCtx->getContext()->getContextType() == RS_CONTEXT_TYPE_DEBUG) {
+        return SYSLIBPATH"/libclcore_debug.bc";
+    }
+
+    if (ME.hasDebugInfo()) {
+        return SYSLIBPATH"/libclcore_g.bc";
+    }
+
+    // If a callback has been registered to specify a library, use that.
+    RSSelectRTCallback selectRTCallback = mCtx->getSelectRTCallback();
+    if (selectRTCallback != nullptr) {
+        return selectRTCallback((const char*)bitcode, bitcodeSize);
+    }
+
+    // Check for a platform specific library
+#if defined(ARCH_ARM_HAVE_NEON) && !defined(DISABLE_CLCORE_NEON)
+    enum bcinfo::RSFloatPrecision prec = ME.getRSFloatPrecision();
+    if (prec == bcinfo::RS_FP_Relaxed) {
+        // NEON-capable ARMv7a devices can use an accelerated math library
+        // for all reduced precision scripts.
+        // ARMv8 does not use NEON, as ASIMD can be used with all precision
+        // levels.
+        return SYSLIBPATH"/libclcore_neon.bc";
+    } else {
+        return defaultLib;
+    }
+#elif defined(__i386__) || defined(__x86_64__)
+    // x86 devices will use an optimized library.
+    return SYSLIBPATH"/libclcore_x86.bc";
+#else
+    return defaultLib;
+#endif
+!!!46903351.cpp!!!	setUpMtlsDimensions(inout mtls : MTLaunchStructCommon, in baseDim : RsLaunchDimensions, in sc : RsScriptCall) : bool
+    rsAssert(mtls);
+
+#define SET_UP_DIMENSION(DIM_FIELD, SC_FIELD) do {            \
+    if (!sc || (sc->SC_FIELD##End == 0)) {                    \
+        mtls->end.DIM_FIELD = baseDim.DIM_FIELD;              \
+    } else {                                                  \
+        mtls->start.DIM_FIELD =                               \
+            rsMin(baseDim.DIM_FIELD, sc->SC_FIELD##Start);    \
+        mtls->end.DIM_FIELD =                                 \
+            rsMin(baseDim.DIM_FIELD, sc->SC_FIELD##End);      \
+        if (mtls->start.DIM_FIELD >= mtls->end.DIM_FIELD) {   \
+            mCtx->getContext()->setError(RS_ERROR_BAD_SCRIPT, \
+                "Failed to launch kernel; Invalid "           \
+                #SC_FIELD "Start or " #SC_FIELD "End.");      \
+            return false;                                     \
+        }                                                     \
+    }} while(0)
+
+    SET_UP_DIMENSION(x, x);
+    SET_UP_DIMENSION(y, y);
+    SET_UP_DIMENSION(z, z);
+    // Checks and setup of fields other than x, y, z are ignored, since those
+    // fields are not used in the runtime and are not visible in the Java API.
+#undef SET_UP_DIMENSION
+
+    return true;

@@ -1,0 +1,289 @@
+class DozeService
+!!!71598775.java!!!	DozeService()
+        if (DEBUG) Log.d(mTag, "new DozeService()");
+        setDebug(DEBUG);
+!!!71598903.java!!!	dumpOnHandler(inout fd : FileDescriptor, inout pw : PrintWriter, inout args : String [[]]) : void
+        super.dumpOnHandler(fd, pw, args);
+        pw.print("  mDreaming: "); pw.println(mDreaming);
+        pw.print("  mPulsing: "); pw.println(mPulsing);
+        pw.print("  mWakeLock: held="); pw.println(mWakeLock.isHeld());
+        pw.print("  mHost: "); pw.println(mHost);
+        pw.print("  mBroadcastReceiverRegistered: "); pw.println(mBroadcastReceiverRegistered);
+        pw.print("  mSigMotionSensor: "); pw.println(mSigMotionSensor);
+        pw.print("  mPickupSensor:"); pw.println(mPickupSensor);
+        pw.print("  mDisplayStateSupported: "); pw.println(mDisplayStateSupported);
+        pw.print("  mNotificationLightOn: "); pw.println(mNotificationLightOn);
+        pw.print("  mPowerSaveActive: "); pw.println(mPowerSaveActive);
+        pw.print("  mCarMode: "); pw.println(mCarMode);
+        pw.print("  mNotificationPulseTime: "); pw.println(mNotificationPulseTime);
+        pw.print("  mScheduleResetsRemaining: "); pw.println(mScheduleResetsRemaining);
+        mDozeParameters.dump(pw);
+!!!71599031.java!!!	onCreate() : void
+        if (DEBUG) Log.d(mTag, "onCreate");
+        super.onCreate();
+
+        if (getApplication() instanceof SystemUIApplication) {
+            final SystemUIApplication app = (SystemUIApplication) getApplication();
+            mHost = app.getComponent(DozeHost.class);
+        }
+        if (mHost == null) Log.w(TAG, "No doze service host found.");
+
+        setWindowless(true);
+
+        mSensors = (SensorManager) mContext.getSystemService(Context.SENSOR_SERVICE);
+        mSigMotionSensor = new TriggerSensor(Sensor.TYPE_SIGNIFICANT_MOTION,
+                mDozeParameters.getPulseOnSigMotion(), mDozeParameters.getVibrateOnSigMotion(),
+                DozeLog.PULSE_REASON_SENSOR_SIGMOTION);
+        mPickupSensor = new TriggerSensor(Sensor.TYPE_PICK_UP_GESTURE,
+                mDozeParameters.getPulseOnPickup(), mDozeParameters.getVibrateOnPickup(),
+                DozeLog.PULSE_REASON_SENSOR_PICKUP);
+        mPowerManager = (PowerManager) mContext.getSystemService(Context.POWER_SERVICE);
+        mWakeLock = mPowerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, TAG);
+        mWakeLock.setReferenceCounted(true);
+        mAlarmManager = (AlarmManager) mContext.getSystemService(Context.ALARM_SERVICE);
+        mDisplayStateSupported = mDozeParameters.getDisplayStateSupported();
+        mUiModeManager = (UiModeManager) mContext.getSystemService(Context.UI_MODE_SERVICE);
+        turnDisplayOff();
+!!!71599159.java!!!	onAttachedToWindow() : void
+        if (DEBUG) Log.d(mTag, "onAttachedToWindow");
+        super.onAttachedToWindow();
+!!!71599287.java!!!	onDreamingStarted() : void
+        super.onDreamingStarted();
+
+        if (mHost == null) {
+            finish();
+            return;
+        }
+
+        mPowerSaveActive = mHost.isPowerSaveActive();
+        mCarMode = mUiModeManager.getCurrentModeType() == Configuration.UI_MODE_TYPE_CAR;
+        if (DEBUG) Log.d(mTag, "onDreamingStarted canDoze=" + canDoze() + " mPowerSaveActive="
+                + mPowerSaveActive + " mCarMode=" + mCarMode);
+        if (mPowerSaveActive) {
+            finishToSavePower();
+            return;
+        }
+        if (mCarMode) {
+            finishForCarMode();
+            return;
+        }
+
+        mDreaming = true;
+        rescheduleNotificationPulse(false /*predicate*/);  // cancel any pending pulse alarms
+        mEarliestPulseDueToLight = System.currentTimeMillis() + EARLIEST_LIGHT_PULSE_AFTER_START_MS;
+        listenForPulseSignals(true);
+
+        // Ask the host to get things ready to start dozing.
+        // Once ready, we call startDozing() at which point the CPU may suspend
+        // and we will need to acquire a wakelock to do work.
+        mHost.startDozing(new Runnable() {
+            @Override
+            public void run() {
+                if (mDreaming) {
+                    startDozing();
+
+                    // From this point until onDreamingStopped we will need to hold a
+                    // wakelock whenever we are doing work.  Note that we never call
+                    // stopDozing because can we just keep dozing until the bitter end.
+                }
+            }
+        });
+!!!71599415.java!!!	onDreamingStopped() : void
+        if (DEBUG) Log.d(mTag, "onDreamingStopped isDozing=" + isDozing());
+        super.onDreamingStopped();
+
+        if (mHost == null) {
+            return;
+        }
+
+        mDreaming = false;
+        listenForPulseSignals(false);
+
+        // Tell the host that it's over.
+        mHost.stopDozing();
+!!!71599543.java!!!	requestPulse(in reason : int) : void
+        if (mHost != null && mDreaming && !mPulsing) {
+            // Let the host know we want to pulse.  Wait for it to be ready, then
+            // turn the screen on.  When finished, turn the screen off again.
+            // Here we need a wakelock to stay awake until the pulse is finished.
+            mWakeLock.acquire();
+            mPulsing = true;
+            if (!mDozeParameters.getProxCheckBeforePulse()) {
+                // skip proximity check
+                continuePulsing(reason);
+                return;
+            }
+            final long start = SystemClock.uptimeMillis();
+            final boolean nonBlocking = reason == DozeLog.PULSE_REASON_SENSOR_PICKUP
+                    && mDozeParameters.getPickupPerformsProxCheck();
+            if (nonBlocking) {
+                // proximity check is only done to capture statistics, continue pulsing
+                continuePulsing(reason);
+            }
+            // perform a proximity check
+            new ProximityCheck() {
+                @Override
+                public void onProximityResult(int result) {
+                    final boolean isNear = result == RESULT_NEAR;
+                    final long end = SystemClock.uptimeMillis();
+                    DozeLog.traceProximityResult(mContext, isNear, end - start, reason);
+                    if (nonBlocking) {
+                        // we already continued
+                        return;
+                    }
+                    // avoid pulsing in pockets
+                    if (isNear) {
+                        mPulsing = false;
+                        mWakeLock.release();
+                        return;
+                    }
+
+                    // not in-pocket, continue pulsing
+                    continuePulsing(reason);
+                }
+            }.check();
+        }
+!!!71599671.java!!!	continuePulsing(in reason : int) : void
+        if (mHost.isPulsingBlocked()) {
+            mPulsing = false;
+            mWakeLock.release();
+            return;
+        }
+        mHost.pulseWhileDozing(new DozeHost.PulseCallback() {
+            @Override
+            public void onPulseStarted() {
+                if (mPulsing && mDreaming) {
+                    turnDisplayOn();
+                }
+            }
+
+            @Override
+            public void onPulseFinished() {
+                if (mPulsing && mDreaming) {
+                    mPulsing = false;
+                    turnDisplayOff();
+                }
+                mWakeLock.release(); // needs to be unconditional to balance acquire
+            }
+        }, reason);
+!!!71599799.java!!!	turnDisplayOff() : void
+        if (DEBUG) Log.d(mTag, "Display off");
+        setDozeScreenState(Display.STATE_OFF);
+!!!71599927.java!!!	turnDisplayOn() : void
+        if (DEBUG) Log.d(mTag, "Display on");
+        setDozeScreenState(mDisplayStateSupported ? Display.STATE_DOZE : Display.STATE_ON);
+!!!71600055.java!!!	finishToSavePower() : void
+        Log.w(mTag, "Exiting ambient mode due to low power battery saver");
+        finish();
+!!!71600183.java!!!	finishForCarMode() : void
+        Log.w(mTag, "Exiting ambient mode, not allowed in car mode");
+        finish();
+!!!71600311.java!!!	listenForPulseSignals(inout listen : boolean) : void
+        if (DEBUG) Log.d(mTag, "listenForPulseSignals: " + listen);
+        mSigMotionSensor.setListening(listen);
+        mPickupSensor.setListening(listen);
+        listenForBroadcasts(listen);
+        listenForNotifications(listen);
+!!!71600439.java!!!	listenForBroadcasts(inout listen : boolean) : void
+        if (listen) {
+            final IntentFilter filter = new IntentFilter(PULSE_ACTION);
+            filter.addAction(NOTIFICATION_PULSE_ACTION);
+            filter.addAction(UiModeManager.ACTION_ENTER_CAR_MODE);
+            mContext.registerReceiver(mBroadcastReceiver, filter);
+            mBroadcastReceiverRegistered = true;
+        } else {
+            if (mBroadcastReceiverRegistered) {
+                mContext.unregisterReceiver(mBroadcastReceiver);
+            }
+            mBroadcastReceiverRegistered = false;
+        }
+!!!71600567.java!!!	listenForNotifications(inout listen : boolean) : void
+        if (listen) {
+            resetNotificationResets();
+            mHost.addCallback(mHostCallback);
+
+            // Continue to pulse for existing LEDs.
+            mNotificationLightOn = mHost.isNotificationLightOn();
+            if (mNotificationLightOn) {
+                updateNotificationPulseDueToLight();
+            }
+        } else {
+            mHost.removeCallback(mHostCallback);
+        }
+!!!71600695.java!!!	resetNotificationResets() : void
+        if (DEBUG) Log.d(mTag, "resetNotificationResets");
+        mScheduleResetsRemaining = mDozeParameters.getPulseScheduleResets();
+!!!71600823.java!!!	updateNotificationPulseDueToLight() : void
+        long timeMs = System.currentTimeMillis();
+        timeMs = Math.max(timeMs, mEarliestPulseDueToLight);
+        updateNotificationPulse(timeMs);
+!!!71600951.java!!!	updateNotificationPulse(in notificationTimeMs : long) : void
+        if (DEBUG) Log.d(mTag, "updateNotificationPulse notificationTimeMs=" + notificationTimeMs);
+        if (!mDozeParameters.getPulseOnNotifications()) return;
+        if (mScheduleResetsRemaining <= 0) {
+            if (DEBUG) Log.d(mTag, "No more schedule resets remaining");
+            return;
+        }
+        final long pulseDuration = mDozeParameters.getPulseDuration(false /*pickup*/);
+        boolean pulseImmediately = System.currentTimeMillis() >= notificationTimeMs;
+        if ((notificationTimeMs - mLastScheduleResetTime) >= pulseDuration) {
+            mScheduleResetsRemaining--;
+            mLastScheduleResetTime = notificationTimeMs;
+        } else if (!pulseImmediately){
+            if (DEBUG) Log.d(mTag, "Recently updated, not resetting schedule");
+            return;
+        }
+        if (DEBUG) Log.d(mTag, "mScheduleResetsRemaining = " + mScheduleResetsRemaining);
+        mNotificationPulseTime = notificationTimeMs;
+        if (pulseImmediately) {
+            DozeLog.traceNotificationPulse(0);
+            requestPulse(DozeLog.PULSE_REASON_NOTIFICATION);
+        }
+        // schedule the rest of the pulses
+        rescheduleNotificationPulse(true /*predicate*/);
+!!!71601079.java!!!	notificationPulseIntent(in instance : long) : PendingIntent
+        return PendingIntent.getBroadcast(mContext, 0,
+                new Intent(NOTIFICATION_PULSE_ACTION)
+                        .setPackage(getPackageName())
+                        .putExtra(EXTRA_INSTANCE, instance)
+                        .setFlags(Intent.FLAG_RECEIVER_FOREGROUND),
+                PendingIntent.FLAG_UPDATE_CURRENT);
+!!!71601207.java!!!	rescheduleNotificationPulse(inout predicate : boolean) : void
+        if (DEBUG) Log.d(mTag, "rescheduleNotificationPulse predicate=" + predicate);
+        final PendingIntent notificationPulseIntent = notificationPulseIntent(0);
+        mAlarmManager.cancel(notificationPulseIntent);
+        if (!predicate) {
+            if (DEBUG) Log.d(mTag, "  don't reschedule: predicate is false");
+            return;
+        }
+        final PulseSchedule schedule = mDozeParameters.getPulseSchedule();
+        if (schedule == null) {
+            if (DEBUG) Log.d(mTag, "  don't reschedule: schedule is null");
+            return;
+        }
+        final long now = System.currentTimeMillis();
+        final long time = schedule.getNextTime(now, mNotificationPulseTime);
+        if (time <= 0) {
+            if (DEBUG) Log.d(mTag, "  don't reschedule: time is " + time);
+            return;
+        }
+        final long delta = time - now;
+        if (delta <= 0) {
+            if (DEBUG) Log.d(mTag, "  don't reschedule: delta is " + delta);
+            return;
+        }
+        final long instance = time - mNotificationPulseTime;
+        if (DEBUG) Log.d(mTag, "Scheduling pulse " + instance + " in " + delta + "ms for "
+                + new Date(time));
+        mAlarmManager.setExact(AlarmManager.RTC_WAKEUP, time, notificationPulseIntent(instance));
+!!!71601335.java!!!	triggerEventToString(inout event : TriggerEvent) : String
+        if (event == null) return null;
+        final StringBuilder sb = new StringBuilder("TriggerEvent[")
+                .append(event.timestamp).append(',')
+                .append(event.sensor.getName());
+        if (event.values != null) {
+            for (int i = 0; i < event.values.length; i++) {
+                sb.append(',').append(event.values[i]);
+            }
+        }
+        return sb.append(']').toString();

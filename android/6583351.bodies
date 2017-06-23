@@ -1,0 +1,166 @@
+class BackgroundDexOptService
+!!!74190647.java!!!	schedule(inout context : Context) : void
+        JobScheduler js = (JobScheduler) context.getSystemService(Context.JOB_SCHEDULER_SERVICE);
+
+        // Schedule a one-off job which scans installed packages and updates
+        // out-of-date oat files.
+        js.schedule(new JobInfo.Builder(JOB_POST_BOOT_UPDATE, sDexoptServiceName)
+                    .setMinimumLatency(TimeUnit.MINUTES.toMillis(1))
+                    .setOverrideDeadline(TimeUnit.MINUTES.toMillis(1))
+                    .build());
+
+        // Schedule a daily job which scans installed packages and compiles
+        // those with fresh profiling data.
+        js.schedule(new JobInfo.Builder(JOB_IDLE_OPTIMIZE, sDexoptServiceName)
+                    .setRequiresDeviceIdle(true)
+                    .setRequiresCharging(true)
+                    .setPeriodic(TimeUnit.DAYS.toMillis(1))
+                    .build());
+
+        if (DEBUG_DEXOPT) {
+            Log.i(TAG, "Jobs scheduled");
+        }
+!!!74190775.java!!!	notifyPackageChanged(inout packageName : String) : void
+        // The idle maintanance job skips packages which previously failed to
+        // compile. The given package has changed and may successfully compile
+        // now. Remove it from the list of known failing packages.
+        synchronized (sFailedPackageNames) {
+            sFailedPackageNames.remove(packageName);
+        }
+!!!74190903.java!!!	getBatteryLevel() : int
+        IntentFilter filter = new IntentFilter(Intent.ACTION_BATTERY_CHANGED);
+        Intent intent = registerReceiver(null, filter);
+        int level = intent.getIntExtra(BatteryManager.EXTRA_LEVEL, -1);
+        int scale = intent.getIntExtra(BatteryManager.EXTRA_SCALE, -1);
+
+        if (level < 0 || scale <= 0) {
+            // Battery data unavailable. This should never happen, so assume the worst.
+            return 0;
+        }
+
+        return (100 * level / scale);
+!!!74191031.java!!!	runPostBootUpdate(in jobParams : JobParameters, in pm : PackageManagerService, in pkgs : ArraySet) : boolean
+        if (mExitPostBootUpdate.get()) {
+            // This job has already been superseded. Do not start it.
+            return false;
+        }
+
+        // Load low battery threshold from the system config. This is a 0-100 integer.
+        final int lowBatteryThreshold = getResources().getInteger(
+                com.android.internal.R.integer.config_lowBatteryWarningLevel);
+
+        mAbortPostBootUpdate.set(false);
+        new Thread("BackgroundDexOptService_PostBootUpdate") {
+            @Override
+            public void run() {
+                for (String pkg : pkgs) {
+                    if (mAbortPostBootUpdate.get()) {
+                        // JobScheduler requested an early abort.
+                        return;
+                    }
+                    if (mExitPostBootUpdate.get()) {
+                        // Different job, which supersedes this one, is running.
+                        break;
+                    }
+                    if (getBatteryLevel() < lowBatteryThreshold) {
+                        // Rather bail than completely drain the battery.
+                        break;
+                    }
+                    if (DEBUG_DEXOPT) {
+                        Log.i(TAG, "Updating package " + pkg);
+                    }
+
+                    // Update package if needed. Note that there can be no race between concurrent
+                    // jobs because PackageDexOptimizer.performDexOpt is synchronized.
+
+                    // checkProfiles is false to avoid merging profiles during boot which
+                    // might interfere with background compilation (b/28612421).
+                    // Unfortunately this will also means that "pm.dexopt.boot=speed-profile" will
+                    // behave differently than "pm.dexopt.bg-dexopt=speed-profile" but that's a
+                    // trade-off worth doing to save boot time work.
+                    pm.performDexOpt(pkg,
+                            /* checkProfiles */ false,
+                            PackageManagerService.REASON_BOOT,
+                            /* force */ false);
+                }
+                // Ran to completion, so we abandon our timeslice and do not reschedule.
+                jobFinished(jobParams, /* reschedule */ false);
+            }
+        }.start();
+        return true;
+!!!74191159.java!!!	runIdleOptimization(in jobParams : JobParameters, in pm : PackageManagerService, in pkgs : ArraySet) : boolean
+        // If post-boot update is still running, request that it exits early.
+        mExitPostBootUpdate.set(true);
+
+        mAbortIdleOptimization.set(false);
+        new Thread("BackgroundDexOptService_IdleOptimization") {
+            @Override
+            public void run() {
+                for (String pkg : pkgs) {
+                    if (mAbortIdleOptimization.get()) {
+                        // JobScheduler requested an early abort.
+                        return;
+                    }
+                    if (sFailedPackageNames.contains(pkg)) {
+                        // Skip previously failing package
+                        continue;
+                    }
+                    // Conservatively add package to the list of failing ones in case performDexOpt
+                    // never returns.
+                    synchronized (sFailedPackageNames) {
+                        sFailedPackageNames.add(pkg);
+                    }
+                    // Optimize package if needed. Note that there can be no race between
+                    // concurrent jobs because PackageDexOptimizer.performDexOpt is synchronized.
+                    if (pm.performDexOpt(pkg,
+                            /* checkProfiles */ true,
+                            PackageManagerService.REASON_BACKGROUND_DEXOPT,
+                            /* force */ false)) {
+                        // Dexopt succeeded, remove package from the list of failing ones.
+                        synchronized (sFailedPackageNames) {
+                            sFailedPackageNames.remove(pkg);
+                        }
+                    }
+                }
+                // Ran to completion, so we abandon our timeslice and do not reschedule.
+                jobFinished(jobParams, /* reschedule */ false);
+            }
+        }.start();
+        return true;
+!!!74191287.java!!!	onStartJob(inout params : JobParameters) : boolean
+        if (DEBUG_DEXOPT) {
+            Log.i(TAG, "onStartJob");
+        }
+
+        PackageManagerService pm = (PackageManagerService)ServiceManager.getService("package");
+        if (pm.isStorageLow()) {
+            if (DEBUG_DEXOPT) {
+                Log.i(TAG, "Low storage, skipping this run");
+            }
+            return false;
+        }
+
+        final ArraySet<String> pkgs = pm.getOptimizablePackages();
+        if (pkgs == null || pkgs.isEmpty()) {
+            if (DEBUG_DEXOPT) {
+                Log.i(TAG, "No packages to optimize");
+            }
+            return false;
+        }
+
+        if (params.getJobId() == JOB_POST_BOOT_UPDATE) {
+            return runPostBootUpdate(params, pm, pkgs);
+        } else {
+            return runIdleOptimization(params, pm, pkgs);
+        }
+!!!74191415.java!!!	onStopJob(inout params : JobParameters) : boolean
+        if (DEBUG_DEXOPT) {
+            Log.i(TAG, "onStopJob");
+        }
+
+        if (params.getJobId() == JOB_POST_BOOT_UPDATE) {
+            mAbortPostBootUpdate.set(true);
+        } else {
+            mAbortIdleOptimization.set(true);
+        }
+        return false;

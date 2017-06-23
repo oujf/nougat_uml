@@ -1,0 +1,330 @@
+class PerformFullTransportBackupTask
+!!!72956599.java!!!	PerformFullTransportBackupTask(inout observer : IFullBackupRestoreObserver, inout whichPackages : String [[]], inout updateSchedule : boolean, inout runningJob : FullBackupJob, inout latch : CountDownLatch, inout backupObserver : IBackupObserver, inout userInitiated : boolean)
+            super(observer);
+            mUpdateSchedule = updateSchedule;
+            mLatch = latch;
+            mKeepRunning = new AtomicBoolean(true);
+            mJob = runningJob;
+            mPackages = new ArrayList<PackageInfo>(whichPackages.length);
+            mBackupObserver = backupObserver;
+            mUserInitiated = userInitiated;
+
+            for (String pkg : whichPackages) {
+                try {
+                    PackageInfo info = mPackageManager.getPackageInfo(pkg,
+                            PackageManager.GET_SIGNATURES);
+                    if (!appIsEligibleForBackup(info.applicationInfo)) {
+                        // Cull any packages that have indicated that backups are not permitted,
+                        // that run as system-domain uids but do not define their own backup agents,
+                        // as well as any explicit mention of the 'special' shared-storage agent
+                        // package (we handle that one at the end).
+                        if (MORE_DEBUG) {
+                            Slog.d(TAG, "Ignoring ineligible package " + pkg);
+                        }
+                        sendBackupOnPackageResult(mBackupObserver, pkg,
+                            BackupManager.ERROR_BACKUP_NOT_ALLOWED);
+                        continue;
+                    } else if (!appGetsFullBackup(info)) {
+                        // Cull any packages that are found in the queue but now aren't supposed
+                        // to get full-data backup operations.
+                        if (MORE_DEBUG) {
+                            Slog.d(TAG, "Ignoring full-data backup of key/value participant "
+                                    + pkg);
+                        }
+                        sendBackupOnPackageResult(mBackupObserver, pkg,
+                                BackupManager.ERROR_BACKUP_NOT_ALLOWED);
+                        continue;
+                    } else if (appIsStopped(info.applicationInfo)) {
+                        // Cull any packages in the 'stopped' state: they've either just been
+                        // installed or have explicitly been force-stopped by the user.  In both
+                        // cases we do not want to launch them for backup.
+                        if (MORE_DEBUG) {
+                            Slog.d(TAG, "Ignoring stopped package " + pkg);
+                        }
+                        sendBackupOnPackageResult(mBackupObserver, pkg,
+                                BackupManager.ERROR_BACKUP_NOT_ALLOWED);
+                        continue;
+                    }
+                    mPackages.add(info);
+                } catch (NameNotFoundException e) {
+                    Slog.i(TAG, "Requested package " + pkg + " not found; ignoring");
+                }
+            }
+!!!72956727.java!!!	setRunning(inout running : boolean) : void
+            mKeepRunning.set(running);
+!!!72956855.java!!!	run() : void
+            // data from the app, passed to us for bridging to the transport
+            ParcelFileDescriptor[] enginePipes = null;
+
+            // Pipe through which we write data to the transport
+            ParcelFileDescriptor[] transportPipes = null;
+
+            long backoff = 0;
+            int backupRunStatus = BackupManager.SUCCESS;
+
+            try {
+                if (!mEnabled || !mProvisioned) {
+                    // Backups are globally disabled, so don't proceed.
+                    if (DEBUG) {
+                        Slog.i(TAG, "full backup requested but e=" + mEnabled
+                                + " p=" + mProvisioned + "; ignoring");
+                    }
+                    mUpdateSchedule = false;
+                    backupRunStatus = BackupManager.ERROR_BACKUP_NOT_ALLOWED;
+                    return;
+                }
+
+                IBackupTransport transport = getTransport(mCurrentTransport);
+                if (transport == null) {
+                    Slog.w(TAG, "Transport not present; full data backup not performed");
+                    backupRunStatus = BackupManager.ERROR_TRANSPORT_ABORTED;
+                    return;
+                }
+
+                // Set up to send data to the transport
+                final int N = mPackages.size();
+                final byte[] buffer = new byte[8192];
+                for (int i = 0; i < N; i++) {
+                    PackageInfo currentPackage = mPackages.get(i);
+                    String packageName = currentPackage.packageName;
+                    if (DEBUG) {
+                        Slog.i(TAG, "Initiating full-data transport backup of " + packageName);
+                    }
+                    EventLog.writeEvent(EventLogTags.FULL_BACKUP_PACKAGE, packageName);
+
+                    transportPipes = ParcelFileDescriptor.createPipe();
+
+                    // Tell the transport the data's coming
+                    int flags = mUserInitiated ? BackupTransport.FLAG_USER_INITIATED : 0;
+                    int backupPackageStatus = transport.performFullBackup(currentPackage,
+                            transportPipes[0], flags);
+                    if (backupPackageStatus == BackupTransport.TRANSPORT_OK) {
+                        // The transport has its own copy of the read end of the pipe,
+                        // so close ours now
+                        transportPipes[0].close();
+                        transportPipes[0] = null;
+
+                        // Now set up the backup engine / data source end of things
+                        enginePipes = ParcelFileDescriptor.createPipe();
+                        SinglePackageBackupRunner backupRunner =
+                                new SinglePackageBackupRunner(enginePipes[1], currentPackage,
+                                        transport);
+                        // The runner dup'd the pipe half, so we close it here
+                        enginePipes[1].close();
+                        enginePipes[1] = null;
+
+                        // Spin off the runner to fetch the app's data and pipe it
+                        // into the engine pipes
+                        (new Thread(backupRunner, "package-backup-bridge")).start();
+
+                        // Read data off the engine pipe and pass it to the transport
+                        // pipe until we hit EOD on the input stream.  We do not take
+                        // close() responsibility for these FDs into these stream wrappers.
+                        FileInputStream in = new FileInputStream(
+                                enginePipes[0].getFileDescriptor());
+                        FileOutputStream out = new FileOutputStream(
+                                transportPipes[1].getFileDescriptor());
+                        long totalRead = 0;
+                        final long preflightResult = backupRunner.getPreflightResultBlocking();
+                        // Preflight result is negative if some error happened on preflight.
+                        if (preflightResult < 0) {
+                            if (MORE_DEBUG) {
+                                Slog.d(TAG, "Backup error after preflight of package "
+                                        + packageName + ": " + preflightResult
+                                        + ", not running backup.");
+                            }
+                            backupPackageStatus = (int) preflightResult;
+                        } else {
+                            int nRead = 0;
+                            do {
+                                if (!mKeepRunning.get()) {
+                                    if (DEBUG_SCHEDULING) {
+                                        Slog.i(TAG, "Full backup task told to stop");
+                                    }
+                                    break;
+                                }
+                                nRead = in.read(buffer);
+                                if (MORE_DEBUG) {
+                                    Slog.v(TAG, "in.read(buffer) from app: " + nRead);
+                                }
+                                if (nRead > 0) {
+                                    out.write(buffer, 0, nRead);
+                                    backupPackageStatus = transport.sendBackupData(nRead);
+                                    totalRead += nRead;
+                                    if (mBackupObserver != null && preflightResult > 0) {
+                                        sendBackupOnUpdate(mBackupObserver, packageName,
+                                                new BackupProgress(preflightResult, totalRead));
+                                    }
+                                }
+                            } while (nRead > 0
+                                    && backupPackageStatus == BackupTransport.TRANSPORT_OK);
+
+                            // Despite preflight succeeded, package still can hit quota on flight.
+                            if (backupPackageStatus == BackupTransport.TRANSPORT_QUOTA_EXCEEDED) {
+                                long quota = transport.getBackupQuota(packageName, true);
+                                Slog.w(TAG, "Package hit quota limit in-flight " + packageName
+                                        + ": " + totalRead + " of " + quota);
+                                backupRunner.sendQuotaExceeded(totalRead, quota);
+                            }
+                        }
+
+                        // If we've lost our running criteria, tell the transport to cancel
+                        // and roll back this (partial) backup payload; otherwise tell it
+                        // that we've reached the clean finish state.
+                        if (!mKeepRunning.get()) {
+                            backupPackageStatus = BackupTransport.TRANSPORT_ERROR;
+                            transport.cancelFullBackup();
+                        } else {
+                            // If we were otherwise in a good state, now interpret the final
+                            // result based on what finishBackup() returns.  If we're in a
+                            // failure case already, preserve that result and ignore whatever
+                            // finishBackup() reports.
+                            final int finishResult = transport.finishBackup();
+                            if (backupPackageStatus == BackupTransport.TRANSPORT_OK) {
+                                backupPackageStatus = finishResult;
+                            }
+                        }
+
+                        // A transport-originated error here means that we've hit an error that the
+                        // runner doesn't know about, so it's still moving data but we're pulling the
+                        // rug out from under it.  Don't ask for its result:  we already know better
+                        // and we'll hang if we block waiting for it, since it relies on us to
+                        // read back the data it's writing into the engine.  Just proceed with
+                        // a graceful failure.  The runner/engine mechanism will tear itself
+                        // down cleanly when we close the pipes from this end.  Transport-level
+                        // errors take precedence over agent/app-specific errors for purposes of
+                        // determining our course of action.
+                        if (backupPackageStatus == BackupTransport.TRANSPORT_OK) {
+                            // We still could fail in backup runner thread, getting result from there.
+                            int backupRunnerResult = backupRunner.getBackupResultBlocking();
+                            if (backupRunnerResult != BackupTransport.TRANSPORT_OK) {
+                                // If there was an error in runner thread and
+                                // not TRANSPORT_ERROR here, overwrite it.
+                                backupPackageStatus = backupRunnerResult;
+                            }
+                        } else {
+                            if (MORE_DEBUG) {
+                                Slog.i(TAG, "Transport-level failure; cancelling agent work");
+                            }
+                        }
+
+                        if (MORE_DEBUG) {
+                            Slog.i(TAG, "Done delivering backup data: result="
+                                    + backupPackageStatus);
+                        }
+
+                        if (backupPackageStatus != BackupTransport.TRANSPORT_OK) {
+                            Slog.e(TAG, "Error " + backupPackageStatus + " backing up "
+                                    + packageName);
+                        }
+
+                        // Also ask the transport how long it wants us to wait before
+                        // moving on to the next package, if any.
+                        backoff = transport.requestFullBackupTime();
+                        if (DEBUG_SCHEDULING) {
+                            Slog.i(TAG, "Transport suggested backoff=" + backoff);
+                        }
+
+                    }
+
+                    // Roll this package to the end of the backup queue if we're
+                    // in a queue-driven mode (regardless of success/failure)
+                    if (mUpdateSchedule) {
+                        enqueueFullBackup(packageName, System.currentTimeMillis());
+                    }
+
+                    if (backupPackageStatus == BackupTransport.TRANSPORT_PACKAGE_REJECTED) {
+                        sendBackupOnPackageResult(mBackupObserver, packageName,
+                                BackupManager.ERROR_TRANSPORT_PACKAGE_REJECTED);
+                        if (DEBUG) {
+                            Slog.i(TAG, "Transport rejected backup of " + packageName
+                                    + ", skipping");
+                        }
+                        EventLog.writeEvent(EventLogTags.FULL_BACKUP_AGENT_FAILURE, packageName,
+                                "transport rejected");
+                        // Do nothing, clean up, and continue looping.
+                    } else if (backupPackageStatus == BackupTransport.TRANSPORT_QUOTA_EXCEEDED) {
+                        sendBackupOnPackageResult(mBackupObserver, packageName,
+                                BackupManager.ERROR_TRANSPORT_QUOTA_EXCEEDED);
+                        if (DEBUG) {
+                            Slog.i(TAG, "Transport quota exceeded for package: " + packageName);
+                            EventLog.writeEvent(EventLogTags.FULL_BACKUP_QUOTA_EXCEEDED,
+                                    packageName);
+                        }
+                        // Do nothing, clean up, and continue looping.
+                    } else if (backupPackageStatus == BackupTransport.AGENT_ERROR) {
+                        sendBackupOnPackageResult(mBackupObserver, packageName,
+                                BackupManager.ERROR_AGENT_FAILURE);
+                        Slog.w(TAG, "Application failure for package: " + packageName);
+                        EventLog.writeEvent(EventLogTags.BACKUP_AGENT_FAILURE, packageName);
+                        tearDownAgentAndKill(currentPackage.applicationInfo);
+                        // Do nothing, clean up, and continue looping.
+                    } else if (backupPackageStatus != BackupTransport.TRANSPORT_OK) {
+                        sendBackupOnPackageResult(mBackupObserver, packageName,
+                            BackupManager.ERROR_TRANSPORT_ABORTED);
+                        Slog.w(TAG, "Transport failed; aborting backup: " + backupPackageStatus);
+                        EventLog.writeEvent(EventLogTags.FULL_BACKUP_TRANSPORT_FAILURE);
+                        // Abort entire backup pass.
+                        backupRunStatus = BackupManager.ERROR_TRANSPORT_ABORTED;
+                        return;
+                    } else {
+                        // Success!
+                        sendBackupOnPackageResult(mBackupObserver, packageName,
+                                BackupManager.SUCCESS);
+                        EventLog.writeEvent(EventLogTags.FULL_BACKUP_SUCCESS, packageName);
+                        logBackupComplete(packageName);
+                    }
+                    cleanUpPipes(transportPipes);
+                    cleanUpPipes(enginePipes);
+                }
+            } catch (Exception e) {
+                backupRunStatus = BackupManager.ERROR_TRANSPORT_ABORTED;
+                Slog.w(TAG, "Exception trying full transport backup", e);
+            } finally {
+                if (DEBUG) {
+                    Slog.i(TAG, "Full backup completed with status: " + backupRunStatus);
+                }
+                sendBackupFinished(mBackupObserver, backupRunStatus);
+
+                cleanUpPipes(transportPipes);
+                cleanUpPipes(enginePipes);
+
+                if (mJob != null) {
+                    mJob.finishBackupPass();
+                }
+
+                synchronized (mQueueLock) {
+                    mRunningFullBackupTask = null;
+                }
+
+                mLatch.countDown();
+
+                // Now that we're actually done with schedule-driven work, reschedule
+                // the next pass based on the new queue state.
+                if (mUpdateSchedule) {
+                    scheduleNextFullBackupJob(backoff);
+                }
+                Slog.i(BackupManagerService.TAG, "Full data backup pass finished.");
+                mWakelock.release();
+            }
+!!!72956983.java!!!	cleanUpPipes(inout pipes : ParcelFileDescriptor [[]]) : void
+            if (pipes != null) {
+                if (pipes[0] != null) {
+                    ParcelFileDescriptor fd = pipes[0];
+                    pipes[0] = null;
+                    try {
+                        fd.close();
+                    } catch (IOException e) {
+                        Slog.w(TAG, "Unable to close pipe!");
+                    }
+                }
+                if (pipes[1] != null) {
+                    ParcelFileDescriptor fd = pipes[1];
+                    pipes[1] = null;
+                    try {
+                        fd.close();
+                    } catch (IOException e) {
+                        Slog.w(TAG, "Unable to close pipe!");
+                    }
+                }
+            }

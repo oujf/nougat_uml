@@ -1,0 +1,148 @@
+class AudioServiceBroadcastReceiver
+!!!73590455.java!!!	onReceive(inout context : Context, inout intent : Intent) : void
+            String action = intent.getAction();
+            int outDevice;
+            int inDevice;
+            int state;
+
+            if (action.equals(Intent.ACTION_DOCK_EVENT)) {
+                int dockState = intent.getIntExtra(Intent.EXTRA_DOCK_STATE,
+                        Intent.EXTRA_DOCK_STATE_UNDOCKED);
+                int config;
+                switch (dockState) {
+                    case Intent.EXTRA_DOCK_STATE_DESK:
+                        config = AudioSystem.FORCE_BT_DESK_DOCK;
+                        break;
+                    case Intent.EXTRA_DOCK_STATE_CAR:
+                        config = AudioSystem.FORCE_BT_CAR_DOCK;
+                        break;
+                    case Intent.EXTRA_DOCK_STATE_LE_DESK:
+                        config = AudioSystem.FORCE_ANALOG_DOCK;
+                        break;
+                    case Intent.EXTRA_DOCK_STATE_HE_DESK:
+                        config = AudioSystem.FORCE_DIGITAL_DOCK;
+                        break;
+                    case Intent.EXTRA_DOCK_STATE_UNDOCKED:
+                    default:
+                        config = AudioSystem.FORCE_NONE;
+                }
+                // Low end docks have a menu to enable or disable audio
+                // (see mDockAudioMediaEnabled)
+                if (!((dockState == Intent.EXTRA_DOCK_STATE_LE_DESK) ||
+                      ((dockState == Intent.EXTRA_DOCK_STATE_UNDOCKED) &&
+                       (mDockState == Intent.EXTRA_DOCK_STATE_LE_DESK)))) {
+                    AudioSystem.setForceUse(AudioSystem.FOR_DOCK, config);
+                }
+                mDockState = dockState;
+            } else if (action.equals(BluetoothHeadset.ACTION_CONNECTION_STATE_CHANGED)) {
+                state = intent.getIntExtra(BluetoothProfile.EXTRA_STATE,
+                                               BluetoothProfile.STATE_DISCONNECTED);
+                BluetoothDevice btDevice = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
+
+                setBtScoDeviceConnectionState(btDevice, state);
+            } else if (action.equals(BluetoothHeadset.ACTION_AUDIO_STATE_CHANGED)) {
+                boolean broadcast = false;
+                int scoAudioState = AudioManager.SCO_AUDIO_STATE_ERROR;
+                synchronized (mScoClients) {
+                    int btState = intent.getIntExtra(BluetoothProfile.EXTRA_STATE, -1);
+                    // broadcast intent if the connection was initated by AudioService
+                    if (!mScoClients.isEmpty() &&
+                            (mScoAudioState == SCO_STATE_ACTIVE_INTERNAL ||
+                             mScoAudioState == SCO_STATE_ACTIVATE_REQ ||
+                             mScoAudioState == SCO_STATE_DEACTIVATE_REQ)) {
+                        broadcast = true;
+                    }
+                    switch (btState) {
+                    case BluetoothHeadset.STATE_AUDIO_CONNECTED:
+                        scoAudioState = AudioManager.SCO_AUDIO_STATE_CONNECTED;
+                        if (mScoAudioState != SCO_STATE_ACTIVE_INTERNAL &&
+                            mScoAudioState != SCO_STATE_DEACTIVATE_REQ &&
+                            mScoAudioState != SCO_STATE_DEACTIVATE_EXT_REQ) {
+                            mScoAudioState = SCO_STATE_ACTIVE_EXTERNAL;
+                        }
+                        break;
+                    case BluetoothHeadset.STATE_AUDIO_DISCONNECTED:
+                        scoAudioState = AudioManager.SCO_AUDIO_STATE_DISCONNECTED;
+                        mScoAudioState = SCO_STATE_INACTIVE;
+                        clearAllScoClients(0, false);
+                        break;
+                    case BluetoothHeadset.STATE_AUDIO_CONNECTING:
+                        if (mScoAudioState != SCO_STATE_ACTIVE_INTERNAL &&
+                            mScoAudioState != SCO_STATE_DEACTIVATE_REQ &&
+                            mScoAudioState != SCO_STATE_DEACTIVATE_EXT_REQ) {
+                            mScoAudioState = SCO_STATE_ACTIVE_EXTERNAL;
+                        }
+                    default:
+                        // do not broadcast CONNECTING or invalid state
+                        broadcast = false;
+                        break;
+                    }
+                }
+                if (broadcast) {
+                    broadcastScoConnectionState(scoAudioState);
+                    //FIXME: this is to maintain compatibility with deprecated intent
+                    // AudioManager.ACTION_SCO_AUDIO_STATE_CHANGED. Remove when appropriate.
+                    Intent newIntent = new Intent(AudioManager.ACTION_SCO_AUDIO_STATE_CHANGED);
+                    newIntent.putExtra(AudioManager.EXTRA_SCO_AUDIO_STATE, scoAudioState);
+                    sendStickyBroadcastToAll(newIntent);
+                }
+            } else if (action.equals(Intent.ACTION_SCREEN_ON)) {
+                if (mMonitorRotation) {
+                    RotationHelper.enable();
+                }
+                AudioSystem.setParameters("screen_state=on");
+            } else if (action.equals(Intent.ACTION_SCREEN_OFF)) {
+                if (mMonitorRotation) {
+                    //reduce wakeups (save current) by only listening when display is on
+                    RotationHelper.disable();
+                }
+                AudioSystem.setParameters("screen_state=off");
+            } else if (action.equals(Intent.ACTION_CONFIGURATION_CHANGED)) {
+                handleConfigurationChanged(context);
+            } else if (action.equals(Intent.ACTION_USER_SWITCHED)) {
+                if (mUserSwitchedReceived) {
+                    // attempt to stop music playback for background user except on first user
+                    // switch (i.e. first boot)
+                    sendMsg(mAudioHandler,
+                            MSG_BROADCAST_AUDIO_BECOMING_NOISY,
+                            SENDMSG_REPLACE,
+                            0,
+                            0,
+                            null,
+                            0);
+                }
+                mUserSwitchedReceived = true;
+                // the current audio focus owner is no longer valid
+                mMediaFocusControl.discardAudioFocusOwner();
+
+                // load volume settings for new user
+                readAudioSettings(true /*userSwitch*/);
+                // preserve STREAM_MUSIC volume from one user to the next.
+                sendMsg(mAudioHandler,
+                        MSG_SET_ALL_VOLUMES,
+                        SENDMSG_QUEUE,
+                        0,
+                        0,
+                        mStreamStates[AudioSystem.STREAM_MUSIC], 0);
+            } else if (action.equals(Intent.ACTION_USER_BACKGROUND)) {
+                // Disable audio recording for the background user/profile
+                int userId = intent.getIntExtra(Intent.EXTRA_USER_HANDLE, -1);
+                if (userId >= 0) {
+                    // TODO Kill recording streams instead of killing processes holding permission
+                    UserInfo userInfo = UserManagerService.getInstance().getUserInfo(userId);
+                    killBackgroundUserProcessesWithRecordAudioPermission(userInfo);
+                }
+                UserManagerService.getInstance().setUserRestriction(
+                        UserManager.DISALLOW_RECORD_AUDIO, true, userId);
+            } else if (action.equals(Intent.ACTION_USER_FOREGROUND)) {
+                // Enable audio recording for foreground user/profile
+                int userId = intent.getIntExtra(Intent.EXTRA_USER_HANDLE, -1);
+                UserManagerService.getInstance().setUserRestriction(
+                        UserManager.DISALLOW_RECORD_AUDIO, false, userId);
+            } else if (action.equals(BluetoothAdapter.ACTION_STATE_CHANGED)) {
+                state = intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, -1);
+                if (state == BluetoothAdapter.STATE_OFF ||
+                        state == BluetoothAdapter.STATE_TURNING_OFF) {
+                    disconnectAllBluetoothProfiles();
+                }
+            }

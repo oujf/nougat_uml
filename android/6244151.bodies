@@ -1,0 +1,393 @@
+class MtpDocumentsProvider
+!!!71047735.java!!!	getInstance() : MtpDocumentsProvider
+        return sSingleton;
+!!!71047863.java!!!	onCreate() : boolean
+        sSingleton = this;
+        mContext = getContext();
+        mResources = getContext().getResources();
+        mMtpManager = new MtpManager(getContext());
+        mResolver = getContext().getContentResolver();
+        mDeviceToolkits = new HashMap<Integer, DeviceToolkit>();
+        mDatabase = new MtpDatabase(getContext(), MtpDatabaseConstants.FLAG_DATABASE_IN_FILE);
+        mRootScanner = new RootScanner(mResolver, mMtpManager, mDatabase);
+        mAppFuse = new AppFuse(TAG, new AppFuseCallback());
+        mIntentSender = new ServiceIntentSender(getContext());
+
+        // Check boot count and cleans database if it's first time to launch MtpDocumentsProvider
+        // after booting.
+        try {
+            final int bootCount = Settings.Global.getInt(mResolver, Settings.Global.BOOT_COUNT, -1);
+            final int lastBootCount = mDatabase.getLastBootCount();
+            if (bootCount != -1 && bootCount != lastBootCount) {
+                mDatabase.setLastBootCount(bootCount);
+                final List<UriPermission> permissions =
+                        mResolver.getOutgoingPersistedUriPermissions();
+                final Uri[] uris = new Uri[permissions.size()];
+                for (int i = 0; i < permissions.size(); i++) {
+                    uris[i] = permissions.get(i).getUri();
+                }
+                mDatabase.cleanDatabase(uris);
+            }
+        } catch (SQLiteDiskIOException error) {
+            // It can happen due to disk shortage.
+            Log.e(TAG, "Failed to clean database.", error);
+            return false;
+        }
+
+        // TODO: Mount AppFuse on demands.
+        try {
+            mAppFuse.mount(getContext().getSystemService(StorageManager.class));
+        } catch (IOException error) {
+            Log.e(TAG, "Failed to start app fuse.", error);
+            return false;
+        }
+
+        resume();
+        return true;
+!!!71047991.java!!!	onCreateForTesting(inout context : Context, inout resources : Resources, inout mtpManager : MtpManager, inout resolver : ContentResolver, inout database : MtpDatabase, inout storageManager : StorageManager, inout intentSender : ServiceIntentSender) : boolean
+        mContext = context;
+        mResources = resources;
+        mMtpManager = mtpManager;
+        mResolver = resolver;
+        mDeviceToolkits = new HashMap<Integer, DeviceToolkit>();
+        mDatabase = database;
+        mRootScanner = new RootScanner(mResolver, mMtpManager, mDatabase);
+        mAppFuse = new AppFuse(TAG, new AppFuseCallback());
+        mIntentSender = intentSender;
+
+        // TODO: Mount AppFuse on demands.
+        try {
+            mAppFuse.mount(storageManager);
+        } catch (IOException e) {
+            Log.e(TAG, "Failed to start app fuse.", e);
+            return false;
+        }
+        resume();
+        return true;
+!!!71048119.java!!!	queryRoots(inout projection : String [[]]) : Cursor
+        if (projection == null) {
+            projection = MtpDocumentsProvider.DEFAULT_ROOT_PROJECTION;
+        }
+        final Cursor cursor = mDatabase.queryRoots(mResources, projection);
+        cursor.setNotificationUri(
+                mResolver, DocumentsContract.buildRootsUri(MtpDocumentsProvider.AUTHORITY));
+        return cursor;
+!!!71048247.java!!!	queryDocument(inout documentId : String, inout projection : String [[]]) : Cursor
+        if (projection == null) {
+            projection = MtpDocumentsProvider.DEFAULT_DOCUMENT_PROJECTION;
+        }
+        return mDatabase.queryDocument(documentId, projection);
+!!!71048375.java!!!	queryChildDocuments(inout parentDocumentId : String, inout projection : String [[]], inout sortOrder : String) : Cursor
+        if (DEBUG) {
+            Log.d(TAG, "queryChildDocuments: " + parentDocumentId);
+        }
+        if (projection == null) {
+            projection = MtpDocumentsProvider.DEFAULT_DOCUMENT_PROJECTION;
+        }
+        Identifier parentIdentifier = mDatabase.createIdentifier(parentDocumentId);
+        try {
+            openDevice(parentIdentifier.mDeviceId);
+            if (parentIdentifier.mDocumentType == MtpDatabaseConstants.DOCUMENT_TYPE_DEVICE) {
+                final String[] storageDocIds = mDatabase.getStorageDocumentIds(parentDocumentId);
+                if (storageDocIds.length == 0) {
+                    // Remote device does not provide storages. Maybe it is locked.
+                    return createErrorCursor(projection, R.string.error_locked_device);
+                } else if (storageDocIds.length > 1) {
+                    // Returns storage list from database.
+                    return mDatabase.queryChildDocuments(projection, parentDocumentId);
+                }
+
+                // Exact one storage is found. Skip storage and returns object in the single
+                // storage.
+                parentIdentifier = mDatabase.createIdentifier(storageDocIds[0]);
+            }
+
+            // Returns object list from document loader.
+            return getDocumentLoader(parentIdentifier).queryChildDocuments(
+                    projection, parentIdentifier);
+        } catch (BusyDeviceException exception) {
+            return createErrorCursor(projection, R.string.error_busy_device);
+        } catch (IOException exception) {
+            Log.e(MtpDocumentsProvider.TAG, "queryChildDocuments", exception);
+            throw new FileNotFoundException(exception.getMessage());
+        }
+!!!71048503.java!!!	openDocument(inout documentId : String, inout mode : String, inout signal : CancellationSignal) : ParcelFileDescriptor
+        if (DEBUG) {
+            Log.d(TAG, "openDocument: " + documentId);
+        }
+        final Identifier identifier = mDatabase.createIdentifier(documentId);
+        try {
+            openDevice(identifier.mDeviceId);
+            final MtpDeviceRecord device = getDeviceToolkit(identifier.mDeviceId).mDeviceRecord;
+            // Turn off MODE_CREATE because openDocument does not allow to create new files.
+            final int modeFlag =
+                    ParcelFileDescriptor.parseMode(mode) & ~ParcelFileDescriptor.MODE_CREATE;
+            if ((modeFlag & ParcelFileDescriptor.MODE_READ_ONLY) != 0) {
+                long fileSize;
+                try {
+                    fileSize = getFileSize(documentId);
+                } catch (UnsupportedOperationException exception) {
+                    fileSize = -1;
+                }
+                if (MtpDeviceRecord.isPartialReadSupported(
+                        device.operationsSupported, fileSize)) {
+                    return mAppFuse.openFile(Integer.parseInt(documentId), modeFlag);
+                } else {
+                    // If getPartialObject{|64} are not supported for the device, returns
+                    // non-seekable pipe FD instead.
+                    return getPipeManager(identifier).readDocument(mMtpManager, identifier);
+                }
+            } else if ((modeFlag & ParcelFileDescriptor.MODE_WRITE_ONLY) != 0) {
+                // TODO: Clear the parent document loader task (if exists) and call notify
+                // when writing is completed.
+                if (MtpDeviceRecord.isWritingSupported(device.operationsSupported)) {
+                    return mAppFuse.openFile(Integer.parseInt(documentId), modeFlag);
+                } else {
+                    throw new UnsupportedOperationException(
+                            "The device does not support writing operation.");
+                }
+            } else {
+                // TODO: Add support for "rw" mode.
+                throw new UnsupportedOperationException("The provider does not support 'rw' mode.");
+            }
+        } catch (FileNotFoundException | RuntimeException error) {
+            Log.e(MtpDocumentsProvider.TAG, "openDocument", error);
+            throw error;
+        } catch (IOException error) {
+            Log.e(MtpDocumentsProvider.TAG, "openDocument", error);
+            throw new IllegalStateException(error);
+        }
+!!!71048631.java!!!	openDocumentThumbnail(inout documentId : String, inout sizeHint : Point, inout signal : CancellationSignal) : AssetFileDescriptor
+        final Identifier identifier = mDatabase.createIdentifier(documentId);
+        try {
+            openDevice(identifier.mDeviceId);
+            return new AssetFileDescriptor(
+                    getPipeManager(identifier).readThumbnail(mMtpManager, identifier),
+                    0,  // Start offset.
+                    AssetFileDescriptor.UNKNOWN_LENGTH);
+        } catch (IOException error) {
+            Log.e(MtpDocumentsProvider.TAG, "openDocumentThumbnail", error);
+            throw new FileNotFoundException(error.getMessage());
+        }
+!!!71048759.java!!!	deleteDocument(inout documentId : String) : void
+        try {
+            final Identifier identifier = mDatabase.createIdentifier(documentId);
+            openDevice(identifier.mDeviceId);
+            final Identifier parentIdentifier = mDatabase.getParentIdentifier(documentId);
+            mMtpManager.deleteDocument(identifier.mDeviceId, identifier.mObjectHandle);
+            mDatabase.deleteDocument(documentId);
+            getDocumentLoader(parentIdentifier).cancelTask(parentIdentifier);
+            notifyChildDocumentsChange(parentIdentifier.mDocumentId);
+            if (parentIdentifier.mDocumentType == MtpDatabaseConstants.DOCUMENT_TYPE_STORAGE) {
+                // If the parent is storage, the object might be appeared as child of device because
+                // we skip storage when the device has only one storage.
+                final Identifier deviceIdentifier = mDatabase.getParentIdentifier(
+                        parentIdentifier.mDocumentId);
+                notifyChildDocumentsChange(deviceIdentifier.mDocumentId);
+            }
+        } catch (IOException error) {
+            Log.e(MtpDocumentsProvider.TAG, "deleteDocument", error);
+            throw new FileNotFoundException(error.getMessage());
+        }
+!!!71048887.java!!!	onTrimMemory(in level : int) : void
+        synchronized (mDeviceListLock) {
+            for (final DeviceToolkit toolkit : mDeviceToolkits.values()) {
+                toolkit.mDocumentLoader.clearCompletedTasks();
+            }
+        }
+!!!71049015.java!!!	createDocument(inout parentDocumentId : String, inout mimeType : String, inout displayName : String) : String
+        if (DEBUG) {
+            Log.d(TAG, "createDocument: " + displayName);
+        }
+        final Identifier parentId;
+        final MtpDeviceRecord record;
+        final ParcelFileDescriptor[] pipe;
+        try {
+            parentId = mDatabase.createIdentifier(parentDocumentId);
+            openDevice(parentId.mDeviceId);
+            record = getDeviceToolkit(parentId.mDeviceId).mDeviceRecord;
+            if (!MtpDeviceRecord.isWritingSupported(record.operationsSupported)) {
+                throw new UnsupportedOperationException(
+                        "Writing operation is not supported by the device.");
+            }
+            pipe = ParcelFileDescriptor.createReliablePipe();
+            int objectHandle = -1;
+            MtpObjectInfo info = null;
+            try {
+                pipe[0].close();  // 0 bytes for a new document.
+
+                final int formatCode = Document.MIME_TYPE_DIR.equals(mimeType) ?
+                        MtpConstants.FORMAT_ASSOCIATION :
+                        MediaFile.getFormatCode(displayName, mimeType);
+                info = new MtpObjectInfo.Builder()
+                        .setStorageId(parentId.mStorageId)
+                        .setParent(parentId.mObjectHandle)
+                        .setFormat(formatCode)
+                        .setName(displayName)
+                        .build();
+
+                final String[] parts = FileUtils.splitFileName(mimeType, displayName);
+                final String baseName = parts[0];
+                final String extension = parts[1];
+                for (int i = 0; i <= 32; i++) {
+                    final MtpObjectInfo infoUniqueName;
+                    if (i == 0) {
+                        infoUniqueName = info;
+                    } else {
+                        String suffixedName = baseName + " (" + i + " )";
+                        if (!extension.isEmpty()) {
+                            suffixedName += "." + extension;
+                        }
+                        infoUniqueName =
+                                new MtpObjectInfo.Builder(info).setName(suffixedName).build();
+                    }
+                    try {
+                        objectHandle = mMtpManager.createDocument(
+                                parentId.mDeviceId, infoUniqueName, pipe[1]);
+                        break;
+                    } catch (SendObjectInfoFailure exp) {
+                        // This can be caused when we have an existing file with the same name.
+                        continue;
+                    }
+                }
+            } finally {
+                pipe[1].close();
+            }
+            if (objectHandle == -1) {
+                throw new IllegalArgumentException(
+                        "The file name \"" + displayName + "\" is conflicted with existing files " +
+                        "and the provider failed to find unique name.");
+            }
+            final MtpObjectInfo infoWithHandle =
+                    new MtpObjectInfo.Builder(info).setObjectHandle(objectHandle).build();
+            final String documentId = mDatabase.putNewDocument(
+                    parentId.mDeviceId, parentDocumentId, record.operationsSupported,
+                    infoWithHandle, 0l);
+            getDocumentLoader(parentId).cancelTask(parentId);
+            notifyChildDocumentsChange(parentDocumentId);
+            return documentId;
+        } catch (FileNotFoundException | RuntimeException error) {
+            Log.e(TAG, "createDocument", error);
+            throw error;
+        } catch (IOException error) {
+            Log.e(TAG, "createDocument", error);
+            throw new IllegalStateException(error);
+        }
+!!!71049143.java!!!	openDevice(in deviceId : int) : void
+        synchronized (mDeviceListLock) {
+            if (mDeviceToolkits.containsKey(deviceId)) {
+                return;
+            }
+            if (DEBUG) {
+                Log.d(TAG, "Open device " + deviceId);
+            }
+            final MtpDeviceRecord device = mMtpManager.openDevice(deviceId);
+            final DeviceToolkit toolkit =
+                    new DeviceToolkit(mMtpManager, mResolver, mDatabase, device);
+            mDeviceToolkits.put(deviceId, toolkit);
+            mIntentSender.sendUpdateNotificationIntent();
+            try {
+                mRootScanner.resume().await();
+            } catch (InterruptedException error) {
+                Log.e(TAG, "openDevice", error);
+            }
+            // Resume document loader to remap disconnected document ID. Must be invoked after the
+            // root scanner resumes.
+            toolkit.mDocumentLoader.resume();
+        }
+!!!71049271.java!!!	closeDevice(in deviceId : int) : void
+        synchronized (mDeviceListLock) {
+            closeDeviceInternal(deviceId);
+        }
+        mRootScanner.resume();
+        mIntentSender.sendUpdateNotificationIntent();
+!!!71049399.java!!!	getOpenedDeviceRecordsCache() : MtpDeviceRecord
+        synchronized (mDeviceListLock) {
+            final MtpDeviceRecord[] records = new MtpDeviceRecord[mDeviceToolkits.size()];
+            int i = 0;
+            for (final DeviceToolkit toolkit : mDeviceToolkits.values()) {
+                records[i] = toolkit.mDeviceRecord;
+                i++;
+            }
+            return records;
+        }
+!!!71049527.java!!!	getDeviceDocumentId(in deviceId : int) : String
+        return mDatabase.getDeviceDocumentId(deviceId);
+!!!71049655.java!!!	resumeRootScanner() : void
+        if (DEBUG) {
+            Log.d(MtpDocumentsProvider.TAG, "resumeRootScanner");
+        }
+        mRootScanner.resume();
+!!!71049783.java!!!	shutdown() : void
+        synchronized (mDeviceListLock) {
+            try {
+                // Copy the opened key set because it will be modified when closing devices.
+                final Integer[] keySet =
+                        mDeviceToolkits.keySet().toArray(new Integer[mDeviceToolkits.size()]);
+                for (final int id : keySet) {
+                    closeDeviceInternal(id);
+                }
+                mRootScanner.pause();
+            } catch (InterruptedException | IOException | TimeoutException e) {
+                // It should fail unit tests by throwing runtime exception.
+                throw new RuntimeException(e);
+            } finally {
+                mDatabase.close();
+                mAppFuse.close();
+                super.shutdown();
+            }
+        }
+!!!71049911.java!!!	notifyChildDocumentsChange(inout parentDocumentId : String) : void
+        mResolver.notifyChange(
+                DocumentsContract.buildChildDocumentsUri(AUTHORITY, parentDocumentId),
+                null,
+                false);
+!!!71050039.java!!!	resume() : void
+        synchronized (mDeviceListLock) {
+            mDatabase.getMapper().clearMapping();
+        }
+!!!71050167.java!!!	closeDeviceInternal(in deviceId : int) : void
+        // TODO: Flush the device before closing (if not closed externally).
+        if (!mDeviceToolkits.containsKey(deviceId)) {
+            return;
+        }
+        if (DEBUG) {
+            Log.d(TAG, "Close device " + deviceId);
+        }
+        getDeviceToolkit(deviceId).close();
+        mDeviceToolkits.remove(deviceId);
+        mMtpManager.closeDevice(deviceId);
+!!!71050295.java!!!	getDeviceToolkit(in deviceId : int) : MtpDocumentsProvider::DeviceToolkit
+        synchronized (mDeviceListLock) {
+            final DeviceToolkit toolkit = mDeviceToolkits.get(deviceId);
+            if (toolkit == null) {
+                throw new FileNotFoundException();
+            }
+            return toolkit;
+        }
+!!!71050423.java!!!	getPipeManager(inout identifier : Identifier) : PipeManager
+        return getDeviceToolkit(identifier.mDeviceId).mPipeManager;
+!!!71050551.java!!!	getDocumentLoader(inout identifier : Identifier) : DocumentLoader
+        return getDeviceToolkit(identifier.mDeviceId).mDocumentLoader;
+!!!71050679.java!!!	getFileSize(inout documentId : String) : long
+        final Cursor cursor = mDatabase.queryDocument(
+                documentId,
+                MtpDatabase.strings(Document.COLUMN_SIZE, Document.COLUMN_DISPLAY_NAME));
+        try {
+            if (cursor.moveToNext()) {
+                if (cursor.isNull(0)) {
+                    throw new UnsupportedOperationException();
+                }
+                return cursor.getLong(0);
+            } else {
+                throw new FileNotFoundException();
+            }
+        } finally {
+            cursor.close();
+        }
+!!!71050807.java!!!	createErrorCursor(inout projection : String [[]], in stringResId : int) : Cursor
+        final Bundle bundle = new Bundle();
+        bundle.putString(DocumentsContract.EXTRA_ERROR, mResources.getString(stringResId));
+        final Cursor cursor = new MatrixCursor(projection);
+        cursor.setExtras(bundle);
+        return cursor;

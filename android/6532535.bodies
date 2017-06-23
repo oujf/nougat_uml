@@ -1,0 +1,283 @@
+class LegacyVpnRunner
+!!!73662391.java!!!	LegacyVpnRunner(inout config : VpnConfig, inout racoon : String [[]], inout mtpd : String [[]])
+            super(TAG);
+            mConfig = config;
+            mDaemons = new String[] {"racoon", "mtpd"};
+            // TODO: clear arguments from memory once launched
+            mArguments = new String[][] {racoon, mtpd};
+            mSockets = new LocalSocket[mDaemons.length];
+
+            // This is the interface which VPN is running on,
+            // mConfig.interfaze will change to point to OUR
+            // internal interface soon. TODO - add inner/outer to mconfig
+            // TODO - we have a race - if the outer iface goes away/disconnects before we hit this
+            // we will leave the VPN up.  We should check that it's still there/connected after
+            // registering
+            mOuterInterface = mConfig.interfaze;
+
+            if (!TextUtils.isEmpty(mOuterInterface)) {
+                final ConnectivityManager cm = ConnectivityManager.from(mContext);
+                for (Network network : cm.getAllNetworks()) {
+                    final LinkProperties lp = cm.getLinkProperties(network);
+                    if (lp != null && lp.getAllInterfaceNames().contains(mOuterInterface)) {
+                        final NetworkInfo networkInfo = cm.getNetworkInfo(network);
+                        if (networkInfo != null) mOuterConnection.set(networkInfo.getType());
+                    }
+                }
+            }
+
+            IntentFilter filter = new IntentFilter();
+            filter.addAction(ConnectivityManager.CONNECTIVITY_ACTION);
+            mContext.registerReceiver(mBroadcastReceiver, filter);
+!!!73662519.java!!!	check(inout interfaze : String) : void
+            if (interfaze.equals(mOuterInterface)) {
+                Log.i(TAG, "Legacy VPN is going down with " + interfaze);
+                exit();
+            }
+!!!73662647.java!!!	exit() : void
+            // We assume that everything is reset after stopping the daemons.
+            interrupt();
+            for (LocalSocket socket : mSockets) {
+                IoUtils.closeQuietly(socket);
+            }
+            agentDisconnect();
+            try {
+                mContext.unregisterReceiver(mBroadcastReceiver);
+            } catch (IllegalArgumentException e) {}
+!!!73662775.java!!!	run() : void
+            // Wait for the previous thread since it has been interrupted.
+            Log.v(TAG, "Waiting");
+            synchronized (TAG) {
+                Log.v(TAG, "Executing");
+                execute();
+                monitorDaemons();
+            }
+!!!73662903.java!!!	checkpoint(inout yield : boolean) : void
+            long now = SystemClock.elapsedRealtime();
+            if (mTimer == -1) {
+                mTimer = now;
+                Thread.sleep(1);
+            } else if (now - mTimer <= 60000) {
+                Thread.sleep(yield ? 200 : 1);
+            } else {
+                updateState(DetailedState.FAILED, "checkpoint");
+                throw new IllegalStateException("Time is up");
+            }
+!!!73663031.java!!!	execute() : void
+            // Catch all exceptions so we can clean up few things.
+            boolean initFinished = false;
+            try {
+                // Initialize the timer.
+                checkpoint(false);
+
+                // Wait for the daemons to stop.
+                for (String daemon : mDaemons) {
+                    while (!SystemService.isStopped(daemon)) {
+                        checkpoint(true);
+                    }
+                }
+
+                // Clear the previous state.
+                File state = new File("/data/misc/vpn/state");
+                state.delete();
+                if (state.exists()) {
+                    throw new IllegalStateException("Cannot delete the state");
+                }
+                new File("/data/misc/vpn/abort").delete();
+                initFinished = true;
+
+                // Check if we need to restart any of the daemons.
+                boolean restart = false;
+                for (String[] arguments : mArguments) {
+                    restart = restart || (arguments != null);
+                }
+                if (!restart) {
+                    agentDisconnect();
+                    return;
+                }
+                updateState(DetailedState.CONNECTING, "execute");
+
+                // Start the daemon with arguments.
+                for (int i = 0; i < mDaemons.length; ++i) {
+                    String[] arguments = mArguments[i];
+                    if (arguments == null) {
+                        continue;
+                    }
+
+                    // Start the daemon.
+                    String daemon = mDaemons[i];
+                    SystemService.start(daemon);
+
+                    // Wait for the daemon to start.
+                    while (!SystemService.isRunning(daemon)) {
+                        checkpoint(true);
+                    }
+
+                    // Create the control socket.
+                    mSockets[i] = new LocalSocket();
+                    LocalSocketAddress address = new LocalSocketAddress(
+                            daemon, LocalSocketAddress.Namespace.RESERVED);
+
+                    // Wait for the socket to connect.
+                    while (true) {
+                        try {
+                            mSockets[i].connect(address);
+                            break;
+                        } catch (Exception e) {
+                            // ignore
+                        }
+                        checkpoint(true);
+                    }
+                    mSockets[i].setSoTimeout(500);
+
+                    // Send over the arguments.
+                    OutputStream out = mSockets[i].getOutputStream();
+                    for (String argument : arguments) {
+                        byte[] bytes = argument.getBytes(StandardCharsets.UTF_8);
+                        if (bytes.length >= 0xFFFF) {
+                            throw new IllegalArgumentException("Argument is too large");
+                        }
+                        out.write(bytes.length >> 8);
+                        out.write(bytes.length);
+                        out.write(bytes);
+                        checkpoint(false);
+                    }
+                    out.write(0xFF);
+                    out.write(0xFF);
+                    out.flush();
+
+                    // Wait for End-of-File.
+                    InputStream in = mSockets[i].getInputStream();
+                    while (true) {
+                        try {
+                            if (in.read() == -1) {
+                                break;
+                            }
+                        } catch (Exception e) {
+                            // ignore
+                        }
+                        checkpoint(true);
+                    }
+                }
+
+                // Wait for the daemons to create the new state.
+                while (!state.exists()) {
+                    // Check if a running daemon is dead.
+                    for (int i = 0; i < mDaemons.length; ++i) {
+                        String daemon = mDaemons[i];
+                        if (mArguments[i] != null && !SystemService.isRunning(daemon)) {
+                            throw new IllegalStateException(daemon + " is dead");
+                        }
+                    }
+                    checkpoint(true);
+                }
+
+                // Now we are connected. Read and parse the new state.
+                String[] parameters = FileUtils.readTextFile(state, 0, null).split("\n", -1);
+                if (parameters.length != 7) {
+                    throw new IllegalStateException("Cannot parse the state");
+                }
+
+                // Set the interface and the addresses in the config.
+                mConfig.interfaze = parameters[0].trim();
+
+                mConfig.addLegacyAddresses(parameters[1]);
+                // Set the routes if they are not set in the config.
+                if (mConfig.routes == null || mConfig.routes.isEmpty()) {
+                    mConfig.addLegacyRoutes(parameters[2]);
+                }
+
+                // Set the DNS servers if they are not set in the config.
+                if (mConfig.dnsServers == null || mConfig.dnsServers.size() == 0) {
+                    String dnsServers = parameters[3].trim();
+                    if (!dnsServers.isEmpty()) {
+                        mConfig.dnsServers = Arrays.asList(dnsServers.split(" "));
+                    }
+                }
+
+                // Set the search domains if they are not set in the config.
+                if (mConfig.searchDomains == null || mConfig.searchDomains.size() == 0) {
+                    String searchDomains = parameters[4].trim();
+                    if (!searchDomains.isEmpty()) {
+                        mConfig.searchDomains = Arrays.asList(searchDomains.split(" "));
+                    }
+                }
+
+                // Add a throw route for the VPN server endpoint, if one was specified.
+                String endpoint = parameters[5];
+                if (!endpoint.isEmpty()) {
+                    try {
+                        InetAddress addr = InetAddress.parseNumericAddress(endpoint);
+                        if (addr instanceof Inet4Address) {
+                            mConfig.routes.add(new RouteInfo(new IpPrefix(addr, 32), RTN_THROW));
+                        } else if (addr instanceof Inet6Address) {
+                            mConfig.routes.add(new RouteInfo(new IpPrefix(addr, 128), RTN_THROW));
+                        } else {
+                            Log.e(TAG, "Unknown IP address family for VPN endpoint: " + endpoint);
+                        }
+                    } catch (IllegalArgumentException e) {
+                        Log.e(TAG, "Exception constructing throw route to " + endpoint + ": " + e);
+                    }
+                }
+
+                // Here is the last step and it must be done synchronously.
+                synchronized (Vpn.this) {
+                    // Set the start time
+                    mConfig.startTime = SystemClock.elapsedRealtime();
+
+                    // Check if the thread is interrupted while we are waiting.
+                    checkpoint(false);
+
+                    // Check if the interface is gone while we are waiting.
+                    if (jniCheck(mConfig.interfaze) == 0) {
+                        throw new IllegalStateException(mConfig.interfaze + " is gone");
+                    }
+
+                    // Now INetworkManagementEventObserver is watching our back.
+                    mInterface = mConfig.interfaze;
+                    prepareStatusIntent();
+
+                    agentConnect();
+
+                    Log.i(TAG, "Connected!");
+                }
+            } catch (Exception e) {
+                Log.i(TAG, "Aborting", e);
+                updateState(DetailedState.FAILED, e.getMessage());
+                exit();
+            } finally {
+                // Kill the daemons if they fail to stop.
+                if (!initFinished) {
+                    for (String daemon : mDaemons) {
+                        SystemService.stop(daemon);
+                    }
+                }
+
+                // Do not leave an unstable state.
+                if (!initFinished || mNetworkInfo.getDetailedState() == DetailedState.CONNECTING) {
+                    agentDisconnect();
+                }
+            }
+!!!73663159.java!!!	monitorDaemons() : void
+            if (!mNetworkInfo.isConnected()) {
+                return;
+            }
+
+            try {
+                while (true) {
+                    Thread.sleep(2000);
+                    for (int i = 0; i < mDaemons.length; i++) {
+                        if (mArguments[i] != null && SystemService.isStopped(mDaemons[i])) {
+                            return;
+                        }
+                    }
+                }
+            } catch (InterruptedException e) {
+                Log.d(TAG, "interrupted during monitorDaemons(); stopping services");
+            } finally {
+                for (String daemon : mDaemons) {
+                    SystemService.stop(daemon);
+                }
+
+                agentDisconnect();
+            }

@@ -1,0 +1,644 @@
+class WallpaperManager
+!!!78257975.java!!!	initGlobals(inout looper : Looper) : void
+        synchronized (sSync) {
+            if (sGlobals == null) {
+                sGlobals = new Globals(looper);
+            }
+        }
+!!!78258103.java!!!	WallpaperManager(inout context : Context, inout handler : Handler)
+        mContext = context;
+        initGlobals(context.getMainLooper());
+!!!78258231.java!!!	getInstance(inout context : Context) : WallpaperManager
+        return (WallpaperManager)context.getSystemService(
+                Context.WALLPAPER_SERVICE);
+!!!78258359.java!!!	getIWallpaperManager() : IWallpaperManager
+        return sGlobals.mService;
+!!!78258487.java!!!	getDrawable() : Drawable
+        Bitmap bm = sGlobals.peekWallpaperBitmap(mContext, true, FLAG_SYSTEM);
+        if (bm != null) {
+            Drawable dr = new BitmapDrawable(mContext.getResources(), bm);
+            dr.setDither(false);
+            return dr;
+        }
+        return null;
+!!!78258615.java!!!	getBuiltInDrawable() : Drawable
+        return getBuiltInDrawable(0, 0, false, 0, 0, FLAG_SYSTEM);
+!!!78258743.java!!!	getBuiltInDrawable(in which : int) : Drawable
+        return getBuiltInDrawable(0, 0, false, 0, 0, which);
+!!!78258871.java!!!	getBuiltInDrawable(in outWidth : int, in outHeight : int, inout scaleToFit : boolean, in horizontalAlignment : float, in verticalAlignment : float) : Drawable
+        return getBuiltInDrawable(outWidth, outHeight, scaleToFit,
+                horizontalAlignment, verticalAlignment, FLAG_SYSTEM);
+!!!78258999.java!!!	getBuiltInDrawable(in outWidth : int, in outHeight : int, inout scaleToFit : boolean, in horizontalAlignment : float, in verticalAlignment : float, in which : int) : Drawable
+        if (sGlobals.mService == null) {
+            Log.w(TAG, "WallpaperService not running");
+            throw new RuntimeException(new DeadSystemException());
+        }
+
+        if (which != FLAG_SYSTEM && which != FLAG_LOCK) {
+            throw new IllegalArgumentException("Must request exactly one kind of wallpaper");
+        }
+
+        Resources resources = mContext.getResources();
+        horizontalAlignment = Math.max(0, Math.min(1, horizontalAlignment));
+        verticalAlignment = Math.max(0, Math.min(1, verticalAlignment));
+
+        InputStream wpStream = openDefaultWallpaper(mContext, which);
+        if (wpStream == null) {
+            if (DEBUG) {
+                Log.w(TAG, "default wallpaper stream " + which + " is null");
+            }
+            return null;
+        } else {
+            InputStream is = new BufferedInputStream(wpStream);
+            if (outWidth <= 0 || outHeight <= 0) {
+                Bitmap fullSize = BitmapFactory.decodeStream(is, null, null);
+                return new BitmapDrawable(resources, fullSize);
+            } else {
+                int inWidth;
+                int inHeight;
+                // Just measure this time through...
+                {
+                    BitmapFactory.Options options = new BitmapFactory.Options();
+                    options.inJustDecodeBounds = true;
+                    BitmapFactory.decodeStream(is, null, options);
+                    if (options.outWidth != 0 && options.outHeight != 0) {
+                        inWidth = options.outWidth;
+                        inHeight = options.outHeight;
+                    } else {
+                        Log.e(TAG, "default wallpaper dimensions are 0");
+                        return null;
+                    }
+                }
+
+                // Reopen the stream to do the full decode.  We know at this point
+                // that openDefaultWallpaper() will return non-null.
+                is = new BufferedInputStream(openDefaultWallpaper(mContext, which));
+
+                RectF cropRectF;
+
+                outWidth = Math.min(inWidth, outWidth);
+                outHeight = Math.min(inHeight, outHeight);
+                if (scaleToFit) {
+                    cropRectF = getMaxCropRect(inWidth, inHeight, outWidth, outHeight,
+                        horizontalAlignment, verticalAlignment);
+                } else {
+                    float left = (inWidth - outWidth) * horizontalAlignment;
+                    float right = left + outWidth;
+                    float top = (inHeight - outHeight) * verticalAlignment;
+                    float bottom = top + outHeight;
+                    cropRectF = new RectF(left, top, right, bottom);
+                }
+                Rect roundedTrueCrop = new Rect();
+                cropRectF.roundOut(roundedTrueCrop);
+
+                if (roundedTrueCrop.width() <= 0 || roundedTrueCrop.height() <= 0) {
+                    Log.w(TAG, "crop has bad values for full size image");
+                    return null;
+                }
+
+                // See how much we're reducing the size of the image
+                int scaleDownSampleSize = Math.min(roundedTrueCrop.width() / outWidth,
+                        roundedTrueCrop.height() / outHeight);
+
+                // Attempt to open a region decoder
+                BitmapRegionDecoder decoder = null;
+                try {
+                    decoder = BitmapRegionDecoder.newInstance(is, true);
+                } catch (IOException e) {
+                    Log.w(TAG, "cannot open region decoder for default wallpaper");
+                }
+
+                Bitmap crop = null;
+                if (decoder != null) {
+                    // Do region decoding to get crop bitmap
+                    BitmapFactory.Options options = new BitmapFactory.Options();
+                    if (scaleDownSampleSize > 1) {
+                        options.inSampleSize = scaleDownSampleSize;
+                    }
+                    crop = decoder.decodeRegion(roundedTrueCrop, options);
+                    decoder.recycle();
+                }
+
+                if (crop == null) {
+                    // BitmapRegionDecoder has failed, try to crop in-memory. We know at
+                    // this point that openDefaultWallpaper() will return non-null.
+                    is = new BufferedInputStream(openDefaultWallpaper(mContext, which));
+                    Bitmap fullSize = null;
+                    BitmapFactory.Options options = new BitmapFactory.Options();
+                    if (scaleDownSampleSize > 1) {
+                        options.inSampleSize = scaleDownSampleSize;
+                    }
+                    fullSize = BitmapFactory.decodeStream(is, null, options);
+                    if (fullSize != null) {
+                        crop = Bitmap.createBitmap(fullSize, roundedTrueCrop.left,
+                                roundedTrueCrop.top, roundedTrueCrop.width(),
+                                roundedTrueCrop.height());
+                    }
+                }
+
+                if (crop == null) {
+                    Log.w(TAG, "cannot decode default wallpaper");
+                    return null;
+                }
+
+                // Scale down if necessary
+                if (outWidth > 0 && outHeight > 0 &&
+                        (crop.getWidth() != outWidth || crop.getHeight() != outHeight)) {
+                    Matrix m = new Matrix();
+                    RectF cropRect = new RectF(0, 0, crop.getWidth(), crop.getHeight());
+                    RectF returnRect = new RectF(0, 0, outWidth, outHeight);
+                    m.setRectToRect(cropRect, returnRect, Matrix.ScaleToFit.FILL);
+                    Bitmap tmp = Bitmap.createBitmap((int) returnRect.width(),
+                            (int) returnRect.height(), Bitmap.Config.ARGB_8888);
+                    if (tmp != null) {
+                        Canvas c = new Canvas(tmp);
+                        Paint p = new Paint();
+                        p.setFilterBitmap(true);
+                        c.drawBitmap(crop, m, p);
+                        crop = tmp;
+                    }
+                }
+
+                return new BitmapDrawable(resources, crop);
+            }
+        }
+!!!78259127.java!!!	getMaxCropRect(in inWidth : int, in inHeight : int, in outWidth : int, in outHeight : int, in horizontalAlignment : float, in verticalAlignment : float) : RectF
+        RectF cropRect = new RectF();
+        // Get a crop rect that will fit this
+        if (inWidth / (float) inHeight > outWidth / (float) outHeight) {
+             cropRect.top = 0;
+             cropRect.bottom = inHeight;
+             float cropWidth = outWidth * (inHeight / (float) outHeight);
+             cropRect.left = (inWidth - cropWidth) * horizontalAlignment;
+             cropRect.right = cropRect.left + cropWidth;
+        } else {
+            cropRect.left = 0;
+            cropRect.right = inWidth;
+            float cropHeight = outHeight * (inWidth / (float) outWidth);
+            cropRect.top = (inHeight - cropHeight) * verticalAlignment;
+            cropRect.bottom = cropRect.top + cropHeight;
+        }
+        return cropRect;
+!!!78259255.java!!!	peekDrawable() : Drawable
+        Bitmap bm = sGlobals.peekWallpaperBitmap(mContext, false, FLAG_SYSTEM);
+        if (bm != null) {
+            Drawable dr = new BitmapDrawable(mContext.getResources(), bm);
+            dr.setDither(false);
+            return dr;
+        }
+        return null;
+!!!78259383.java!!!	getFastDrawable() : Drawable
+        Bitmap bm = sGlobals.peekWallpaperBitmap(mContext, true, FLAG_SYSTEM);
+        if (bm != null) {
+            return new FastBitmapDrawable(bm);
+        }
+        return null;
+!!!78259511.java!!!	peekFastDrawable() : Drawable
+       Bitmap bm = sGlobals.peekWallpaperBitmap(mContext, false, FLAG_SYSTEM);
+        if (bm != null) {
+            return new FastBitmapDrawable(bm);
+        }
+        return null;
+!!!78259639.java!!!	getBitmap() : Bitmap
+        return getBitmapAsUser(mContext.getUserId());
+!!!78259767.java!!!	getBitmapAsUser(in userId : int) : Bitmap
+        return sGlobals.peekWallpaperBitmap(mContext, true, FLAG_SYSTEM, userId);
+!!!78259895.java!!!	getWallpaperFile(in which : int) : ParcelFileDescriptor
+        return getWallpaperFile(which, mContext.getUserId());
+!!!78260023.java!!!	getWallpaperFile(in which : int, in userId : int) : ParcelFileDescriptor
+        if (which != FLAG_SYSTEM && which != FLAG_LOCK) {
+            throw new IllegalArgumentException("Must request exactly one kind of wallpaper");
+        }
+
+        if (sGlobals.mService == null) {
+            Log.w(TAG, "WallpaperService not running");
+            throw new RuntimeException(new DeadSystemException());
+        } else {
+            try {
+                Bundle outParams = new Bundle();
+                return sGlobals.mService.getWallpaper(null, which, outParams, userId);
+            } catch (RemoteException e) {
+                throw e.rethrowFromSystemServer();
+            }
+        }
+!!!78260151.java!!!	forgetLoadedWallpaper() : void
+        sGlobals.forgetLoadedWallpaper();
+!!!78260279.java!!!	getWallpaperInfo() : WallpaperInfo
+        try {
+            if (sGlobals.mService == null) {
+                Log.w(TAG, "WallpaperService not running");
+                throw new RuntimeException(new DeadSystemException());
+            } else {
+                return sGlobals.mService.getWallpaperInfo();
+            }
+        } catch (RemoteException e) {
+            throw e.rethrowFromSystemServer();
+        }
+!!!78260407.java!!!	getWallpaperId(in which : int) : int
+        return getWallpaperIdForUser(which, mContext.getUserId());
+!!!78260535.java!!!	getWallpaperIdForUser(in which : int, in userId : int) : int
+        try {
+            if (sGlobals.mService == null) {
+                Log.w(TAG, "WallpaperService not running");
+                throw new RuntimeException(new DeadSystemException());
+            } else {
+                return sGlobals.mService.getWallpaperIdForUser(which, userId);
+            }
+        } catch (RemoteException e) {
+            throw e.rethrowFromSystemServer();
+        }
+!!!78260663.java!!!	getCropAndSetWallpaperIntent(inout imageUri : Uri) : Intent
+        if (imageUri == null) {
+            throw new IllegalArgumentException("Image URI must not be null");
+        }
+
+        if (!ContentResolver.SCHEME_CONTENT.equals(imageUri.getScheme())) {
+            throw new IllegalArgumentException("Image URI must be of the "
+                    + ContentResolver.SCHEME_CONTENT + " scheme type");
+        }
+
+        final PackageManager packageManager = mContext.getPackageManager();
+        Intent cropAndSetWallpaperIntent =
+                new Intent(ACTION_CROP_AND_SET_WALLPAPER, imageUri);
+        cropAndSetWallpaperIntent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+
+        // Find out if the default HOME activity supports CROP_AND_SET_WALLPAPER
+        Intent homeIntent = new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME);
+        ResolveInfo resolvedHome = packageManager.resolveActivity(homeIntent,
+                PackageManager.MATCH_DEFAULT_ONLY);
+        if (resolvedHome != null) {
+            cropAndSetWallpaperIntent.setPackage(resolvedHome.activityInfo.packageName);
+
+            List<ResolveInfo> cropAppList = packageManager.queryIntentActivities(
+                    cropAndSetWallpaperIntent, 0);
+            if (cropAppList.size() > 0) {
+                return cropAndSetWallpaperIntent;
+            }
+        }
+
+        // fallback crop activity
+        final String cropperPackage = mContext.getString(
+                com.android.internal.R.string.config_wallpaperCropperPackage);
+        cropAndSetWallpaperIntent.setPackage(cropperPackage);
+        List<ResolveInfo> cropAppList = packageManager.queryIntentActivities(
+                cropAndSetWallpaperIntent, 0);
+        if (cropAppList.size() > 0) {
+            return cropAndSetWallpaperIntent;
+        }
+        // If the URI is not of the right type, or for some reason the system wallpaper
+        // cropper doesn't exist, return null
+        throw new IllegalArgumentException("Cannot use passed URI to set wallpaper; " +
+            "check that the type returned by ContentProvider matches image/*");
+!!!78260791.java!!!	setResource(in resid : int) : void
+        setResource(resid, FLAG_SYSTEM);
+!!!78260919.java!!!	setResource(in resid : int, in which : int) : int
+        if (sGlobals.mService == null) {
+            Log.w(TAG, "WallpaperService not running");
+            throw new RuntimeException(new DeadSystemException());
+        }
+        final Bundle result = new Bundle();
+        final WallpaperSetCompletion completion = new WallpaperSetCompletion();
+        try {
+            Resources resources = mContext.getResources();
+            /* Set the wallpaper to the default values */
+            ParcelFileDescriptor fd = sGlobals.mService.setWallpaper(
+                    "res:" + resources.getResourceName(resid),
+                    mContext.getOpPackageName(), null, false, result, which, completion);
+            if (fd != null) {
+                FileOutputStream fos = null;
+                boolean ok = false;
+                try {
+                    fos = new ParcelFileDescriptor.AutoCloseOutputStream(fd);
+                    copyStreamToWallpaperFile(resources.openRawResource(resid), fos);
+                    // The 'close()' is the trigger for any server-side image manipulation,
+                    // so we must do that before waiting for completion.
+                    fos.close();
+                    completion.waitForCompletion();
+                } finally {
+                    // Might be redundant but completion shouldn't wait unless the write
+                    // succeeded; this is a fallback if it threw past the close+wait.
+                    IoUtils.closeQuietly(fos);
+                }
+            }
+        } catch (RemoteException e) {
+            throw e.rethrowFromSystemServer();
+        }
+        return result.getInt(EXTRA_NEW_WALLPAPER_ID, 0);
+!!!78261047.java!!!	setBitmap(inout bitmap : Bitmap) : void
+        setBitmap(bitmap, null, true);
+!!!78261175.java!!!	setBitmap(inout fullImage : Bitmap, inout visibleCropHint : Rect, inout allowBackup : boolean) : int
+        return setBitmap(fullImage, visibleCropHint, allowBackup, FLAG_SYSTEM);
+!!!78261303.java!!!	setBitmap(inout fullImage : Bitmap, inout visibleCropHint : Rect, inout allowBackup : boolean, in which : int) : int
+        validateRect(visibleCropHint);
+        if (sGlobals.mService == null) {
+            Log.w(TAG, "WallpaperService not running");
+            throw new RuntimeException(new DeadSystemException());
+        }
+        final Bundle result = new Bundle();
+        final WallpaperSetCompletion completion = new WallpaperSetCompletion();
+        try {
+            ParcelFileDescriptor fd = sGlobals.mService.setWallpaper(null,
+                    mContext.getOpPackageName(), visibleCropHint, allowBackup,
+                    result, which, completion);
+            if (fd != null) {
+                FileOutputStream fos = null;
+                try {
+                    fos = new ParcelFileDescriptor.AutoCloseOutputStream(fd);
+                    fullImage.compress(Bitmap.CompressFormat.PNG, 90, fos);
+                    fos.close();
+                    completion.waitForCompletion();
+                } finally {
+                    IoUtils.closeQuietly(fos);
+                }
+            }
+        } catch (RemoteException e) {
+            throw e.rethrowFromSystemServer();
+        }
+        return result.getInt(EXTRA_NEW_WALLPAPER_ID, 0);
+!!!78261431.java!!!	validateRect(inout rect : Rect) : void
+        if (rect != null && rect.isEmpty()) {
+            throw new IllegalArgumentException("visibleCrop rectangle must be valid and non-empty");
+        }
+!!!78261559.java!!!	setStream(inout bitmapData : InputStream) : void
+        setStream(bitmapData, null, true);
+!!!78261687.java!!!	copyStreamToWallpaperFile(inout data : InputStream, inout fos : FileOutputStream) : void
+        byte[] buffer = new byte[32768];
+        int amt;
+        while ((amt=data.read(buffer)) > 0) {
+            fos.write(buffer, 0, amt);
+        }
+!!!78261815.java!!!	setStream(inout bitmapData : InputStream, inout visibleCropHint : Rect, inout allowBackup : boolean) : int
+        return setStream(bitmapData, visibleCropHint, allowBackup, FLAG_SYSTEM);
+!!!78261943.java!!!	setStream(inout bitmapData : InputStream, inout visibleCropHint : Rect, inout allowBackup : boolean, in which : int) : int
+        validateRect(visibleCropHint);
+        if (sGlobals.mService == null) {
+            Log.w(TAG, "WallpaperService not running");
+            throw new RuntimeException(new DeadSystemException());
+        }
+        final Bundle result = new Bundle();
+        final WallpaperSetCompletion completion = new WallpaperSetCompletion();
+        try {
+            ParcelFileDescriptor fd = sGlobals.mService.setWallpaper(null,
+                    mContext.getOpPackageName(), visibleCropHint, allowBackup,
+                    result, which, completion);
+            if (fd != null) {
+                FileOutputStream fos = null;
+                try {
+                    fos = new ParcelFileDescriptor.AutoCloseOutputStream(fd);
+                    copyStreamToWallpaperFile(bitmapData, fos);
+                    fos.close();
+                    completion.waitForCompletion();
+                } finally {
+                    IoUtils.closeQuietly(fos);
+                }
+            }
+        } catch (RemoteException e) {
+            throw e.rethrowFromSystemServer();
+        }
+
+        return result.getInt(EXTRA_NEW_WALLPAPER_ID, 0);
+!!!78262071.java!!!	hasResourceWallpaper(in resid : int) : boolean
+        if (sGlobals.mService == null) {
+            Log.w(TAG, "WallpaperService not running");
+            throw new RuntimeException(new DeadSystemException());
+        }
+        try {
+            Resources resources = mContext.getResources();
+            String name = "res:" + resources.getResourceName(resid);
+            return sGlobals.mService.hasNamedWallpaper(name);
+        } catch (RemoteException e) {
+            throw e.rethrowFromSystemServer();
+        }
+!!!78262199.java!!!	getDesiredMinimumWidth() : int
+        if (sGlobals.mService == null) {
+            Log.w(TAG, "WallpaperService not running");
+            throw new RuntimeException(new DeadSystemException());
+        }
+        try {
+            return sGlobals.mService.getWidthHint();
+        } catch (RemoteException e) {
+            throw e.rethrowFromSystemServer();
+        }
+!!!78262327.java!!!	getDesiredMinimumHeight() : int
+        if (sGlobals.mService == null) {
+            Log.w(TAG, "WallpaperService not running");
+            throw new RuntimeException(new DeadSystemException());
+        }
+        try {
+            return sGlobals.mService.getHeightHint();
+        } catch (RemoteException e) {
+            throw e.rethrowFromSystemServer();
+        }
+!!!78262455.java!!!	suggestDesiredDimensions(in minimumWidth : int, in minimumHeight : int) : void
+        try {
+            /**
+             * The framework makes no attempt to limit the window size
+             * to the maximum texture size. Any window larger than this
+             * cannot be composited.
+             *
+             * Read maximum texture size from system property and scale down
+             * minimumWidth and minimumHeight accordingly.
+             */
+            int maximumTextureSize;
+            try {
+                maximumTextureSize = SystemProperties.getInt("sys.max_texture_size", 0);
+            } catch (Exception e) {
+                maximumTextureSize = 0;
+            }
+
+            if (maximumTextureSize > 0) {
+                if ((minimumWidth > maximumTextureSize) ||
+                    (minimumHeight > maximumTextureSize)) {
+                    float aspect = (float)minimumHeight / (float)minimumWidth;
+                    if (minimumWidth > minimumHeight) {
+                        minimumWidth = maximumTextureSize;
+                        minimumHeight = (int)((minimumWidth * aspect) + 0.5);
+                    } else {
+                        minimumHeight = maximumTextureSize;
+                        minimumWidth = (int)((minimumHeight / aspect) + 0.5);
+                    }
+                }
+            }
+
+            if (sGlobals.mService == null) {
+                Log.w(TAG, "WallpaperService not running");
+                throw new RuntimeException(new DeadSystemException());
+            } else {
+                sGlobals.mService.setDimensionHints(minimumWidth, minimumHeight,
+                        mContext.getOpPackageName());
+            }
+        } catch (RemoteException e) {
+            throw e.rethrowFromSystemServer();
+        }
+!!!78262583.java!!!	setDisplayPadding(inout padding : Rect) : void
+        try {
+            if (sGlobals.mService == null) {
+                Log.w(TAG, "WallpaperService not running");
+                throw new RuntimeException(new DeadSystemException());
+            } else {
+                sGlobals.mService.setDisplayPadding(padding, mContext.getOpPackageName());
+            }
+        } catch (RemoteException e) {
+            throw e.rethrowFromSystemServer();
+        }
+!!!78262711.java!!!	setDisplayOffset(inout windowToken : IBinder, in x : int, in y : int) : void
+        try {
+            //Log.v(TAG, "Sending new wallpaper display offsets from app...");
+            WindowManagerGlobal.getWindowSession().setWallpaperDisplayOffset(
+                    windowToken, x, y);
+            //Log.v(TAG, "...app returning after sending display offset!");
+        } catch (RemoteException e) {
+            throw e.rethrowFromSystemServer();
+        }
+!!!78262839.java!!!	clearWallpaper() : void
+        clearWallpaper(FLAG_SYSTEM, mContext.getUserId());
+!!!78262967.java!!!	clearWallpaper(in which : int, in userId : int) : void
+        if (sGlobals.mService == null) {
+            Log.w(TAG, "WallpaperService not running");
+            throw new RuntimeException(new DeadSystemException());
+        }
+        try {
+            sGlobals.mService.clearWallpaper(mContext.getOpPackageName(), which, userId);
+        } catch (RemoteException e) {
+            throw e.rethrowFromSystemServer();
+        }
+!!!78263095.java!!!	setWallpaperComponent(inout name : ComponentName) : boolean
+        if (sGlobals.mService == null) {
+            Log.w(TAG, "WallpaperService not running");
+            throw new RuntimeException(new DeadSystemException());
+        }
+        try {
+            sGlobals.mService.setWallpaperComponentChecked(name, mContext.getOpPackageName());
+            return true;
+        } catch (RemoteException e) {
+            throw e.rethrowFromSystemServer();
+        }
+!!!78263223.java!!!	setWallpaperOffsets(inout windowToken : IBinder, in xOffset : float, in yOffset : float) : void
+        try {
+            //Log.v(TAG, "Sending new wallpaper offsets from app...");
+            WindowManagerGlobal.getWindowSession().setWallpaperPosition(
+                    windowToken, xOffset, yOffset, mWallpaperXStep, mWallpaperYStep);
+            //Log.v(TAG, "...app returning after sending offsets!");
+        } catch (RemoteException e) {
+            throw e.rethrowFromSystemServer();
+        }
+!!!78263351.java!!!	setWallpaperOffsetSteps(in xStep : float, in yStep : float) : void
+        mWallpaperXStep = xStep;
+        mWallpaperYStep = yStep;
+!!!78263479.java!!!	sendWallpaperCommand(inout windowToken : IBinder, inout action : String, in x : int, in y : int, in z : int, inout extras : Bundle) : void
+        try {
+            //Log.v(TAG, "Sending new wallpaper offsets from app...");
+            WindowManagerGlobal.getWindowSession().sendWallpaperCommand(
+                    windowToken, action, x, y, z, extras, false);
+            //Log.v(TAG, "...app returning after sending offsets!");
+        } catch (RemoteException e) {
+            throw e.rethrowFromSystemServer();
+        }
+!!!78263607.java!!!	isWallpaperSupported() : boolean
+        if (sGlobals.mService == null) {
+            Log.w(TAG, "WallpaperService not running");
+            throw new RuntimeException(new DeadSystemException());
+        } else {
+            try {
+                return sGlobals.mService.isWallpaperSupported(mContext.getOpPackageName());
+            } catch (RemoteException e) {
+                throw e.rethrowFromSystemServer();
+            }
+        }
+!!!78263735.java!!!	isSetWallpaperAllowed() : boolean
+        if (sGlobals.mService == null) {
+            Log.w(TAG, "WallpaperService not running");
+            throw new RuntimeException(new DeadSystemException());
+        } else {
+            try {
+                return sGlobals.mService.isSetWallpaperAllowed(mContext.getOpPackageName());
+            } catch (RemoteException e) {
+                throw e.rethrowFromSystemServer();
+            }
+        }
+!!!78263863.java!!!	clearWallpaperOffsets(inout windowToken : IBinder) : void
+        try {
+            WindowManagerGlobal.getWindowSession().setWallpaperPosition(
+                    windowToken, -1, -1, -1, -1);
+        } catch (RemoteException e) {
+            throw e.rethrowFromSystemServer();
+        }
+!!!78263991.java!!!	clear() : void
+        setStream(openDefaultWallpaper(mContext, FLAG_SYSTEM), null, false);
+!!!78264119.java!!!	clear(in which : int) : void
+        if ((which & FLAG_SYSTEM) != 0) {
+            clear();
+        }
+        if ((which & FLAG_LOCK) != 0) {
+            clearWallpaper(FLAG_LOCK, mContext.getUserId());
+        }
+!!!78264247.java!!!	openDefaultWallpaper(inout context : Context, in which : int) : InputStream
+        final String whichProp;
+        final int defaultResId;
+        if (which == FLAG_LOCK) {
+            /* Factory-default lock wallpapers are not yet supported
+            whichProp = PROP_LOCK_WALLPAPER;
+            defaultResId = com.android.internal.R.drawable.default_lock_wallpaper;
+            */
+            return null;
+        } else {
+            whichProp = PROP_WALLPAPER;
+            defaultResId = com.android.internal.R.drawable.default_wallpaper;
+        }
+        final String path = SystemProperties.get(whichProp);
+        if (!TextUtils.isEmpty(path)) {
+            final File file = new File(path);
+            if (file.exists()) {
+                try {
+                    return new FileInputStream(file);
+                } catch (IOException e) {
+                    // Ignored, fall back to platform default below
+                }
+            }
+        }
+        try {
+            return context.getResources().openRawResource(defaultResId);
+        } catch (NotFoundException e) {
+            // no default defined for this device; this is not a failure
+        }
+        return null;
+!!!78264375.java!!!	getDefaultWallpaperComponent(inout context : Context) : ComponentName
+        String flat = SystemProperties.get(PROP_WALLPAPER_COMPONENT);
+        if (!TextUtils.isEmpty(flat)) {
+            final ComponentName cn = ComponentName.unflattenFromString(flat);
+            if (cn != null) {
+                return cn;
+            }
+        }
+
+        flat = context.getString(com.android.internal.R.string.default_wallpaper_component);
+        if (!TextUtils.isEmpty(flat)) {
+            final ComponentName cn = ComponentName.unflattenFromString(flat);
+            if (cn != null) {
+                return cn;
+            }
+        }
+
+        return null;
+!!!78264503.java!!!	setLockWallpaperCallback(inout callback : IWallpaperManagerCallback) : boolean
+        if (sGlobals.mService == null) {
+            Log.w(TAG, "WallpaperService not running");
+            throw new RuntimeException(new DeadSystemException());
+        }
+
+        try {
+            return sGlobals.mService.setLockWallpaperCallback(callback);
+        } catch (RemoteException e) {
+            throw e.rethrowFromSystemServer();
+        }
+!!!78264631.java!!!	isWallpaperBackupEligible() : boolean
+        if (sGlobals.mService == null) {
+            Log.w(TAG, "WallpaperService not running");
+            throw new RuntimeException(new DeadSystemException());
+        }
+        try {
+            return sGlobals.mService.isWallpaperBackupEligible(mContext.getUserId());
+        } catch (RemoteException e) {
+            Log.e(TAG, "Exception querying wallpaper backup eligibility: " + e.getMessage());
+        }
+        return false;

@@ -1,0 +1,201 @@
+class EventSelectionSet
+!!!43034807.cpp!!!	AddEventType(in event_type_modifier : EventTypeAndModifier) : bool
+  EventSelection selection;
+  selection.event_type_modifier = event_type_modifier;
+  selection.event_attr = CreateDefaultPerfEventAttr(event_type_modifier.event_type);
+  selection.event_attr.exclude_user = event_type_modifier.exclude_user;
+  selection.event_attr.exclude_kernel = event_type_modifier.exclude_kernel;
+  selection.event_attr.exclude_hv = event_type_modifier.exclude_hv;
+  selection.event_attr.exclude_host = event_type_modifier.exclude_host;
+  selection.event_attr.exclude_guest = event_type_modifier.exclude_guest;
+  selection.event_attr.precise_ip = event_type_modifier.precise_ip;
+  if (!IsEventAttrSupportedByKernel(selection.event_attr)) {
+    LOG(ERROR) << "Event type '" << event_type_modifier.name << "' is not supported by the kernel";
+    return false;
+  }
+  selections_.push_back(std::move(selection));
+  UnionSampleType();
+  return true;
+!!!43034935.cpp!!!	SetEnableOnExec(in enable : bool) : void
+  for (auto& selection : selections_) {
+    // If sampling is enabled on exec, then it is disabled at startup, otherwise
+    // it should be enabled at startup. Don't use ioctl(PERF_EVENT_IOC_ENABLE)
+    // to enable it after perf_event_open(). Because some android kernels can't
+    // handle ioctl() well when cpu-hotplug happens. See http://b/25193162.
+    if (enable) {
+      selection.event_attr.enable_on_exec = 1;
+      selection.event_attr.disabled = 1;
+    } else {
+      selection.event_attr.enable_on_exec = 0;
+      selection.event_attr.disabled = 0;
+    }
+  }
+!!!43035063.cpp!!!	GetEnableOnExec() : bool
+  for (auto& selection : selections_) {
+    if (selection.event_attr.enable_on_exec == 0) {
+      return false;
+    }
+  }
+  return true;
+!!!43035191.cpp!!!	SampleIdAll() : void
+  for (auto& selection : selections_) {
+    selection.event_attr.sample_id_all = 1;
+  }
+!!!43035319.cpp!!!	SetSampleFreq(in sample_freq : uint64_t) : void
+  for (auto& selection : selections_) {
+    perf_event_attr& attr = selection.event_attr;
+    attr.freq = 1;
+    attr.sample_freq = sample_freq;
+  }
+!!!43035447.cpp!!!	SetSamplePeriod(in sample_period : uint64_t) : void
+  for (auto& selection : selections_) {
+    perf_event_attr& attr = selection.event_attr;
+    attr.freq = 0;
+    attr.sample_period = sample_period;
+  }
+!!!43035575.cpp!!!	SetBranchSampling(in branch_sample_type : uint64_t) : bool
+  if (branch_sample_type != 0 &&
+      (branch_sample_type & (PERF_SAMPLE_BRANCH_ANY | PERF_SAMPLE_BRANCH_ANY_CALL |
+                             PERF_SAMPLE_BRANCH_ANY_RETURN | PERF_SAMPLE_BRANCH_IND_CALL)) == 0) {
+    LOG(ERROR) << "Invalid branch_sample_type: 0x" << std::hex << branch_sample_type;
+    return false;
+  }
+  if (branch_sample_type != 0 && !IsBranchSamplingSupported()) {
+    LOG(ERROR) << "branch stack sampling is not supported on this device.";
+    return false;
+  }
+  for (auto& selection : selections_) {
+    perf_event_attr& attr = selection.event_attr;
+    if (branch_sample_type != 0) {
+      attr.sample_type |= PERF_SAMPLE_BRANCH_STACK;
+    } else {
+      attr.sample_type &= ~PERF_SAMPLE_BRANCH_STACK;
+    }
+    attr.branch_sample_type = branch_sample_type;
+  }
+  return true;
+!!!43035703.cpp!!!	EnableFpCallChainSampling() : void
+  for (auto& selection : selections_) {
+    selection.event_attr.sample_type |= PERF_SAMPLE_CALLCHAIN;
+  }
+!!!43035831.cpp!!!	EnableDwarfCallChainSampling(in dump_stack_size : uint32_t) : bool
+  if (!IsDwarfCallChainSamplingSupported()) {
+    LOG(ERROR) << "dwarf callchain sampling is not supported on this device.";
+    return false;
+  }
+  for (auto& selection : selections_) {
+    selection.event_attr.sample_type |=
+        PERF_SAMPLE_CALLCHAIN | PERF_SAMPLE_REGS_USER | PERF_SAMPLE_STACK_USER;
+    selection.event_attr.exclude_callchain_user = 1;
+    selection.event_attr.sample_regs_user = GetSupportedRegMask(GetBuildArch());
+    selection.event_attr.sample_stack_user = dump_stack_size;
+  }
+  return true;
+!!!43035959.cpp!!!	SetInherit(in enable : bool) : void
+  for (auto& selection : selections_) {
+    selection.event_attr.inherit = (enable ? 1 : 0);
+  }
+!!!43036087.cpp!!!	OpenEventFilesForCpus(in cpus : std::vector<int>) : bool
+  return OpenEventFilesForThreadsOnCpus({-1}, cpus);
+!!!43036215.cpp!!!	OpenEventFilesForThreadsOnCpus(in threads : std::vector<pid_t>, in cpus : std::vector<int>) : bool
+  if (!cpus.empty()) {
+    if (!CheckIfCpusOnline(cpus)) {
+      return false;
+    }
+  } else {
+    cpus = GetOnlineCpus();
+  }
+  return OpenEventFiles(threads, cpus);
+!!!43036343.cpp!!!	ReadCounters(inout counters : std::vector<CountersInfo>) : bool
+  counters->clear();
+  for (auto& selection : selections_) {
+    CountersInfo counters_info;
+    counters_info.event_type = &selection.event_type_modifier;
+    for (auto& event_fd : selection.event_fds) {
+      CountersInfo::CounterInfo counter_info;
+      if (!event_fd->ReadCounter(&counter_info.counter)) {
+        return false;
+      }
+      counter_info.tid = event_fd->ThreadId();
+      counter_info.cpu = event_fd->Cpu();
+      counters_info.counters.push_back(counter_info);
+    }
+    counters->push_back(counters_info);
+  }
+  return true;
+!!!43036471.cpp!!!	PreparePollForEventFiles(inout pollfds : std::vector<pollfd>) : void
+  for (auto& selection : selections_) {
+    for (auto& event_fd : selection.event_fds) {
+      pollfd poll_fd;
+      event_fd->PreparePollForMmapData(&poll_fd);
+      pollfds->push_back(poll_fd);
+    }
+  }
+!!!43036599.cpp!!!	MmapEventFiles(in mmap_pages : size_t) : bool
+  for (auto& selection : selections_) {
+    for (auto& event_fd : selection.event_fds) {
+      if (!event_fd->MmapContent(mmap_pages)) {
+        return false;
+      }
+    }
+  }
+  return true;
+!!!43036727.cpp!!!	ReadMmapEventData(in callback : std::function<bool(const char*, size_t)>) : bool
+  for (auto& selection : selections_) {
+    for (auto& event_fd : selection.event_fds) {
+      while (true) {
+        bool have_data;
+        if (!ReadMmapEventDataForFd(event_fd, callback, &have_data)) {
+          return false;
+        }
+        if (!have_data) {
+          break;
+        }
+      }
+    }
+  }
+  return true;
+!!!43036855.cpp!!!	FindEventAttrByType(in event_type_modifier : EventTypeAndModifier) : perf_event_attr
+  EventSelection* selection = FindSelectionByType(event_type_modifier);
+  return (selection != nullptr) ? &selection->event_attr : nullptr;
+!!!43036983.cpp!!!	FindEventFdsByType(in event_type_modifier : EventTypeAndModifier) : std::vector<std::unique_ptr<EventFd>>
+  EventSelection* selection = FindSelectionByType(event_type_modifier);
+  return (selection != nullptr) ? &selection->event_fds : nullptr;
+!!!43037111.cpp!!!	UnionSampleType() : void
+  uint64_t sample_type = 0;
+  for (auto& selection : selections_) {
+    sample_type |= selection.event_attr.sample_type;
+  }
+  for (auto& selection : selections_) {
+    selection.event_attr.sample_type = sample_type;
+  }
+!!!43037239.cpp!!!	OpenEventFiles(in threads : std::vector<pid_t>, in cpus : std::vector<int>) : bool
+  for (auto& selection : selections_) {
+    for (auto& tid : threads) {
+      size_t open_per_thread = 0;
+      for (auto& cpu : cpus) {
+        auto event_fd = EventFd::OpenEventFile(selection.event_attr, tid, cpu);
+        if (event_fd != nullptr) {
+          LOG(VERBOSE) << "OpenEventFile for tid " << tid << ", cpu " << cpu;
+          selection.event_fds.push_back(std::move(event_fd));
+          ++open_per_thread;
+        }
+      }
+      // As the online cpus can be enabled or disabled at runtime, we may not open event file for
+      // all cpus successfully. But we should open at least one cpu successfully.
+      if (open_per_thread == 0) {
+        PLOG(ERROR) << "failed to open perf event file for event_type "
+                    << selection.event_type_modifier.name << " for "
+                    << (tid == -1 ? "all threads" : android::base::StringPrintf(" thread %d", tid));
+        return false;
+      }
+    }
+  }
+  return true;
+!!!43037367.cpp!!!	FindSelectionByType(in event_type_modifier : EventTypeAndModifier) : EventSelectionSet::EventSelection
+  for (auto& selection : selections_) {
+    if (selection.event_type_modifier.name == event_type_modifier.name) {
+      return &selection;
+    }
+  }
+  return nullptr;

@@ -1,0 +1,228 @@
+class ImageReader
+!!!47952311.java!!!	newInstance(in width : int, in height : int, in format : int, in maxImages : int) : ImageReader
+        return new ImageReader(width, height, format, maxImages);
+!!!47952439.java!!!	ImageReader(in width : int, in height : int, in format : int, in maxImages : int)
+        mWidth = width;
+        mHeight = height;
+        mFormat = format;
+        mMaxImages = maxImages;
+
+        if (width < 1 || height < 1) {
+            throw new IllegalArgumentException(
+                "The image dimensions must be positive");
+        }
+        if (mMaxImages < 1) {
+            throw new IllegalArgumentException(
+                "Maximum outstanding image count must be at least 1");
+        }
+
+        if (format == ImageFormat.NV21) {
+            throw new IllegalArgumentException(
+                    "NV21 format is not supported");
+        }
+
+        mNumPlanes = ImageUtils.getNumPlanesForFormat(mFormat);
+
+        nativeInit(new WeakReference<ImageReader>(this), width, height, format, maxImages);
+
+        mSurface = nativeGetSurface();
+
+        mIsReaderValid = true;
+        // Estimate the native buffer allocation size and register it so it gets accounted for
+        // during GC. Note that this doesn't include the buffers required by the buffer queue
+        // itself and the buffers requested by the producer.
+        // Only include memory for 1 buffer, since actually accounting for the memory used is
+        // complex, and 1 buffer is enough for the VM to treat the ImageReader as being of some
+        // size.
+        mEstimatedNativeAllocBytes = ImageUtils.getEstimatedNativeAllocBytes(
+                width, height, format, /*buffer count*/ 1);
+        VMRuntime.getRuntime().registerNativeAllocation(mEstimatedNativeAllocBytes);
+!!!47952567.java!!!	getWidth() : int
+        return mWidth;
+!!!47952695.java!!!	getHeight() : int
+        return mHeight;
+!!!47952823.java!!!	getImageFormat() : int
+        return mFormat;
+!!!47952951.java!!!	getMaxImages() : int
+        return mMaxImages;
+!!!47953079.java!!!	getSurface() : Surface
+        return mSurface;
+!!!47953207.java!!!	acquireLatestImage() : Image
+        Image image = acquireNextImage();
+        if (image == null) {
+            return null;
+        }
+        try {
+            for (;;) {
+                Image next = acquireNextImageNoThrowISE();
+                if (next == null) {
+                    Image result = image;
+                    image = null;
+                    return result;
+                }
+                image.close();
+                image = next;
+            }
+        } finally {
+            if (image != null) {
+                image.close();
+            }
+        }
+!!!47953335.java!!!	acquireNextImageNoThrowISE() : Image
+        SurfaceImage si = new SurfaceImage(mFormat);
+        return acquireNextSurfaceImage(si) == ACQUIRE_SUCCESS ? si : null;
+!!!47953463.java!!!	acquireNextSurfaceImage(inout si : ImageReader::SurfaceImage) : int
+        synchronized (mCloseLock) {
+            // A null image will eventually be returned if ImageReader is already closed.
+            int status = ACQUIRE_NO_BUFS;
+            if (mIsReaderValid) {
+                status = nativeImageSetup(si);
+            }
+
+            switch (status) {
+                case ACQUIRE_SUCCESS:
+                    si.mIsImageValid = true;
+                case ACQUIRE_NO_BUFS:
+                case ACQUIRE_MAX_IMAGES:
+                    break;
+                default:
+                    throw new AssertionError("Unknown nativeImageSetup return code " + status);
+            }
+
+            // Only keep track the successfully acquired image, as the native buffer is only mapped
+            // for such case.
+            if (status == ACQUIRE_SUCCESS) {
+                mAcquiredImages.add(si);
+            }
+            return status;
+        }
+!!!47953591.java!!!	acquireNextImage() : Image
+        // Initialize with reader format, but can be overwritten by native if the image
+        // format is different from the reader format.
+        SurfaceImage si = new SurfaceImage(mFormat);
+        int status = acquireNextSurfaceImage(si);
+
+        switch (status) {
+            case ACQUIRE_SUCCESS:
+                return si;
+            case ACQUIRE_NO_BUFS:
+                return null;
+            case ACQUIRE_MAX_IMAGES:
+                throw new IllegalStateException(
+                        String.format(
+                                "maxImages (%d) has already been acquired, " +
+                                "call #close before acquiring more.", mMaxImages));
+            default:
+                throw new AssertionError("Unknown nativeImageSetup return code " + status);
+        }
+!!!47953719.java!!!	releaseImage(inout i : Image) : void
+        if (! (i instanceof SurfaceImage) ) {
+            throw new IllegalArgumentException(
+                "This image was not produced by an ImageReader");
+        }
+        SurfaceImage si = (SurfaceImage) i;
+        if (si.mIsImageValid == false) {
+            return;
+        }
+
+        if (si.getReader() != this || !mAcquiredImages.contains(i)) {
+            throw new IllegalArgumentException(
+                "This image was not produced by this ImageReader");
+        }
+
+        si.clearSurfacePlanes();
+        nativeReleaseImage(i);
+        si.mIsImageValid = false;
+        mAcquiredImages.remove(i);
+!!!47953847.java!!!	setOnImageAvailableListener(inout listener : ImageReader::OnImageAvailableListener, inout handler : Handler) : void
+        synchronized (mListenerLock) {
+            if (listener != null) {
+                Looper looper = handler != null ? handler.getLooper() : Looper.myLooper();
+                if (looper == null) {
+                    throw new IllegalArgumentException(
+                            "handler is null but the current thread is not a looper");
+                }
+                if (mListenerHandler == null || mListenerHandler.getLooper() != looper) {
+                    mListenerHandler = new ListenerHandler(looper);
+                }
+                mListener = listener;
+            } else {
+                mListener = null;
+                mListenerHandler = null;
+            }
+        }
+!!!47954103.java!!!	close() : void
+        setOnImageAvailableListener(null, null);
+        if (mSurface != null) mSurface.release();
+
+        /**
+         * Close all outstanding acquired images before closing the ImageReader. It is a good
+         * practice to close all the images as soon as it is not used to reduce system instantaneous
+         * memory pressure. CopyOnWrite list will use a copy of current list content. For the images
+         * being closed by other thread (e.g., GC thread), doubling the close call is harmless. For
+         * the image being acquired by other threads, mCloseLock is used to synchronize close and
+         * acquire operations.
+         */
+        synchronized (mCloseLock) {
+            mIsReaderValid = false;
+            for (Image image : mAcquiredImages) {
+                image.close();
+            }
+            mAcquiredImages.clear();
+
+            nativeClose();
+        }
+
+        if (mEstimatedNativeAllocBytes > 0) {
+            VMRuntime.getRuntime().registerNativeFree(mEstimatedNativeAllocBytes);
+            mEstimatedNativeAllocBytes = 0;
+        }
+!!!47954231.java!!!	discardFreeBuffers() : void
+        synchronized (mCloseLock) {
+            nativeDiscardFreeBuffers();
+        }
+!!!47954359.java!!!	finalize() : void
+        try {
+            close();
+        } finally {
+            super.finalize();
+        }
+!!!47954487.java!!!	detachImage(inout image : Image) : void
+       if (image == null) {
+           throw new IllegalArgumentException("input image must not be null");
+       }
+       if (!isImageOwnedbyMe(image)) {
+           throw new IllegalArgumentException("Trying to detach an image that is not owned by"
+                   + " this ImageReader");
+       }
+
+        SurfaceImage si = (SurfaceImage) image;
+        si.throwISEIfImageIsInvalid();
+
+        if (si.isAttachable()) {
+            throw new IllegalStateException("Image was already detached from this ImageReader");
+        }
+
+        nativeDetachImage(image);
+        si.setDetached(true);
+!!!47954615.java!!!	isImageOwnedbyMe(inout image : Image) : boolean
+        if (!(image instanceof SurfaceImage)) {
+            return false;
+        }
+        SurfaceImage si = (SurfaceImage) image;
+        return si.getReader() == this;
+!!!47954743.java!!!	postEventFromNative(inout selfRef : Object) : void
+        @SuppressWarnings("unchecked")
+        WeakReference<ImageReader> weakSelf = (WeakReference<ImageReader>)selfRef;
+        final ImageReader ir = weakSelf.get();
+        if (ir == null) {
+            return;
+        }
+
+        final Handler handler;
+        synchronized (ir.mListenerLock) {
+            handler = ir.mListenerHandler;
+        }
+        if (handler != null) {
+            handler.sendEmptyMessage(0);
+        }

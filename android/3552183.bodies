@@ -1,0 +1,201 @@
+class NanoHub
+!!!44069943.cpp!!!	run(inout data : void) : void
+    NanoHub *self = static_cast<NanoHub*>(data);
+    return self->doRun();
+!!!44070071.cpp!!!	doRun() : void
+    enum {
+        IDX_NANOHUB,
+        IDX_CLOSE_PIPE,
+        IDX_INOTIFY
+    };
+    pollfd myFds[3] = {
+        [IDX_NANOHUB] = { .fd = mFd, .events = POLLIN, },
+        [IDX_CLOSE_PIPE] = { .fd = mThreadClosingPipe[0], .events = POLLIN, },
+    };
+    pollfd &inotifyFd = myFds[IDX_INOTIFY];
+    bool hasInotify = false;
+    int numPollFds = 2;
+
+    if (init_inotify(&inotifyFd)) {
+        numPollFds++;
+        hasInotify = true;
+    }
+
+    setDebugFlags(property_get_int32("persist.nanohub.debug", 0));
+
+    while (1) {
+        int ret = poll(myFds, numPollFds, -1);
+        if (ret <= 0) {
+            ALOGD("poll is being weird");
+            continue;
+        }
+
+        if (hasInotify) {
+            wait_on_dev_lock(inotifyFd);
+        }
+
+        if (myFds[IDX_NANOHUB].revents & POLLIN) { // we have data
+
+            nano_message msg;
+
+            ret = rread(mFd, &msg, sizeof(msg));
+            if (ret <= 0) {
+                ALOGE("read failed with %d", ret);
+                break;
+            }
+            if (ret < (int)sizeof(msg.hdr)) {
+                ALOGE("Only read %d bytes", ret);
+                break;
+            }
+
+            uint32_t len = msg.hdr.len;
+
+            if (len > sizeof(msg.data)) {
+                ALOGE("malformed packet with len %" PRIu32, len);
+                break;
+            }
+
+            if (ret != (int)(sizeof(msg.hdr) + len)) {
+                ALOGE("Expected %zu bytes, read %d bytes", sizeof(msg.hdr) + len, ret);
+                break;
+            }
+
+            ret = SystemComm::handleRx(&msg);
+            if (ret < 0) {
+                ALOGE("SystemComm::handleRx() returned %d", ret);
+            } else if (ret) {
+                if (messageTracingEnabled()) {
+                    dumpBuffer("DEV -> APP", msg.hdr.app_name, msg.hdr.event_id, &msg.data[0], msg.hdr.len);
+                }
+                doSendToApp(&msg.hdr.app_name, msg.hdr.event_id, &msg.data[0], msg.hdr.len);
+            }
+        }
+
+        if (myFds[IDX_CLOSE_PIPE].revents & POLLIN) { // we have been asked to die
+            ALOGD("thread exiting");
+            break;
+        }
+    }
+
+    close(mFd);
+    return NULL;
+!!!44070199.cpp!!!	openHub() : int
+    int ret = 0;
+
+    mFd = open(get_devnode_path(), O_RDWR);
+    if (mFd < 0) {
+        ALOGE("cannot find hub devnode '%s'", get_devnode_path());
+        ret = -errno;
+        goto fail_open;
+    }
+
+    if (pipe(mThreadClosingPipe)) {
+        ALOGE("failed to create signal pipe");
+        ret = -errno;
+        goto fail_pipe;
+    }
+
+    if (pthread_create(&mWorkerThread, NULL, &NanoHub::run, this)) {
+        ALOGE("failed to spawn worker thread");
+        ret = -errno;
+        goto fail_thread;
+    }
+
+    return 0;
+
+fail_thread:
+    close(mThreadClosingPipe[0]);
+    close(mThreadClosingPipe[1]);
+
+fail_pipe:
+    close(mFd);
+
+fail_open:
+    return ret;
+!!!44070583.cpp!!!	doSubscribeMessages(in hub_id : uint32_t, inout cbk : context_hub_callback, inout cookie : void) : int
+    if (hub_id) {
+        return -ENODEV;
+    }
+
+    Mutex::Autolock _l(mLock);
+    int ret = 0;
+
+    if (!mMsgCbkFunc && !cbk) { //we're off and staying off - do nothing
+
+        ALOGD("staying off");
+    } else if (cbk && mMsgCbkFunc) { //new callback but staying on
+
+        ALOGD("staying on");
+    } else if (mMsgCbkFunc) {     //we were on but turning off
+
+        ALOGD("turning off");
+
+        ret = closeHub();
+    } else if (cbk) {             //we're turning on
+
+        ALOGD("turning on");
+        ret = openHub();
+    }
+
+    mMsgCbkFunc = cbk;
+    mMsgCbkData = cookie;
+
+    return ret;
+!!!44070711.cpp!!!	doSendToNanohub(in hub_id : uint32_t, in msg : hub_message_t) : int
+    if (hub_id) {
+        return -ENODEV;
+    }
+
+    int ret = 0;
+    Mutex::Autolock _l(mLock);
+
+    if (!mMsgCbkFunc) {
+        ALOGW("refusing to send a message when nobody around to get a reply!");
+        ret = -EIO;
+    } else {
+        if (!msg || !msg->message) {
+            ALOGW("not sending invalid message 1");
+            ret = -EINVAL;
+        } else if (get_hub_info()->os_app_name == msg->app_name) {
+            //messages to the "system" app are special - hal handles them
+            if (messageTracingEnabled()) {
+                dumpBuffer("APP -> HAL", msg->app_name, msg->message_type, msg->message, msg->message_len);
+            }
+            ret = SystemComm::handleTx(msg);
+        } else if (msg->message_type || msg->message_len > MAX_RX_PACKET) {
+            ALOGW("not sending invalid message 2");
+            ret = -EINVAL;
+        } else {
+            if (messageTracingEnabled()) {
+                dumpBuffer("APP -> DEV", msg->app_name, 0, msg->message, msg->message_len);
+            }
+            ret = doSendToDevice(&msg->app_name, msg->message, msg->message_len);
+        }
+    }
+
+    return ret;
+!!!44070839.cpp!!!	doSendToDevice(in name : hub_app_name_t, in data : void, in len : uint32_t) : int
+    if (len > MAX_RX_PACKET) {
+        return -EINVAL;
+    }
+
+    nano_message msg = {
+        .hdr = {
+            .event_id = APP_FROM_HOST_EVENT_ID,
+            .app_name = *name,
+            .len = static_cast<uint8_t>(len),
+        },
+    };
+
+    memcpy(&msg.data[0], data, len);
+
+    return rwrite(mFd, &msg, len + sizeof(msg.hdr));
+!!!44070967.cpp!!!	doSendToApp(in name : hub_app_name_t, in typ : uint32_t, in data : void, in len : uint32_t) : void
+    hub_message_t msg = {
+        .app_name = *name,
+        .message_type = typ,
+        .message_len = len,
+        .message = data,
+    };
+
+    mMsgCbkFunc(0, &msg, mMsgCbkData);

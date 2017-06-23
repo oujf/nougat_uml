@@ -1,0 +1,195 @@
+class EventConditionProvider
+!!!85085239.java!!!	EventConditionProvider()
+        if (DEBUG) Slog.d(TAG, "new " + SIMPLE_NAME + "()");
+        mThread = new HandlerThread(TAG, Process.THREAD_PRIORITY_BACKGROUND);
+        mThread.start();
+        mWorker = new Handler(mThread.getLooper());
+!!!85085367.java!!!	getComponent() : ComponentName
+        return COMPONENT;
+!!!85085495.java!!!	isValidConditionId(inout id : Uri) : boolean
+        return ZenModeConfig.isValidEventConditionId(id);
+!!!85085623.java!!!	dump(inout pw : PrintWriter, inout filter : NotificationManagerService::DumpFilter) : void
+        pw.print("    "); pw.print(SIMPLE_NAME); pw.println(":");
+        pw.print("      mConnected="); pw.println(mConnected);
+        pw.print("      mRegistered="); pw.println(mRegistered);
+        pw.print("      mBootComplete="); pw.println(mBootComplete);
+        dumpUpcomingTime(pw, "mNextAlarmTime", mNextAlarmTime, System.currentTimeMillis());
+        synchronized (mSubscriptions) {
+            pw.println("      mSubscriptions=");
+            for (Uri conditionId : mSubscriptions) {
+                pw.print("        ");
+                pw.println(conditionId);
+            }
+        }
+        pw.println("      mTrackers=");
+        for (int i = 0; i < mTrackers.size(); i++) {
+            pw.print("        user="); pw.println(mTrackers.keyAt(i));
+            mTrackers.valueAt(i).dump("          ", pw);
+        }
+!!!85085751.java!!!	onBootComplete() : void
+        if (DEBUG) Slog.d(TAG, "onBootComplete");
+        if (mBootComplete) return;
+        mBootComplete = true;
+        final IntentFilter filter = new IntentFilter();
+        filter.addAction(Intent.ACTION_MANAGED_PROFILE_ADDED);
+        filter.addAction(Intent.ACTION_MANAGED_PROFILE_REMOVED);
+        mContext.registerReceiver(new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                reloadTrackers();
+            }
+        }, filter);
+        reloadTrackers();
+!!!85085879.java!!!	onConnected() : void
+        if (DEBUG) Slog.d(TAG, "onConnected");
+        mConnected = true;
+!!!85086007.java!!!	onDestroy() : void
+        super.onDestroy();
+        if (DEBUG) Slog.d(TAG, "onDestroy");
+        mConnected = false;
+!!!85086135.java!!!	onSubscribe(inout conditionId : Uri) : void
+        if (DEBUG) Slog.d(TAG, "onSubscribe " + conditionId);
+        if (!ZenModeConfig.isValidEventConditionId(conditionId)) {
+            notifyCondition(createCondition(conditionId, Condition.STATE_FALSE));
+            return;
+        }
+        synchronized (mSubscriptions) {
+            if (mSubscriptions.add(conditionId)) {
+                evaluateSubscriptions();
+            }
+        }
+!!!85086263.java!!!	onUnsubscribe(inout conditionId : Uri) : void
+        if (DEBUG) Slog.d(TAG, "onUnsubscribe " + conditionId);
+        synchronized (mSubscriptions) {
+            if (mSubscriptions.remove(conditionId)) {
+                evaluateSubscriptions();
+            }
+        }
+!!!85086391.java!!!	attachBase(inout base : Context) : void
+        attachBaseContext(base);
+!!!85086519.java!!!	asInterface() : IConditionProvider
+        return (IConditionProvider) onBind(null);
+!!!85086647.java!!!	reloadTrackers() : void
+        if (DEBUG) Slog.d(TAG, "reloadTrackers");
+        for (int i = 0; i < mTrackers.size(); i++) {
+            mTrackers.valueAt(i).setCallback(null);
+        }
+        mTrackers.clear();
+        for (UserHandle user : UserManager.get(mContext).getUserProfiles()) {
+            final Context context = user.isSystem() ? mContext : getContextForUser(mContext, user);
+            if (context == null) {
+                Slog.w(TAG, "Unable to create context for user " + user.getIdentifier());
+                continue;
+            }
+            mTrackers.put(user.getIdentifier(), new CalendarTracker(mContext, context));
+        }
+        evaluateSubscriptions();
+!!!85086775.java!!!	evaluateSubscriptions() : void
+        if (!mWorker.hasCallbacks(mEvaluateSubscriptionsW)) {
+            mWorker.post(mEvaluateSubscriptionsW);
+        }
+!!!85086903.java!!!	evaluateSubscriptionsW() : void
+        if (DEBUG) Slog.d(TAG, "evaluateSubscriptions");
+        if (!mBootComplete) {
+            if (DEBUG) Slog.d(TAG, "Skipping evaluate before boot complete");
+            return;
+        }
+        final long now = System.currentTimeMillis();
+        List<Condition> conditionsToNotify = new ArrayList<>();
+        synchronized (mSubscriptions) {
+            for (int i = 0; i < mTrackers.size(); i++) {
+                mTrackers.valueAt(i).setCallback(
+                        mSubscriptions.isEmpty() ? null : mTrackerCallback);
+            }
+            setRegistered(!mSubscriptions.isEmpty());
+            long reevaluateAt = 0;
+            for (Uri conditionId : mSubscriptions) {
+                final EventInfo event = ZenModeConfig.tryParseEventConditionId(conditionId);
+                if (event == null) {
+                    conditionsToNotify.add(createCondition(conditionId, Condition.STATE_FALSE));
+                    continue;
+                }
+                CheckEventResult result = null;
+                if (event.calendar == null) { // any calendar
+                    // event could exist on any tracker
+                    for (int i = 0; i < mTrackers.size(); i++) {
+                        final CalendarTracker tracker = mTrackers.valueAt(i);
+                        final CheckEventResult r = tracker.checkEvent(event, now);
+                        if (result == null) {
+                            result = r;
+                        } else {
+                            result.inEvent |= r.inEvent;
+                            result.recheckAt = Math.min(result.recheckAt, r.recheckAt);
+                        }
+                    }
+                } else {
+                    // event should exist on one tracker
+                    final int userId = EventInfo.resolveUserId(event.userId);
+                    final CalendarTracker tracker = mTrackers.get(userId);
+                    if (tracker == null) {
+                        Slog.w(TAG, "No calendar tracker found for user " + userId);
+                        conditionsToNotify.add(createCondition(conditionId, Condition.STATE_FALSE));
+                        continue;
+                    }
+                    result = tracker.checkEvent(event, now);
+                }
+                if (result.recheckAt != 0
+                        && (reevaluateAt == 0 || result.recheckAt < reevaluateAt)) {
+                    reevaluateAt = result.recheckAt;
+                }
+                if (!result.inEvent) {
+                    conditionsToNotify.add(createCondition(conditionId, Condition.STATE_FALSE));
+                    continue;
+                }
+                conditionsToNotify.add(createCondition(conditionId, Condition.STATE_TRUE));
+            }
+            rescheduleAlarm(now, reevaluateAt);
+        }
+        for (Condition condition : conditionsToNotify) {
+            if (condition != null) {
+                notifyCondition(condition);
+            }
+        }
+        if (DEBUG) Slog.d(TAG, "evaluateSubscriptions took " + (System.currentTimeMillis() - now));
+!!!85087031.java!!!	rescheduleAlarm(in now : long, in time : long) : void
+        mNextAlarmTime = time;
+        final AlarmManager alarms = (AlarmManager) mContext.getSystemService(Context.ALARM_SERVICE);
+        final PendingIntent pendingIntent = PendingIntent.getBroadcast(mContext,
+                REQUEST_CODE_EVALUATE,
+                new Intent(ACTION_EVALUATE)
+                        .addFlags(Intent.FLAG_RECEIVER_FOREGROUND)
+                        .putExtra(EXTRA_TIME, time),
+                PendingIntent.FLAG_UPDATE_CURRENT);
+        alarms.cancel(pendingIntent);
+        if (time == 0 || time < now) {
+            if (DEBUG) Slog.d(TAG, "Not scheduling evaluate: " + (time == 0 ? "no time specified"
+                    : "specified time in the past"));
+            return;
+        }
+        if (DEBUG) Slog.d(TAG, String.format("Scheduling evaluate for %s, in %s, now=%s",
+                ts(time), formatDuration(time - now), ts(now)));
+        alarms.setExact(AlarmManager.RTC_WAKEUP, time, pendingIntent);
+!!!85087159.java!!!	createCondition(inout id : Uri, in state : int) : Condition
+        final String summary = NOT_SHOWN;
+        final String line1 = NOT_SHOWN;
+        final String line2 = NOT_SHOWN;
+        return new Condition(id, summary, line1, line2, 0, state, Condition.FLAG_RELEVANT_ALWAYS);
+!!!85087287.java!!!	setRegistered(inout registered : boolean) : void
+        if (mRegistered == registered) return;
+        if (DEBUG) Slog.d(TAG, "setRegistered " + registered);
+        mRegistered = registered;
+        if (mRegistered) {
+            final IntentFilter filter = new IntentFilter();
+            filter.addAction(Intent.ACTION_TIME_CHANGED);
+            filter.addAction(Intent.ACTION_TIMEZONE_CHANGED);
+            filter.addAction(ACTION_EVALUATE);
+            registerReceiver(mReceiver, filter);
+        } else {
+            unregisterReceiver(mReceiver);
+        }
+!!!85087415.java!!!	getContextForUser(inout context : Context, inout user : UserHandle) : Context
+        try {
+            return context.createPackageContextAsUser(context.getPackageName(), 0, user);
+        } catch (NameNotFoundException e) {
+            return null;
+        }

@@ -1,0 +1,136 @@
+class LazyTaskWriterThread
+!!!73537847.java!!!	LazyTaskWriterThread(inout name : String)
+            super(name);
+!!!73537975.java!!!	run() : void
+            Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND);
+            ArraySet<Integer> persistentTaskIds = new ArraySet<Integer>();
+            while (true) {
+                // We can't lock mService while holding TaskPersister.this, but we don't want to
+                // call removeObsoleteFiles every time through the loop, only the last time before
+                // going to sleep. The risk is that we call removeObsoleteFiles() successively.
+                final boolean probablyDone;
+                synchronized (TaskPersister.this) {
+                    probablyDone = mWriteQueue.isEmpty();
+                }
+                if (probablyDone) {
+                    if (DEBUG) Slog.d(TAG, "Looking for obsolete files.");
+                    persistentTaskIds.clear();
+                    synchronized (mService) {
+                        if (DEBUG) Slog.d(TAG, "mRecents=" + mRecentTasks);
+                        for (int taskNdx = mRecentTasks.size() - 1; taskNdx >= 0; --taskNdx) {
+                            final TaskRecord task = mRecentTasks.get(taskNdx);
+                            if (DEBUG) Slog.d(TAG, "LazyTaskWriter: task=" + task +
+                                    " persistable=" + task.isPersistable);
+                            if ((task.isPersistable || task.inRecents)
+                                    && (task.stack == null || !task.stack.isHomeStack())) {
+                                if (DEBUG) Slog.d(TAG, "adding to persistentTaskIds task=" + task);
+                                persistentTaskIds.add(task.taskId);
+                            } else {
+                                if (DEBUG) Slog.d(TAG,
+                                        "omitting from persistentTaskIds task=" + task);
+                            }
+                        }
+                    }
+                    removeObsoleteFiles(persistentTaskIds);
+                }
+                writeTaskIdsFiles();
+
+                // If mNextWriteTime, then don't delay between each call to saveToXml().
+                final WriteQueueItem item;
+                synchronized (TaskPersister.this) {
+                    if (mNextWriteTime != FLUSH_QUEUE) {
+                        // The next write we don't have to wait so long.
+                        mNextWriteTime = SystemClock.uptimeMillis() + INTER_WRITE_DELAY_MS;
+                        if (DEBUG) Slog.d(TAG, "Next write time may be in " +
+                                INTER_WRITE_DELAY_MS + " msec. (" + mNextWriteTime + ")");
+                    }
+
+                    while (mWriteQueue.isEmpty()) {
+                        if (mNextWriteTime != 0) {
+                            mNextWriteTime = 0; // idle.
+                            TaskPersister.this.notifyAll(); // wake up flush() if needed.
+                        }
+                        try {
+                            if (DEBUG) Slog.d(TAG, "LazyTaskWriter: waiting indefinitely.");
+                            TaskPersister.this.wait();
+                        } catch (InterruptedException e) {
+                        }
+                        // Invariant: mNextWriteTime is either FLUSH_QUEUE or PRE_WRITE_DELAY_MS
+                        // from now.
+                    }
+                    item = mWriteQueue.remove(0);
+
+                    long now = SystemClock.uptimeMillis();
+                    if (DEBUG) Slog.d(TAG, "LazyTaskWriter: now=" + now + " mNextWriteTime=" +
+                            mNextWriteTime + " mWriteQueue.size=" + mWriteQueue.size());
+                    while (now < mNextWriteTime) {
+                        try {
+                            if (DEBUG) Slog.d(TAG, "LazyTaskWriter: waiting " +
+                                    (mNextWriteTime - now));
+                            TaskPersister.this.wait(mNextWriteTime - now);
+                        } catch (InterruptedException e) {
+                        }
+                        now = SystemClock.uptimeMillis();
+                    }
+
+                    // Got something to do.
+                }
+
+                if (item instanceof ImageWriteQueueItem) {
+                    ImageWriteQueueItem imageWriteQueueItem = (ImageWriteQueueItem) item;
+                    final String filePath = imageWriteQueueItem.mFilePath;
+                    if (!createParentDirectory(filePath)) {
+                        Slog.e(TAG, "Error while creating images directory for file: " + filePath);
+                        continue;
+                    }
+                    final Bitmap bitmap = imageWriteQueueItem.mImage;
+                    if (DEBUG) Slog.d(TAG, "writing bitmap: filename=" + filePath);
+                    FileOutputStream imageFile = null;
+                    try {
+                        imageFile = new FileOutputStream(new File(filePath));
+                        bitmap.compress(Bitmap.CompressFormat.PNG, 100, imageFile);
+                    } catch (Exception e) {
+                        Slog.e(TAG, "saveImage: unable to save " + filePath, e);
+                    } finally {
+                        IoUtils.closeQuietly(imageFile);
+                    }
+                } else if (item instanceof TaskWriteQueueItem) {
+                    // Write out one task.
+                    StringWriter stringWriter = null;
+                    TaskRecord task = ((TaskWriteQueueItem) item).mTask;
+                    if (DEBUG) Slog.d(TAG, "Writing task=" + task);
+                    synchronized (mService) {
+                        if (task.inRecents) {
+                            // Still there.
+                            try {
+                                if (DEBUG) Slog.d(TAG, "Saving task=" + task);
+                                stringWriter = saveToXml(task);
+                            } catch (IOException e) {
+                            } catch (XmlPullParserException e) {
+                            }
+                        }
+                    }
+                    if (stringWriter != null) {
+                        // Write out xml file while not holding mService lock.
+                        FileOutputStream file = null;
+                        AtomicFile atomicFile = null;
+                        try {
+                            atomicFile = new AtomicFile(new File(
+                                    getUserTasksDir(task.userId),
+                                    String.valueOf(task.taskId) + RECENTS_FILENAME
+                                    + TASK_EXTENSION));
+                            file = atomicFile.startWrite();
+                            file.write(stringWriter.toString().getBytes());
+                            file.write('\n');
+                            atomicFile.finishWrite(file);
+
+                        } catch (IOException e) {
+                            if (file != null) {
+                                atomicFile.failWrite(file);
+                            }
+                            Slog.e(TAG,
+                                    "Unable to open " + atomicFile + " for persisting. " + e);
+                        }
+                    }
+                }
+            }

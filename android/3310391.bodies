@@ -1,0 +1,251 @@
+class LanguageTypeNamespace
+!!!43383991.cpp!!!	Find(in aidl_type : AidlType) : T
+  using std::string;
+  using std::vector;
+  using android::base::Join;
+  using android::base::Trim;
+
+  string name = Trim(aidl_type.GetName());
+  if (IsContainerType(name)) {
+    vector<string> container_class;
+    vector<string> contained_type_names;
+    if (!CanonicalizeContainerType(aidl_type, &container_class,
+                                   &contained_type_names)) {
+      return nullptr;
+    }
+    name = Join(container_class, '.') +
+           "<" + Join(contained_type_names, ',') + ">";
+  }
+  // Here, we know that we have the canonical name for this container.
+  return FindTypeByCanonicalName(name);
+!!!43384119.cpp!!!	FindTypeByCanonicalName(in raw_name : std::string) : T
+  using android::base::Trim;
+
+  std::string name = Trim(raw_name);
+  const T* ret = nullptr;
+  for (const auto& type : types_) {
+    // Always prefer a exact match if possible.
+    // This works for primitives and class names qualified with a package.
+    if (type->CanonicalName() == name) {
+      ret = type.get();
+      break;
+    }
+    // We allow authors to drop packages when refering to a class name.
+    if (type->ShortName() == name) {
+      ret = type.get();
+    }
+  }
+
+  return ret;
+!!!43384631.cpp!!!	MaybeAddContainerType(in aidl_type : AidlType) : bool
+  using android::base::Join;
+
+  std::string type_name = aidl_type.GetName();
+  if (!IsContainerType(type_name)) {
+    return true;
+  }
+
+  std::vector<std::string> container_class;
+  std::vector<std::string> contained_type_names;
+  if (!CanonicalizeContainerType(aidl_type, &container_class,
+                                 &contained_type_names)) {
+    return false;
+  }
+
+  const std::string canonical_name = Join(container_class, ".") +
+      "<" + Join(contained_type_names, ",") + ">";
+  if (HasTypeByCanonicalName(canonical_name)) {
+    return true;
+  }
+
+
+  // We only support two types right now and this type is one of them.
+  switch (contained_type_names.size()) {
+    case 1:
+      return AddListType(contained_type_names[0]);
+    case 2:
+      return AddMapType(contained_type_names[0], contained_type_names[1]);
+    default:
+      break;  // Should never get here, will FATAL below.
+  }
+
+  LOG(FATAL) << "aidl internal error";
+  return false;
+!!!43385015.cpp!!!	Add(in type : T) : bool
+  const T* existing = FindTypeByCanonicalName(type->CanonicalName());
+  if (!existing) {
+    types_.emplace_back(type);
+    return true;
+  }
+
+  if (existing->Kind() == ValidatableType::KIND_BUILT_IN) {
+    LOG(ERROR) << type->DeclFile() << ":" << type->DeclLine()
+               << " attempt to redefine built in class "
+               << type->CanonicalName();
+    return false;
+  }
+
+  if (type->Kind() != existing->Kind()) {
+    LOG(ERROR) << type->DeclFile() << ":" << type->DeclLine()
+               << " attempt to redefine " << type->CanonicalName()
+               << " as " << type->HumanReadableKind();
+    LOG(ERROR) << existing->DeclFile() << ":" << existing->DeclLine()
+               << " previously defined here as "
+               << existing->HumanReadableKind();
+    return false;
+  }
+
+  return true;
+!!!43385143.cpp!!!	CanonicalizeContainerType(in aidl_type : AidlType, inout container_class : std::vector<std::string>, inout contained_type_names : std::vector<std::string>) : bool
+  using android::base::Trim;
+  using android::base::Split;
+
+  std::string name = Trim(aidl_type.GetName());
+  const size_t opening_brace = name.find('<');
+  const size_t closing_brace = name.find('>');
+  if (opening_brace == std::string::npos ||
+      closing_brace == std::string::npos) {
+    return false;
+  }
+
+  if (opening_brace != name.rfind('<') ||
+      closing_brace != name.rfind('>') ||
+      closing_brace != name.length() - 1) {
+    // Nested/invalid templates are forbidden.
+    LOG(ERROR) << "Invalid template type '" << name << "'";
+    return false;
+  }
+
+  std::string container = Trim(name.substr(0, opening_brace));
+  std::string remainder = name.substr(opening_brace + 1,
+                                 (closing_brace - opening_brace) - 1);
+  std::vector<std::string> args = Split(remainder, ",");
+  for (auto& type_name: args) {
+    // Here, we are relying on FindTypeByCanonicalName to do its best when
+    // given a non-canonical name for non-compound type (i.e. not another
+    // container).
+    const T* arg_type = FindTypeByCanonicalName(type_name);
+    if (!arg_type) {
+      return false;
+    }
+
+    // Now get the canonical names for these contained types, remapping them if
+    // necessary.
+    type_name = arg_type->CanonicalName();
+    if (aidl_type.IsUtf8() && type_name == "java.lang.String") {
+      type_name = kUtf8StringCanonicalName;
+    } else if (aidl_type.IsUtf8InCpp() && type_name == "java.lang.String") {
+      type_name = kUtf8InCppStringCanonicalName;
+    }
+  }
+
+  // Map the container name to its canonical form for supported containers.
+  if ((container == "List" || container == "java.util.List") &&
+      args.size() == 1) {
+    *container_class = {"java", "util", "List"};
+    *contained_type_names = args;
+    return true;
+  }
+  if ((container == "Map" || container == "java.util.Map") &&
+      args.size() == 2) {
+    *container_class = {"java", "util", "Map"};
+    *contained_type_names = args;
+    return true;
+  }
+
+  LOG(ERROR) << "Unknown find container with name " << container
+             << " and " << args.size() << "contained types.";
+  return false;
+!!!43385271.cpp!!!	IsContainerType(in type_name : std::string) : bool
+  const size_t opening_brace = type_name.find('<');
+  const size_t closing_brace = type_name.find('>');
+  if (opening_brace != std::string::npos ||
+      closing_brace != std::string::npos) {
+    return true;  // Neither < nor > appear in normal AIDL types.
+  }
+  return false;
+!!!43385399.cpp!!!	GetValidatableType(in aidl_type : AidlType, inout error_msg : std::string) : ValidatableType
+  using android::base::StringPrintf;
+
+  const ValidatableType* type = Find(aidl_type);
+  if (type == nullptr) {
+    *error_msg = "unknown type";
+    return nullptr;
+  }
+
+  if (aidl_type.GetName() == "void") {
+    if (aidl_type.IsArray()) {
+      *error_msg = "void type cannot be an array";
+      return nullptr;
+    }
+    if (aidl_type.IsNullable() || aidl_type.IsUtf8() ||
+        aidl_type.IsUtf8InCpp()) {
+      *error_msg = "void type cannot be annotated";
+      return nullptr;
+    }
+    // We have no more special handling for void.
+    return type;
+  }
+
+  // No type may be annotated with both these annotations.
+  if (aidl_type.IsUtf8() && aidl_type.IsUtf8InCpp()) {
+    *error_msg = StringPrintf("Type cannot be marked as both %s and %s.",
+                              kUtf8Annotation, kUtf8InCppAnnotation);
+    return nullptr;
+  }
+
+  // Strings inside containers get remapped to appropriate utf8 versions when
+  // we convert the container name to its canonical form and the look up the
+  // type.  However, for non-compound types (i.e. those not in a container) we
+  // must patch them up here.
+  if (!IsContainerType(type->CanonicalName()) &&
+      (aidl_type.IsUtf8() || aidl_type.IsUtf8InCpp())) {
+    const char* annotation_literal =
+        (aidl_type.IsUtf8()) ? kUtf8Annotation : kUtf8InCppAnnotation;
+    if (aidl_type.GetName() != "String" &&
+        aidl_type.GetName() != "java.lang.String") {
+      *error_msg = StringPrintf("type '%s' may not be annotated as %s.",
+                                aidl_type.GetName().c_str(),
+                                annotation_literal);
+      return nullptr;
+    }
+
+    if (aidl_type.IsUtf8()) {
+      type = FindTypeByCanonicalName(kUtf8StringCanonicalName);
+    } else {  // aidl_type.IsUtf8InCpp()
+      type = FindTypeByCanonicalName(kUtf8InCppStringCanonicalName);
+    }
+
+    if (type == nullptr) {
+      *error_msg = StringPrintf(
+          "%s is unsupported when generating code for this language.",
+          annotation_literal);
+      return nullptr;
+    }
+  }
+
+  if (!type->CanWriteToParcel()) {
+    *error_msg = "type cannot be marshalled";
+    return nullptr;
+  }
+
+  if (aidl_type.IsArray()) {
+    type = type->ArrayType();
+    if (!type) {
+      *error_msg = StringPrintf("type '%s' cannot be an array",
+                                aidl_type.GetName().c_str());
+      return nullptr;
+    }
+  }
+
+  if (aidl_type.IsNullable()) {
+    type = type->NullableType();
+    if (!type) {
+      *error_msg = StringPrintf("type '%s%s' cannot be marked as possibly null",
+                                aidl_type.GetName().c_str(),
+                                (aidl_type.IsArray()) ? "[]" : "");
+      return nullptr;
+    }
+  }
+
+  return type;

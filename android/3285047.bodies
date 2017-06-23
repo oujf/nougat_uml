@@ -1,0 +1,198 @@
+class NetworkController
+!!!43256887.cpp!!!	NetworkController()
+    mNetworks[LOCAL_NET_ID] = new LocalNetwork(LOCAL_NET_ID);
+    mNetworks[DUMMY_NET_ID] = new DummyNetwork(DUMMY_NET_ID);
+!!!43257015.cpp!!!	getDefaultNetwork() : uint
+    android::RWLock::AutoRLock lock(mRWLock);
+    return mDefaultNetId;
+!!!43257271.cpp!!!	getNetworkForDns(inout netId : uint, in uid : uid_t) : uint32_t
+    android::RWLock::AutoRLock lock(mRWLock);
+    Fwmark fwmark;
+    fwmark.protectedFromVpn = true;
+    fwmark.permission = PERMISSION_SYSTEM;
+    if (checkUserNetworkAccessLocked(uid, *netId) == 0) {
+        // If a non-zero NetId was explicitly specified, and the user has permission for that
+        // network, use that network's DNS servers. Do not fall through to the default network even
+        // if the explicitly selected network is a split tunnel VPN: the explicitlySelected bit
+        // ensures that the VPN fallthrough rule does not match.
+        fwmark.explicitlySelected = true;
+
+        // If the network is a VPN and it doesn't have DNS servers, use the default network's DNS
+        // servers (through the default network). Otherwise, the query is guaranteed to fail.
+        // http://b/29498052
+        Network *network = getNetworkLocked(*netId);
+        if (network && network->getType() == Network::VIRTUAL &&
+                !static_cast<VirtualNetwork *>(network)->getHasDns()) {
+            *netId = mDefaultNetId;
+        }
+    } else {
+        // If the user is subject to a VPN and the VPN provides DNS servers, use those servers
+        // (possibly falling through to the default network if the VPN doesn't provide a route to
+        // them). Otherwise, use the default network's DNS servers.
+        VirtualNetwork* virtualNetwork = getVirtualNetworkForUserLocked(uid);
+        if (virtualNetwork && virtualNetwork->getHasDns()) {
+            *netId = virtualNetwork->getNetId();
+        } else {
+            // TODO: return an error instead of silently doing the DNS lookup on the wrong network.
+            // http://b/27560555
+            *netId = mDefaultNetId;
+        }
+    }
+    fwmark.netId = *netId;
+    return fwmark.intValue;
+!!!43257399.cpp!!!	getNetworkForUser(in uid : uid_t) : uint
+    android::RWLock::AutoRLock lock(mRWLock);
+    if (VirtualNetwork* virtualNetwork = getVirtualNetworkForUserLocked(uid)) {
+        return virtualNetwork->getNetId();
+    }
+    return mDefaultNetId;
+!!!43257527.cpp!!!	getNetworkForConnect(in uid : uid_t) : uint
+    android::RWLock::AutoRLock lock(mRWLock);
+    VirtualNetwork* virtualNetwork = getVirtualNetworkForUserLocked(uid);
+    if (virtualNetwork && !virtualNetwork->isSecure()) {
+        return virtualNetwork->getNetId();
+    }
+    return mDefaultNetId;
+!!!43257655.cpp!!!	getNetworkContext(in netId : uint, in uid : uid_t, inout netcontext : android_net_context) : void
+    struct android_net_context nc = {
+            .app_netid = netId,
+            .app_mark = MARK_UNSET,
+            .dns_netid = netId,
+            .dns_mark = MARK_UNSET,
+            .uid = uid,
+    };
+
+    // |netId| comes directly (via dnsproxyd) from the value returned by netIdForResolv() in the
+    // client process. This value is nonzero iff.:
+    //
+    // 1. The app specified a netid/nethandle to a DNS resolution method such as:
+    //        - [Java] android.net.Network#getAllByName()
+    //        - [C/++] android_getaddrinfofornetwork()
+    // 2. The app specified a netid/nethandle to be used as a process default via:
+    //        - [Java] android.net.ConnectivityManager#bindProcessToNetwork()
+    //        - [C/++] android_setprocnetwork()
+    // 3. The app called android.net.ConnectivityManager#startUsingNetworkFeature().
+    //
+    // In all these cases (with the possible exception of #3), the right thing to do is to treat
+    // such cases as explicitlySelected.
+    const bool explicitlySelected = (nc.app_netid != NETID_UNSET);
+    if (!explicitlySelected) {
+        nc.app_netid = getNetworkForConnect(uid);
+    }
+
+    Fwmark fwmark;
+    fwmark.netId = nc.app_netid;
+    fwmark.explicitlySelected = explicitlySelected;
+    fwmark.protectedFromVpn = canProtect(uid);
+    fwmark.permission = getPermissionForUser(uid);
+    nc.app_mark = fwmark.intValue;
+
+    nc.dns_mark = getNetworkForDns(&(nc.dns_netid), uid);
+
+    if (netcontext) {
+        *netcontext = nc;
+    }
+!!!43257783.cpp!!!	getNetworkForInterface(in interface : char) : uint
+    android::RWLock::AutoRLock lock(mRWLock);
+    for (const auto& entry : mNetworks) {
+        if (entry.second->hasInterface(interface)) {
+            return entry.first;
+        }
+    }
+    return NETID_UNSET;
+!!!43257911.cpp!!!	isVirtualNetwork(in netId : uint) : bool
+    android::RWLock::AutoRLock lock(mRWLock);
+    Network* network = getNetworkLocked(netId);
+    return network && network->getType() == Network::VIRTUAL;
+!!!43258679.cpp!!!	getPermissionForUser(in uid : uid_t) : Permission
+    android::RWLock::AutoRLock lock(mRWLock);
+    return getPermissionForUserLocked(uid);
+!!!43258807.cpp!!!	setPermissionForUsers(in permission : Permission, in uids : std::vector<uid_t>) : void
+    android::RWLock::AutoWLock lock(mRWLock);
+    for (uid_t uid : uids) {
+        mUsers[uid] = permission;
+    }
+!!!43258935.cpp!!!	checkUserNetworkAccess(in uid : uid_t, in netId : uint) : int
+    android::RWLock::AutoRLock lock(mRWLock);
+    return checkUserNetworkAccessLocked(uid, netId);
+!!!43259703.cpp!!!	canProtect(in uid : uid_t) : bool
+    android::RWLock::AutoRLock lock(mRWLock);
+    return ((getPermissionForUserLocked(uid) & PERMISSION_SYSTEM) == PERMISSION_SYSTEM) ||
+           mProtectableUsers.find(uid) != mProtectableUsers.end();
+!!!43259831.cpp!!!	allowProtect(in uids : std::vector<uid_t>) : void
+    android::RWLock::AutoWLock lock(mRWLock);
+    mProtectableUsers.insert(uids.begin(), uids.end());
+!!!43259959.cpp!!!	denyProtect(in uids : std::vector<uid_t>) : void
+    android::RWLock::AutoWLock lock(mRWLock);
+    for (uid_t uid : uids) {
+        mProtectableUsers.erase(uid);
+    }
+!!!43260087.cpp!!!	dump(inout dw : DumpWriter) : void
+    android::RWLock::AutoRLock lock(mRWLock);
+
+    dw.incIndent();
+    dw.println("NetworkController");
+
+    dw.incIndent();
+    dw.println("Default network: %u", mDefaultNetId);
+
+    dw.blankline();
+    dw.println("Networks:");
+    dw.incIndent();
+    for (const auto& i : mNetworks) {
+        dw.println(i.second->toString().c_str());
+        android::net::gCtls->resolverCtrl.dump(dw, i.first);
+        dw.blankline();
+    }
+    dw.decIndent();
+
+    dw.decIndent();
+
+    dw.decIndent();
+!!!43260215.cpp!!!	isValidNetwork(in netId : uint) : bool
+    android::RWLock::AutoRLock lock(mRWLock);
+    return getNetworkLocked(netId);
+!!!43260343.cpp!!!	getNetworkLocked(in netId : uint) : Network
+    auto iter = mNetworks.find(netId);
+    return iter == mNetworks.end() ? NULL : iter->second;
+!!!43260471.cpp!!!	getVirtualNetworkForUserLocked(in uid : uid_t) : VirtualNetwork
+    for (const auto& entry : mNetworks) {
+        if (entry.second->getType() == Network::VIRTUAL) {
+            VirtualNetwork* virtualNetwork = static_cast<VirtualNetwork*>(entry.second);
+            if (virtualNetwork->appliesToUser(uid)) {
+                return virtualNetwork;
+            }
+        }
+    }
+    return NULL;
+!!!43260599.cpp!!!	getPermissionForUserLocked(in uid : uid_t) : Permission
+    auto iter = mUsers.find(uid);
+    if (iter != mUsers.end()) {
+        return iter->second;
+    }
+    return uid < FIRST_APPLICATION_UID ? PERMISSION_SYSTEM : PERMISSION_NONE;
+!!!43260727.cpp!!!	checkUserNetworkAccessLocked(in uid : uid_t, in netId : uint) : int
+    Network* network = getNetworkLocked(netId);
+    if (!network) {
+        return -ENONET;
+    }
+
+    // If uid is INVALID_UID, this likely means that we were unable to retrieve the UID of the peer
+    // (using SO_PEERCRED). Be safe and deny access to the network, even if it's valid.
+    if (uid == INVALID_UID) {
+        return -EREMOTEIO;
+    }
+    Permission userPermission = getPermissionForUserLocked(uid);
+    if ((userPermission & PERMISSION_SYSTEM) == PERMISSION_SYSTEM) {
+        return 0;
+    }
+    if (network->getType() == Network::VIRTUAL) {
+        return static_cast<VirtualNetwork*>(network)->appliesToUser(uid) ? 0 : -EPERM;
+    }
+    VirtualNetwork* virtualNetwork = getVirtualNetworkForUserLocked(uid);
+    if (virtualNetwork && virtualNetwork->isSecure() &&
+            mProtectableUsers.find(uid) == mProtectableUsers.end()) {
+        return -EPERM;
+    }
+    Permission networkPermission = static_cast<PhysicalNetwork*>(network)->getPermission();
+    return ((userPermission & networkPermission) == networkPermission) ? 0 : -EACCES;

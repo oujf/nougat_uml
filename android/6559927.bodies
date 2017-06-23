@@ -1,0 +1,145 @@
+class WriteJobsMapToDiskRunnable
+!!!73920311.java!!!	run() : void
+            final long startElapsed = SystemClock.elapsedRealtime();
+            final List<JobStatus> storeCopy = new ArrayList<JobStatus>();
+            synchronized (mLock) {
+                // Clone the jobs so we can release the lock before writing.
+                mJobSet.forEachJob(new JobStatusFunctor() {
+                    @Override
+                    public void process(JobStatus job) {
+                        if (job.isPersisted()) {
+                            storeCopy.add(new JobStatus(job));
+                        }
+                    }
+                });
+            }
+            writeJobsMapImpl(storeCopy);
+            if (JobSchedulerService.DEBUG) {
+                Slog.v(TAG, "Finished writing, took " + (SystemClock.elapsedRealtime()
+                        - startElapsed) + "ms");
+            }
+!!!73920439.java!!!	writeJobsMapImpl(inout jobList : List<JobStatus>) : void
+            try {
+                ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                XmlSerializer out = new FastXmlSerializer();
+                out.setOutput(baos, StandardCharsets.UTF_8.name());
+                out.startDocument(null, true);
+                out.setFeature("http://xmlpull.org/v1/doc/features.html#indent-output", true);
+
+                out.startTag(null, "job-info");
+                out.attribute(null, "version", Integer.toString(JOBS_FILE_VERSION));
+                for (int i=0; i<jobList.size(); i++) {
+                    JobStatus jobStatus = jobList.get(i);
+                    if (DEBUG) {
+                        Slog.d(TAG, "Saving job " + jobStatus.getJobId());
+                    }
+                    out.startTag(null, "job");
+                    addAttributesToJobTag(out, jobStatus);
+                    writeConstraintsToXml(out, jobStatus);
+                    writeExecutionCriteriaToXml(out, jobStatus);
+                    writeBundleToXml(jobStatus.getExtras(), out);
+                    out.endTag(null, "job");
+                }
+                out.endTag(null, "job-info");
+                out.endDocument();
+
+                // Write out to disk in one fell sweep.
+                FileOutputStream fos = mJobsFile.startWrite();
+                fos.write(baos.toByteArray());
+                mJobsFile.finishWrite(fos);
+                mDirtyOperations = 0;
+            } catch (IOException e) {
+                if (DEBUG) {
+                    Slog.v(TAG, "Error writing out job data.", e);
+                }
+            } catch (XmlPullParserException e) {
+                if (DEBUG) {
+                    Slog.d(TAG, "Error persisting bundle.", e);
+                }
+            }
+!!!73920567.java!!!	addAttributesToJobTag(inout out : XmlSerializer, inout jobStatus : JobStatus) : void
+            out.attribute(null, "jobid", Integer.toString(jobStatus.getJobId()));
+            out.attribute(null, "package", jobStatus.getServiceComponent().getPackageName());
+            out.attribute(null, "class", jobStatus.getServiceComponent().getClassName());
+            if (jobStatus.getSourcePackageName() != null) {
+                out.attribute(null, "sourcePackageName", jobStatus.getSourcePackageName());
+            }
+            if (jobStatus.getSourceTag() != null) {
+                out.attribute(null, "sourceTag", jobStatus.getSourceTag());
+            }
+            out.attribute(null, "sourceUserId", String.valueOf(jobStatus.getSourceUserId()));
+            out.attribute(null, "uid", Integer.toString(jobStatus.getUid()));
+            out.attribute(null, "priority", String.valueOf(jobStatus.getPriority()));
+            out.attribute(null, "flags", String.valueOf(jobStatus.getFlags()));
+!!!73920695.java!!!	writeBundleToXml(inout extras : PersistableBundle, inout out : XmlSerializer) : void
+            out.startTag(null, XML_TAG_EXTRAS);
+            PersistableBundle extrasCopy = deepCopyBundle(extras, 10);
+            extrasCopy.saveToXml(out);
+            out.endTag(null, XML_TAG_EXTRAS);
+!!!73920823.java!!!	deepCopyBundle(inout bundle : PersistableBundle, in maxDepth : int) : PersistableBundle
+            if (maxDepth <= 0) {
+                return null;
+            }
+            PersistableBundle copy = (PersistableBundle) bundle.clone();
+            Set<String> keySet = bundle.keySet();
+            for (String key: keySet) {
+                Object o = copy.get(key);
+                if (o instanceof PersistableBundle) {
+                    PersistableBundle bCopy = deepCopyBundle((PersistableBundle) o, maxDepth-1);
+                    copy.putPersistableBundle(key, bCopy);
+                }
+            }
+            return copy;
+!!!73920951.java!!!	writeConstraintsToXml(inout out : XmlSerializer, inout jobStatus : JobStatus) : void
+            out.startTag(null, XML_TAG_PARAMS_CONSTRAINTS);
+            if (jobStatus.hasConnectivityConstraint()) {
+                out.attribute(null, "connectivity", Boolean.toString(true));
+            }
+            if (jobStatus.hasUnmeteredConstraint()) {
+                out.attribute(null, "unmetered", Boolean.toString(true));
+            }
+            if (jobStatus.hasNotRoamingConstraint()) {
+                out.attribute(null, "not-roaming", Boolean.toString(true));
+            }
+            if (jobStatus.hasIdleConstraint()) {
+                out.attribute(null, "idle", Boolean.toString(true));
+            }
+            if (jobStatus.hasChargingConstraint()) {
+                out.attribute(null, "charging", Boolean.toString(true));
+            }
+            out.endTag(null, XML_TAG_PARAMS_CONSTRAINTS);
+!!!73921079.java!!!	writeExecutionCriteriaToXml(inout out : XmlSerializer, inout jobStatus : JobStatus) : void
+            final JobInfo job = jobStatus.getJob();
+            if (jobStatus.getJob().isPeriodic()) {
+                out.startTag(null, XML_TAG_PERIODIC);
+                out.attribute(null, "period", Long.toString(job.getIntervalMillis()));
+                out.attribute(null, "flex", Long.toString(job.getFlexMillis()));
+            } else {
+                out.startTag(null, XML_TAG_ONEOFF);
+            }
+
+            if (jobStatus.hasDeadlineConstraint()) {
+                // Wall clock deadline.
+                final long deadlineWallclock =  System.currentTimeMillis() +
+                        (jobStatus.getLatestRunTimeElapsed() - SystemClock.elapsedRealtime());
+                out.attribute(null, "deadline", Long.toString(deadlineWallclock));
+            }
+            if (jobStatus.hasTimingDelayConstraint()) {
+                final long delayWallclock = System.currentTimeMillis() +
+                        (jobStatus.getEarliestRunTime() - SystemClock.elapsedRealtime());
+                out.attribute(null, "delay", Long.toString(delayWallclock));
+            }
+
+            // Only write out back-off policy if it differs from the default.
+            // This also helps the case where the job is idle -> these aren't allowed to specify
+            // back-off.
+            if (jobStatus.getJob().getInitialBackoffMillis() != JobInfo.DEFAULT_INITIAL_BACKOFF_MILLIS
+                    || jobStatus.getJob().getBackoffPolicy() != JobInfo.DEFAULT_BACKOFF_POLICY) {
+                out.attribute(null, "backoff-policy", Integer.toString(job.getBackoffPolicy()));
+                out.attribute(null, "initial-backoff", Long.toString(job.getInitialBackoffMillis()));
+            }
+            if (job.isPeriodic()) {
+                out.endTag(null, XML_TAG_PERIODIC);
+            } else {
+                out.endTag(null, XML_TAG_ONEOFF);
+            }

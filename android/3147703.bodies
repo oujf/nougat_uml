@@ -1,0 +1,130 @@
+class HeapWalker
+!!!42836791.cpp!!!	Allocation(in begin : uintptr_t, in end : uintptr_t) : bool
+  if (end == begin) {
+    end = begin + 1;
+  }
+  Range range{begin, end};
+  auto inserted = allocations_.insert(std::pair<Range, AllocationInfo>(range, AllocationInfo{}));
+  if (inserted.second) {
+    valid_allocations_range_.begin = std::min(valid_allocations_range_.begin, begin);
+    valid_allocations_range_.end = std::max(valid_allocations_range_.end, end);
+    allocation_bytes_ += range.size();
+    return true;
+  } else {
+    Range overlap = inserted.first->first;
+    if (overlap != range) {
+      ALOGE("range %p-%p overlaps with existing range %p-%p",
+          reinterpret_cast<void*>(begin),
+          reinterpret_cast<void*>(end),
+          reinterpret_cast<void*>(overlap.begin),
+          reinterpret_cast<void*>(overlap.end));
+    }
+    return false;
+  }
+!!!42836919.cpp!!!	Root(in begin : uintptr_t, in end : uintptr_t) : void
+  roots_.push_back(Range{begin, end});
+!!!42837047.cpp!!!	Root(in vals : allocator::vector<uintptr_t>) : void
+  root_vals_.insert(root_vals_.end(), vals.begin(), vals.end());
+!!!42837175.cpp!!!	DetectLeaks() : bool
+  // Recursively walk pointers from roots to mark referenced allocations
+  for (auto it = roots_.begin(); it != roots_.end(); it++) {
+    RecurseRoot(*it);
+  }
+
+  Range vals;
+  vals.begin = reinterpret_cast<uintptr_t>(root_vals_.data());
+  vals.end = vals.begin + root_vals_.size() * sizeof(uintptr_t);
+
+  RecurseRoot(vals);
+
+  return true;
+!!!42837303.cpp!!!	Leaked(inout leaked : allocator::vector<Range>, in limit : size_t, inout num_leaks_out : size_t, inout leak_bytes_out : size_t) : bool
+  leaked.clear();
+
+  size_t num_leaks = 0;
+  size_t leak_bytes = 0;
+  for (auto it = allocations_.begin(); it != allocations_.end(); it++) {
+    if (!it->second.referenced_from_root) {
+      num_leaks++;
+      leak_bytes += it->first.end - it->first.begin;
+    }
+  }
+
+  size_t n = 0;
+  for (auto it = allocations_.begin(); it != allocations_.end(); it++) {
+    if (!it->second.referenced_from_root) {
+      if (n++ < limit) {
+        leaked.push_back(it->first);
+      }
+    }
+  }
+
+  if (num_leaks_out) {
+    *num_leaks_out = num_leaks;
+  }
+  if (leak_bytes_out) {
+    *leak_bytes_out = leak_bytes;
+  }
+
+  return true;
+!!!42837431.cpp!!!	Allocations() : size_t
+  return allocations_.size();
+!!!42837559.cpp!!!	AllocationBytes() : size_t
+  return allocation_bytes_;
+!!!42837687.cpp!!!	ForEachPtrInRange(in range : Range, inout f : F) : void
+  uintptr_t begin = (range.begin + (sizeof(uintptr_t) - 1)) & ~(sizeof(uintptr_t) - 1);
+  // TODO(ccross): we might need to consider a pointer to the end of a buffer
+  // to be inside the buffer, which means the common case of a pointer to the
+  // beginning of a buffer may keep two ranges live.
+  for (uintptr_t i = begin; i < range.end; i += sizeof(uintptr_t)) {
+    Range ref_range;
+    AllocationInfo* ref_info;
+    if (WordContainsAllocationPtr(i, &ref_range, &ref_info)) {
+      f(ref_range, ref_info);
+    }
+  }
+!!!42837815.cpp!!!	ForEachAllocation(inout f : F) : void
+  for (auto& it : allocations_) {
+    const Range& range = it.first;
+    HeapWalker::AllocationInfo& allocation = it.second;
+    f(range, allocation);
+  }
+!!!42837943.cpp!!!	RecurseRoot(in root : Range) : void
+  allocator::vector<Range> to_do(1, root, allocator_);
+  while (!to_do.empty()) {
+    Range range = to_do.back();
+    to_do.pop_back();
+
+    ForEachPtrInRange(range, [&](Range& ref_range, AllocationInfo* ref_info) {
+      if (!ref_info->referenced_from_root) {
+        ref_info->referenced_from_root = true;
+        to_do.push_back(ref_range);
+      }
+    });
+  }
+!!!42838071.cpp!!!	WordContainsAllocationPtr(in word_ptr : uintptr_t, inout range : Range, inout info : HeapWalker::AllocationInfo) : bool
+  walking_ptr_ = word_ptr;
+  // This access may segfault if the process under test has done something strange,
+  // for example mprotect(PROT_NONE) on a native heap page.  If so, it will be
+  // caught and handled by mmaping a zero page over the faulting page.
+  uintptr_t value = *reinterpret_cast<uintptr_t*>(word_ptr);
+  walking_ptr_ = 0;
+  if (value >= valid_allocations_range_.begin && value < valid_allocations_range_.end) {
+    AllocationMap::iterator it = allocations_.find(Range{value, value + 1});
+    if (it != allocations_.end()) {
+      *range = it->first;
+      *info = &it->second;
+      return true;
+    }
+  }
+  return false;
+!!!42838199.cpp!!!	HandleSegFault(inout handler : ScopedSignalHandler, in signal : int, inout si : siginfo_t, inout  : void) : void
+  uintptr_t addr = reinterpret_cast<uintptr_t>(si->si_addr);
+  if (addr != walking_ptr_) {
+    handler.reset();
+    return;
+  }
+  ALOGW("failed to read page at %p, signal %d", si->si_addr, signal);
+  if (!MapOverPage(si->si_addr)) {
+    handler.reset();
+  }

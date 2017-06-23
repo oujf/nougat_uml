@@ -1,0 +1,1280 @@
+class ExifInterface
+!!!69623863.java!!!	ExifInterface(inout filename : String)
+        if (filename == null) {
+            throw new IllegalArgumentException("filename cannot be null");
+        }
+        FileInputStream in = null;
+        mAssetInputStream = null;
+        mFilename = filename;
+        mIsInputStream = false;
+        try {
+            in = new FileInputStream(filename);
+            if (isSeekableFD(in.getFD())) {
+                mSeekableFileDescriptor = in.getFD();
+            } else {
+                mSeekableFileDescriptor = null;
+            }
+            loadAttributes(in);
+        } finally {
+            IoUtils.closeQuietly(in);
+        }
+!!!69623991.java!!!	ExifInterface(inout fileDescriptor : FileDescriptor)
+        if (fileDescriptor == null) {
+            throw new IllegalArgumentException("fileDescriptor cannot be null");
+        }
+        mAssetInputStream = null;
+        mFilename = null;
+        if (isSeekableFD(fileDescriptor)) {
+            mSeekableFileDescriptor = fileDescriptor;
+            // Keep the original file descriptor in order to save attributes when it's seekable.
+            // Otherwise, just close the given file descriptor after reading it because the save
+            // feature won't be working.
+            try {
+                fileDescriptor = Os.dup(fileDescriptor);
+            } catch (ErrnoException e) {
+                throw e.rethrowAsIOException();
+            }
+        } else {
+            mSeekableFileDescriptor = null;
+        }
+        mIsInputStream = false;
+        FileInputStream in = null;
+        try {
+            in = new FileInputStream(fileDescriptor);
+            loadAttributes(in);
+        } finally {
+            IoUtils.closeQuietly(in);
+        }
+!!!69624119.java!!!	ExifInterface(inout inputStream : InputStream)
+        if (inputStream == null) {
+            throw new IllegalArgumentException("inputStream cannot be null");
+        }
+        mFilename = null;
+        if (inputStream instanceof AssetManager.AssetInputStream) {
+            mAssetInputStream = (AssetManager.AssetInputStream) inputStream;
+            mSeekableFileDescriptor = null;
+        } else if (inputStream instanceof FileInputStream
+                && isSeekableFD(((FileInputStream) inputStream).getFD())) {
+            mAssetInputStream = null;
+            mSeekableFileDescriptor = ((FileInputStream) inputStream).getFD();
+        } else {
+            mAssetInputStream = null;
+            mSeekableFileDescriptor = null;
+        }
+        mIsInputStream = true;
+        loadAttributes(inputStream);
+!!!69624247.java!!!	getExifAttribute(inout tag : String) : ExifInterface::ExifAttribute
+        // Retrieves all tag groups. The value from primary image tag group has a higher priority
+        // than the value from the thumbnail tag group if there are more than one candidates.
+        for (int i = 0; i < EXIF_TAGS.length; ++i) {
+            Object value = mAttributes[i].get(tag);
+            if (value != null) {
+                return (ExifAttribute) value;
+            }
+        }
+        return null;
+!!!69624375.java!!!	getAttribute(inout tag : String) : String
+        ExifAttribute attribute = getExifAttribute(tag);
+        if (attribute != null) {
+            if (!sTagSetForCompatibility.contains(tag)) {
+                return attribute.getStringValue(mExifByteOrder);
+            }
+            if (tag.equals(TAG_GPS_TIMESTAMP)) {
+                // Convert the rational values to the custom formats for backwards compatibility.
+                if (attribute.format != IFD_FORMAT_URATIONAL
+                        && attribute.format != IFD_FORMAT_SRATIONAL) {
+                    return null;
+                }
+                Rational[] array = (Rational[]) attribute.getValue(mExifByteOrder);
+                if (array.length != 3) {
+                    return null;
+                }
+                return String.format("%02d:%02d:%02d",
+                        (int) ((float) array[0].numerator / array[0].denominator),
+                        (int) ((float) array[1].numerator / array[1].denominator),
+                        (int) ((float) array[2].numerator / array[2].denominator));
+            }
+            try {
+                return Double.toString(attribute.getDoubleValue(mExifByteOrder));
+            } catch (NumberFormatException e) {
+                return null;
+            }
+        }
+        return null;
+!!!69624503.java!!!	getAttributeInt(inout tag : String, in defaultValue : int) : int
+        ExifAttribute exifAttribute = getExifAttribute(tag);
+        if (exifAttribute == null) {
+            return defaultValue;
+        }
+
+        try {
+            return exifAttribute.getIntValue(mExifByteOrder);
+        } catch (NumberFormatException e) {
+            return defaultValue;
+        }
+!!!69624631.java!!!	getAttributeDouble(inout tag : String, in defaultValue : double) : double
+        ExifAttribute exifAttribute = getExifAttribute(tag);
+        if (exifAttribute == null) {
+            return defaultValue;
+        }
+
+        try {
+            return exifAttribute.getDoubleValue(mExifByteOrder);
+        } catch (NumberFormatException e) {
+            return defaultValue;
+        }
+!!!69624759.java!!!	setAttribute(inout tag : String, inout value : String) : void
+        // Convert the given value to rational values for backwards compatibility.
+        if (value != null && sTagSetForCompatibility.contains(tag)) {
+            if (tag.equals(TAG_GPS_TIMESTAMP)) {
+                Matcher m = sGpsTimestampPattern.matcher(value);
+                if (!m.find()) {
+                    Log.w(TAG, "Invalid value for " + tag + " : " + value);
+                    return;
+                }
+                value = Integer.parseInt(m.group(1)) + "/1," + Integer.parseInt(m.group(2)) + "/1,"
+                        + Integer.parseInt(m.group(3)) + "/1";
+            } else {
+                try {
+                    double doubleValue = Double.parseDouble(value);
+                    value = (long) (doubleValue * 10000L) + "/10000";
+                } catch (NumberFormatException e) {
+                    Log.w(TAG, "Invalid value for " + tag + " : " + value);
+                    return;
+                }
+            }
+        }
+
+        for (int i = 0 ; i < EXIF_TAGS.length; ++i) {
+            if (i == IFD_THUMBNAIL_HINT && !mHasThumbnail) {
+                continue;
+            }
+            final Object obj = sExifTagMapsForWriting[i].get(tag);
+            if (obj != null) {
+                if (value == null) {
+                    mAttributes[i].remove(tag);
+                    continue;
+                }
+                final ExifTag exifTag = (ExifTag) obj;
+                Pair<Integer, Integer> guess = guessDataFormat(value);
+                int dataFormat;
+                if (exifTag.primaryFormat == guess.first || exifTag.primaryFormat == guess.second) {
+                    dataFormat = exifTag.primaryFormat;
+                } else if (exifTag.secondaryFormat != -1 && (exifTag.secondaryFormat == guess.first
+                        || exifTag.secondaryFormat == guess.second)) {
+                    dataFormat = exifTag.secondaryFormat;
+                } else if (exifTag.primaryFormat == IFD_FORMAT_BYTE
+                        || exifTag.primaryFormat == IFD_FORMAT_UNDEFINED
+                        || exifTag.primaryFormat == IFD_FORMAT_STRING) {
+                    dataFormat = exifTag.primaryFormat;
+                } else {
+                    Log.w(TAG, "Given tag (" + tag + ") value didn't match with one of expected "
+                            + "formats: " + IFD_FORMAT_NAMES[exifTag.primaryFormat]
+                            + (exifTag.secondaryFormat == -1 ? "" : ", "
+                            + IFD_FORMAT_NAMES[exifTag.secondaryFormat]) + " (guess: "
+                            + IFD_FORMAT_NAMES[guess.first] + (guess.second == -1 ? "" : ", "
+                            + IFD_FORMAT_NAMES[guess.second]) + ")");
+                    continue;
+                }
+                switch (dataFormat) {
+                    case IFD_FORMAT_BYTE: {
+                        mAttributes[i].put(tag, ExifAttribute.createByte(value));
+                        break;
+                    }
+                    case IFD_FORMAT_UNDEFINED:
+                    case IFD_FORMAT_STRING: {
+                        mAttributes[i].put(tag, ExifAttribute.createString(value));
+                        break;
+                    }
+                    case IFD_FORMAT_USHORT: {
+                        final String[] values = value.split(",");
+                        final int[] intArray = new int[values.length];
+                        for (int j = 0; j < values.length; ++j) {
+                            intArray[j] = Integer.parseInt(values[j]);
+                        }
+                        mAttributes[i].put(tag,
+                                ExifAttribute.createUShort(intArray, mExifByteOrder));
+                        break;
+                    }
+                    case IFD_FORMAT_SLONG: {
+                        final String[] values = value.split(",");
+                        final int[] intArray = new int[values.length];
+                        for (int j = 0; j < values.length; ++j) {
+                            intArray[j] = Integer.parseInt(values[j]);
+                        }
+                        mAttributes[i].put(tag,
+                                ExifAttribute.createSLong(intArray, mExifByteOrder));
+                        break;
+                    }
+                    case IFD_FORMAT_ULONG: {
+                        final String[] values = value.split(",");
+                        final long[] longArray = new long[values.length];
+                        for (int j = 0; j < values.length; ++j) {
+                            longArray[j] = Long.parseLong(values[j]);
+                        }
+                        mAttributes[i].put(tag,
+                                ExifAttribute.createULong(longArray, mExifByteOrder));
+                        break;
+                    }
+                    case IFD_FORMAT_URATIONAL: {
+                        final String[] values = value.split(",");
+                        final Rational[] rationalArray = new Rational[values.length];
+                        for (int j = 0; j < values.length; ++j) {
+                            final String[] numbers = values[j].split("/");
+                            rationalArray[j] = new Rational(Long.parseLong(numbers[0]),
+                                    Long.parseLong(numbers[1]));
+                        }
+                        mAttributes[i].put(tag,
+                                ExifAttribute.createURational(rationalArray, mExifByteOrder));
+                        break;
+                    }
+                    case IFD_FORMAT_SRATIONAL: {
+                        final String[] values = value.split(",");
+                        final Rational[] rationalArray = new Rational[values.length];
+                        for (int j = 0; j < values.length; ++j) {
+                            final String[] numbers = values[j].split("/");
+                            rationalArray[j] = new Rational(Long.parseLong(numbers[0]),
+                                    Long.parseLong(numbers[1]));
+                        }
+                        mAttributes[i].put(tag,
+                                ExifAttribute.createSRational(rationalArray, mExifByteOrder));
+                        break;
+                    }
+                    case IFD_FORMAT_DOUBLE: {
+                        final String[] values = value.split(",");
+                        final double[] doubleArray = new double[values.length];
+                        for (int j = 0; j < values.length; ++j) {
+                            doubleArray[j] = Double.parseDouble(values[j]);
+                        }
+                        mAttributes[i].put(tag,
+                                ExifAttribute.createDouble(doubleArray, mExifByteOrder));
+                        break;
+                    }
+                    default:
+                        Log.w(TAG, "Data format isn't one of expected formats: " + dataFormat);
+                        continue;
+                }
+            }
+        }
+!!!69624887.java!!!	updateAttribute(inout tag : String, inout value : ExifInterface::ExifAttribute) : boolean
+        boolean updated = false;
+        for (int i = 0 ; i < EXIF_TAGS.length; ++i) {
+            if (mAttributes[i].containsKey(tag)) {
+                mAttributes[i].put(tag, value);
+                updated = true;
+            }
+        }
+        return updated;
+!!!69625015.java!!!	removeAttribute(inout tag : String) : void
+        for (int i = 0 ; i < EXIF_TAGS.length; ++i) {
+            mAttributes[i].remove(tag);
+        }
+!!!69625143.java!!!	loadAttributes(inout in : InputStream) : void
+        try {
+            // Initialize mAttributes.
+            for (int i = 0; i < EXIF_TAGS.length; ++i) {
+                mAttributes[i] = new HashMap();
+            }
+
+            // Process RAW input stream
+            if (mAssetInputStream != null) {
+                long asset = mAssetInputStream.getNativeAsset();
+                if (handleRawResult(nativeGetRawAttributesFromAsset(asset))) {
+                    return;
+                }
+            } else if (mSeekableFileDescriptor != null) {
+                if (handleRawResult(nativeGetRawAttributesFromFileDescriptor(
+                        mSeekableFileDescriptor))) {
+                    return;
+                }
+            } else {
+                in = new BufferedInputStream(in, JPEG_SIGNATURE_SIZE);
+                if (!isJpegInputStream((BufferedInputStream) in) && handleRawResult(
+                        nativeGetRawAttributesFromInputStream(in))) {
+                    return;
+                }
+            }
+
+            // Process JPEG input stream
+            getJpegAttributes(in);
+        } catch (IOException e) {
+            // Ignore exceptions in order to keep the compatibility with the old versions of
+            // ExifInterface.
+            Log.w(TAG, "Invalid image: ExifInterface got an unsupported image format file"
+                    + "(ExifInterface supports JPEG and some RAW image formats only) "
+                    + "or a corrupted JPEG file to ExifInterface.", e);
+        } finally {
+            addDefaultValuesForCompatibility();
+
+            if (DEBUG) {
+                printAttributes();
+            }
+        }
+!!!69625271.java!!!	isJpegInputStream(inout in : BufferedInputStream) : boolean
+        in.mark(JPEG_SIGNATURE_SIZE);
+        byte[] signatureBytes = new byte[JPEG_SIGNATURE_SIZE];
+        if (in.read(signatureBytes) != JPEG_SIGNATURE_SIZE) {
+            throw new EOFException();
+        }
+        boolean isJpeg = Arrays.equals(JPEG_SIGNATURE, signatureBytes);
+        in.reset();
+        return isJpeg;
+!!!69625399.java!!!	handleRawResult(inout map : HashMap) : boolean
+        if (map == null) {
+            return false;
+        }
+
+        // Mark for disabling the save feature.
+        mIsRaw = true;
+
+        String value = (String) map.remove(TAG_HAS_THUMBNAIL);
+        mHasThumbnail = value != null && value.equalsIgnoreCase("true");
+        value = (String) map.remove(TAG_THUMBNAIL_OFFSET);
+        if (value != null) {
+            mThumbnailOffset = Integer.parseInt(value);
+        }
+        value = (String) map.remove(TAG_THUMBNAIL_LENGTH);
+        if (value != null) {
+            mThumbnailLength = Integer.parseInt(value);
+        }
+        mThumbnailBytes = (byte[]) map.remove(TAG_THUMBNAIL_DATA);
+
+        for (Map.Entry entry : (Set<Map.Entry>) map.entrySet()) {
+            setAttribute((String) entry.getKey(), (String) entry.getValue());
+        }
+
+        return true;
+!!!69625527.java!!!	isSeekableFD(inout fd : FileDescriptor) : boolean
+        try {
+            Os.lseek(fd, 0, OsConstants.SEEK_CUR);
+            return true;
+        } catch (ErrnoException e) {
+            return false;
+        }
+!!!69625655.java!!!	printAttributes() : void
+        for (int i = 0; i < mAttributes.length; ++i) {
+            Log.d(TAG, "The size of tag group[" + i + "]: " + mAttributes[i].size());
+            for (Map.Entry entry : (Set<Map.Entry>) mAttributes[i].entrySet()) {
+                final ExifAttribute tagValue = (ExifAttribute) entry.getValue();
+                Log.d(TAG, "tagName: " + entry.getKey() + ", tagType: " + tagValue.toString()
+                        + ", tagValue: '" + tagValue.getStringValue(mExifByteOrder) + "'");
+            }
+        }
+!!!69625783.java!!!	saveAttributes() : void
+        if (mIsRaw) {
+            throw new UnsupportedOperationException(
+                    "ExifInterface does not support saving attributes on RAW formats.");
+        }
+        if (mIsInputStream || (mSeekableFileDescriptor == null && mFilename == null)) {
+            throw new UnsupportedOperationException(
+                    "ExifInterface does not support saving attributes for the current input.");
+        }
+
+        // Keep the thumbnail in memory
+        mThumbnailBytes = getThumbnail();
+
+        FileInputStream in = null;
+        FileOutputStream out = null;
+        File tempFile = null;
+        try {
+            // Move the original file to temporary file.
+            if (mFilename != null) {
+                tempFile = new File(mFilename + ".tmp");
+                File originalFile = new File(mFilename);
+                if (!originalFile.renameTo(tempFile)) {
+                    throw new IOException("Could'nt rename to " + tempFile.getAbsolutePath());
+                }
+            } else if (mSeekableFileDescriptor != null) {
+                tempFile = File.createTempFile("temp", "jpg");
+                Os.lseek(mSeekableFileDescriptor, 0, OsConstants.SEEK_SET);
+                in = new FileInputStream(mSeekableFileDescriptor);
+                out = new FileOutputStream(tempFile);
+                Streams.copy(in, out);
+            }
+        } catch (ErrnoException e) {
+            throw e.rethrowAsIOException();
+        } finally {
+            IoUtils.closeQuietly(in);
+            IoUtils.closeQuietly(out);
+        }
+
+        in = null;
+        out = null;
+        try {
+            // Save the new file.
+            in = new FileInputStream(tempFile);
+            if (mFilename != null) {
+                out = new FileOutputStream(mFilename);
+            } else if (mSeekableFileDescriptor != null) {
+                Os.lseek(mSeekableFileDescriptor, 0, OsConstants.SEEK_SET);
+                out = new FileOutputStream(mSeekableFileDescriptor);
+            }
+            saveJpegAttributes(in, out);
+        } catch (ErrnoException e) {
+            throw e.rethrowAsIOException();
+        } finally {
+            IoUtils.closeQuietly(in);
+            IoUtils.closeQuietly(out);
+            tempFile.delete();
+        }
+
+        // Discard the thumbnail in memory
+        mThumbnailBytes = null;
+!!!69625911.java!!!	hasThumbnail() : boolean
+        return mHasThumbnail;
+!!!69626039.java!!!	getThumbnail() : byte
+        if (!mHasThumbnail) {
+            return null;
+        }
+        if (mThumbnailBytes != null) {
+            return mThumbnailBytes;
+        }
+
+        // Read the thumbnail.
+        FileInputStream in = null;
+        try {
+            if (mAssetInputStream != null) {
+                return nativeGetThumbnailFromAsset(
+                        mAssetInputStream.getNativeAsset(), mThumbnailOffset, mThumbnailLength);
+            } else if (mFilename != null) {
+                in = new FileInputStream(mFilename);
+            } else if (mSeekableFileDescriptor != null) {
+                FileDescriptor fileDescriptor = Os.dup(mSeekableFileDescriptor);
+                Os.lseek(fileDescriptor, 0, OsConstants.SEEK_SET);
+                in = new FileInputStream(fileDescriptor);
+            }
+            if (in == null) {
+                // Should not be reached this.
+                throw new FileNotFoundException();
+            }
+            if (in.skip(mThumbnailOffset) != mThumbnailOffset) {
+                throw new IOException("Corrupted image");
+            }
+            byte[] buffer = new byte[mThumbnailLength];
+            if (in.read(buffer) != mThumbnailLength) {
+                throw new IOException("Corrupted image");
+            }
+            return buffer;
+        } catch (IOException | ErrnoException e) {
+            // Couldn't get a thumbnail image.
+        } finally {
+            IoUtils.closeQuietly(in);
+        }
+        return null;
+!!!69626167.java!!!	getThumbnailRange() : long
+        if (!mHasThumbnail) {
+            return null;
+        }
+
+        long[] range = new long[2];
+        range[0] = mThumbnailOffset;
+        range[1] = mThumbnailLength;
+
+        return range;
+!!!69626295.java!!!	getLatLong(inout output : float [[]]) : boolean
+        String latValue = getAttribute(TAG_GPS_LATITUDE);
+        String latRef = getAttribute(TAG_GPS_LATITUDE_REF);
+        String lngValue = getAttribute(TAG_GPS_LONGITUDE);
+        String lngRef = getAttribute(TAG_GPS_LONGITUDE_REF);
+
+        if (latValue != null && latRef != null && lngValue != null && lngRef != null) {
+            try {
+                output[0] = convertRationalLatLonToFloat(latValue, latRef);
+                output[1] = convertRationalLatLonToFloat(lngValue, lngRef);
+                return true;
+            } catch (IllegalArgumentException e) {
+                // if values are not parseable
+            }
+        }
+
+        return false;
+!!!69626423.java!!!	getAltitude(in defaultValue : double) : double
+        double altitude = getAttributeDouble(TAG_GPS_ALTITUDE, -1);
+        int ref = getAttributeInt(TAG_GPS_ALTITUDE_REF, -1);
+
+        if (altitude >= 0 && ref >= 0) {
+            return (altitude * ((ref == 1) ? -1 : 1));
+        } else {
+            return defaultValue;
+        }
+!!!69626551.java!!!	getDateTime() : long
+        String dateTimeString = getAttribute(TAG_DATETIME);
+        if (dateTimeString == null
+                || !sNonZeroTimePattern.matcher(dateTimeString).matches()) return -1;
+
+        ParsePosition pos = new ParsePosition(0);
+        try {
+            // The exif field is in local time. Parsing it as if it is UTC will yield time
+            // since 1/1/1970 local time
+            Date datetime = sFormatter.parse(dateTimeString, pos);
+            if (datetime == null) return -1;
+            long msecs = datetime.getTime();
+
+            String subSecs = getAttribute(TAG_SUBSEC_TIME);
+            if (subSecs != null) {
+                try {
+                    long sub = Long.valueOf(subSecs);
+                    while (sub > 1000) {
+                        sub /= 10;
+                    }
+                    msecs += sub;
+                } catch (NumberFormatException e) {
+                    // Ignored
+                }
+            }
+            return msecs;
+        } catch (IllegalArgumentException e) {
+            return -1;
+        }
+!!!69626679.java!!!	getGpsDateTime() : long
+        String date = getAttribute(TAG_GPS_DATESTAMP);
+        String time = getAttribute(TAG_GPS_TIMESTAMP);
+        if (date == null || time == null
+                || (!sNonZeroTimePattern.matcher(date).matches()
+                && !sNonZeroTimePattern.matcher(time).matches())) {
+            return -1;
+        }
+
+        String dateTimeString = date + ' ' + time;
+
+        ParsePosition pos = new ParsePosition(0);
+        try {
+            Date datetime = sFormatter.parse(dateTimeString, pos);
+            if (datetime == null) return -1;
+            return datetime.getTime();
+        } catch (IllegalArgumentException e) {
+            return -1;
+        }
+!!!69626807.java!!!	convertRationalLatLonToFloat(inout rationalString : String, inout ref : String) : float
+        try {
+            String [] parts = rationalString.split(",");
+
+            String [] pair;
+            pair = parts[0].split("/");
+            double degrees = Double.parseDouble(pair[0].trim())
+                    / Double.parseDouble(pair[1].trim());
+
+            pair = parts[1].split("/");
+            double minutes = Double.parseDouble(pair[0].trim())
+                    / Double.parseDouble(pair[1].trim());
+
+            pair = parts[2].split("/");
+            double seconds = Double.parseDouble(pair[0].trim())
+                    / Double.parseDouble(pair[1].trim());
+
+            double result = degrees + (minutes / 60.0) + (seconds / 3600.0);
+            if ((ref.equals("S") || ref.equals("W"))) {
+                return (float) -result;
+            }
+            return (float) result;
+        } catch (NumberFormatException | ArrayIndexOutOfBoundsException e) {
+            // Not valid
+            throw new IllegalArgumentException();
+        }
+!!!69626935.java!!!	getJpegAttributes(inout inputStream : InputStream) : void
+        // See JPEG File Interchange Format Specification page 5.
+        if (DEBUG) {
+            Log.d(TAG, "getJpegAttributes starting with: " + inputStream);
+        }
+        DataInputStream dataInputStream = new DataInputStream(inputStream);
+        byte marker;
+        int bytesRead = 0;
+        if ((marker = dataInputStream.readByte()) != MARKER) {
+            throw new IOException("Invalid marker: " + Integer.toHexString(marker & 0xff));
+        }
+        ++bytesRead;
+        if (dataInputStream.readByte() != MARKER_SOI) {
+            throw new IOException("Invalid marker: " + Integer.toHexString(marker & 0xff));
+        }
+        ++bytesRead;
+        while (true) {
+            marker = dataInputStream.readByte();
+            if (marker != MARKER) {
+                throw new IOException("Invalid marker:" + Integer.toHexString(marker & 0xff));
+            }
+            ++bytesRead;
+            marker = dataInputStream.readByte();
+            if (DEBUG) {
+                Log.d(TAG, "Found JPEG segment indicator: " + Integer.toHexString(marker & 0xff));
+            }
+            ++bytesRead;
+
+            // EOI indicates the end of an image and in case of SOS, JPEG image stream starts and
+            // the image data will terminate right after.
+            if (marker == MARKER_EOI || marker == MARKER_SOS) {
+                break;
+            }
+            int length = dataInputStream.readUnsignedShort() - 2;
+            bytesRead += 2;
+            if (DEBUG) {
+                Log.d(TAG, "JPEG segment: " + Integer.toHexString(marker & 0xff) + " (length: "
+                        + (length + 2) + ")");
+            }
+            if (length < 0) {
+                throw new IOException("Invalid length");
+            }
+            switch (marker) {
+                case MARKER_APP1: {
+                    if (DEBUG) {
+                        Log.d(TAG, "MARKER_APP1");
+                    }
+                    if (length < 6) {
+                        // Skip if it's not an EXIF APP1 segment.
+                        break;
+                    }
+                    byte[] identifier = new byte[6];
+                    if (inputStream.read(identifier) != 6) {
+                        throw new IOException("Invalid exif");
+                    }
+                    bytesRead += 6;
+                    length -= 6;
+                    if (!Arrays.equals(identifier, IDENTIFIER_EXIF_APP1)) {
+                        // Skip if it's not an EXIF APP1 segment.
+                        break;
+                    }
+                    if (length <= 0) {
+                        throw new IOException("Invalid exif");
+                    }
+                    if (DEBUG) {
+                        Log.d(TAG, "readExifSegment with a byte array (length: " + length + ")");
+                    }
+                    byte[] bytes = new byte[length];
+                    if (dataInputStream.read(bytes) != length) {
+                        throw new IOException("Invalid exif");
+                    }
+                    readExifSegment(bytes, bytesRead);
+                    bytesRead += length;
+                    length = 0;
+                    break;
+                }
+
+                case MARKER_COM: {
+                    byte[] bytes = new byte[length];
+                    if (dataInputStream.read(bytes) != length) {
+                        throw new IOException("Invalid exif");
+                    }
+                    length = 0;
+                    if (getAttribute(TAG_USER_COMMENT) == null) {
+                        mAttributes[IFD_EXIF_HINT].put(TAG_USER_COMMENT, ExifAttribute.createString(
+                                new String(bytes, ASCII)));
+                    }
+                    break;
+                }
+
+                case MARKER_SOF0:
+                case MARKER_SOF1:
+                case MARKER_SOF2:
+                case MARKER_SOF3:
+                case MARKER_SOF5:
+                case MARKER_SOF6:
+                case MARKER_SOF7:
+                case MARKER_SOF9:
+                case MARKER_SOF10:
+                case MARKER_SOF11:
+                case MARKER_SOF13:
+                case MARKER_SOF14:
+                case MARKER_SOF15: {
+                    if (dataInputStream.skipBytes(1) != 1) {
+                        throw new IOException("Invalid SOFx");
+                    }
+                    mAttributes[IFD_TIFF_HINT].put(TAG_IMAGE_LENGTH, ExifAttribute.createULong(
+                            dataInputStream.readUnsignedShort(), mExifByteOrder));
+                    mAttributes[IFD_TIFF_HINT].put(TAG_IMAGE_WIDTH, ExifAttribute.createULong(
+                            dataInputStream.readUnsignedShort(), mExifByteOrder));
+                    length -= 5;
+                    break;
+                }
+
+                default: {
+                    break;
+                }
+            }
+            if (length < 0) {
+                throw new IOException("Invalid length");
+            }
+            if (dataInputStream.skipBytes(length) != length) {
+                throw new IOException("Invalid JPEG segment");
+            }
+            bytesRead += length;
+        }
+!!!69627063.java!!!	saveJpegAttributes(inout inputStream : InputStream, inout outputStream : OutputStream) : void
+        // See JPEG File Interchange Format Specification page 5.
+        if (DEBUG) {
+            Log.d(TAG, "saveJpegAttributes starting with (inputStream: " + inputStream
+                    + ", outputStream: " + outputStream + ")");
+        }
+        DataInputStream dataInputStream = new DataInputStream(inputStream);
+        ByteOrderAwarenessDataOutputStream dataOutputStream =
+                new ByteOrderAwarenessDataOutputStream(outputStream, ByteOrder.BIG_ENDIAN);
+        if (dataInputStream.readByte() != MARKER) {
+            throw new IOException("Invalid marker");
+        }
+        dataOutputStream.writeByte(MARKER);
+        if (dataInputStream.readByte() != MARKER_SOI) {
+            throw new IOException("Invalid marker");
+        }
+        dataOutputStream.writeByte(MARKER_SOI);
+
+        // Write EXIF APP1 segment
+        dataOutputStream.writeByte(MARKER);
+        dataOutputStream.writeByte(MARKER_APP1);
+        writeExifSegment(dataOutputStream, 6);
+
+        byte[] bytes = new byte[4096];
+
+        while (true) {
+            byte marker = dataInputStream.readByte();
+            if (marker != MARKER) {
+                throw new IOException("Invalid marker");
+            }
+            marker = dataInputStream.readByte();
+            switch (marker) {
+                case MARKER_APP1: {
+                    int length = dataInputStream.readUnsignedShort() - 2;
+                    if (length < 0) {
+                        throw new IOException("Invalid length");
+                    }
+                    byte[] identifier = new byte[6];
+                    if (length >= 6) {
+                        if (dataInputStream.read(identifier) != 6) {
+                            throw new IOException("Invalid exif");
+                        }
+                        if (Arrays.equals(identifier, IDENTIFIER_EXIF_APP1)) {
+                            // Skip the original EXIF APP1 segment.
+                            if (dataInputStream.skip(length - 6) != length - 6) {
+                                throw new IOException("Invalid length");
+                            }
+                            break;
+                        }
+                    }
+                    // Copy non-EXIF APP1 segment.
+                    dataOutputStream.writeByte(MARKER);
+                    dataOutputStream.writeByte(marker);
+                    dataOutputStream.writeUnsignedShort(length + 2);
+                    if (length >= 6) {
+                        length -= 6;
+                        dataOutputStream.write(identifier);
+                    }
+                    int read;
+                    while (length > 0 && (read = dataInputStream.read(
+                            bytes, 0, Math.min(length, bytes.length))) >= 0) {
+                        dataOutputStream.write(bytes, 0, read);
+                        length -= read;
+                    }
+                    break;
+                }
+                case MARKER_EOI:
+                case MARKER_SOS: {
+                    dataOutputStream.writeByte(MARKER);
+                    dataOutputStream.writeByte(marker);
+                    // Copy all the remaining data
+                    Streams.copy(dataInputStream, dataOutputStream);
+                    return;
+                }
+                default: {
+                    // Copy JPEG segment
+                    dataOutputStream.writeByte(MARKER);
+                    dataOutputStream.writeByte(marker);
+                    int length = dataInputStream.readUnsignedShort();
+                    dataOutputStream.writeUnsignedShort(length);
+                    length -= 2;
+                    if (length < 0) {
+                        throw new IOException("Invalid length");
+                    }
+                    int read;
+                    while (length > 0 && (read = dataInputStream.read(
+                            bytes, 0, Math.min(length, bytes.length))) >= 0) {
+                        dataOutputStream.write(bytes, 0, read);
+                        length -= read;
+                    }
+                    break;
+                }
+            }
+        }
+!!!69627191.java!!!	readExifSegment(inout exifBytes : byte [[]], in exifOffsetFromBeginning : int) : void
+        // Parse TIFF Headers. See JEITA CP-3451C Table 1. page 10.
+        ByteOrderAwarenessDataInputStream dataInputStream =
+                new ByteOrderAwarenessDataInputStream(exifBytes);
+
+        // Read byte align
+        short byteOrder = dataInputStream.readShort();
+        switch (byteOrder) {
+            case BYTE_ALIGN_II:
+                if (DEBUG) {
+                    Log.d(TAG, "readExifSegment: Byte Align II");
+                }
+                mExifByteOrder = ByteOrder.LITTLE_ENDIAN;
+                break;
+            case BYTE_ALIGN_MM:
+                if (DEBUG) {
+                    Log.d(TAG, "readExifSegment: Byte Align MM");
+                }
+                mExifByteOrder = ByteOrder.BIG_ENDIAN;
+                break;
+            default:
+                throw new IOException("Invalid byte order: " + Integer.toHexString(byteOrder));
+        }
+
+        // Set byte order.
+        dataInputStream.setByteOrder(mExifByteOrder);
+
+        int startCode = dataInputStream.readUnsignedShort();
+        if (startCode != 0x2a) {
+            throw new IOException("Invalid exif start: " + Integer.toHexString(startCode));
+        }
+
+        // Read first ifd offset
+        long firstIfdOffset = dataInputStream.readUnsignedInt();
+        if (firstIfdOffset < 8 || firstIfdOffset >= exifBytes.length) {
+            throw new IOException("Invalid first Ifd offset: " + firstIfdOffset);
+        }
+        firstIfdOffset -= 8;
+        if (firstIfdOffset > 0) {
+            if (dataInputStream.skip(firstIfdOffset) != firstIfdOffset) {
+                throw new IOException("Couldn't jump to first Ifd: " + firstIfdOffset);
+            }
+        }
+
+        // Read primary image TIFF image file directory.
+        readImageFileDirectory(dataInputStream, IFD_TIFF_HINT);
+
+        // Process thumbnail.
+        String jpegInterchangeFormatString = getAttribute(JPEG_INTERCHANGE_FORMAT_TAG.name);
+        String jpegInterchangeFormatLengthString =
+                getAttribute(JPEG_INTERCHANGE_FORMAT_LENGTH_TAG.name);
+        if (jpegInterchangeFormatString != null && jpegInterchangeFormatLengthString != null) {
+            try {
+                int jpegInterchangeFormat = Integer.parseInt(jpegInterchangeFormatString);
+                int jpegInterchangeFormatLength = Integer
+                        .parseInt(jpegInterchangeFormatLengthString);
+                // The following code limits the size of thumbnail size not to overflow EXIF data area.
+                jpegInterchangeFormatLength = Math.min(jpegInterchangeFormat
+                        + jpegInterchangeFormatLength, exifBytes.length) - jpegInterchangeFormat;
+                if (jpegInterchangeFormat > 0 && jpegInterchangeFormatLength > 0) {
+                    mHasThumbnail = true;
+                    mThumbnailOffset = exifOffsetFromBeginning + jpegInterchangeFormat;
+                    mThumbnailLength = jpegInterchangeFormatLength;
+
+                    if (mFilename == null && mAssetInputStream == null
+                            && mSeekableFileDescriptor == null) {
+                        // Save the thumbnail in memory if the input doesn't support reading again.
+                        byte[] thumbnailBytes = new byte[jpegInterchangeFormatLength];
+                        dataInputStream.seek(jpegInterchangeFormat);
+                        dataInputStream.readFully(thumbnailBytes);
+                        mThumbnailBytes = thumbnailBytes;
+
+                        if (DEBUG) {
+                            Bitmap bitmap = BitmapFactory.decodeByteArray(
+                                    thumbnailBytes, 0, thumbnailBytes.length);
+                            Log.d(TAG, "Thumbnail offset: " + mThumbnailOffset + ", length: "
+                                    + mThumbnailLength + ", width: " + bitmap.getWidth()
+                                    + ", height: "
+                                    + bitmap.getHeight());
+                        }
+                    }
+                }
+            } catch (NumberFormatException e) {
+                // Ignored the corrupted image.
+            }
+        }
+!!!69627319.java!!!	addDefaultValuesForCompatibility() : void
+        // The value of DATETIME tag has the same value of DATETIME_ORIGINAL tag.
+        String valueOfDateTimeOriginal = getAttribute(TAG_DATETIME_ORIGINAL);
+        if (valueOfDateTimeOriginal != null) {
+            mAttributes[IFD_TIFF_HINT].put(TAG_DATETIME,
+                    ExifAttribute.createString(valueOfDateTimeOriginal));
+        }
+
+        // Add the default value.
+        if (getAttribute(TAG_IMAGE_WIDTH) == null) {
+            mAttributes[IFD_TIFF_HINT].put(TAG_IMAGE_WIDTH,
+                    ExifAttribute.createULong(0, mExifByteOrder));
+        }
+        if (getAttribute(TAG_IMAGE_LENGTH) == null) {
+            mAttributes[IFD_TIFF_HINT].put(TAG_IMAGE_LENGTH,
+                    ExifAttribute.createULong(0, mExifByteOrder));
+        }
+        if (getAttribute(TAG_ORIENTATION) == null) {
+            mAttributes[IFD_TIFF_HINT].put(TAG_ORIENTATION,
+                    ExifAttribute.createULong(0, mExifByteOrder));
+        }
+        if (getAttribute(TAG_LIGHT_SOURCE) == null) {
+            mAttributes[IFD_EXIF_HINT].put(TAG_LIGHT_SOURCE,
+                    ExifAttribute.createULong(0, mExifByteOrder));
+        }
+!!!69627447.java!!!	readImageFileDirectory(inout dataInputStream : ExifInterface::ByteOrderAwarenessDataInputStream, in hint : int) : void
+        if (dataInputStream.peek() + 2 > dataInputStream.mLength) {
+            // Return if there is no data from the offset.
+            return;
+        }
+        // See JEITA CP-3451 Figure 5. page 9.
+        short numberOfDirectoryEntry = dataInputStream.readShort();
+        if (dataInputStream.peek() + 12 * numberOfDirectoryEntry > dataInputStream.mLength) {
+            // Return if the size of entries is too big.
+            return;
+        }
+
+        if (DEBUG) {
+            Log.d(TAG, "numberOfDirectoryEntry: " + numberOfDirectoryEntry);
+        }
+
+        for (short i = 0; i < numberOfDirectoryEntry; ++i) {
+            int tagNumber = dataInputStream.readUnsignedShort();
+            int dataFormat = dataInputStream.readUnsignedShort();
+            int numberOfComponents = dataInputStream.readInt();
+            long nextEntryOffset = dataInputStream.peek() + 4;  // next four bytes is for data
+                                                                // offset or value.
+            // Look up a corresponding tag from tag number
+            final ExifTag tag = (ExifTag) sExifTagMapsForReading[hint].get(tagNumber);
+
+            if (DEBUG) {
+                Log.d(TAG, String.format("hint: %d, tagNumber: %d, tagName: %s, dataFormat: %d, " +
+                        "numberOfComponents: %d", hint, tagNumber, tag != null ? tag.name : null,
+                        dataFormat, numberOfComponents));
+            }
+
+            if (tag == null || dataFormat <= 0 ||
+                    dataFormat >= IFD_FORMAT_BYTES_PER_FORMAT.length) {
+                // Skip if the parsed tag number is not defined or invalid data format.
+                if (tag == null) {
+                    Log.w(TAG, "Skip the tag entry since tag number is not defined: " + tagNumber);
+                } else {
+                    Log.w(TAG, "Skip the tag entry since data format is invalid: " + dataFormat);
+                }
+                dataInputStream.seek(nextEntryOffset);
+                continue;
+            }
+
+            // Read a value from data field or seek to the value offset which is stored in data
+            // field if the size of the entry value is bigger than 4.
+            int byteCount = numberOfComponents * IFD_FORMAT_BYTES_PER_FORMAT[dataFormat];
+            if (byteCount > 4) {
+                long offset = dataInputStream.readUnsignedInt();
+                if (DEBUG) {
+                    Log.d(TAG, "seek to data offset: " + offset);
+                }
+                if (offset + byteCount <= dataInputStream.mLength) {
+                    dataInputStream.seek(offset);
+                } else {
+                     // Skip if invalid data offset.
+                    Log.w(TAG, "Skip the tag entry since data offset is invalid: " + offset);
+                    dataInputStream.seek(nextEntryOffset);
+                    continue;
+                }
+            }
+
+            // Recursively parse IFD when a IFD pointer tag appears.
+            int innerIfdHint = getIfdHintFromTagNumber(tagNumber);
+            if (DEBUG) {
+                Log.d(TAG, "innerIfdHint: " + innerIfdHint + " byteCount: " + byteCount);
+            }
+
+            if (innerIfdHint >= 0) {
+                long offset = -1L;
+                // Get offset from data field
+                switch (dataFormat) {
+                    case IFD_FORMAT_USHORT: {
+                        offset = dataInputStream.readUnsignedShort();
+                        break;
+                    }
+                    case IFD_FORMAT_SSHORT: {
+                        offset = dataInputStream.readShort();
+                        break;
+                    }
+                    case IFD_FORMAT_ULONG: {
+                        offset = dataInputStream.readUnsignedInt();
+                        break;
+                    }
+                    case IFD_FORMAT_SLONG: {
+                        offset = dataInputStream.readInt();
+                        break;
+                    }
+                    default: {
+                        // Nothing to do
+                        break;
+                    }
+                }
+                if (DEBUG) {
+                    Log.d(TAG, String.format("Offset: %d, tagName: %s", offset, tag.name));
+                }
+                if (offset > 0L && offset < dataInputStream.mLength) {
+                    dataInputStream.seek(offset);
+                    readImageFileDirectory(dataInputStream, innerIfdHint);
+                } else {
+                    Log.w(TAG, "Skip jump into the IFD since its offset is invalid: " + offset);
+                }
+
+                dataInputStream.seek(nextEntryOffset);
+                continue;
+            }
+
+            byte[] bytes = new byte[numberOfComponents * IFD_FORMAT_BYTES_PER_FORMAT[dataFormat]];
+            dataInputStream.readFully(bytes);
+            mAttributes[hint].put(
+                    tag.name, new ExifAttribute(dataFormat, numberOfComponents, bytes));
+            if (dataInputStream.peek() != nextEntryOffset) {
+                dataInputStream.seek(nextEntryOffset);
+            }
+        }
+
+        if (dataInputStream.peek() + 4 <= dataInputStream.mLength) {
+            long nextIfdOffset = dataInputStream.readUnsignedInt();
+            if (DEBUG) {
+                Log.d(TAG, String.format("nextIfdOffset: %d", nextIfdOffset));
+            }
+            // The next IFD offset needs to be bigger than 8
+            // since the first IFD offset is at least 8.
+            if (nextIfdOffset > 8 && nextIfdOffset < dataInputStream.mLength) {
+                dataInputStream.seek(nextIfdOffset);
+                readImageFileDirectory(dataInputStream, IFD_THUMBNAIL_HINT);
+            }
+        }
+!!!69627575.java!!!	getIfdHintFromTagNumber(in tagNumber : int) : int
+        for (int i = 0; i < IFD_POINTER_TAG_HINTS.length; ++i) {
+            if (IFD_POINTER_TAGS[i].number == tagNumber) {
+                return IFD_POINTER_TAG_HINTS[i];
+            }
+        }
+        return -1;
+!!!69627703.java!!!	writeExifSegment(inout dataOutputStream : ExifInterface::ByteOrderAwarenessDataOutputStream, in exifOffsetFromBeginning : int) : int
+        // The following variables are for calculating each IFD tag group size in bytes.
+        int[] ifdOffsets = new int[EXIF_TAGS.length];
+        int[] ifdDataSizes = new int[EXIF_TAGS.length];
+
+        // Remove IFD pointer tags (we'll re-add it later.)
+        for (ExifTag tag : IFD_POINTER_TAGS) {
+            removeAttribute(tag.name);
+        }
+        // Remove old thumbnail data
+        removeAttribute(JPEG_INTERCHANGE_FORMAT_TAG.name);
+        removeAttribute(JPEG_INTERCHANGE_FORMAT_LENGTH_TAG.name);
+
+        // Remove null value tags.
+        for (int hint = 0; hint < EXIF_TAGS.length; ++hint) {
+            for (Object obj : mAttributes[hint].entrySet().toArray()) {
+                final Map.Entry entry = (Map.Entry) obj;
+                if (entry.getValue() == null) {
+                    mAttributes[hint].remove(entry.getKey());
+                }
+            }
+        }
+
+        // Add IFD pointer tags. The next offset of primary image TIFF IFD will have thumbnail IFD
+        // offset when there is one or more tags in the thumbnail IFD.
+        if (!mAttributes[IFD_INTEROPERABILITY_HINT].isEmpty()) {
+            mAttributes[IFD_EXIF_HINT].put(IFD_POINTER_TAGS[2].name,
+                    ExifAttribute.createULong(0, mExifByteOrder));
+        }
+        if (!mAttributes[IFD_EXIF_HINT].isEmpty()) {
+            mAttributes[IFD_TIFF_HINT].put(IFD_POINTER_TAGS[0].name,
+                    ExifAttribute.createULong(0, mExifByteOrder));
+        }
+        if (!mAttributes[IFD_GPS_HINT].isEmpty()) {
+            mAttributes[IFD_TIFF_HINT].put(IFD_POINTER_TAGS[1].name,
+                    ExifAttribute.createULong(0, mExifByteOrder));
+        }
+        if (mHasThumbnail) {
+            mAttributes[IFD_TIFF_HINT].put(JPEG_INTERCHANGE_FORMAT_TAG.name,
+                    ExifAttribute.createULong(0, mExifByteOrder));
+            mAttributes[IFD_TIFF_HINT].put(JPEG_INTERCHANGE_FORMAT_LENGTH_TAG.name,
+                    ExifAttribute.createULong(mThumbnailLength, mExifByteOrder));
+        }
+
+        // Calculate IFD group data area sizes. IFD group data area is assigned to save the entry
+        // value which has a bigger size than 4 bytes.
+        for (int i = 0; i < EXIF_TAGS.length; ++i) {
+            int sum = 0;
+            for (Map.Entry entry : (Set<Map.Entry>) mAttributes[i].entrySet()) {
+                final ExifAttribute exifAttribute = (ExifAttribute) ((Map.Entry) entry).getValue();
+                final int size = exifAttribute.size();
+                if (size > 4) {
+                    sum += size;
+                }
+            }
+            ifdDataSizes[i] += sum;
+        }
+
+        // Calculate IFD offsets.
+        int position = 8;
+        for (int hint = 0; hint < EXIF_TAGS.length; ++hint) {
+            if (!mAttributes[hint].isEmpty()) {
+                ifdOffsets[hint] = position;
+                position += 2 + mAttributes[hint].size() * 12 + 4 + ifdDataSizes[hint];
+            }
+        }
+        if (mHasThumbnail) {
+            int thumbnailOffset = position;
+            mAttributes[IFD_TIFF_HINT].put(JPEG_INTERCHANGE_FORMAT_TAG.name,
+                    ExifAttribute.createULong(thumbnailOffset, mExifByteOrder));
+            mThumbnailOffset = exifOffsetFromBeginning + thumbnailOffset;
+            position += mThumbnailLength;
+        }
+
+        // Calculate the total size
+        int totalSize = position + 8;  // eight bytes is for header part.
+        if (DEBUG) {
+            Log.d(TAG, "totalSize length: " + totalSize);
+            for (int i = 0; i < EXIF_TAGS.length; ++i) {
+                Log.d(TAG, String.format("index: %d, offsets: %d, tag count: %d, data sizes: %d",
+                        i, ifdOffsets[i], mAttributes[i].size(), ifdDataSizes[i]));
+            }
+        }
+
+        // Update IFD pointer tags with the calculated offsets.
+        if (!mAttributes[IFD_EXIF_HINT].isEmpty()) {
+            mAttributes[IFD_TIFF_HINT].put(IFD_POINTER_TAGS[0].name,
+                    ExifAttribute.createULong(ifdOffsets[IFD_EXIF_HINT], mExifByteOrder));
+        }
+        if (!mAttributes[IFD_GPS_HINT].isEmpty()) {
+            mAttributes[IFD_TIFF_HINT].put(IFD_POINTER_TAGS[1].name,
+                    ExifAttribute.createULong(ifdOffsets[IFD_GPS_HINT], mExifByteOrder));
+        }
+        if (!mAttributes[IFD_INTEROPERABILITY_HINT].isEmpty()) {
+            mAttributes[IFD_EXIF_HINT].put(IFD_POINTER_TAGS[2].name, ExifAttribute.createULong(
+                    ifdOffsets[IFD_INTEROPERABILITY_HINT], mExifByteOrder));
+        }
+
+        // Write TIFF Headers. See JEITA CP-3451C Table 1. page 10.
+        dataOutputStream.writeUnsignedShort(totalSize);
+        dataOutputStream.write(IDENTIFIER_EXIF_APP1);
+        dataOutputStream.writeShort(mExifByteOrder == ByteOrder.BIG_ENDIAN
+                ? BYTE_ALIGN_MM : BYTE_ALIGN_II);
+        dataOutputStream.setByteOrder(mExifByteOrder);
+        dataOutputStream.writeUnsignedShort(0x2a);
+        dataOutputStream.writeUnsignedInt(8);
+
+        // Write IFD groups. See JEITA CP-3451C Figure 7. page 12.
+        for (int hint = 0; hint < EXIF_TAGS.length; ++hint) {
+            if (!mAttributes[hint].isEmpty()) {
+                // See JEITA CP-3451C 4.6.2 IFD structure. page 13.
+                // Write entry count
+                dataOutputStream.writeUnsignedShort(mAttributes[hint].size());
+
+                // Write entry info
+                int dataOffset = ifdOffsets[hint] + 2 + mAttributes[hint].size() * 12 + 4;
+                for (Map.Entry entry : (Set<Map.Entry>) mAttributes[hint].entrySet()) {
+                    // Convert tag name to tag number.
+                    final ExifTag tag = (ExifTag) sExifTagMapsForWriting[hint].get(entry.getKey());
+                    final int tagNumber = tag.number;
+                    final ExifAttribute attribute = (ExifAttribute) entry.getValue();
+                    final int size = attribute.size();
+
+                    dataOutputStream.writeUnsignedShort(tagNumber);
+                    dataOutputStream.writeUnsignedShort(attribute.format);
+                    dataOutputStream.writeInt(attribute.numberOfComponents);
+                    if (size > 4) {
+                        dataOutputStream.writeUnsignedInt(dataOffset);
+                        dataOffset += size;
+                    } else {
+                        dataOutputStream.write(attribute.bytes);
+                        // Fill zero up to 4 bytes
+                        if (size < 4) {
+                            for (int i = size; i < 4; ++i) {
+                                dataOutputStream.writeByte(0);
+                            }
+                        }
+                    }
+                }
+
+                // Write the next offset. It writes the offset of thumbnail IFD if there is one or
+                // more tags in the thumbnail IFD when the current IFD is the primary image TIFF
+                // IFD; Otherwise 0.
+                if (hint == 0 && !mAttributes[IFD_THUMBNAIL_HINT].isEmpty()) {
+                    dataOutputStream.writeUnsignedInt(ifdOffsets[IFD_THUMBNAIL_HINT]);
+                } else {
+                    dataOutputStream.writeUnsignedInt(0);
+                }
+
+                // Write values of data field exceeding 4 bytes after the next offset.
+                for (Map.Entry entry : (Set<Map.Entry>) mAttributes[hint].entrySet()) {
+                    ExifAttribute attribute = (ExifAttribute) entry.getValue();
+
+                    if (attribute.bytes.length > 4) {
+                        dataOutputStream.write(attribute.bytes, 0, attribute.bytes.length);
+                    }
+                }
+            }
+        }
+
+        // Write thumbnail
+        if (mHasThumbnail) {
+            dataOutputStream.write(getThumbnail());
+        }
+
+        // Reset the byte order to big endian in order to write remaining parts of the JPEG file.
+        dataOutputStream.setByteOrder(ByteOrder.BIG_ENDIAN);
+
+        return totalSize;
+!!!69627831.java!!!	guessDataFormat(inout entryValue : String) : Pair
+        // See TIFF 6.0 spec Types. page 15.
+        // Take the first component if there are more than one component.
+        if (entryValue.contains(",")) {
+            String[] entryValues = entryValue.split(",");
+            Pair<Integer, Integer> dataFormat = guessDataFormat(entryValues[0]);
+            if (dataFormat.first == IFD_FORMAT_STRING) {
+                return dataFormat;
+            }
+            for (int i = 1; i < entryValues.length; ++i) {
+                final Pair<Integer, Integer> guessDataFormat = guessDataFormat(entryValues[i]);
+                int first = -1, second = -1;
+                if (guessDataFormat.first == dataFormat.first
+                        || guessDataFormat.second == dataFormat.first) {
+                    first = dataFormat.first;
+                }
+                if (dataFormat.second != -1 && (guessDataFormat.first == dataFormat.second
+                        || guessDataFormat.second == dataFormat.second)) {
+                    second = dataFormat.second;
+                }
+                if (first == -1 && second == -1) {
+                    return new Pair<>(IFD_FORMAT_STRING, -1);
+                }
+                if (first == -1) {
+                    dataFormat = new Pair<>(second, -1);
+                    continue;
+                }
+                if (second == -1) {
+                    dataFormat = new Pair<>(first, -1);
+                    continue;
+                }
+            }
+            return dataFormat;
+        }
+
+        if (entryValue.contains("/")) {
+            String[] rationalNumber = entryValue.split("/");
+            if (rationalNumber.length == 2) {
+                try {
+                    long numerator = Long.parseLong(rationalNumber[0]);
+                    long denominator = Long.parseLong(rationalNumber[1]);
+                    if (numerator < 0L || denominator < 0L) {
+                        return new Pair<>(IFD_FORMAT_SRATIONAL, - 1);
+                    }
+                    if (numerator > Integer.MAX_VALUE || denominator > Integer.MAX_VALUE) {
+                        return new Pair<>(IFD_FORMAT_URATIONAL, -1);
+                    }
+                    return new Pair<>(IFD_FORMAT_SRATIONAL, IFD_FORMAT_URATIONAL);
+                } catch (NumberFormatException e)  {
+                    // Ignored
+                }
+            }
+            return new Pair<>(IFD_FORMAT_STRING, -1);
+        }
+        try {
+            Long longValue = Long.parseLong(entryValue);
+            if (longValue >= 0 && longValue <= 65535) {
+                return new Pair<>(IFD_FORMAT_USHORT, IFD_FORMAT_ULONG);
+            }
+            if (longValue < 0) {
+                return new Pair<>(IFD_FORMAT_SLONG, -1);
+            }
+            return new Pair<>(IFD_FORMAT_ULONG, -1);
+        } catch (NumberFormatException e) {
+            // Ignored
+        }
+        try {
+            Double.parseDouble(entryValue);
+            return new Pair<>(IFD_FORMAT_DOUBLE, -1);
+        } catch (NumberFormatException e) {
+            // Ignored
+        }
+        return new Pair<>(IFD_FORMAT_STRING, -1);

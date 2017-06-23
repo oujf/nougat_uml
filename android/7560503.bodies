@@ -1,0 +1,194 @@
+class InstallerConnection
+!!!83035191.java!!!	setWarnIfHeld(inout warnIfHeld : Object) : void
+        Preconditions.checkState(mWarnIfHeld == null);
+        mWarnIfHeld = Preconditions.checkNotNull(warnIfHeld);
+!!!83035319.java!!!	transact(inout cmd : String) : String
+        if (mWarnIfHeld != null && Thread.holdsLock(mWarnIfHeld)) {
+            Slog.wtf(TAG, "Calling thread " + Thread.currentThread().getName() + " is holding 0x"
+                    + Integer.toHexString(System.identityHashCode(mWarnIfHeld)), new Throwable());
+        }
+
+        if (!connect()) {
+            Slog.e(TAG, "connection failed");
+            return "-1";
+        }
+
+        if (!writeCommand(cmd)) {
+            /*
+             * If installd died and restarted in the background (unlikely but
+             * possible) we'll fail on the next write (this one). Try to
+             * reconnect and write the command one more time before giving up.
+             */
+            Slog.e(TAG, "write command failed? reconnect!");
+            if (!connect() || !writeCommand(cmd)) {
+                return "-1";
+            }
+        }
+        if (LOCAL_DEBUG) {
+            Slog.i(TAG, "send: '" + cmd + "'");
+        }
+
+        final int replyLength = readReply();
+        if (replyLength > 0) {
+            String s = new String(buf, 0, replyLength);
+            if (LOCAL_DEBUG) {
+                Slog.i(TAG, "recv: '" + s + "'");
+            }
+            return s;
+        } else {
+            if (LOCAL_DEBUG) {
+                Slog.i(TAG, "fail");
+            }
+            return "-1";
+        }
+!!!83035447.java!!!	execute(inout cmd : String, inout  : Object...args) : String
+        final StringBuilder builder = new StringBuilder(cmd);
+        for (Object arg : args) {
+            String escaped;
+            if (arg == null) {
+                escaped = "";
+            } else {
+                escaped = String.valueOf(arg);
+            }
+            if (escaped.indexOf('\0') != -1 || escaped.indexOf(' ') != -1 || "!".equals(escaped)) {
+                throw new InstallerException(
+                        "Invalid argument while executing " + cmd + " " + Arrays.toString(args));
+            }
+            if (TextUtils.isEmpty(escaped)) {
+                escaped = "!";
+            }
+            builder.append(' ').append(escaped);
+        }
+        final String[] resRaw = transact(builder.toString()).split(" ");
+        int res = -1;
+        try {
+            res = Integer.parseInt(resRaw[0]);
+        } catch (ArrayIndexOutOfBoundsException | NumberFormatException ignored) {
+        }
+        if (res != 0) {
+            throw new InstallerException(
+                    "Failed to execute " + cmd + " " + Arrays.toString(args) + ": " + res);
+        }
+        return resRaw;
+!!!83035575.java!!!	dexopt(inout apkPath : String, in uid : int, inout instructionSet : String, in dexoptNeeded : int, in dexFlags : int, inout compilerFilter : String, inout volumeUuid : String, inout sharedLibraries : String) : void
+        dexopt(apkPath, uid, "*", instructionSet, dexoptNeeded, null /*outputPath*/, dexFlags,
+                compilerFilter, volumeUuid, sharedLibraries);
+!!!83035703.java!!!	dexopt(inout apkPath : String, in uid : int, inout pkgName : String, inout instructionSet : String, in dexoptNeeded : int, inout outputPath : String, in dexFlags : int, inout compilerFilter : String, inout volumeUuid : String, inout sharedLibraries : String) : void
+        execute("dexopt",
+                apkPath,
+                uid,
+                pkgName,
+                instructionSet,
+                dexoptNeeded,
+                outputPath,
+                dexFlags,
+                compilerFilter,
+                volumeUuid,
+                sharedLibraries);
+!!!83035831.java!!!	safeParseBooleanResult(inout res : String [[]]) : boolean
+        if ((res == null) || (res.length != 2)) {
+            throw new InstallerException("Invalid size result: " + Arrays.toString(res));
+        }
+
+        // Just as a sanity check. Anything != "true" will be interpreted as false by parseBoolean.
+        if (!res[1].equals("true") && !res[1].equals("false")) {
+            throw new InstallerException("Invalid boolean result: " + Arrays.toString(res));
+        }
+
+        return Boolean.parseBoolean(res[1]);
+!!!83035959.java!!!	mergeProfiles(in uid : int, inout pkgName : String) : boolean
+        final String[] res = execute("merge_profiles", uid, pkgName);
+
+        return safeParseBooleanResult(res);
+!!!83036087.java!!!	dumpProfiles(inout gid : String, inout packageName : String, inout codePaths : String) : boolean
+        final String[] res = execute("dump_profiles", gid, packageName, codePaths);
+
+        return safeParseBooleanResult(res);
+!!!83036215.java!!!	connect() : boolean
+        if (mSocket != null) {
+            return true;
+        }
+        Slog.i(TAG, "connecting...");
+        try {
+            mSocket = new LocalSocket();
+
+            LocalSocketAddress address = new LocalSocketAddress("installd",
+                    LocalSocketAddress.Namespace.RESERVED);
+
+            mSocket.connect(address);
+
+            mIn = mSocket.getInputStream();
+            mOut = mSocket.getOutputStream();
+        } catch (IOException ex) {
+            disconnect();
+            return false;
+        }
+        return true;
+!!!83036343.java!!!	disconnect() : void
+        Slog.i(TAG, "disconnecting...");
+        IoUtils.closeQuietly(mSocket);
+        IoUtils.closeQuietly(mIn);
+        IoUtils.closeQuietly(mOut);
+
+        mSocket = null;
+        mIn = null;
+        mOut = null;
+!!!83036471.java!!!	readFully(inout buffer : byte [[]], in len : int) : boolean
+        try {
+            Streams.readFully(mIn, buffer, 0, len);
+        } catch (IOException ioe) {
+            Slog.e(TAG, "read exception");
+            disconnect();
+            return false;
+        }
+
+        if (LOCAL_DEBUG) {
+            Slog.i(TAG, "read " + len + " bytes");
+        }
+
+        return true;
+!!!83036599.java!!!	readReply() : int
+        if (!readFully(buf, 2)) {
+            return -1;
+        }
+
+        final int len = (((int) buf[0]) & 0xff) | ((((int) buf[1]) & 0xff) << 8);
+        if ((len < 1) || (len > buf.length)) {
+            Slog.e(TAG, "invalid reply length (" + len + ")");
+            disconnect();
+            return -1;
+        }
+
+        if (!readFully(buf, len)) {
+            return -1;
+        }
+
+        return len;
+!!!83036727.java!!!	writeCommand(inout cmdString : String) : boolean
+        final byte[] cmd = cmdString.getBytes();
+        final int len = cmd.length;
+        if ((len < 1) || (len > buf.length)) {
+            return false;
+        }
+
+        buf[0] = (byte) (len & 0xff);
+        buf[1] = (byte) ((len >> 8) & 0xff);
+        try {
+            mOut.write(buf, 0, 2);
+            mOut.write(cmd, 0, len);
+        } catch (IOException ex) {
+            Slog.e(TAG, "write error");
+            disconnect();
+            return false;
+        }
+        return true;
+!!!83036855.java!!!	waitForConnection() : void
+        for (;;) {
+            try {
+                execute("ping");
+                return;
+            } catch (InstallerException ignored) {
+            }
+            Slog.w(TAG, "installd not ready");
+            SystemClock.sleep(1000);
+        }

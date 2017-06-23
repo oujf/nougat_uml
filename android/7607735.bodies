@@ -1,0 +1,252 @@
+class AccountSyncSettingsBackupHelper
+!!!83548599.java!!!	AccountSyncSettingsBackupHelper(inout context : Context)
+        mContext = context;
+        mAccountManager = AccountManager.get(mContext);
+!!!83548727.java!!!	performBackup(inout oldState : ParcelFileDescriptor, inout output : BackupDataOutput, inout newState : ParcelFileDescriptor) : void
+        try {
+            JSONObject dataJSON = serializeAccountSyncSettingsToJSON();
+
+            if (DEBUG) {
+                Log.d(TAG, "Account sync settings JSON: " + dataJSON);
+            }
+
+            // Encode JSON data to bytes.
+            byte[] dataBytes = dataJSON.toString().getBytes(JSON_FORMAT_ENCODING);
+            byte[] oldMd5Checksum = readOldMd5Checksum(oldState);
+            byte[] newMd5Checksum = generateMd5Checksum(dataBytes);
+            if (!Arrays.equals(oldMd5Checksum, newMd5Checksum)) {
+                int dataSize = dataBytes.length;
+                output.writeEntityHeader(JSON_FORMAT_HEADER_KEY, dataSize);
+                output.writeEntityData(dataBytes, dataSize);
+
+                Log.i(TAG, "Backup successful.");
+            } else {
+                Log.i(TAG, "Old and new MD5 checksums match. Skipping backup.");
+            }
+
+            writeNewMd5Checksum(newState, newMd5Checksum);
+        } catch (JSONException | IOException | NoSuchAlgorithmException e) {
+            Log.e(TAG, "Couldn't backup account sync settings\n" + e);
+        }
+!!!83548855.java!!!	serializeAccountSyncSettingsToJSON() : JSONObject
+        Account[] accounts = mAccountManager.getAccounts();
+        SyncAdapterType[] syncAdapters = ContentResolver.getSyncAdapterTypesAsUser(
+                mContext.getUserId());
+
+        // Create a map of Account types to authorities. Later this will make it easier for us to
+        // generate our JSON.
+        HashMap<String, List<String>> accountTypeToAuthorities = new HashMap<String,
+                List<String>>();
+        for (SyncAdapterType syncAdapter : syncAdapters) {
+            // Skip adapters that aren’t visible to the user.
+            if (!syncAdapter.isUserVisible()) {
+                continue;
+            }
+            if (!accountTypeToAuthorities.containsKey(syncAdapter.accountType)) {
+                accountTypeToAuthorities.put(syncAdapter.accountType, new ArrayList<String>());
+            }
+            accountTypeToAuthorities.get(syncAdapter.accountType).add(syncAdapter.authority);
+        }
+
+        // Generate JSON.
+        JSONObject backupJSON = new JSONObject();
+        backupJSON.put(KEY_VERSION, JSON_FORMAT_VERSION);
+        backupJSON.put(KEY_MASTER_SYNC_ENABLED, ContentResolver.getMasterSyncAutomatically());
+
+        JSONArray accountJSONArray = new JSONArray();
+        for (Account account : accounts) {
+            List<String> authorities = accountTypeToAuthorities.get(account.type);
+
+            // We ignore Accounts that don't have any authorities because there would be no sync
+            // settings for us to restore.
+            if (authorities == null || authorities.isEmpty()) {
+                continue;
+            }
+
+            JSONObject accountJSON = new JSONObject();
+            accountJSON.put(KEY_ACCOUNT_NAME, account.name);
+            accountJSON.put(KEY_ACCOUNT_TYPE, account.type);
+
+            // Add authorities for this Account type and check whether or not sync is enabled.
+            JSONArray authoritiesJSONArray = new JSONArray();
+            for (String authority : authorities) {
+                int syncState = ContentResolver.getIsSyncable(account, authority);
+                boolean syncEnabled = ContentResolver.getSyncAutomatically(account, authority);
+
+                JSONObject authorityJSON = new JSONObject();
+                authorityJSON.put(KEY_AUTHORITY_NAME, authority);
+                authorityJSON.put(KEY_AUTHORITY_SYNC_STATE, syncState);
+                authorityJSON.put(KEY_AUTHORITY_SYNC_ENABLED, syncEnabled);
+                authoritiesJSONArray.put(authorityJSON);
+            }
+            accountJSON.put(KEY_ACCOUNT_AUTHORITIES, authoritiesJSONArray);
+
+            accountJSONArray.put(accountJSON);
+        }
+        backupJSON.put(KEY_ACCOUNTS, accountJSONArray);
+
+        return backupJSON;
+!!!83548983.java!!!	readOldMd5Checksum(inout oldState : ParcelFileDescriptor) : byte
+        DataInputStream dataInput = new DataInputStream(
+                new FileInputStream(oldState.getFileDescriptor()));
+
+        byte[] oldMd5Checksum = new byte[MD5_BYTE_SIZE];
+        try {
+            int stateVersion = dataInput.readInt();
+            if (stateVersion <= STATE_VERSION) {
+                // If the state version is a version we can understand then read the MD5 sum,
+                // otherwise we return an empty byte array for the MD5 sum which will force a
+                // backup.
+                for (int i = 0; i < MD5_BYTE_SIZE; i++) {
+                    oldMd5Checksum[i] = dataInput.readByte();
+                }
+            } else {
+                Log.i(TAG, "Backup state version is: " + stateVersion
+                        + " (support only up to version " + STATE_VERSION + ")");
+            }
+        } catch (EOFException eof) {
+            // Initial state may be empty.
+        }
+        // We explicitly don't close 'dataInput' because we must not close the backing fd.
+        return oldMd5Checksum;
+!!!83549111.java!!!	writeNewMd5Checksum(inout newState : ParcelFileDescriptor, inout md5Checksum : byte [[]]) : void
+        DataOutputStream dataOutput = new DataOutputStream(
+                new BufferedOutputStream(new FileOutputStream(newState.getFileDescriptor())));
+
+        dataOutput.writeInt(STATE_VERSION);
+        dataOutput.write(md5Checksum);
+
+        // We explicitly don't close 'dataOutput' because we must not close the backing fd.
+        // The FileOutputStream will not close it implicitly.
+
+!!!83549239.java!!!	generateMd5Checksum(inout data : byte [[]]) : byte
+        if (data == null) {
+            return null;
+        }
+
+        MessageDigest md5 = MessageDigest.getInstance("MD5");
+        return md5.digest(data);
+!!!83549367.java!!!	restoreEntity(inout data : BackupDataInputStream) : void
+        byte[] dataBytes = new byte[data.size()];
+        try {
+            // Read the data and convert it to a String.
+            data.read(dataBytes);
+            String dataString = new String(dataBytes, JSON_FORMAT_ENCODING);
+
+            // Convert data to a JSON object.
+            JSONObject dataJSON = new JSONObject(dataString);
+            boolean masterSyncEnabled = dataJSON.getBoolean(KEY_MASTER_SYNC_ENABLED);
+            JSONArray accountJSONArray = dataJSON.getJSONArray(KEY_ACCOUNTS);
+
+            boolean currentMasterSyncEnabled = ContentResolver.getMasterSyncAutomatically();
+            if (currentMasterSyncEnabled) {
+                // Disable master sync to prevent any syncs from running.
+                ContentResolver.setMasterSyncAutomatically(false);
+            }
+
+            try {
+                restoreFromJsonArray(accountJSONArray);
+            } finally {
+                // Set the master sync preference to the value from the backup set.
+                ContentResolver.setMasterSyncAutomatically(masterSyncEnabled);
+            }
+            Log.i(TAG, "Restore successful.");
+        } catch (IOException | JSONException e) {
+            Log.e(TAG, "Couldn't restore account sync settings\n" + e);
+        }
+!!!83549495.java!!!	restoreFromJsonArray(inout accountJSONArray : JSONArray) : void
+        HashSet<Account> currentAccounts = getAccounts();
+        JSONArray unaddedAccountsJSONArray = new JSONArray();
+        for (int i = 0; i < accountJSONArray.length(); i++) {
+            JSONObject accountJSON = (JSONObject) accountJSONArray.get(i);
+            String accountName = accountJSON.getString(KEY_ACCOUNT_NAME);
+            String accountType = accountJSON.getString(KEY_ACCOUNT_TYPE);
+
+            Account account = null;
+            try {
+                account = new Account(accountName, accountType);
+            } catch (IllegalArgumentException iae) {
+                continue;
+            }
+
+            // Check if the account already exists. Accounts that don't exist on the device
+            // yet won't be restored.
+            if (currentAccounts.contains(account)) {
+                if (DEBUG) Log.i(TAG, "Restoring Sync Settings for" + accountName);
+                restoreExistingAccountSyncSettingsFromJSON(accountJSON);
+            } else {
+                unaddedAccountsJSONArray.put(accountJSON);
+            }
+        }
+
+        if (unaddedAccountsJSONArray.length() > 0) {
+            try (FileOutputStream fOutput = new FileOutputStream(STASH_FILE)) {
+                String jsonString = unaddedAccountsJSONArray.toString();
+                DataOutputStream out = new DataOutputStream(fOutput);
+                out.writeUTF(jsonString);
+            } catch (IOException ioe) {
+                // Error in writing to stash file
+                Log.e(TAG, "unable to write the sync settings to the stash file", ioe);
+            }
+        } else {
+            File stashFile = new File(STASH_FILE);
+            if (stashFile.exists()) stashFile.delete();
+        }
+!!!83549623.java!!!	accountAddedInternal() : void
+        String jsonString;
+
+        try (FileInputStream fIn = new FileInputStream(new File(STASH_FILE))) {
+            DataInputStream in = new DataInputStream(fIn);
+            jsonString = in.readUTF();
+        } catch (FileNotFoundException fnfe) {
+            // This is expected to happen when there is no accounts info stashed
+            if (DEBUG) Log.d(TAG, "unable to find the stash file", fnfe);
+            return;
+        } catch (IOException ioe) {
+            if (DEBUG) Log.d(TAG, "could not read sync settings from stash file", ioe);
+            return;
+        }
+
+        try {
+            JSONArray unaddedAccountsJSONArray = new JSONArray(jsonString);
+            restoreFromJsonArray(unaddedAccountsJSONArray);
+        } catch (JSONException jse) {
+            // Malformed jsonString
+            Log.e(TAG, "there was an error with the stashed sync settings", jse);
+        }
+!!!83549751.java!!!	accountAdded(inout context : Context) : void
+        AccountSyncSettingsBackupHelper helper = new AccountSyncSettingsBackupHelper(context);
+        helper.accountAddedInternal();
+!!!83549879.java!!!	getAccounts() : Account
+        Account[] accounts = mAccountManager.getAccounts();
+        HashSet<Account> accountHashSet = new HashSet<Account>();
+        for (Account account : accounts) {
+            accountHashSet.add(account);
+        }
+        return accountHashSet;
+!!!83550007.java!!!	restoreExistingAccountSyncSettingsFromJSON(inout accountJSON : JSONObject) : void
+        // Restore authorities.
+        JSONArray authorities = accountJSON.getJSONArray(KEY_ACCOUNT_AUTHORITIES);
+        String accountName = accountJSON.getString(KEY_ACCOUNT_NAME);
+        String accountType = accountJSON.getString(KEY_ACCOUNT_TYPE);
+
+        final Account account = new Account(accountName, accountType);
+        for (int i = 0; i < authorities.length(); i++) {
+            JSONObject authority = (JSONObject) authorities.get(i);
+            final String authorityName = authority.getString(KEY_AUTHORITY_NAME);
+            boolean wasSyncEnabled = authority.getBoolean(KEY_AUTHORITY_SYNC_ENABLED);
+            int wasSyncable = authority.getInt(KEY_AUTHORITY_SYNC_STATE);
+
+            ContentResolver.setSyncAutomaticallyAsUser(
+                    account, authorityName, wasSyncEnabled, 0 /* user Id */);
+
+            if (!wasSyncEnabled) {
+                ContentResolver.setIsSyncable(
+                        account,
+                        authorityName,
+                        wasSyncable == 0 ?
+                                0 /* not syncable */ : 2 /* syncable but needs initialization */);
+            }
+        }
+!!!83550135.java!!!	writeNewStateDescription(inout newState : ParcelFileDescriptor) : void
+

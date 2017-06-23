@@ -1,0 +1,125 @@
+class GsmCellBroadcastHandler
+!!!76523063.java!!!	GsmCellBroadcastHandler(inout context : Context, inout phone : Phone)
+        super("GsmCellBroadcastHandler", context, phone);
+        phone.mCi.setOnNewGsmBroadcastSms(getHandler(), EVENT_NEW_SMS_MESSAGE, null);
+!!!76523191.java!!!	onQuitting() : void
+        mPhone.mCi.unSetOnNewGsmBroadcastSms(getHandler());
+        super.onQuitting();     // release wakelock
+!!!76523319.java!!!	makeGsmCellBroadcastHandler(inout context : Context, inout phone : Phone) : GsmCellBroadcastHandler
+        GsmCellBroadcastHandler handler = new GsmCellBroadcastHandler(context, phone);
+        handler.start();
+        return handler;
+!!!76523447.java!!!	handleSmsMessage(inout message : Message) : boolean
+        if (message.obj instanceof AsyncResult) {
+            SmsCbMessage cbMessage = handleGsmBroadcastSms((AsyncResult) message.obj);
+            if (cbMessage != null) {
+                handleBroadcastSms(cbMessage);
+                return true;
+            }
+        }
+        return super.handleSmsMessage(message);
+!!!76523575.java!!!	handleGsmBroadcastSms(inout ar : AsyncResult) : SmsCbMessage
+        try {
+            byte[] receivedPdu = (byte[]) ar.result;
+
+            if (VDBG) {
+                int pduLength = receivedPdu.length;
+                for (int i = 0; i < pduLength; i += 8) {
+                    StringBuilder sb = new StringBuilder("SMS CB pdu data: ");
+                    for (int j = i; j < i + 8 && j < pduLength; j++) {
+                        int b = receivedPdu[j] & 0xff;
+                        if (b < 0x10) {
+                            sb.append('0');
+                        }
+                        sb.append(Integer.toHexString(b)).append(' ');
+                    }
+                    log(sb.toString());
+                }
+            }
+
+            SmsCbHeader header = new SmsCbHeader(receivedPdu);
+            String plmn = TelephonyManager.from(mContext).getNetworkOperatorForPhone(
+                    mPhone.getPhoneId());
+            int lac = -1;
+            int cid = -1;
+            CellLocation cl = mPhone.getCellLocation();
+            // Check if cell location is GsmCellLocation.  This is required to support
+            // dual-mode devices such as CDMA/LTE devices that require support for
+            // both 3GPP and 3GPP2 format messages
+            if (cl instanceof GsmCellLocation) {
+                GsmCellLocation cellLocation = (GsmCellLocation)cl;
+                lac = cellLocation.getLac();
+                cid = cellLocation.getCid();
+            }
+
+            SmsCbLocation location;
+            switch (header.getGeographicalScope()) {
+                case SmsCbMessage.GEOGRAPHICAL_SCOPE_LA_WIDE:
+                    location = new SmsCbLocation(plmn, lac, -1);
+                    break;
+
+                case SmsCbMessage.GEOGRAPHICAL_SCOPE_CELL_WIDE:
+                case SmsCbMessage.GEOGRAPHICAL_SCOPE_CELL_WIDE_IMMEDIATE:
+                    location = new SmsCbLocation(plmn, lac, cid);
+                    break;
+
+                case SmsCbMessage.GEOGRAPHICAL_SCOPE_PLMN_WIDE:
+                default:
+                    location = new SmsCbLocation(plmn);
+                    break;
+            }
+
+            byte[][] pdus;
+            int pageCount = header.getNumberOfPages();
+            if (pageCount > 1) {
+                // Multi-page message
+                SmsCbConcatInfo concatInfo = new SmsCbConcatInfo(header, location);
+
+                // Try to find other pages of the same message
+                pdus = mSmsCbPageMap.get(concatInfo);
+
+                if (pdus == null) {
+                    // This is the first page of this message, make room for all
+                    // pages and keep until complete
+                    pdus = new byte[pageCount][];
+
+                    mSmsCbPageMap.put(concatInfo, pdus);
+                }
+
+                // Page parameter is one-based
+                pdus[header.getPageIndex() - 1] = receivedPdu;
+
+                for (byte[] pdu : pdus) {
+                    if (pdu == null) {
+                        // Still missing pages, exit
+                        return null;
+                    }
+                }
+
+                // Message complete, remove and dispatch
+                mSmsCbPageMap.remove(concatInfo);
+            } else {
+                // Single page message
+                pdus = new byte[1][];
+                pdus[0] = receivedPdu;
+            }
+
+            // Remove messages that are out of scope to prevent the map from
+            // growing indefinitely, containing incomplete messages that were
+            // never assembled
+            Iterator<SmsCbConcatInfo> iter = mSmsCbPageMap.keySet().iterator();
+
+            while (iter.hasNext()) {
+                SmsCbConcatInfo info = iter.next();
+
+                if (!info.matchesLocation(plmn, lac, cid)) {
+                    iter.remove();
+                }
+            }
+
+            return GsmSmsCbMessage.createSmsCbMessage(header, location, pdus);
+
+        } catch (RuntimeException e) {
+            loge("Error in decoding SMS CB pdu", e);
+            return null;
+        }

@@ -1,0 +1,612 @@
+class RecentsImpl
+!!!71776311.java!!!	RecentsImpl(inout context : Context)
+        mContext = context;
+        mHandler = new Handler();
+
+        // Initialize the static foreground thread
+        ForegroundThread.get();
+
+        // Register the task stack listener
+        mTaskStackListener = new TaskStackListenerImpl();
+        SystemServicesProxy ssp = Recents.getSystemServices();
+        ssp.registerTaskStackListener(mTaskStackListener);
+
+        // Initialize the static configuration resources
+        LayoutInflater inflater = LayoutInflater.from(mContext);
+        mDummyStackView = new TaskStackView(mContext);
+        mHeaderBar = (TaskViewHeader) inflater.inflate(R.layout.recents_task_view_header,
+                null, false);
+        reloadResources();
+!!!71776439.java!!!	onBootCompleted() : void
+        // When we start, preload the data associated with the previous recent tasks.
+        // We can use a new plan since the caches will be the same.
+        RecentsTaskLoader loader = Recents.getTaskLoader();
+        RecentsTaskLoadPlan plan = loader.createLoadPlan(mContext);
+        loader.preloadTasks(plan, -1, false /* includeFrontMostExcludedTask */);
+        RecentsTaskLoadPlan.Options launchOpts = new RecentsTaskLoadPlan.Options();
+        launchOpts.numVisibleTasks = loader.getIconCacheSize();
+        launchOpts.numVisibleTaskThumbnails = loader.getThumbnailCacheSize();
+        launchOpts.onlyLoadForCache = true;
+        loader.loadTasks(mContext, plan, launchOpts);
+!!!71776567.java!!!	onConfigurationChanged() : void
+        reloadResources();
+        mDummyStackView.reloadOnConfigurationChange();
+        mHeaderBar.onConfigurationChanged();
+!!!71776695.java!!!	onVisibilityChanged(inout context : Context, inout visible : boolean) : void
+        SystemUIApplication app = (SystemUIApplication) context;
+        PhoneStatusBar statusBar = app.getComponent(PhoneStatusBar.class);
+        if (statusBar != null) {
+            statusBar.updateRecentsVisibility(visible);
+        }
+!!!71776823.java!!!	onStartScreenPinning(inout context : Context, in taskId : int) : void
+        SystemUIApplication app = (SystemUIApplication) context;
+        PhoneStatusBar statusBar = app.getComponent(PhoneStatusBar.class);
+        if (statusBar != null) {
+            statusBar.showScreenPinningRequest(taskId, false);
+        }
+!!!71776951.java!!!	showRecents(inout triggeredFromAltTab : boolean, inout draggingInRecents : boolean, inout animate : boolean, inout launchedWhileDockingTask : boolean, inout fromHome : boolean, in growTarget : int) : void
+        mTriggeredFromAltTab = triggeredFromAltTab;
+        mDraggingInRecents = draggingInRecents;
+        mLaunchedWhileDocking = launchedWhileDockingTask;
+        if (mFastAltTabTrigger.isAsleep()) {
+            // Fast alt-tab duration has elapsed, fall through to showing Recents and reset
+            mFastAltTabTrigger.stopDozing();
+        } else if (mFastAltTabTrigger.isDozing()) {
+            // Fast alt-tab duration has not elapsed.  If this is triggered by a different
+            // showRecents() call, then ignore that call for now.
+            // TODO: We can not handle quick tabs that happen between the initial showRecents() call
+            //       that started the activity and the activity starting up.  The severity of this
+            //       is inversely proportional to the FAST_ALT_TAB_DELAY_MS duration though.
+            if (!triggeredFromAltTab) {
+                return;
+            }
+            mFastAltTabTrigger.stopDozing();
+        } else if (triggeredFromAltTab) {
+            // The fast alt-tab detector is not yet running, so start the trigger and wait for the
+            // hideRecents() call, or for the fast alt-tab duration to elapse
+            mFastAltTabTrigger.startDozing();
+            return;
+        }
+
+        try {
+            // Check if the top task is in the home stack, and start the recents activity
+            SystemServicesProxy ssp = Recents.getSystemServices();
+            boolean forceVisible = launchedWhileDockingTask || draggingInRecents;
+            MutableBoolean isHomeStackVisible = new MutableBoolean(forceVisible);
+            if (forceVisible || !ssp.isRecentsActivityVisible(isHomeStackVisible)) {
+                ActivityManager.RunningTaskInfo runningTask = ssp.getRunningTask();
+                startRecentsActivity(runningTask, isHomeStackVisible.value || fromHome, animate,
+                        growTarget);
+            }
+        } catch (ActivityNotFoundException e) {
+            Log.e(TAG, "Failed to launch RecentsActivity", e);
+        }
+!!!71777079.java!!!	hideRecents(inout triggeredFromAltTab : boolean, inout triggeredFromHomeKey : boolean) : void
+        if (triggeredFromAltTab && mFastAltTabTrigger.isDozing()) {
+            // The user has released alt-tab before the trigger has run, so just show the next
+            // task immediately
+            showNextTask();
+
+            // Cancel the fast alt-tab trigger
+            mFastAltTabTrigger.stopDozing();
+            return;
+        }
+
+        // Defer to the activity to handle hiding recents, if it handles it, then it must still
+        // be visible
+        EventBus.getDefault().post(new HideRecentsEvent(triggeredFromAltTab,
+                triggeredFromHomeKey));
+!!!71777207.java!!!	toggleRecents(in growTarget : int) : void
+        // Skip this toggle if we are already waiting to trigger recents via alt-tab
+        if (mFastAltTabTrigger.isDozing()) {
+            return;
+        }
+
+        mDraggingInRecents = false;
+        mLaunchedWhileDocking = false;
+        mTriggeredFromAltTab = false;
+
+        try {
+            SystemServicesProxy ssp = Recents.getSystemServices();
+            MutableBoolean isHomeStackVisible = new MutableBoolean(true);
+            long elapsedTime = SystemClock.elapsedRealtime() - mLastToggleTime;
+
+            if (ssp.isRecentsActivityVisible(isHomeStackVisible)) {
+                RecentsDebugFlags debugFlags = Recents.getDebugFlags();
+                RecentsConfiguration config = Recents.getConfiguration();
+                RecentsActivityLaunchState launchState = config.getLaunchState();
+                if (!launchState.launchedWithAltTab) {
+                    // If the user taps quickly
+                    if (!debugFlags.isPagingEnabled() ||
+                            (ViewConfiguration.getDoubleTapMinTime() < elapsedTime &&
+                                    elapsedTime < ViewConfiguration.getDoubleTapTimeout())) {
+                        // Launch the next focused task
+                        EventBus.getDefault().post(new LaunchNextTaskRequestEvent());
+                    } else {
+                        // Notify recents to move onto the next task
+                        EventBus.getDefault().post(new IterateRecentsEvent());
+                    }
+                } else {
+                    // If the user has toggled it too quickly, then just eat up the event here (it's
+                    // better than showing a janky screenshot).
+                    // NOTE: Ideally, the screenshot mechanism would take the window transform into
+                    // account
+                    if (elapsedTime < MIN_TOGGLE_DELAY_MS) {
+                        return;
+                    }
+
+                    EventBus.getDefault().post(new ToggleRecentsEvent());
+                    mLastToggleTime = SystemClock.elapsedRealtime();
+                }
+                return;
+            } else {
+                // If the user has toggled it too quickly, then just eat up the event here (it's
+                // better than showing a janky screenshot).
+                // NOTE: Ideally, the screenshot mechanism would take the window transform into
+                // account
+                if (elapsedTime < MIN_TOGGLE_DELAY_MS) {
+                    return;
+                }
+
+                // Otherwise, start the recents activity
+                ActivityManager.RunningTaskInfo runningTask = ssp.getRunningTask();
+                startRecentsActivity(runningTask, isHomeStackVisible.value, true /* animate */,
+                        growTarget);
+
+                // Only close the other system windows if we are actually showing recents
+                ssp.sendCloseSystemWindows(BaseStatusBar.SYSTEM_DIALOG_REASON_RECENT_APPS);
+                mLastToggleTime = SystemClock.elapsedRealtime();
+            }
+        } catch (ActivityNotFoundException e) {
+            Log.e(TAG, "Failed to launch RecentsActivity", e);
+        }
+!!!71777335.java!!!	preloadRecents() : void
+        // Preload only the raw task list into a new load plan (which will be consumed by the
+        // RecentsActivity) only if there is a task to animate to.
+        SystemServicesProxy ssp = Recents.getSystemServices();
+        MutableBoolean isHomeStackVisible = new MutableBoolean(true);
+        if (!ssp.isRecentsActivityVisible(isHomeStackVisible)) {
+            ActivityManager.RunningTaskInfo runningTask = ssp.getRunningTask();
+            RecentsTaskLoader loader = Recents.getTaskLoader();
+            sInstanceLoadPlan = loader.createLoadPlan(mContext);
+            sInstanceLoadPlan.preloadRawTasks(!isHomeStackVisible.value);
+            loader.preloadTasks(sInstanceLoadPlan, runningTask.id, !isHomeStackVisible.value);
+            TaskStack stack = sInstanceLoadPlan.getTaskStack();
+            if (stack.getTaskCount() > 0) {
+                // Only preload the icon (but not the thumbnail since it may not have been taken for
+                // the pausing activity)
+                preloadIcon(runningTask.id);
+
+                // At this point, we don't know anything about the stack state.  So only calculate
+                // the dimensions of the thumbnail that we need for the transition into Recents, but
+                // do not draw it until we construct the activity options when we start Recents
+                updateHeaderBarLayout(stack, null /* window rect override*/);
+            }
+        }
+!!!71777463.java!!!	cancelPreloadingRecents() : void
+        // Do nothing
+!!!71777591.java!!!	onDraggingInRecents(in distanceFromTop : float) : void
+        EventBus.getDefault().sendOntoMainThread(new DraggingInRecentsEvent(distanceFromTop));
+!!!71777719.java!!!	onDraggingInRecentsEnded(in velocity : float) : void
+        EventBus.getDefault().sendOntoMainThread(new DraggingInRecentsEndedEvent(velocity));
+!!!71777847.java!!!	showNextTask() : void
+        SystemServicesProxy ssp = Recents.getSystemServices();
+        RecentsTaskLoader loader = Recents.getTaskLoader();
+        RecentsTaskLoadPlan plan = loader.createLoadPlan(mContext);
+        loader.preloadTasks(plan, -1, false /* includeFrontMostExcludedTask */);
+        TaskStack focusedStack = plan.getTaskStack();
+
+        // Return early if there are no tasks in the focused stack
+        if (focusedStack == null || focusedStack.getTaskCount() == 0) return;
+
+        // Return early if there is no running task
+        ActivityManager.RunningTaskInfo runningTask = ssp.getRunningTask();
+        if (runningTask == null) return;
+
+        // Find the task in the recents list
+        boolean isRunningTaskInHomeStack = SystemServicesProxy.isHomeStack(runningTask.stackId);
+        ArrayList<Task> tasks = focusedStack.getStackTasks();
+        Task toTask = null;
+        ActivityOptions launchOpts = null;
+        int taskCount = tasks.size();
+        for (int i = taskCount - 1; i >= 1; i--) {
+            Task task = tasks.get(i);
+            if (isRunningTaskInHomeStack) {
+                toTask = tasks.get(i - 1);
+                launchOpts = ActivityOptions.makeCustomAnimation(mContext,
+                        R.anim.recents_launch_next_affiliated_task_target,
+                        R.anim.recents_fast_toggle_app_home_exit);
+                break;
+            } else if (task.key.id == runningTask.id) {
+                toTask = tasks.get(i - 1);
+                launchOpts = ActivityOptions.makeCustomAnimation(mContext,
+                        R.anim.recents_launch_prev_affiliated_task_target,
+                        R.anim.recents_launch_prev_affiliated_task_source);
+                break;
+            }
+        }
+
+        // Return early if there is no next task
+        if (toTask == null) {
+            ssp.startInPlaceAnimationOnFrontMostApplication(
+                    ActivityOptions.makeCustomInPlaceAnimation(mContext,
+                            R.anim.recents_launch_prev_affiliated_task_bounce));
+            return;
+        }
+
+        // Launch the task
+        ssp.startActivityFromRecents(mContext, toTask.key, toTask.title, launchOpts);
+!!!71777975.java!!!	showRelativeAffiliatedTask(inout showNextTask : boolean) : void
+        SystemServicesProxy ssp = Recents.getSystemServices();
+        RecentsTaskLoader loader = Recents.getTaskLoader();
+        RecentsTaskLoadPlan plan = loader.createLoadPlan(mContext);
+        loader.preloadTasks(plan, -1, false /* includeFrontMostExcludedTask */);
+        TaskStack focusedStack = plan.getTaskStack();
+
+        // Return early if there are no tasks in the focused stack
+        if (focusedStack == null || focusedStack.getTaskCount() == 0) return;
+
+        // Return early if there is no running task (can't determine affiliated tasks in this case)
+        ActivityManager.RunningTaskInfo runningTask = ssp.getRunningTask();
+        if (runningTask == null) return;
+        // Return early if the running task is in the home stack (optimization)
+        if (SystemServicesProxy.isHomeStack(runningTask.stackId)) return;
+
+        // Find the task in the recents list
+        ArrayList<Task> tasks = focusedStack.getStackTasks();
+        Task toTask = null;
+        ActivityOptions launchOpts = null;
+        int taskCount = tasks.size();
+        int numAffiliatedTasks = 0;
+        for (int i = 0; i < taskCount; i++) {
+            Task task = tasks.get(i);
+            if (task.key.id == runningTask.id) {
+                TaskGrouping group = task.group;
+                Task.TaskKey toTaskKey;
+                if (showNextTask) {
+                    toTaskKey = group.getNextTaskInGroup(task);
+                    launchOpts = ActivityOptions.makeCustomAnimation(mContext,
+                            R.anim.recents_launch_next_affiliated_task_target,
+                            R.anim.recents_launch_next_affiliated_task_source);
+                } else {
+                    toTaskKey = group.getPrevTaskInGroup(task);
+                    launchOpts = ActivityOptions.makeCustomAnimation(mContext,
+                            R.anim.recents_launch_prev_affiliated_task_target,
+                            R.anim.recents_launch_prev_affiliated_task_source);
+                }
+                if (toTaskKey != null) {
+                    toTask = focusedStack.findTaskWithId(toTaskKey.id);
+                }
+                numAffiliatedTasks = group.getTaskCount();
+                break;
+            }
+        }
+
+        // Return early if there is no next task
+        if (toTask == null) {
+            if (numAffiliatedTasks > 1) {
+                if (showNextTask) {
+                    ssp.startInPlaceAnimationOnFrontMostApplication(
+                            ActivityOptions.makeCustomInPlaceAnimation(mContext,
+                                    R.anim.recents_launch_next_affiliated_task_bounce));
+                } else {
+                    ssp.startInPlaceAnimationOnFrontMostApplication(
+                            ActivityOptions.makeCustomInPlaceAnimation(mContext,
+                                    R.anim.recents_launch_prev_affiliated_task_bounce));
+                }
+            }
+            return;
+        }
+
+        // Keep track of actually launched affiliated tasks
+        MetricsLogger.count(mContext, "overview_affiliated_task_launch", 1);
+
+        // Launch the task
+        ssp.startActivityFromRecents(mContext, toTask.key, toTask.title, launchOpts);
+!!!71778103.java!!!	showNextAffiliatedTask() : void
+        // Keep track of when the affiliated task is triggered
+        MetricsLogger.count(mContext, "overview_affiliated_task_next", 1);
+        showRelativeAffiliatedTask(true);
+!!!71778231.java!!!	showPrevAffiliatedTask() : void
+        // Keep track of when the affiliated task is triggered
+        MetricsLogger.count(mContext, "overview_affiliated_task_prev", 1);
+        showRelativeAffiliatedTask(false);
+!!!71778359.java!!!	dockTopTask(in topTaskId : int, in dragMode : int, in stackCreateMode : int, inout initialBounds : Rect) : void
+        SystemServicesProxy ssp = Recents.getSystemServices();
+
+        // Make sure we inform DividerView before we actually start the activity so we can change
+        // the resize mode already.
+        if (ssp.moveTaskToDockedStack(topTaskId, stackCreateMode, initialBounds)) {
+            EventBus.getDefault().send(new DockedTopTaskEvent(dragMode, initialBounds));
+            showRecents(
+                    false /* triggeredFromAltTab */,
+                    dragMode == NavigationBarGestureHelper.DRAG_MODE_RECENTS,
+                    false /* animate */,
+                    true /* launchedWhileDockingTask*/,
+                    false /* fromHome */,
+                    DividerView.INVALID_RECENTS_GROW_TARGET);
+        }
+!!!71778487.java!!!	consumeInstanceLoadPlan() : RecentsTaskLoadPlan
+        RecentsTaskLoadPlan plan = sInstanceLoadPlan;
+        sInstanceLoadPlan = null;
+        return plan;
+!!!71778615.java!!!	reloadResources() : void
+        Resources res = mContext.getResources();
+
+        mStatusBarHeight = res.getDimensionPixelSize(
+                com.android.internal.R.dimen.status_bar_height);
+        mNavBarHeight = res.getDimensionPixelSize(
+                com.android.internal.R.dimen.navigation_bar_height);
+        mNavBarWidth = res.getDimensionPixelSize(
+                com.android.internal.R.dimen.navigation_bar_width);
+        mTaskBarHeight = TaskStackLayoutAlgorithm.getDimensionForDevice(mContext,
+                R.dimen.recents_task_view_header_height,
+                R.dimen.recents_task_view_header_height,
+                R.dimen.recents_task_view_header_height,
+                R.dimen.recents_task_view_header_height_tablet_land,
+                R.dimen.recents_task_view_header_height,
+                R.dimen.recents_task_view_header_height_tablet_land);
+!!!71778743.java!!!	updateHeaderBarLayout(inout stack : TaskStack, inout windowRectOverride : Rect) : void
+        SystemServicesProxy ssp = Recents.getSystemServices();
+        Rect displayRect = ssp.getDisplayRect();
+        Rect systemInsets = new Rect();
+        ssp.getStableInsets(systemInsets);
+        Rect windowRect = windowRectOverride != null
+                ? new Rect(windowRectOverride)
+                : ssp.getWindowRect();
+        // When docked, the nav bar insets are consumed and the activity is measured without insets.
+        // However, the window bounds include the insets, so we need to subtract them here to make
+        // them identical.
+        if (ssp.hasDockedTask()) {
+            windowRect.bottom -= systemInsets.bottom;
+            systemInsets.bottom = 0;
+        }
+        calculateWindowStableInsets(systemInsets, windowRect);
+        windowRect.offsetTo(0, 0);
+
+        TaskStackLayoutAlgorithm stackLayout = mDummyStackView.getStackAlgorithm();
+
+        // Rebind the header bar and draw it for the transition
+        stackLayout.setSystemInsets(systemInsets);
+        if (stack != null) {
+            stackLayout.getTaskStackBounds(displayRect, windowRect, systemInsets.top,
+                    systemInsets.right, mTaskStackBounds);
+            stackLayout.reset();
+            stackLayout.initialize(displayRect, windowRect, mTaskStackBounds,
+                    TaskStackLayoutAlgorithm.StackState.getStackStateForStack(stack));
+            mDummyStackView.setTasks(stack, false /* allowNotifyStackChanges */);
+
+            Rect taskViewBounds = stackLayout.getUntransformedTaskViewBounds();
+            if (!taskViewBounds.isEmpty()) {
+                int taskViewWidth = taskViewBounds.width();
+                synchronized (mHeaderBarLock) {
+                    if (mHeaderBar.getMeasuredWidth() != taskViewWidth ||
+                            mHeaderBar.getMeasuredHeight() != mTaskBarHeight) {
+                        mHeaderBar.measure(
+                                MeasureSpec.makeMeasureSpec(taskViewWidth, MeasureSpec.EXACTLY),
+                                MeasureSpec.makeMeasureSpec(mTaskBarHeight, MeasureSpec.EXACTLY));
+                    }
+                    mHeaderBar.layout(0, 0, taskViewWidth, mTaskBarHeight);
+                }
+
+                // Update the transition bitmap to match the new header bar height
+                if (mThumbTransitionBitmapCache == null ||
+                        (mThumbTransitionBitmapCache.getWidth() != taskViewWidth) ||
+                        (mThumbTransitionBitmapCache.getHeight() != mTaskBarHeight)) {
+                    mThumbTransitionBitmapCache = Bitmap.createBitmap(taskViewWidth,
+                            mTaskBarHeight, Bitmap.Config.ARGB_8888);
+                }
+            }
+        }
+!!!71778871.java!!!	calculateWindowStableInsets(inout inOutInsets : Rect, inout windowRect : Rect) : void
+        Rect displayRect = Recents.getSystemServices().getDisplayRect();
+
+        // Display rect without insets - available app space
+        Rect appRect = new Rect(displayRect);
+        appRect.inset(inOutInsets);
+
+        // Our window intersected with available app space
+        Rect windowRectWithInsets = new Rect(windowRect);
+        windowRectWithInsets.intersect(appRect);
+        inOutInsets.left = windowRectWithInsets.left - windowRect.left;
+        inOutInsets.top = windowRectWithInsets.top - windowRect.top;
+        inOutInsets.right = windowRect.right - windowRectWithInsets.right;
+        inOutInsets.bottom = windowRect.bottom - windowRectWithInsets.bottom;
+!!!71778999.java!!!	preloadIcon(in runningTaskId : int) : void
+        // Ensure that we load the running task's icon
+        RecentsTaskLoadPlan.Options launchOpts = new RecentsTaskLoadPlan.Options();
+        launchOpts.runningTaskId = runningTaskId;
+        launchOpts.loadThumbnails = false;
+        launchOpts.onlyLoadForCache = true;
+        Recents.getTaskLoader().loadTasks(mContext, sInstanceLoadPlan, launchOpts);
+!!!71779127.java!!!	getUnknownTransitionActivityOptions() : ActivityOptions
+        return ActivityOptions.makeCustomAnimation(mContext,
+                R.anim.recents_from_unknown_enter,
+                R.anim.recents_from_unknown_exit,
+                mHandler, null);
+!!!71779255.java!!!	getHomeTransitionActivityOptions() : ActivityOptions
+        return ActivityOptions.makeCustomAnimation(mContext,
+                R.anim.recents_from_launcher_enter,
+                R.anim.recents_from_launcher_exit,
+                mHandler, null);
+!!!71779383.java!!!	getThumbnailTransitionActivityOptions(inout runningTask : ActivityManager::RunningTaskInfo, inout stackView : TaskStackView, inout windowOverrideRect : Rect) : ActivityOptions
+        if (runningTask != null && runningTask.stackId == FREEFORM_WORKSPACE_STACK_ID) {
+            ArrayList<AppTransitionAnimationSpec> specs = new ArrayList<>();
+            ArrayList<Task> tasks = stackView.getStack().getStackTasks();
+            TaskStackLayoutAlgorithm stackLayout = stackView.getStackAlgorithm();
+            TaskStackViewScroller stackScroller = stackView.getScroller();
+
+            stackView.updateLayoutAlgorithm(true /* boundScroll */);
+            stackView.updateToInitialState();
+
+            for (int i = tasks.size() - 1; i >= 0; i--) {
+                Task task = tasks.get(i);
+                if (task.isFreeformTask()) {
+                    mTmpTransform = stackLayout.getStackTransformScreenCoordinates(task,
+                            stackScroller.getStackScroll(), mTmpTransform, null,
+                            windowOverrideRect);
+                    Bitmap thumbnail = drawThumbnailTransitionBitmap(task, mTmpTransform,
+                            mThumbTransitionBitmapCache);
+                    Rect toTaskRect = new Rect();
+                    mTmpTransform.rect.round(toTaskRect);
+                    specs.add(new AppTransitionAnimationSpec(task.key.id, thumbnail, toTaskRect));
+                }
+            }
+            AppTransitionAnimationSpec[] specsArray = new AppTransitionAnimationSpec[specs.size()];
+            specs.toArray(specsArray);
+            return ActivityOptions.makeThumbnailAspectScaleDownAnimation(mDummyStackView,
+                    specsArray, mHandler, null, this);
+        } else {
+            // Update the destination rect
+            Task toTask = new Task();
+            TaskViewTransform toTransform = getThumbnailTransitionTransform(stackView, toTask,
+                    windowOverrideRect);
+            Bitmap thumbnail = drawThumbnailTransitionBitmap(toTask, toTransform,
+                    mThumbTransitionBitmapCache);
+            if (thumbnail != null) {
+                RectF toTaskRect = toTransform.rect;
+                return ActivityOptions.makeThumbnailAspectScaleDownAnimation(mDummyStackView,
+                        thumbnail, (int) toTaskRect.left, (int) toTaskRect.top,
+                        (int) toTaskRect.width(), (int) toTaskRect.height(), mHandler, null);
+            }
+            // If both the screenshot and thumbnail fails, then just fall back to the default transition
+            return getUnknownTransitionActivityOptions();
+        }
+!!!71779511.java!!!	getThumbnailTransitionTransform(inout stackView : TaskStackView, inout runningTaskOut : Task, inout windowOverrideRect : Rect) : TaskViewTransform
+        // Find the running task in the TaskStack
+        TaskStack stack = stackView.getStack();
+        Task launchTask = stack.getLaunchTarget();
+        if (launchTask != null) {
+            runningTaskOut.copyFrom(launchTask);
+        } else {
+            // If no task is specified or we can not find the task just use the front most one
+            launchTask = stack.getStackFrontMostTask(true /* includeFreeform */);
+            runningTaskOut.copyFrom(launchTask);
+        }
+
+        // Get the transform for the running task
+        stackView.updateLayoutAlgorithm(true /* boundScroll */);
+        stackView.updateToInitialState();
+        stackView.getStackAlgorithm().getStackTransformScreenCoordinates(launchTask,
+                stackView.getScroller().getStackScroll(), mTmpTransform, null, windowOverrideRect);
+        return mTmpTransform;
+!!!71779639.java!!!	drawThumbnailTransitionBitmap(inout toTask : Task, inout toTransform : TaskViewTransform, inout thumbnail : Bitmap) : Bitmap
+        SystemServicesProxy ssp = Recents.getSystemServices();
+        if (toTransform != null && toTask.key != null) {
+            synchronized (mHeaderBarLock) {
+                boolean disabledInSafeMode = !toTask.isSystemApp && ssp.isInSafeMode();
+                mHeaderBar.onTaskViewSizeChanged((int) toTransform.rect.width(),
+                        (int) toTransform.rect.height());
+                if (RecentsDebugFlags.Static.EnableTransitionThumbnailDebugMode) {
+                    thumbnail.eraseColor(0xFFff0000);
+                } else {
+                    thumbnail.eraseColor(0);
+                    Canvas c = new Canvas(thumbnail);
+                    // Workaround for b/27815919, reset the callback so that we do not trigger an
+                    // invalidate on the header bar as a result of updating the icon
+                    Drawable icon = mHeaderBar.getIconView().getDrawable();
+                    if (icon != null) {
+                        icon.setCallback(null);
+                    }
+                    mHeaderBar.bindToTask(toTask, false /* touchExplorationEnabled */,
+                            disabledInSafeMode);
+                    mHeaderBar.onTaskDataLoaded();
+                    mHeaderBar.setDimAlpha(toTransform.dimAlpha);
+                    mHeaderBar.draw(c);
+                    c.setBitmap(null);
+                }
+            }
+            return thumbnail.createAshmemBitmap();
+        }
+        return null;
+!!!71779767.java!!!	startRecentsActivity(inout runningTask : ActivityManager::RunningTaskInfo, inout isHomeStackVisible : boolean, inout animate : boolean, in growTarget : int) : void
+        RecentsTaskLoader loader = Recents.getTaskLoader();
+        RecentsActivityLaunchState launchState = Recents.getConfiguration().getLaunchState();
+
+        int runningTaskId = !mLaunchedWhileDocking && (runningTask != null)
+                ? runningTask.id
+                : -1;
+
+        // In the case where alt-tab is triggered, we never get a preloadRecents() call, so we
+        // should always preload the tasks now. If we are dragging in recents, reload them as
+        // the stacks might have changed.
+        if (mLaunchedWhileDocking || mTriggeredFromAltTab ||sInstanceLoadPlan == null) {
+            // Create a new load plan if preloadRecents() was never triggered
+            sInstanceLoadPlan = loader.createLoadPlan(mContext);
+        }
+        if (mLaunchedWhileDocking || mTriggeredFromAltTab || !sInstanceLoadPlan.hasTasks()) {
+            loader.preloadTasks(sInstanceLoadPlan, runningTaskId, !isHomeStackVisible);
+        }
+
+        TaskStack stack = sInstanceLoadPlan.getTaskStack();
+        boolean hasRecentTasks = stack.getTaskCount() > 0;
+        boolean useThumbnailTransition = (runningTask != null) && !isHomeStackVisible && hasRecentTasks;
+
+        // Update the launch state that we need in updateHeaderBarLayout()
+        launchState.launchedFromHome = !useThumbnailTransition && !mLaunchedWhileDocking;
+        launchState.launchedFromApp = useThumbnailTransition || mLaunchedWhileDocking;
+        launchState.launchedViaDockGesture = mLaunchedWhileDocking;
+        launchState.launchedViaDragGesture = mDraggingInRecents;
+        launchState.launchedToTaskId = runningTaskId;
+        launchState.launchedWithAltTab = mTriggeredFromAltTab;
+
+        // Preload the icon (this will be a null-op if we have preloaded the icon already in
+        // preloadRecents())
+        preloadIcon(runningTaskId);
+
+        // Update the header bar if necessary
+        Rect windowOverrideRect = getWindowRectOverride(growTarget);
+        updateHeaderBarLayout(stack, windowOverrideRect);
+
+        // Prepare the dummy stack for the transition
+        TaskStackLayoutAlgorithm.VisibilityReport stackVr =
+                mDummyStackView.computeStackVisibilityReport();
+
+        // Update the remaining launch state
+        launchState.launchedNumVisibleTasks = stackVr.numVisibleTasks;
+        launchState.launchedNumVisibleThumbnails = stackVr.numVisibleThumbnails;
+
+        if (!animate) {
+            startRecentsActivity(ActivityOptions.makeCustomAnimation(mContext, -1, -1));
+            return;
+        }
+
+        ActivityOptions opts;
+        if (useThumbnailTransition) {
+            // Try starting with a thumbnail transition
+            opts = getThumbnailTransitionActivityOptions(runningTask, mDummyStackView,
+                    windowOverrideRect);
+        } else {
+            // If there is no thumbnail transition, but is launching from home into recents, then
+            // use a quick home transition
+            opts = hasRecentTasks
+                ? getHomeTransitionActivityOptions()
+                : getUnknownTransitionActivityOptions();
+        }
+        startRecentsActivity(opts);
+        mLastToggleTime = SystemClock.elapsedRealtime();
+!!!71779895.java!!!	getWindowRectOverride(in growTarget : int) : Rect
+        if (growTarget == DividerView.INVALID_RECENTS_GROW_TARGET) {
+            return null;
+        }
+        Rect result = new Rect();
+        Rect displayRect = Recents.getSystemServices().getDisplayRect();
+        DockedDividerUtils.calculateBoundsForPosition(growTarget, WindowManager.DOCKED_BOTTOM,
+                result, displayRect.width(), displayRect.height(),
+                Recents.getSystemServices().getDockedDividerSize(mContext));
+        return result;
+!!!71780023.java!!!	startRecentsActivity(inout opts : ActivityOptions) : void
+        Intent intent = new Intent();
+        intent.setClassName(RECENTS_PACKAGE, RECENTS_ACTIVITY);
+        intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK
+                | Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS
+                | Intent.FLAG_ACTIVITY_TASK_ON_HOME);
+
+        if (opts != null) {
+            mContext.startActivityAsUser(intent, opts.toBundle(), UserHandle.CURRENT);
+        } else {
+            mContext.startActivityAsUser(intent, UserHandle.CURRENT);
+        }
+        EventBus.getDefault().send(new RecentsActivityStartingEvent());
+!!!71780151.java!!!	onAnimationFinished() : void
+        EventBus.getDefault().post(new EnterRecentsWindowLastAnimationFrameEvent());
